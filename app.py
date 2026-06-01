@@ -24,7 +24,7 @@ TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler      = WebhookHandler(LINE_SECRET)
 genai.configure(api_key=GEMINI_API_KEY)
-gemini       = genai.GenerativeModel("gemini-1.5-flash")
+gemini       = genai.GenerativeModel("gemini-2.0-flash")
 
 # ─── In-memory storage ────────────────────────────────────────────────────────
 daily_slips      = {}
@@ -39,9 +39,12 @@ active_groups    = set()
 
 def extract_slip_info(image_bytes: bytes) -> dict:
     prompt = (
-        "วิเคราะห์สลิปโอนเงินนี้แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
-        '{"sender":null,"amount":0.00,"datetime":null,"bank":null,'
+        "ดูรูปนี้ว่าเป็นสลิป/หลักฐานการโอนเงินจากธนาคารหรือแอปธนาคารหรือไม่ "
+        "แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
+        '{"is_slip":true,"sender":null,"amount":0.00,"datetime":null,"bank":null,'
         '"account":null,"ref_number":null,"fraud_score":0,"fraud_reasons":[]}\n\n'
+        "is_slip: true ถ้าเป็นสลิปโอนเงินจริง, false ถ้าเป็นรูปอื่น (เช่น รูปคน อาหาร ใบเสร็จ เมนู วิว ฯลฯ)\n"
+        "ถ้า is_slip เป็น false ให้ใส่ค่าที่เหลือเป็น null/0 ได้เลย\n"
         "fraud_score: 0-100 (0=ปลอดภัย, 100=น่าสงสัยมาก)\n"
         "fraud_reasons: เหตุผลที่น่าสงสัย เช่น ฟอนต์ผิดปกติ, ตัดต่อ, โลโก้ไม่ถูกต้อง"
     )
@@ -245,6 +248,12 @@ def handle_image(event):
 
     try:
         info      = extract_slip_info(image_bytes)
+
+        # ถ้าไม่ใช่สลิปโอนเงิน → เงียบไว้ ไม่ต้องตอบอะไร
+        if not info.get("is_slip", True):
+            print(f"[skip] not a slip, group={group_id}", flush=True)
+            return
+
         promptpay = verify_with_promptpay(image_bytes)
         is_dup    = check_duplicate(group_id, info.get("ref_number"))
         verdict   = build_verdict(info, promptpay, is_dup)
@@ -254,16 +263,15 @@ def handle_image(event):
         if verdict["admin_msg"] and ADMIN_USER_ID:
             line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
     except Exception as e:
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=f"⚠️ อ่านสลิปไม่ได้ครับ กรุณาส่งรูปให้ชัดขึ้น\n({str(e)[:60]})")
-        )
+        # อ่าน error แล้วเงียบไว้ ไม่รบกวนกรุ๊ป (กันรูปที่ไม่ใช่สลิปโดนทัก)
+        print(f"[error] handle_image group={group_id}: {e}", flush=True)
 
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     text     = event.message.text.strip()
     group_id = getattr(event.source, "group_id", event.source.user_id)
+    print(f"[GROUP_ID] source_type={event.source.type} id={group_id} text={text}", flush=True)
     if any(kw in text for kw in ["สรุป", "รายงาน", "report", "summary"]):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
 
