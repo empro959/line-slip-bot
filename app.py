@@ -87,9 +87,6 @@ init_db()
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_slip_info(image_bytes: bytes) -> dict:
-    now      = datetime.now(TZ)
-    today_ce = now.strftime("%Y-%m-%d")
-    today_be = now.year + 543
     prompt = (
         "ดูรูปนี้ว่าเป็นสลิป/หลักฐานการโอนเงินจากธนาคารหรือแอปธนาคารหรือไม่ "
         "แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
@@ -97,10 +94,11 @@ def extract_slip_info(image_bytes: bytes) -> dict:
         '"account":null,"ref_number":null,"fraud_score":0,"fraud_reasons":[]}\n\n'
         "is_slip: true ถ้าเป็นสลิปโอนเงินจริง, false ถ้าเป็นรูปอื่น (เช่น รูปคน อาหาร ใบเสร็จ เมนู วิว ฯลฯ)\n"
         "ถ้า is_slip เป็น false ให้ใส่ค่าที่เหลือเป็น null/0 ได้เลย\n\n"
-        f"วันนี้คือ {today_ce} (ตรงกับ พ.ศ. {today_be}) ใช้เป็นฐานพิจารณาเรื่องวันที่\n"
-        "เรื่องปีสำคัญมาก: สลิปไทยมักใช้พุทธศักราช (พ.ศ.) เช่น 2569 = ค.ศ. 2026 (พ.ศ. ลบ 543). "
-        "ห้ามตัดสินว่าเป็น 'วันในอนาคต' ถ้าแปลง พ.ศ.→ค.ศ. แล้วเป็นวันนี้หรืออดีต\n"
-        "datetime: ให้ตอบเป็น ค.ศ. รูปแบบ ISO YYYY-MM-DDTHH:MM:SS เสมอ\n\n"
+        "datetime: ดึงวันเวลาจากสลิป แปลงเป็น ค.ศ. รูปแบบ ISO YYYY-MM-DDTHH:MM:SS เสมอ "
+        "(สลิปไทยใช้ พ.ศ. เช่น 2569 = ค.ศ. 2026 ให้ลบ 543)\n"
+        "⚠️ ห้ามนำเรื่องวันที่ (ว่าเป็นอนาคตหรืออดีต) มาเป็นเหตุผล fraud โดยเด็ดขาด ไม่ว่ากรณีใดๆ — "
+        "คุณไม่รู้วันที่ปัจจุบันที่แท้จริง ระบบจะตรวจวันที่เองด้วยโค้ดภายหลัง "
+        "ให้ดึงวันที่ออกมาเฉยๆ และห้ามใส่เรื่องวันที่ใน fraud_reasons\n\n"
         "fraud_score: 0-100 ยึดหลักฐานที่ชัดเจนเท่านั้น อย่าเดา:\n"
         "  • 0-39 = ดูปกติ (ค่าเริ่มต้นของสลิปทั่วไปควรอยู่ช่วงนี้)\n"
         "  • 40-69 = มีจุดน่าสงสัยจริงแต่ไม่ชัด\n"
@@ -160,6 +158,22 @@ def check_duplicate(group_id: str, ref_number: str) -> bool:
 # Verdict Builder
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _slip_is_future(dt_str) -> bool:
+    """โค้ดเช็คเองว่าวันที่ในสลิปเป็นอนาคตจริงไหม (รู้วันปัจจุบันแน่นอน + แปลง พ.ศ.→ค.ศ. ให้)"""
+    if not dt_str:
+        return False
+    try:
+        date_part = str(dt_str).strip().replace("/", "-")[:10]
+        y, m, d = (int(x) for x in date_part.split("-")[:3])
+        if y > 2400:          # เป็น พ.ศ. → แปลงเป็น ค.ศ.
+            y -= 543
+        slip_date = date(y, m, d)
+        # เผื่อ buffer 1 วัน กัน timezone คลาดเคลื่อน — เตือนเฉพาะที่เป็นอนาคตจริงๆ
+        return slip_date > (datetime.now(TZ).date() + timedelta(days=1))
+    except Exception:
+        return False
+
+
 def build_verdict(info: dict, promptpay: dict, is_duplicate: bool) -> dict:
     issues = []
     fraud_score = info.get("fraud_score", 0)
@@ -183,6 +197,9 @@ def build_verdict(info: dict, promptpay: dict, is_duplicate: bool) -> dict:
 
     if is_duplicate:
         issues.append(f"🔴 เลขอ้างอิง {info.get('ref_number')} เคยถูกส่งมาแล้ว! (สลิปซ้ำ)")
+
+    if _slip_is_future(info.get("datetime")):
+        issues.append("🟡 วันที่ในสลิปเป็นอนาคต — ควรตรวจสอบเพิ่มเติม")
 
     critical = sum(1 for i in issues if i.startswith("🔴"))
     warning  = sum(1 for i in issues if i.startswith("🟡"))
