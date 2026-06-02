@@ -26,10 +26,37 @@ handler      = WebhookHandler(LINE_SECRET)
 genai.configure(api_key=GEMINI_API_KEY)
 gemini       = genai.GenerativeModel("gemini-2.0-flash")
 
-# ─── In-memory storage ────────────────────────────────────────────────────────
-daily_slips      = {}
-seen_ref_numbers = {}
-active_groups    = set()
+# ─── Persistent storage (SQLite) ──────────────────────────────────────────────
+import sqlite3
+
+# ใช้ disk ถาวรถ้ามี (Render Persistent Disk mount ที่ /var/data) ไม่งั้นใช้โฟลเดอร์ปัจจุบัน
+DB_DIR  = "/var/data" if os.path.isdir("/var/data") else "."
+DB_PATH = os.path.join(DB_DIR, "slips.db")
+
+def _db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with _db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS slips (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id    TEXT,
+                slip_date   TEXT,
+                sender      TEXT,
+                amount      REAL,
+                bank        TEXT,
+                ref_number  TEXT,
+                verdict     TEXT,
+                recorded_at TEXT
+            )
+        """)
+        conn.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY)")
+        conn.commit()
+
+init_db()
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -85,11 +112,12 @@ def verify_with_promptpay(image_bytes: bytes) -> dict:
 def check_duplicate(group_id: str, ref_number: str) -> bool:
     if not ref_number:
         return False
-    refs = seen_ref_numbers.setdefault(group_id, set())
-    if ref_number in refs:
-        return True
-    refs.add(ref_number)
-    return False
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM slips WHERE group_id=? AND ref_number=? LIMIT 1",
+            (group_id, ref_number)
+        ).fetchone()
+    return row is not None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -164,18 +192,27 @@ def build_verdict(info: dict, promptpay: dict, is_duplicate: bool) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def save_slip(group_id: str, info: dict, verdict_status: str):
-    today = date.today().isoformat()
-    key   = f"{group_id}_{today}"
-    daily_slips.setdefault(key, [])
-    info["recorded_at"] = datetime.now(TZ).strftime("%H:%M:%S")
-    info["verdict"]     = verdict_status
-    daily_slips[key].append(info)
-    active_groups.add(group_id)
+    today       = date.today().isoformat()
+    recorded_at = datetime.now(TZ).strftime("%H:%M:%S")
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO slips (group_id, slip_date, sender, amount, bank, ref_number, verdict, recorded_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (group_id, today, info.get("sender"), float(info.get("amount") or 0),
+             info.get("bank"), info.get("ref_number"), verdict_status, recorded_at)
+        )
+        conn.execute("INSERT OR IGNORE INTO groups (group_id) VALUES (?)", (group_id,))
+        conn.commit()
 
 
 def build_daily_report(group_id: str, report_date: str = None) -> str:
     report_date = report_date or date.today().isoformat()
-    slips = daily_slips.get(f"{group_id}_{report_date}", [])
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM slips WHERE group_id=? AND slip_date=? ORDER BY id",
+            (group_id, report_date)
+        ).fetchall()
+    slips = [dict(r) for r in rows]
     if not slips:
         return f"📊 ไม่มีสลิปวันที่ {report_date}"
 
@@ -214,7 +251,9 @@ def midnight_report_loop():
     while True:
         time.sleep(_seconds_until_next_0010())
         yesterday = (date.today() - timedelta(days=1)).isoformat()
-        for group_id in list(active_groups):
+        with _db() as conn:
+            group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
+        for group_id in group_ids:
             try:
                 line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
             except Exception as e:
@@ -278,8 +317,12 @@ def handle_text(event):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return {"status": "ok", "slips_today": sum(len(v) for v in daily_slips.values()),
-            "active_groups": len(active_groups)}
+    with _db() as conn:
+        today_count = conn.execute(
+            "SELECT COUNT(*) c FROM slips WHERE slip_date=?", (date.today().isoformat(),)
+        ).fetchone()["c"]
+        group_count = conn.execute("SELECT COUNT(*) c FROM groups").fetchone()["c"]
+    return {"status": "ok", "slips_today": today_count, "active_groups": group_count}
 
 
 if __name__ == "__main__":
