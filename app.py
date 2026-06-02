@@ -93,9 +93,21 @@ def extract_slip_info(image_bytes: bytes) -> dict:
         '{"is_slip":true,"sender":null,"amount":0.00,"datetime":null,"bank":null,'
         '"account":null,"ref_number":null,"fraud_score":0,"fraud_reasons":[]}\n\n'
         "is_slip: true ถ้าเป็นสลิปโอนเงินจริง, false ถ้าเป็นรูปอื่น (เช่น รูปคน อาหาร ใบเสร็จ เมนู วิว ฯลฯ)\n"
-        "ถ้า is_slip เป็น false ให้ใส่ค่าที่เหลือเป็น null/0 ได้เลย\n"
-        "fraud_score: 0-100 (0=ปลอดภัย, 100=น่าสงสัยมาก)\n"
-        "fraud_reasons: เหตุผลที่น่าสงสัย เช่น ฟอนต์ผิดปกติ, ตัดต่อ, โลโก้ไม่ถูกต้อง"
+        "ถ้า is_slip เป็น false ให้ใส่ค่าที่เหลือเป็น null/0 ได้เลย\n\n"
+        "datetime: ดึงวันเวลาจากสลิป แปลงเป็น ค.ศ. รูปแบบ ISO YYYY-MM-DDTHH:MM:SS เสมอ "
+        "(สลิปไทยใช้ พ.ศ. เช่น 2569 = ค.ศ. 2026 ให้ลบ 543)\n"
+        "⚠️ ห้ามนำเรื่องวันที่ (ว่าเป็นอนาคตหรืออดีต) มาเป็นเหตุผล fraud โดยเด็ดขาด ไม่ว่ากรณีใดๆ — "
+        "คุณไม่รู้วันที่ปัจจุบันที่แท้จริง ระบบจะตรวจวันที่เองด้วยโค้ดภายหลัง "
+        "ให้ดึงวันที่ออกมาเฉยๆ และห้ามใส่เรื่องวันที่ใน fraud_reasons\n\n"
+        "fraud_score: 0-100 ยึดหลักฐานที่ชัดเจนเท่านั้น อย่าเดา:\n"
+        "  • 0-39 = ดูปกติ (ค่าเริ่มต้นของสลิปทั่วไปควรอยู่ช่วงนี้)\n"
+        "  • 40-69 = มีจุดน่าสงสัยจริงแต่ไม่ชัด\n"
+        "  • 70-100 = เห็นการตัดต่อชัดเจน เช่น ตัวเลขจำนวนเงินถูกแก้ทับ ฟอนต์ในตัวเลขไม่สม่ำเสมอ "
+        "ข้อความซ้อนเหลื่อม สีพื้นรอบตัวเลขไม่เนียน\n"
+        "ห้ามให้คะแนนสูงเพราะสิ่งเหล่านี้ (เป็นเรื่องปกติของสลิปจริง): "
+        "ลายน้ำ/พื้นหลังโลโก้ธนาคาร (เช่น KBIZ/K+ มีรูปตึก), ถ่ายภาพหน้าจอเอียงหรือมีแสงสะท้อน, "
+        "ชื่อบริษัท/ผู้โอนที่อ่านจากรูปไม่ชัดเพราะ OCR เพี้ยน, รูปแบบสลิปของแอปธุรกิจที่ต่างจากแอปบุคคล\n"
+        "fraud_reasons: ใส่เฉพาะเหตุผลที่น่าสงสัยจริงๆ ถ้าไม่มีให้เป็น []"
     )
     img_part = {"mime_type": "image/jpeg", "data": image_bytes}
     response = gemini.generate_content([prompt, img_part])
@@ -146,6 +158,22 @@ def check_duplicate(group_id: str, ref_number: str) -> bool:
 # Verdict Builder
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _slip_is_future(dt_str) -> bool:
+    """โค้ดเช็คเองว่าวันที่ในสลิปเป็นอนาคตจริงไหม (รู้วันปัจจุบันแน่นอน + แปลง พ.ศ.→ค.ศ. ให้)"""
+    if not dt_str:
+        return False
+    try:
+        date_part = str(dt_str).strip().replace("/", "-")[:10]
+        y, m, d = (int(x) for x in date_part.split("-")[:3])
+        if y > 2400:          # เป็น พ.ศ. → แปลงเป็น ค.ศ.
+            y -= 543
+        slip_date = date(y, m, d)
+        # เผื่อ buffer 1 วัน กัน timezone คลาดเคลื่อน — เตือนเฉพาะที่เป็นอนาคตจริงๆ
+        return slip_date > (datetime.now(TZ).date() + timedelta(days=1))
+    except Exception:
+        return False
+
+
 def build_verdict(info: dict, promptpay: dict, is_duplicate: bool) -> dict:
     issues = []
     fraud_score = info.get("fraud_score", 0)
@@ -169,6 +197,9 @@ def build_verdict(info: dict, promptpay: dict, is_duplicate: bool) -> dict:
 
     if is_duplicate:
         issues.append(f"🔴 เลขอ้างอิง {info.get('ref_number')} เคยถูกส่งมาแล้ว! (สลิปซ้ำ)")
+
+    if _slip_is_future(info.get("datetime")):
+        issues.append("🟡 วันที่ในสลิปเป็นอนาคต — ควรตรวจสอบเพิ่มเติม")
 
     critical = sum(1 for i in issues if i.startswith("🔴"))
     warning  = sum(1 for i in issues if i.startswith("🟡"))
