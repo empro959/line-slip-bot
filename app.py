@@ -9,7 +9,10 @@ from zoneinfo import ZoneInfo
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, ImageMessage, TextMessage, TextSendMessage
+from linebot.models import (
+    MessageEvent, ImageMessage, TextMessage, TextSendMessage,
+    PostbackEvent, TemplateSendMessage, ButtonsTemplate, PostbackAction,
+)
 import google.generativeai as genai
 
 app = Flask(__name__)
@@ -19,6 +22,8 @@ LINE_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
 ADMIN_USER_ID     = os.environ.get("LINE_ADMIN_USER_ID", "")
 PROMPTPAY_API_KEY = os.environ.get("PROMPTPAY_API_KEY", "")
+# กรุ๊ป "บาร์น้ำ+จองโต๊ะล่วงหน้า" สำหรับรับแจ้งเตือนการจอง (ดู Group ID จาก log [GROUP_ID] บน Render)
+BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
 TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 
 line_bot_api = LineBotApi(LINE_TOKEN)
@@ -54,6 +59,23 @@ def init_db():
             )
         """)
         conn.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reservations (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                origin_group_id TEXT,
+                requested_by    TEXT,
+                customer        TEXT,
+                people          TEXT,
+                resv_datetime   TEXT,
+                table_no        TEXT,
+                note            TEXT,
+                raw_text        TEXT,
+                status          TEXT,
+                created_at      TEXT,
+                confirmed_by    TEXT,
+                confirmed_at    TEXT
+            )
+        """)
         conn.commit()
 
 init_db()
@@ -265,6 +287,172 @@ threading.Thread(target=midnight_report_loop, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Table Reservation Alerts (แจ้งเตือนจองโต๊ะ)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# คำที่เป็นไปได้ว่าเกี่ยวกับการจอง (เกตเบื้องต้นแบบประหยัด ก่อนส่งให้ AI ตัดสินจริง)
+_RESV_HINTS = ("จอง", "โต๊ะ", "table", "reserve", "booking", "ลูกค้า")
+
+
+def get_display_name(source) -> str:
+    """ดึงชื่อผู้ส่ง/ผู้กดปุ่มจาก LINE (กรุ๊ปหรือแชทเดี่ยว) — ล้มเหลวก็คืน 'ไม่ทราบชื่อ'"""
+    try:
+        user_id = getattr(source, "user_id", None)
+        if not user_id:
+            return "ไม่ทราบชื่อ"
+        if source.type == "group":
+            return line_bot_api.get_group_member_profile(source.group_id, user_id).display_name
+        if source.type == "room":
+            return line_bot_api.get_room_member_profile(source.room_id, user_id).display_name
+        return line_bot_api.get_profile(user_id).display_name
+    except Exception as e:
+        print(f"[resv] get_display_name failed: {e}", flush=True)
+        return "ไม่ทราบชื่อ"
+
+
+def extract_reservation(text: str) -> dict:
+    """ให้ Gemini ตัดสินว่าข้อความเป็นการจองโต๊ะหรือไม่ แล้วดึงรายละเอียด"""
+    prompt = (
+        "ข้อความต่อไปนี้จากแชทพนักงานร้าน เป็นการ 'จองโต๊ะ' ให้ลูกค้าหรือไม่ "
+        "(ไม่ใช่การคุยเล่นที่บังเอิญมีคำว่าจอง/โต๊ะ) ตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
+        '{"is_reservation":true,"customer":null,"people":null,"datetime":null,'
+        '"table":null,"note":null}\n\n'
+        "is_reservation: true เฉพาะเมื่อเป็นการจองโต๊ะจริง (มีเจตนานัด/จองที่นั่งให้ลูกค้า)\n"
+        "customer: ชื่อลูกค้า/ผู้จอง (ถ้ามี)\n"
+        "people: จำนวนคน เช่น '4 คน' (ถ้ามี)\n"
+        "datetime: วันและเวลาที่จอง เช่น 'วันนี้ 20:00' (ถ้ามี)\n"
+        "table: โต๊ะ/โซน (ถ้ามี)\n"
+        "note: รายละเอียดเพิ่มเติม (ถ้ามี)\n"
+        "ฟิลด์ที่ไม่มีข้อมูลให้เป็น null\n\n"
+        f"ข้อความ: {text}"
+    )
+    response = gemini.generate_content(prompt)
+    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+
+def _resv_detail_lines(r: dict) -> str:
+    parts = []
+    if r.get("customer"): parts.append(f"👤 ลูกค้า: {r['customer']}")
+    if r.get("people"):   parts.append(f"👥 จำนวน: {r['people']}")
+    if r.get("datetime"): parts.append(f"🕗 เวลา: {r['datetime']}")
+    if r.get("table"):    parts.append(f"🪑 โต๊ะ: {r['table']}")
+    if r.get("note"):     parts.append(f"📝 หมายเหตุ: {r['note']}")
+    return "\n".join(parts) if parts else "(ไม่มีรายละเอียดเพิ่มเติม)"
+
+
+def save_reservation(origin_group_id: str, requested_by: str, info: dict, raw_text: str) -> int:
+    created_at = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    with _db() as conn:
+        cur = conn.execute(
+            "INSERT INTO reservations "
+            "(origin_group_id, requested_by, customer, people, resv_datetime, table_no, note, raw_text, status, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (origin_group_id, requested_by, info.get("customer"), info.get("people"),
+             info.get("datetime"), info.get("table"), info.get("note"), raw_text, "PENDING", created_at)
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_reservation(resv_id: int) -> dict:
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM reservations WHERE id=?", (resv_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def mark_reservation_confirmed(resv_id: int, confirmed_by: str):
+    confirmed_at = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    with _db() as conn:
+        conn.execute(
+            "UPDATE reservations SET status='CONFIRMED', confirmed_by=?, confirmed_at=? WHERE id=?",
+            (confirmed_by, confirmed_at, resv_id)
+        )
+        conn.commit()
+
+
+def handle_reservation_text(event, text: str, group_id: str):
+    """ตรวจจับการจองในกรุ๊ปทั่วไป แล้วส่งแจ้งเตือนไปกรุ๊ปบาร์น้ำพร้อมปุ่มคอนเฟิร์ม"""
+    if not BAR_GROUP_ID:
+        print("[resv] ยังไม่ได้ตั้งค่า BAR_GROUP_ID — ข้ามการแจ้งเตือนจอง", flush=True)
+        return False
+    # ไม่ตรวจในกรุ๊ปบาร์น้ำเอง (เป็นปลายทาง) และเกตคำเบื้องต้นเพื่อประหยัด quota
+    if group_id == BAR_GROUP_ID or not any(h in text.lower() for h in _RESV_HINTS):
+        return False
+
+    try:
+        info = extract_reservation(text)
+    except Exception as e:
+        print(f"[resv] extract failed: {e}", flush=True)
+        return False
+    if not info.get("is_reservation"):
+        return False
+
+    requested_by = get_display_name(event.source)
+    resv_id = save_reservation(group_id, requested_by, info, text)
+    detail = _resv_detail_lines(info)
+
+    # การ์ดในกรุ๊ปบาร์น้ำ + ปุ่มคอนเฟิร์ม (postback ส่งกลับ id)
+    body = f"จากคุณ {requested_by}\n─────────────────\n{detail}"
+    template = TemplateSendMessage(
+        alt_text=f"🔔 จองโต๊ะใหม่ #{resv_id}",
+        template=ButtonsTemplate(
+            title=f"🔔 จองโต๊ะใหม่ #{resv_id}",
+            text=body[:160],
+            actions=[PostbackAction(
+                label="✅ คอนเฟิร์มการจอง",
+                data=f"confirm_resv:{resv_id}",
+                display_text="คอนเฟิร์มการจอง"
+            )],
+        ),
+    )
+    try:
+        line_bot_api.push_message(BAR_GROUP_ID, template)
+    except Exception as e:
+        print(f"[resv] push to bar group failed: {e}", flush=True)
+        line_bot_api.reply_message(event.reply_token,
+            TextSendMessage(text="⚠️ ส่งแจ้งเตือนไปกรุ๊ปบาร์น้ำไม่สำเร็จ กรุณาตรวจสอบ BAR_GROUP_ID"))
+        return True
+
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text=f"📤 ส่งคำขอจอง #{resv_id} ไปยังกรุ๊ปบาร์น้ำแล้ว รอคอนเฟิร์ม\n─────────────────\n{detail}"))
+    return True
+
+
+def handle_reservation_confirm(event, resv_id: int):
+    resv = get_reservation(resv_id)
+    if not resv:
+        line_bot_api.reply_message(event.reply_token,
+            TextSendMessage(text=f"❓ ไม่พบการจอง #{resv_id}"))
+        return
+
+    confirmer = get_display_name(event.source)
+    detail = _resv_detail_lines(resv)
+
+    if resv["status"] == "CONFIRMED":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"ℹ️ การจอง #{resv_id} ถูกคอนเฟิร์มไปแล้วโดย {resv['confirmed_by']} "
+                 f"({resv['confirmed_at']})"))
+        return
+
+    mark_reservation_confirmed(resv_id, confirmer)
+
+    # ตอบกลับในกรุ๊ปบาร์น้ำ
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text=f"✅ คอนเฟิร์มการจอง #{resv_id} เรียบร้อย\nโดย {confirmer}\n─────────────────\n{detail}"))
+
+    # แจ้งกลับกรุ๊ปต้นทาง + สรุป
+    if resv.get("origin_group_id"):
+        try:
+            line_bot_api.push_message(resv["origin_group_id"], TextSendMessage(
+                text=f"✅ การจอง #{resv_id} ได้รับการคอนเฟิร์มแล้ว!\n"
+                     f"ยืนยันโดย {confirmer} (บาร์น้ำ)\n─────────────────\n"
+                     f"ผู้แจ้งจอง: {resv.get('requested_by','-')}\n{detail}"))
+        except Exception as e:
+            print(f"[resv] notify origin failed: {e}", flush=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LINE Webhook
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -313,6 +501,28 @@ def handle_text(event):
     print(f"[GROUP_ID] source_type={event.source.type} id={group_id} text={text}", flush=True)
     if any(kw in text for kw in ["สรุป", "รายงาน", "report", "summary"]):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
+        return
+
+    # ตรวจจับการจองโต๊ะ → แจ้งเตือนไปกรุ๊ปบาร์น้ำ
+    try:
+        handle_reservation_text(event, text, group_id)
+    except Exception as e:
+        print(f"[resv] handle_text error group={group_id}: {e}", flush=True)
+
+
+@handler.add(PostbackEvent)
+def handle_postback(event):
+    data = event.postback.data or ""
+    print(f"[POSTBACK] source_type={event.source.type} data={data}", flush=True)
+    if data.startswith("confirm_resv:"):
+        try:
+            resv_id = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        try:
+            handle_reservation_confirm(event, resv_id)
+        except Exception as e:
+            print(f"[resv] confirm error: {e}", flush=True)
 
 
 @app.route("/health", methods=["GET"])
