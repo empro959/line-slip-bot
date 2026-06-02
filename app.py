@@ -29,7 +29,7 @@ TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler      = WebhookHandler(LINE_SECRET)
 genai.configure(api_key=GEMINI_API_KEY)
-gemini       = genai.GenerativeModel("gemini-2.0-flash")
+gemini       = genai.GenerativeModel("gemini-2.5-flash")
 
 # ─── Persistent storage (SQLite) ──────────────────────────────────────────────
 import sqlite3
@@ -490,8 +490,20 @@ def handle_image(event):
         if verdict["admin_msg"] and ADMIN_USER_ID:
             line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
     except Exception as e:
-        # อ่าน error แล้วเงียบไว้ ไม่รบกวนกรุ๊ป (กันรูปที่ไม่ใช่สลิปโดนทัก)
+        # ประมวลผลสลิปไม่สำเร็จ — ไม่กลืนเงียบ เพราะอาจทำสลิปจริงหายโดยไม่มีใครรู้
         print(f"[error] handle_image group={group_id}: {e}", flush=True)
+        try:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="⚠️ ระบบอ่านสลิปขัดข้องชั่วคราว กรุณาส่งสลิปใหม่อีกครั้ง\n"
+                     "ถ้ายังไม่ได้ กรุณาแจ้ง Admin ตรวจสอบระบบ"))
+        except Exception:
+            pass
+        if ADMIN_USER_ID:
+            try:
+                line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(
+                    text=f"🛠️ [SYSTEM] บอทอ่านสลิปไม่สำเร็จ (group={group_id})\nสาเหตุ: {str(e)[:300]}"))
+            except Exception:
+                pass
 
 
 @handler.add(MessageEvent, message=TextMessage)
