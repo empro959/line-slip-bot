@@ -110,9 +110,18 @@ def extract_slip_info(image_bytes: bytes) -> dict:
         "fraud_reasons: ใส่เฉพาะเหตุผลที่น่าสงสัยจริงๆ ถ้าไม่มีให้เป็น []"
     )
     img_part = {"mime_type": "image/jpeg", "data": image_bytes}
-    response = gemini.generate_content([prompt, img_part])
-    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    # ลองใหม่ได้ 1 ครั้ง เผื่อชนลิมิตชั่วคราว (rate limit ต่อนาที)
+    last_err = None
+    for attempt in range(2):
+        try:
+            response = gemini.generate_content([prompt, img_part])
+            raw = response.text.strip().replace("```json", "").replace("```", "").strip()
+            return json.loads(raw)
+        except Exception as e:
+            last_err = e
+            if attempt == 0:
+                time.sleep(2)
+    raise last_err
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -245,7 +254,7 @@ def build_verdict(info: dict, promptpay: dict, is_duplicate: bool) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def save_slip(group_id: str, info: dict, verdict_status: str):
-    today       = date.today().isoformat()
+    today       = datetime.now(TZ).date().isoformat()
     recorded_at = datetime.now(TZ).strftime("%H:%M:%S")
     with _db() as conn:
         conn.execute(
@@ -259,7 +268,7 @@ def save_slip(group_id: str, info: dict, verdict_status: str):
 
 
 def build_daily_report(group_id: str, report_date: str = None) -> str:
-    report_date = report_date or date.today().isoformat()
+    report_date = report_date or datetime.now(TZ).date().isoformat()
     with _db() as conn:
         rows = conn.execute(
             "SELECT * FROM slips WHERE group_id=? AND slip_date=? ORDER BY id",
@@ -303,7 +312,7 @@ def _seconds_until_next_0010() -> float:
 def midnight_report_loop():
     while True:
         time.sleep(_seconds_until_next_0010())
-        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
         with _db() as conn:
             group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
         for group_id in group_ids:
@@ -498,6 +507,26 @@ def callback():
     return "OK"
 
 
+_last_admin_error_ts = 0.0
+
+def notify_admin_error(group_id, err):
+    """แจ้ง Admin เวลาบอทอ่านสลิปพลาด แบบจำกัด 1 ครั้ง/10 นาที (กัน Admin โดนสแปม)"""
+    global _last_admin_error_ts
+    if not ADMIN_USER_ID:
+        return
+    if time.time() - _last_admin_error_ts < 600:
+        return
+    _last_admin_error_ts = time.time()
+    try:
+        line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(
+            text=f"🛠️ [SYSTEM] บอทอ่านสลิปไม่สำเร็จ (group={group_id})\n"
+                 f"สาเหตุ: {str(err)[:250]}\n"
+                 "ถ้าเป็นช่วงเย็น/สลิปเยอะ อาจเป็นเพราะโควต้า Gemini ฟรีหมดรายวัน "
+                 "→ พิจารณาเปิดบิลลิ่ง Gemini (ถูกมาก) เพื่อให้ไม่ขาดช่วง"))
+    except Exception:
+        pass
+
+
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
     group_id    = getattr(event.source, "group_id", event.source.user_id)
@@ -521,20 +550,10 @@ def handle_image(event):
         if verdict["admin_msg"] and ADMIN_USER_ID:
             line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
     except Exception as e:
-        # ประมวลผลสลิปไม่สำเร็จ — ไม่กลืนเงียบ เพราะอาจทำสลิปจริงหายโดยไม่มีใครรู้
+        # ประมวลผลสลิปไม่สำเร็จ → เงียบในกรุ๊ป (กันสแปมรูปที่ไม่ใช่สลิป/ตอนโควต้าหมด)
+        # แต่เตือน Admin ส่วนตัวแบบจำกัดความถี่ จะได้รู้ว่าระบบมีปัญหา
         print(f"[error] handle_image group={group_id}: {e}", flush=True)
-        try:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="⚠️ ระบบอ่านสลิปขัดข้องชั่วคราว กรุณาส่งสลิปใหม่อีกครั้ง\n"
-                     "ถ้ายังไม่ได้ กรุณาแจ้ง Admin ตรวจสอบระบบ"))
-        except Exception:
-            pass
-        if ADMIN_USER_ID:
-            try:
-                line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(
-                    text=f"🛠️ [SYSTEM] บอทอ่านสลิปไม่สำเร็จ (group={group_id})\nสาเหตุ: {str(e)[:300]}"))
-            except Exception:
-                pass
+        notify_admin_error(group_id, e)
 
 
 @handler.add(MessageEvent, message=TextMessage)
@@ -572,7 +591,7 @@ def handle_postback(event):
 def health():
     with _db() as conn:
         today_count = conn.execute(
-            "SELECT COUNT(*) c FROM slips WHERE slip_date=?", (date.today().isoformat(),)
+            "SELECT COUNT(*) c FROM slips WHERE slip_date=?", (datetime.now(TZ).date().isoformat(),)
         ).fetchone()["c"]
         group_count = conn.execute("SELECT COUNT(*) c FROM groups").fetchone()["c"]
     return {"status": "ok", "slips_today": today_count, "active_groups": group_count}
