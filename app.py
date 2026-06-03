@@ -569,6 +569,81 @@ def _process_image_event(event):
         notify_admin_error(group_id, e)
 
 
+def _today_iso():
+    return datetime.now(TZ).date().isoformat()
+
+
+def delete_latest_slip(event, group_id):
+    today = _today_iso()
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT id, sender, amount FROM slips WHERE group_id=? AND slip_date=? ORDER BY id DESC LIMIT 1",
+            (group_id, today)
+        ).fetchone()
+        if not row:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="📊 ไม่มีสลิปวันนี้ให้ลบ"))
+            return
+        conn.execute("DELETE FROM slips WHERE id=?", (row["id"],))
+        conn.commit()
+    amt = f"{float(row['amount'] or 0):,.2f}"
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text=f"🗑️ ลบสลิปใบล่าสุดแล้ว: {row['sender'] or '?'} | {amt} บาท"))
+
+
+def delete_slip_by_index(event, group_id, n):
+    today = _today_iso()
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT id, sender, amount FROM slips WHERE group_id=? AND slip_date=? ORDER BY id",
+            (group_id, today)
+        ).fetchall()
+    if n < 1 or n > len(rows):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"❌ ไม่มีรายการที่ {n} (วันนี้มี {len(rows)} รายการ)\nพิมพ์ 'สรุป' ดูเลขรายการก่อน"))
+        return
+    row = rows[n - 1]
+    with _db() as conn:
+        conn.execute("DELETE FROM slips WHERE id=?", (row["id"],))
+        conn.commit()
+    amt = f"{float(row['amount'] or 0):,.2f}"
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text=f"🗑️ ลบรายการที่ {n} แล้ว: {row['sender'] or '?'} | {amt} บาท\n"
+             "(เลขรายการอาจเลื่อน พิมพ์ 'สรุป' ดูใหม่)"))
+
+
+def send_reset_confirm(event, group_id):
+    today = _today_iso()
+    with _db() as conn:
+        cnt = conn.execute(
+            "SELECT COUNT(*) c FROM slips WHERE group_id=? AND slip_date=?", (group_id, today)
+        ).fetchone()["c"]
+    if cnt == 0:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="📊 ไม่มีสลิปวันนี้ให้ล้าง"))
+        return
+    template = TemplateSendMessage(
+        alt_text="ยืนยันล้างสลิปวันนี้",
+        template=ButtonsTemplate(
+            title="⚠️ ล้างสลิปวันนี้",
+            text=f"จะลบสลิปวันนี้ทั้งหมด {cnt} รายการ (เฉพาะกรุ๊ปนี้) ยืนยันไหม?",
+            actions=[PostbackAction(label="🗑️ ยืนยันล้างทั้งหมด",
+                                    data=f"reset_today:{today}",
+                                    display_text="ยืนยันล้างสลิปวันนี้")],
+        ),
+    )
+    line_bot_api.reply_message(event.reply_token, template)
+
+
+def do_reset_today(event, date_str):
+    group_id = getattr(event.source, "group_id", event.source.user_id)
+    with _db() as conn:
+        cur = conn.execute("DELETE FROM slips WHERE group_id=? AND slip_date=?", (group_id, date_str))
+        deleted = cur.rowcount
+        conn.commit()
+    confirmer = get_display_name(event.source)
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text=f"🗑️ ล้างสลิปวันที่ {date_str} เรียบร้อย {deleted} รายการ\nโดย {confirmer}"))
+
+
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     text     = event.message.text.strip()
@@ -577,6 +652,19 @@ def handle_text(event):
     if any(kw in text for kw in ["สรุป", "รายงาน", "report", "summary"]):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
         return
+
+    # คำสั่งลบสลิป (กรณีส่งผิด/ซ้ำ)
+    if text in ("ล้างวันนี้", "รีเซ็ตวันนี้", "ล้างสลิปวันนี้", "รีเซ็ต"):
+        send_reset_confirm(event, group_id)
+        return
+    if text.startswith("ลบ"):
+        arg = text[2:].strip()
+        if arg in ("ล่าสุด", "ใบล่าสุด"):
+            delete_latest_slip(event, group_id)
+            return
+        if arg.isdigit():
+            delete_slip_by_index(event, group_id, int(arg))
+            return
 
     # ตรวจจับการจองโต๊ะ → แจ้งเตือนไปกรุ๊ปบาร์น้ำ
     try:
@@ -598,6 +686,11 @@ def handle_postback(event):
             handle_reservation_confirm(event, resv_id)
         except Exception as e:
             print(f"[resv] confirm error: {e}", flush=True)
+    elif data.startswith("reset_today:"):
+        try:
+            do_reset_today(event, data.split(":", 1)[1])
+        except Exception as e:
+            print(f"[reset] error: {e}", flush=True)
 
 
 @app.route("/health", methods=["GET"])
