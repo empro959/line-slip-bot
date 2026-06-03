@@ -489,6 +489,20 @@ def callback():
 
 
 _last_admin_error_ts = 0.0
+_last_group_error_ts = {}   # group_id -> เวลาที่เตือน error ในกรุ๊ปล่าสุด
+
+def notify_group_error(event, group_id):
+    """เตือนในกรุ๊ปว่ามีสลิปอ่านไม่สำเร็จ แบบจำกัด 1 ครั้ง/5 นาที/กรุ๊ป
+    (สลิปที่พลาดจะไม่หายเงียบ คนส่งรู้ว่าต้องส่งใหม่ แต่ไม่สแปม)"""
+    if time.time() - _last_group_error_ts.get(group_id, 0) < 300:
+        return
+    _last_group_error_ts[group_id] = time.time()
+    try:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text="⚠️ มีสลิปบางรายการที่ระบบอ่านไม่ทัน กรุณาส่งสลิปนั้นใหม่อีกครั้ง"))
+    except Exception:
+        pass
+
 
 def notify_admin_error(group_id, err):
     """แจ้ง Admin เวลาบอทอ่านสลิปพลาด แบบจำกัด 1 ครั้ง/10 นาที (กัน Admin โดนสแปม)"""
@@ -534,9 +548,10 @@ def handle_image(event):
         if verdict["admin_msg"] and ADMIN_USER_ID:
             line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
     except Exception as e:
-        # ประมวลผลสลิปไม่สำเร็จ → เงียบในกรุ๊ป (กันสแปมรูปที่ไม่ใช่สลิป/ตอนโควต้าหมด)
-        # แต่เตือน Admin ส่วนตัวแบบจำกัดความถี่ จะได้รู้ว่าระบบมีปัญหา
+        # ประมวลผลสลิปไม่สำเร็จ → เตือนแบบจำกัดความถี่ (สลิปไม่หายเงียบ แต่ไม่สแปม)
+        # + เตือน Admin ส่วนตัวด้วย จะได้รู้ว่าระบบมีปัญหา
         print(f"[error] handle_image group={group_id}: {e}", flush=True)
+        notify_group_error(event, group_id)
         notify_admin_error(group_id, e)
 
 
