@@ -546,7 +546,10 @@ def handle_image(event):
         verdict   = build_verdict(info, promptpay, is_dup)
         save_slip(group_id, info, verdict["status"])
 
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=verdict["group_msg"]))
+        # สลิปผ่าน (PASS) → เงียบไว้ ไม่รกแชท (ยังบันทึกไว้ ดูรวมได้ที่ "สรุป")
+        # เตือนในกรุ๊ปเฉพาะที่มีปัญหา (WARN/FAIL)
+        if verdict["status"] != "PASS":
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=verdict["group_msg"]))
         if verdict["admin_msg"] and ADMIN_USER_ID:
             line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
     except Exception as e:
