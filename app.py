@@ -263,13 +263,18 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
     passed = sum(1 for s in slips if s.get("verdict") == "PASS")
     warned = sum(1 for s in slips if s.get("verdict") == "WARN")
     failed = sum(1 for s in slips if s.get("verdict") == "FAIL")
+    pass_amt = sum(float(s.get("amount") or 0) for s in slips if s.get("verdict") == "PASS")
+    warn_amt = sum(float(s.get("amount") or 0) for s in slips if s.get("verdict") == "WARN")
+    fail_amt = sum(float(s.get("amount") or 0) for s in slips if s.get("verdict") == "FAIL")
     icons  = {"PASS": "✅", "WARN": "⚠️", "FAIL": "🚨"}
 
     lines = [
         f"📊 รายงานสรุปประจำวัน {report_date}",
         "─────────────────",
-        f"รวม {len(slips)} รายการ | {total:,.2f} บาท",
-        f"✅ ผ่าน {passed}  ⚠️ น่าสงสัย {warned}  🚨 ปลอม {failed}", "",
+        f"รวมทั้งหมด {len(slips)} รายการ | {total:,.2f} บาท",
+        f"✅ ผ่าน {passed} รายการ | {pass_amt:,.2f} บาท",
+        f"⚠️ น่าสงสัย {warned} รายการ | {warn_amt:,.2f} บาท",
+        f"🚨 ปลอม {failed} รายการ | {fail_amt:,.2f} บาท", "",
     ]
     for i, s in enumerate(slips, 1):
         amt  = f"{float(s.get('amount', 0)):,.2f}" if s.get("amount") else "?"
