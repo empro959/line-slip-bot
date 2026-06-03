@@ -29,7 +29,7 @@ TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler      = WebhookHandler(LINE_SECRET)
 genai.configure(api_key=GEMINI_API_KEY)
-gemini       = genai.GenerativeModel("gemini-2.5-flash")
+gemini       = genai.GenerativeModel("gemini-2.5-flash-lite")
 
 # ─── Persistent storage (SQLite) ──────────────────────────────────────────────
 import sqlite3
