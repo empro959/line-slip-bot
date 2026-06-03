@@ -167,22 +167,6 @@ def check_duplicate(group_id: str, ref_number: str) -> bool:
 # Verdict Builder
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _slip_is_future(dt_str) -> bool:
-    """โค้ดเช็คเองว่าวันที่ในสลิปเป็นอนาคตจริงไหม (รู้วันปัจจุบันแน่นอน + แปลง พ.ศ.→ค.ศ. ให้)"""
-    if not dt_str:
-        return False
-    try:
-        date_part = str(dt_str).strip().replace("/", "-")[:10]
-        y, m, d = (int(x) for x in date_part.split("-")[:3])
-        if y > 2400:          # เป็น พ.ศ. → แปลงเป็น ค.ศ.
-            y -= 543
-        slip_date = date(y, m, d)
-        # เผื่อ buffer 1 วัน กัน timezone คลาดเคลื่อน — เตือนเฉพาะที่เป็นอนาคตจริงๆ
-        return slip_date > (datetime.now(TZ).date() + timedelta(days=1))
-    except Exception:
-        return False
-
-
 def build_verdict(info: dict, promptpay: dict, is_duplicate: bool) -> dict:
     issues = []
     fraud_score = info.get("fraud_score", 0)
@@ -206,9 +190,6 @@ def build_verdict(info: dict, promptpay: dict, is_duplicate: bool) -> dict:
 
     if is_duplicate:
         issues.append(f"🔴 เลขอ้างอิง {info.get('ref_number')} เคยถูกส่งมาแล้ว! (สลิปซ้ำ)")
-
-    if _slip_is_future(info.get("datetime")):
-        issues.append("🟡 วันที่ในสลิปเป็นอนาคต — ควรตรวจสอบเพิ่มเติม")
 
     critical = sum(1 for i in issues if i.startswith("🔴"))
     warning  = sum(1 for i in issues if i.startswith("🟡"))
