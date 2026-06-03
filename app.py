@@ -29,7 +29,7 @@ TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler      = WebhookHandler(LINE_SECRET)
 genai.configure(api_key=GEMINI_API_KEY)
-gemini       = genai.GenerativeModel("gemini-2.5-flash-lite")
+gemini       = genai.GenerativeModel("gemini-2.5-flash")
 
 # ─── Persistent storage (SQLite) ──────────────────────────────────────────────
 import sqlite3
@@ -87,20 +87,6 @@ init_db()
 # LAYER 1 — AI Visual Analysis (Gemini)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ตัวเว้นจังหวะการเรียก Gemini ทั่วทั้งระบบ — กันยิงพร้อมกันทีเดียว (burst) จนชนลิมิตฟรี
-# flash-lite ฟรี = 30 ครั้ง/นาที → เว้น 2.5 วิ/ครั้ง = ~24/นาที (ปลอดภัยใต้ลิมิต)
-_GEMINI_MIN_INTERVAL = 2.5
-_gemini_lock = threading.Lock()
-_gemini_last_call = [0.0]
-
-def _gemini_rate_wait():
-    with _gemini_lock:
-        wait = _GEMINI_MIN_INTERVAL - (time.time() - _gemini_last_call[0])
-        if wait > 0:
-            time.sleep(wait)
-        _gemini_last_call[0] = time.time()
-
-
 def extract_slip_info(image_bytes: bytes) -> dict:
     prompt = (
         "ดูรูปนี้ว่าเป็นสลิป/หลักฐานการโอนเงินจากธนาคารหรือแอปธนาคารหรือไม่ "
@@ -133,7 +119,6 @@ def extract_slip_info(image_bytes: bytes) -> dict:
     last_err = None
     for attempt in range(2):
         try:
-            _gemini_rate_wait()   # เว้นจังหวะ กันยิงพร้อมกันทีเดียวจนชนลิมิต
             response = gemini.generate_content([prompt, img_part])
             raw = response.text.strip().replace("```json", "").replace("```", "").strip()
             return json.loads(raw)
@@ -372,7 +357,6 @@ def extract_reservation(text: str) -> dict:
         "ฟิลด์ที่ไม่มีข้อมูลให้เป็น null\n\n"
         f"ข้อความ: {text}"
     )
-    _gemini_rate_wait()
     response = gemini.generate_content(prompt)
     raw = response.text.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
