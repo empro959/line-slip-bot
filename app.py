@@ -587,7 +587,8 @@ def delete_latest_slip(event, group_id):
         conn.commit()
     amt = f"{float(row['amount'] or 0):,.2f}"
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
-        text=f"🗑️ ลบสลิปใบล่าสุดแล้ว: {row['sender'] or '?'} | {amt} บาท"))
+        text=f"🗑️ ลบสลิปใบล่าสุดแล้ว: {row['sender'] or '?'} | {amt} บาท\n"
+             "─────────────────\n" + build_daily_report(group_id)))
 
 
 def delete_slip_by_index(event, group_id, n):
@@ -608,7 +609,7 @@ def delete_slip_by_index(event, group_id, n):
     amt = f"{float(row['amount'] or 0):,.2f}"
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
         text=f"🗑️ ลบรายการที่ {n} แล้ว: {row['sender'] or '?'} | {amt} บาท\n"
-             "(เลขรายการอาจเลื่อน พิมพ์ 'สรุป' ดูใหม่)"))
+             "─────────────────\n" + build_daily_report(group_id)))
 
 
 def send_reset_confirm(event, group_id):
@@ -641,7 +642,8 @@ def do_reset_today(event, date_str):
         conn.commit()
     confirmer = get_display_name(event.source)
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
-        text=f"🗑️ ล้างสลิปวันที่ {date_str} เรียบร้อย {deleted} รายการ\nโดย {confirmer}"))
+        text=f"🗑️ ล้างสลิปวันที่ {date_str} เรียบร้อย {deleted} รายการ (โดย {confirmer})\n"
+             "─────────────────\n" + build_daily_report(group_id, date_str)))
 
 
 @handler.add(MessageEvent, message=TextMessage)
