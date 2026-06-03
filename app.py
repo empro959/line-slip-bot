@@ -39,7 +39,8 @@ DB_DIR  = "/var/data" if os.path.isdir("/var/data") else "."
 DB_PATH = os.path.join(DB_DIR, "slips.db")
 
 def _db():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout เผื่อหลาย thread เขียนพร้อมกัน (กัน 'database is locked' ตอนรูปเยอะ)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -533,12 +534,16 @@ def notify_admin_error(group_id, err):
 
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
-    group_id    = getattr(event.source, "group_id", event.source.user_id)
-    content     = line_bot_api.get_message_content(event.message.id)
-    image_bytes = b"".join(chunk for chunk in content.iter_content())
+    # ประมวลผลแบบ background → ตอบ LINE ทันที (กันคอขวด/โทเค็นหมดอายุตอนส่งรูปทีละหลายๆ รูป)
+    threading.Thread(target=_process_image_event, args=(event,), daemon=True).start()
 
+
+def _process_image_event(event):
+    group_id = getattr(event.source, "group_id", event.source.user_id)
     try:
-        info      = extract_slip_info(image_bytes)
+        content     = line_bot_api.get_message_content(event.message.id)
+        image_bytes = b"".join(chunk for chunk in content.iter_content())
+        info        = extract_slip_info(image_bytes)
 
         # ถ้าไม่ใช่สลิปโอนเงิน → เงียบไว้ ไม่ต้องตอบอะไร
         if not info.get("is_slip", True):
