@@ -651,7 +651,7 @@ def handle_text(event):
     text     = event.message.text.strip()
     group_id = getattr(event.source, "group_id", event.source.user_id)
     print(f"[GROUP_ID] source_type={event.source.type} id={group_id} text={text}", flush=True)
-    if any(kw in text for kw in ["สรุป", "รายงาน", "report", "summary"]):
+    if text.lower() in ("สรุป", "รายงาน", "report", "summary"):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
         return
 
