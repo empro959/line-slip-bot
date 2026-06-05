@@ -655,6 +655,16 @@ def handle_text(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
         return
 
+    # สรุปย้อนหลังรายวัน เช่น "สรุป 2026-06-03" (เอาไว้ตรวจเทียบยอด)
+    if text.startswith("สรุป ") or text.startswith("รายงาน "):
+        arg = text.split(" ", 1)[1].strip()
+        try:
+            datetime.strptime(arg, "%Y-%m-%d")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id, arg)))
+            return
+        except ValueError:
+            pass
+
     # คำสั่งลบสลิป (กรณีส่งผิด/ซ้ำ)
     if text in ("ล้างวันนี้", "รีเซ็ตวันนี้", "ล้างสลิปวันนี้", "รีเซ็ต"):
         send_reset_confirm(event, group_id)
