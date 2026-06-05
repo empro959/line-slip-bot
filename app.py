@@ -289,12 +289,12 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Midnight Scheduler (00:10 Asia/Bangkok)
+# Midnight Scheduler (00:30 Asia/Bangkok)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _seconds_until_next_0010() -> float:
+def _seconds_until_next_report() -> float:
     now    = datetime.now(TZ)
-    target = now.replace(hour=0, minute=10, second=0, microsecond=0)
+    target = now.replace(hour=0, minute=30, second=0, microsecond=0)
     if now >= target:
         target += timedelta(days=1)
     return (target - now).total_seconds()
@@ -302,7 +302,7 @@ def _seconds_until_next_0010() -> float:
 
 def midnight_report_loop():
     while True:
-        time.sleep(_seconds_until_next_0010())
+        time.sleep(_seconds_until_next_report())
         yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
         with _db() as conn:
             group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
