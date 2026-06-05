@@ -289,12 +289,12 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Midnight Scheduler (00:10 Asia/Bangkok)
+# Midnight Scheduler (00:30 Asia/Bangkok)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _seconds_until_next_0010() -> float:
+def _seconds_until_next_report() -> float:
     now    = datetime.now(TZ)
-    target = now.replace(hour=0, minute=10, second=0, microsecond=0)
+    target = now.replace(hour=0, minute=30, second=0, microsecond=0)
     if now >= target:
         target += timedelta(days=1)
     return (target - now).total_seconds()
@@ -302,7 +302,7 @@ def _seconds_until_next_0010() -> float:
 
 def midnight_report_loop():
     while True:
-        time.sleep(_seconds_until_next_0010())
+        time.sleep(_seconds_until_next_report())
         yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
         with _db() as conn:
             group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
@@ -651,7 +651,7 @@ def handle_text(event):
     text     = event.message.text.strip()
     group_id = getattr(event.source, "group_id", event.source.user_id)
     print(f"[GROUP_ID] source_type={event.source.type} id={group_id} text={text}", flush=True)
-    if any(kw in text for kw in ["สรุป", "รายงาน", "report", "summary"]):
+    if text.lower() in ("สรุป", "รายงาน", "report", "summary"):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
         return
 
