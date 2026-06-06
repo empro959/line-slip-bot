@@ -111,6 +111,9 @@ def extract_slip_info(image_bytes: bytes) -> dict:
         "  - ฟอนต์ ขนาด ความหนา หรือช่องไฟของตัวเลข ไม่สม่ำเสมอกับตัวเลขอื่นในสลิปเดียวกัน\n"
         "  - สีพื้นหลัง/เงา/noise รอบตัวเลขไม่กลมกลืน เหมือนถูก copy-paste หรือมีกล่องสีทับ\n"
         "  - ตัวอักษรซ้อนเหลื่อม เส้นบรรทัดเบี้ยว ขอบตัวเลขมีรอยถู/เกลี่ย\n"
+        "❗ จุดที่ถูกปลอมบ่อยสุดคือ 'จำนวนเงิน' — เทียบ ขนาด/ฟอนต์/ความคม/ความหนา ของตัวเลขจำนวนเงิน "
+        "กับตัวเลขอื่นในสลิป (เช่น เลขบัญชี วันเวลา) ถ้าจำนวนเงินขนาดหรือฟอนต์ต่างจากตัวเลขอื่นอย่างเห็นได้ชัด "
+        "= ถูกแก้ไขแน่นอน ให้ fraud_score >= 80\n"
         "fraud_score: 0-100 ยึดสิ่งที่เห็นจริง อย่าเดา:\n"
         "  • 0-39 = ไม่พบร่องรอยตัดต่อ ดูปกติ (สลิปทั่วไปควรอยู่ช่วงนี้)\n"
         "  • 40-69 = พบจุดน่าสงสัยแต่ไม่ฟันธง\n"
@@ -166,29 +169,36 @@ def verify_with_promptpay(image_bytes: bytes) -> dict:
 _dup_lock = threading.Lock()   # กัน race ตอนเช็คซ้ำ+บันทึก เมื่อหลาย thread ทำพร้อมกัน
 
 def find_duplicate(group_id: str, info: dict):
-    """หาว่าสลิปนี้ซ้ำกับใบก่อนหน้าในกรุ๊ปไหม — คืน 'ref' / 'amount_time' / None
-    - ref: เลขอ้างอิงตรงกัน (ชัวร์สุด)
-    - amount_time: ยอดเงิน + วันเวลาบนสลิป ตรงกัน (กันกรณี ref อ่านเพี้ยน)"""
+    """หาความซ้ำ/ความผิดปกติเทียบกับใบก่อนหน้าในกรุ๊ป — คืน (type, prev_amount)
+    - ref_mismatch: เลขอ้างอิงเดียวกันแต่ยอดเงินไม่ตรง = ถูกตัดต่อ! (ฟันธง)
+    - ref: เลขอ้างอิงตรง + ยอดตรง = สลิปซ้ำจริง
+    - amount_time: ยอดเงิน + วันเวลาบนสลิปตรงกัน (กันกรณี ref อ่านเพี้ยน)"""
     ref    = info.get("ref_number")
-    amount = info.get("amount")
+    amount = float(info.get("amount") or 0)
     dt     = info.get("datetime")
     with _db() as conn:
         if ref:
-            if conn.execute("SELECT 1 FROM slips WHERE group_id=? AND ref_number=? LIMIT 1",
-                            (group_id, ref)).fetchone():
-                return "ref"
+            row = conn.execute(
+                "SELECT amount FROM slips WHERE group_id=? AND ref_number=? ORDER BY id LIMIT 1",
+                (group_id, ref)).fetchone()
+            if row:
+                prev = float(row["amount"] or 0)
+                if amount and prev and abs(prev - amount) > 0.01:
+                    return ("ref_mismatch", prev)
+                return ("ref", None)
         if amount and dt:
-            if conn.execute("SELECT 1 FROM slips WHERE group_id=? AND amount=? AND slip_datetime=? LIMIT 1",
-                            (group_id, float(amount), dt)).fetchone():
-                return "amount_time"
-    return None
+            if conn.execute(
+                "SELECT 1 FROM slips WHERE group_id=? AND amount=? AND slip_datetime=? LIMIT 1",
+                (group_id, amount, dt)).fetchone():
+                return ("amount_time", None)
+    return (None, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Verdict Builder
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_verdict(info: dict, promptpay: dict, dup_type=None) -> dict:
+def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None) -> dict:
     issues = []
     fraud_score = info.get("fraud_score", 0)
 
@@ -209,7 +219,12 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None) -> dict:
         if api_amt and slip_amt and abs(float(api_amt) - float(slip_amt)) > 0.01:
             issues.append(f"🔴 ยอดเงินไม่ตรง: สลิปแสดง {slip_amt} แต่ API พบ {api_amt} บาท")
 
-    if dup_type == "ref":
+    if dup_type == "ref_mismatch":
+        cur_amt  = f"{float(info.get('amount') or 0):,.2f}"
+        prev_amt = f"{float(prev_amount or 0):,.2f}"
+        issues.append(f"🔴 เลขอ้างอิงเดียวกับสลิปใบก่อน แต่ยอดเงินไม่ตรง! "
+                      f"(ใบก่อน {prev_amt} / ใบนี้ {cur_amt} บาท) → สลิปถูกตัดต่อ!")
+    elif dup_type == "ref":
         issues.append(f"🔴 เลขอ้างอิง {info.get('ref_number')} เคยถูกส่งมาแล้ว! (สลิปซ้ำ)")
     elif dup_type == "amount_time":
         issues.append(f"🔴 ยอด {info.get('amount')} บาท + วันเวลาเดียวกับสลิปใบก่อนหน้า → น่าจะเป็นสลิปซ้ำ (โปรดตรวจสอบ)")
@@ -575,8 +590,8 @@ def _process_image_event(event):
         promptpay = verify_with_promptpay(image_bytes)
         # ล็อกช่วงเช็คซ้ำ+บันทึก ให้เป็นจังหวะเดียว กัน race ตอนส่งซ้ำพร้อมกันหลาย thread
         with _dup_lock:
-            dup_type = find_duplicate(group_id, info)
-            verdict  = build_verdict(info, promptpay, dup_type)
+            dup_type, prev_amount = find_duplicate(group_id, info)
+            verdict  = build_verdict(info, promptpay, dup_type, prev_amount)
             save_slip(group_id, info, verdict["status"])
 
         # สลิปผ่าน (PASS) → เงียบไว้ ไม่รกแชท (ยังบันทึกไว้ ดูรวมได้ที่ "สรุป")
