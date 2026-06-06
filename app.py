@@ -48,17 +48,23 @@ def init_db():
     with _db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS slips (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                group_id    TEXT,
-                slip_date   TEXT,
-                sender      TEXT,
-                amount      REAL,
-                bank        TEXT,
-                ref_number  TEXT,
-                verdict     TEXT,
-                recorded_at TEXT
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id      TEXT,
+                slip_date     TEXT,
+                sender        TEXT,
+                amount        REAL,
+                bank          TEXT,
+                ref_number    TEXT,
+                slip_datetime TEXT,
+                verdict       TEXT,
+                recorded_at   TEXT
             )
         """)
+        # migration: เพิ่มคอลัมน์ slip_datetime ให้ DB เก่าที่ยังไม่มี (ไว้จับซ้ำด้วยยอด+เวลา)
+        try:
+            conn.execute("ALTER TABLE slips ADD COLUMN slip_datetime TEXT")
+        except Exception:
+            pass
         conn.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS reservations (
@@ -159,22 +165,30 @@ def verify_with_promptpay(image_bytes: bytes) -> dict:
 
 _dup_lock = threading.Lock()   # กัน race ตอนเช็คซ้ำ+บันทึก เมื่อหลาย thread ทำพร้อมกัน
 
-def check_duplicate(group_id: str, ref_number: str) -> bool:
-    if not ref_number:
-        return False
+def find_duplicate(group_id: str, info: dict):
+    """หาว่าสลิปนี้ซ้ำกับใบก่อนหน้าในกรุ๊ปไหม — คืน 'ref' / 'amount_time' / None
+    - ref: เลขอ้างอิงตรงกัน (ชัวร์สุด)
+    - amount_time: ยอดเงิน + วันเวลาบนสลิป ตรงกัน (กันกรณี ref อ่านเพี้ยน)"""
+    ref    = info.get("ref_number")
+    amount = info.get("amount")
+    dt     = info.get("datetime")
     with _db() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM slips WHERE group_id=? AND ref_number=? LIMIT 1",
-            (group_id, ref_number)
-        ).fetchone()
-    return row is not None
+        if ref:
+            if conn.execute("SELECT 1 FROM slips WHERE group_id=? AND ref_number=? LIMIT 1",
+                            (group_id, ref)).fetchone():
+                return "ref"
+        if amount and dt:
+            if conn.execute("SELECT 1 FROM slips WHERE group_id=? AND amount=? AND slip_datetime=? LIMIT 1",
+                            (group_id, float(amount), dt)).fetchone():
+                return "amount_time"
+    return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Verdict Builder
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_verdict(info: dict, promptpay: dict, is_duplicate: bool) -> dict:
+def build_verdict(info: dict, promptpay: dict, dup_type=None) -> dict:
     issues = []
     fraud_score = info.get("fraud_score", 0)
 
@@ -195,8 +209,10 @@ def build_verdict(info: dict, promptpay: dict, is_duplicate: bool) -> dict:
         if api_amt and slip_amt and abs(float(api_amt) - float(slip_amt)) > 0.01:
             issues.append(f"🔴 ยอดเงินไม่ตรง: สลิปแสดง {slip_amt} แต่ API พบ {api_amt} บาท")
 
-    if is_duplicate:
+    if dup_type == "ref":
         issues.append(f"🔴 เลขอ้างอิง {info.get('ref_number')} เคยถูกส่งมาแล้ว! (สลิปซ้ำ)")
+    elif dup_type == "amount_time":
+        issues.append(f"🔴 ยอด {info.get('amount')} บาท + วันเวลาเดียวกับสลิปใบก่อนหน้า → น่าจะเป็นสลิปซ้ำ (โปรดตรวจสอบ)")
 
     critical = sum(1 for i in issues if i.startswith("🔴"))
     warning  = sum(1 for i in issues if i.startswith("🟡"))
@@ -246,10 +262,10 @@ def save_slip(group_id: str, info: dict, verdict_status: str):
     recorded_at = datetime.now(TZ).strftime("%H:%M:%S")
     with _db() as conn:
         conn.execute(
-            "INSERT INTO slips (group_id, slip_date, sender, amount, bank, ref_number, verdict, recorded_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO slips (group_id, slip_date, sender, amount, bank, ref_number, slip_datetime, verdict, recorded_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (group_id, today, info.get("sender"), float(info.get("amount") or 0),
-             info.get("bank"), info.get("ref_number"), verdict_status, recorded_at)
+             info.get("bank"), info.get("ref_number"), info.get("datetime"), verdict_status, recorded_at)
         )
         conn.execute("INSERT OR IGNORE INTO groups (group_id) VALUES (?)", (group_id,))
         conn.commit()
@@ -559,8 +575,8 @@ def _process_image_event(event):
         promptpay = verify_with_promptpay(image_bytes)
         # ล็อกช่วงเช็คซ้ำ+บันทึก ให้เป็นจังหวะเดียว กัน race ตอนส่งซ้ำพร้อมกันหลาย thread
         with _dup_lock:
-            is_dup  = check_duplicate(group_id, info.get("ref_number"))
-            verdict = build_verdict(info, promptpay, is_dup)
+            dup_type = find_duplicate(group_id, info)
+            verdict  = build_verdict(info, promptpay, dup_type)
             save_slip(group_id, info, verdict["status"])
 
         # สลิปผ่าน (PASS) → เงียบไว้ ไม่รกแชท (ยังบันทึกไว้ ดูรวมได้ที่ "สรุป")
