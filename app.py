@@ -157,6 +157,8 @@ def verify_with_promptpay(image_bytes: bytes) -> dict:
 # LAYER 3 — Duplicate Reference Number Check
 # ══════════════════════════════════════════════════════════════════════════════
 
+_dup_lock = threading.Lock()   # กัน race ตอนเช็คซ้ำ+บันทึก เมื่อหลาย thread ทำพร้อมกัน
+
 def check_duplicate(group_id: str, ref_number: str) -> bool:
     if not ref_number:
         return False
@@ -550,10 +552,16 @@ def _process_image_event(event):
             print(f"[skip] not a slip, group={group_id}", flush=True)
             return
 
+        # normalize เลขอ้างอิง (ตัวพิมพ์ใหญ่ + ตัดช่องว่าง) กันอ่านเพี้ยนเล็กน้อยแล้วเทียบไม่ตรง
+        if info.get("ref_number"):
+            info["ref_number"] = "".join(str(info["ref_number"]).upper().split())
+
         promptpay = verify_with_promptpay(image_bytes)
-        is_dup    = check_duplicate(group_id, info.get("ref_number"))
-        verdict   = build_verdict(info, promptpay, is_dup)
-        save_slip(group_id, info, verdict["status"])
+        # ล็อกช่วงเช็คซ้ำ+บันทึก ให้เป็นจังหวะเดียว กัน race ตอนส่งซ้ำพร้อมกันหลาย thread
+        with _dup_lock:
+            is_dup  = check_duplicate(group_id, info.get("ref_number"))
+            verdict = build_verdict(info, promptpay, is_dup)
+            save_slip(group_id, info, verdict["status"])
 
         # สลิปผ่าน (PASS) → เงียบไว้ ไม่รกแชท (ยังบันทึกไว้ ดูรวมได้ที่ "สรุป")
         # เตือนในกรุ๊ปเฉพาะที่มีปัญหา (WARN/FAIL)
