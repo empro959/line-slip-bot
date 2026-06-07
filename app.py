@@ -24,6 +24,8 @@ ADMIN_USER_ID     = os.environ.get("LINE_ADMIN_USER_ID", "")
 PROMPTPAY_API_KEY = os.environ.get("PROMPTPAY_API_KEY", "")
 # กรุ๊ป "บาร์น้ำ+จองโต๊ะล่วงหน้า" สำหรับรับแจ้งเตือนการจอง (ดู Group ID จาก log [GROUP_ID] บน Render)
 BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
+# กลุ่มที่อนุญาตให้ตรวจจับ "จองโต๊ะ" (คั่นด้วยคอมมา) — ถ้าเว้นว่าง = ทุกกลุ่ม / ตั้งช่วงเทสให้เฉพาะกลุ่มทดสอบ
+RESV_GROUPS       = [g.strip() for g in os.environ.get("RESV_GROUPS", "").split(",") if g.strip()]
 # คีย์เวิร์ดบัญชีรับเงินของร้าน (ชื่อ ไทย/อังกฤษ + เลขบัญชี/เลขท้าย) คั่นด้วยคอมมา
 # ใช้เทียบ "ปลายทาง" บนสลิป ถ้าไม่ตรงสักคำ = เตือนว่าอาจโอนผิดบัญชี (ตั้งบน Render กัน repo public เห็นเลขบัญชี)
 PAYEE_KEYWORDS    = [k.strip().lower() for k in os.environ.get("PAYEE_KEYWORDS", "").split(",") if k.strip()]
@@ -466,6 +468,9 @@ def handle_reservation_text(event, text: str, group_id: str):
     """ตรวจจับการจองในกรุ๊ปทั่วไป แล้วส่งแจ้งเตือนไปกรุ๊ปบาร์น้ำพร้อมปุ่มคอนเฟิร์ม"""
     if not BAR_GROUP_ID:
         print("[resv] ยังไม่ได้ตั้งค่า BAR_GROUP_ID — ข้ามการแจ้งเตือนจอง", flush=True)
+        return False
+    # ถ้ากำหนด RESV_GROUPS ไว้ → ตรวจจับจองเฉพาะกลุ่มที่อนุญาตเท่านั้น (กันกลุ่มอื่นเด้งมั่ว/ช่วงเทส)
+    if RESV_GROUPS and group_id not in RESV_GROUPS:
         return False
     # ไม่ตรวจในกรุ๊ปบาร์น้ำเอง (เป็นปลายทาง) และเกตคำเบื้องต้นเพื่อประหยัด quota
     if group_id == BAR_GROUP_ID or not any(h in text.lower() for h in _RESV_HINTS):
