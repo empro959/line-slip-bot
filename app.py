@@ -466,21 +466,27 @@ def handle_reservation_text(event, text: str, group_id: str):
     """ตรวจจับการจองในกลุ่ม แล้วโพสต์การ์ด+ปุ่มคอนเฟิร์ม 'ในกลุ่มเดียวกันนั้น'
     เปิดรับจองเฉพาะกลุ่มที่อยู่ใน RESV_GROUPS (ถ้าไม่ตั้ง = ปิดทุกกลุ่ม)"""
     if not RESV_GROUPS or group_id not in RESV_GROUPS:
+        print(f"[resv] skip: group={group_id} ไม่อยู่ใน RESV_GROUPS={RESV_GROUPS}", flush=True)
         return False
     if not any(h in text.lower() for h in _RESV_HINTS):
+        print(f"[resv] skip: ไม่มีคำใบ้จองใน text", flush=True)
         return False
 
+    print(f"[resv] กำลังเช็คจอง group={group_id} text={text}", flush=True)
     try:
         info = extract_reservation(text)
     except Exception as e:
         print(f"[resv] extract failed: {e}", flush=True)
         return False
+    print(f"[resv] ผล AI: {info}", flush=True)
     if not info.get("is_reservation"):
+        print(f"[resv] AI ตัดสินว่าไม่ใช่การจอง → ข้าม", flush=True)
         return False
 
     requested_by = get_display_name(event.source)
     resv_id = save_reservation(group_id, requested_by, info, text)
     detail = _resv_detail_lines(info)
+    print(f"[resv] โพสต์การ์ดจอง #{resv_id} ในกลุ่ม {group_id}", flush=True)
 
     # โพสต์ในกลุ่มเดียวกับที่พิมพ์จอง — แยก 2 ข้อความ:
     # (1) รายละเอียดเต็ม (ข้อความธรรมดา ไม่มีลิมิต) (2) การ์ดปุ่มสั้นๆ (ButtonsTemplate text จำกัด 60 ตัวเมื่อมี title)
