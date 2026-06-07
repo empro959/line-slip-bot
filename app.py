@@ -697,6 +697,10 @@ def handle_text(event):
     text     = event.message.text.strip()
     group_id = getattr(event.source, "group_id", event.source.user_id)
     print(f"[GROUP_ID] source_type={event.source.type} id={group_id} text={text}", flush=True)
+    # พิมพ์ "groupid" → บอทตอบ Group ID กลับมาในแชท (ไว้ก๊อปไปตั้งค่า RESV_GROUPS/อื่นๆ ได้ง่าย)
+    if text.lower().replace(" ", "") == "groupid":
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"🆔 Group ID:\n{group_id}"))
+        return
     if text.lower() in ("สรุป", "รายงาน", "report", "summary"):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
         return
