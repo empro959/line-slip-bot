@@ -101,11 +101,12 @@ def extract_slip_info(image_bytes: bytes) -> dict:
         "ดูรูปนี้ว่าเป็นสลิป/หลักฐานการโอนเงินจากธนาคารหรือแอปธนาคารหรือไม่ "
         "แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
         '{"is_slip":true,"sender":null,"amount":0.00,"datetime":null,"bank":null,'
-        '"account":null,"receiver":null,"receiver_account":null,"ref_number":null,"fraud_score":0,"fraud_reasons":[]}\n\n'
+        '"account":null,"receiver":null,"receiver_account":null,"ref_number":null,"cropped":false,"fraud_score":0,"fraud_reasons":[]}\n\n'
         "is_slip: true ถ้าเป็นสลิปโอนเงินจริง, false ถ้าเป็นรูปอื่น (เช่น รูปคน อาหาร ใบเสร็จ เมนู วิว ฯลฯ)\n"
         "ถ้า is_slip เป็น false ให้ใส่ค่าที่เหลือเป็น null/0 ได้เลย\n"
         "receiver: ชื่อบัญชี 'ปลายทาง/ผู้รับเงิน' (ฝั่ง 'ไปยัง') ตามที่เห็นในสลิป (ถ้ามีข้อมูลเพิ่มในวงเล็บก็ใส่ด้วย)\n"
-        "receiver_account: เลขบัญชีปลายทาง/ผู้รับ (ตามที่เห็น แม้ถูกปิดบางส่วน เช่น xxx-x-x4818-x ก็ใส่)\n\n"
+        "receiver_account: เลขบัญชีปลายทาง/ผู้รับ (ตามที่เห็น แม้ถูกปิดบางส่วน เช่น xxx-x-x4818-x ก็ใส่)\n"
+        "cropped: true ถ้าสลิปถูกตัด/ครอป หรือมีบางส่วนถูกบัง/นิ้วบัง จนข้อมูลสำคัญ (ปลายทาง/ยอดเงิน/เลขอ้างอิง) มองไม่เห็นครบ\n\n"
         "datetime: ดึงวันเวลาจากสลิป แปลงเป็น ค.ศ. รูปแบบ ISO YYYY-MM-DDTHH:MM:SS เสมอ "
         "(สลิปไทยใช้ พ.ศ. เช่น 2569 = ค.ศ. 2026 ให้ลบ 543)\n"
         "⚠️ ห้ามนำเรื่องวันที่ (ว่าเป็นอนาคตหรืออดีต) มาเป็นเหตุผล fraud โดยเด็ดขาด ไม่ว่ากรณีใดๆ — "
@@ -242,7 +243,17 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None) 
     elif dup_type == "amount_time":
         issues.append(f"🔴 ยอด {info.get('amount')} บาท + วันเวลาเดียวกับสลิปใบก่อนหน้า → น่าจะเป็นสลิปซ้ำ (โปรดตรวจสอบ)")
 
-    if not _payee_matches(info):
+    # ข้อมูลไม่ครบ / ถูกตัด-บัง (เคสซ่อนปลายทาง ฯลฯ)
+    receiver_missing = not (info.get("receiver") or info.get("receiver_account"))
+    if info.get("cropped"):
+        issues.append("🟡 สลิปอาจถูกตัด/ครอป หรือมีบางส่วนถูกบัง — โปรดตรวจสอบข้อมูลให้ครบ")
+    if not info.get("amount"):
+        issues.append("🟡 อ่านจำนวนเงินบนสลิปไม่ได้ — โปรดตรวจสอบ")
+
+    # ปลายทาง: ถ้ามองไม่เห็น = อาจถูกบัง / ถ้าเห็นแต่ไม่ตรงบัญชีร้าน = อาจโอนผิดบัญชี
+    if PAYEE_KEYWORDS and receiver_missing:
+        issues.append("🟡 มองไม่เห็นบัญชีปลายทางในสลิป (อาจถูกตัด/บัง) — โปรดตรวจว่าโอนเข้าบัญชีร้านจริง")
+    elif not _payee_matches(info):
         issues.append(f"🟡 บัญชีปลายทางไม่ตรงกับบัญชีร้าน ({info.get('receiver') or '?'} {info.get('receiver_account') or ''}) — โปรดตรวจสอบก่อนรับเงิน")
 
     critical = sum(1 for i in issues if i.startswith("🔴"))
