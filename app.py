@@ -22,9 +22,7 @@ LINE_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
 ADMIN_USER_ID     = os.environ.get("LINE_ADMIN_USER_ID", "")
 PROMPTPAY_API_KEY = os.environ.get("PROMPTPAY_API_KEY", "")
-# กรุ๊ป "บาร์น้ำ+จองโต๊ะล่วงหน้า" สำหรับรับแจ้งเตือนการจอง (ดู Group ID จาก log [GROUP_ID] บน Render)
-BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
-# กลุ่มที่อนุญาตให้ตรวจจับ "จองโต๊ะ" (คั่นด้วยคอมมา) — ถ้าเว้นว่าง = ทุกกลุ่ม / ตั้งช่วงเทสให้เฉพาะกลุ่มทดสอบ
+# กลุ่มที่ "เปิดรับจองโต๊ะ" (คั่นด้วยคอมมา) — จองในกลุ่มไหน การ์ด+ปุ่มคอนเฟิร์มขึ้นในกลุ่มนั้น / เว้นว่าง = ปิดทุกกลุ่ม
 RESV_GROUPS       = [g.strip() for g in os.environ.get("RESV_GROUPS", "").split(",") if g.strip()]
 # คีย์เวิร์ดบัญชีรับเงินของร้าน (ชื่อ ไทย/อังกฤษ + เลขบัญชี/เลขท้าย) คั่นด้วยคอมมา
 # ใช้เทียบ "ปลายทาง" บนสลิป ถ้าไม่ตรงสักคำ = เตือนว่าอาจโอนผิดบัญชี (ตั้งบน Render กัน repo public เห็นเลขบัญชี)
@@ -465,15 +463,11 @@ def mark_reservation_confirmed(resv_id: int, confirmed_by: str):
 
 
 def handle_reservation_text(event, text: str, group_id: str):
-    """ตรวจจับการจองในกรุ๊ปทั่วไป แล้วส่งแจ้งเตือนไปกรุ๊ปบาร์น้ำพร้อมปุ่มคอนเฟิร์ม"""
-    if not BAR_GROUP_ID:
-        print("[resv] ยังไม่ได้ตั้งค่า BAR_GROUP_ID — ข้ามการแจ้งเตือนจอง", flush=True)
+    """ตรวจจับการจองในกลุ่ม แล้วโพสต์การ์ด+ปุ่มคอนเฟิร์ม 'ในกลุ่มเดียวกันนั้น'
+    เปิดรับจองเฉพาะกลุ่มที่อยู่ใน RESV_GROUPS (ถ้าไม่ตั้ง = ปิดทุกกลุ่ม)"""
+    if not RESV_GROUPS or group_id not in RESV_GROUPS:
         return False
-    # ถ้ากำหนด RESV_GROUPS ไว้ → ตรวจจับจองเฉพาะกลุ่มที่อนุญาตเท่านั้น (กันกลุ่มอื่นเด้งมั่ว/ช่วงเทส)
-    if RESV_GROUPS and group_id not in RESV_GROUPS:
-        return False
-    # ไม่ตรวจในกรุ๊ปบาร์น้ำเอง (เป็นปลายทาง) และเกตคำเบื้องต้นเพื่อประหยัด quota
-    if group_id == BAR_GROUP_ID or not any(h in text.lower() for h in _RESV_HINTS):
+    if not any(h in text.lower() for h in _RESV_HINTS):
         return False
 
     try:
@@ -488,7 +482,7 @@ def handle_reservation_text(event, text: str, group_id: str):
     resv_id = save_reservation(group_id, requested_by, info, text)
     detail = _resv_detail_lines(info)
 
-    # การ์ดในกรุ๊ปบาร์น้ำ + ปุ่มคอนเฟิร์ม (postback ส่งกลับ id)
+    # โพสต์การ์ด + ปุ่มคอนเฟิร์ม ในกลุ่มเดียวกับที่พิมพ์จอง
     body = f"จากคุณ {requested_by}\n─────────────────\n{detail}"
     template = TemplateSendMessage(
         alt_text=f"🔔 จองโต๊ะใหม่ #{resv_id}",
@@ -502,16 +496,7 @@ def handle_reservation_text(event, text: str, group_id: str):
             )],
         ),
     )
-    try:
-        line_bot_api.push_message(BAR_GROUP_ID, template)
-    except Exception as e:
-        print(f"[resv] push to bar group failed: {e}", flush=True)
-        line_bot_api.reply_message(event.reply_token,
-            TextSendMessage(text="⚠️ ส่งแจ้งเตือนไปกรุ๊ปบาร์น้ำไม่สำเร็จ กรุณาตรวจสอบ BAR_GROUP_ID"))
-        return True
-
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(
-        text=f"📤 ส่งคำขอจอง #{resv_id} ไปยังกรุ๊ปบาร์น้ำแล้ว รอคอนเฟิร์ม\n─────────────────\n{detail}"))
+    line_bot_api.reply_message(event.reply_token, template)
     return True
 
 
@@ -532,20 +517,10 @@ def handle_reservation_confirm(event, resv_id: int):
         return
 
     mark_reservation_confirmed(resv_id, confirmer)
-
-    # ตอบกลับในกรุ๊ปบาร์น้ำ
+    # คอนเฟิร์มในกลุ่มเดิม (ที่กดปุ่ม)
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
-        text=f"✅ คอนเฟิร์มการจอง #{resv_id} เรียบร้อย\nโดย {confirmer}\n─────────────────\n{detail}"))
-
-    # แจ้งกลับกรุ๊ปต้นทาง + สรุป
-    if resv.get("origin_group_id"):
-        try:
-            line_bot_api.push_message(resv["origin_group_id"], TextSendMessage(
-                text=f"✅ การจอง #{resv_id} ได้รับการคอนเฟิร์มแล้ว!\n"
-                     f"ยืนยันโดย {confirmer} (บาร์น้ำ)\n─────────────────\n"
-                     f"ผู้แจ้งจอง: {resv.get('requested_by','-')}\n{detail}"))
-        except Exception as e:
-            print(f"[resv] notify origin failed: {e}", flush=True)
+        text=f"✅ การจอง #{resv_id} คอนเฟิร์มแล้ว!\nโดย {confirmer}\n─────────────────\n"
+             f"ผู้แจ้งจอง: {resv.get('requested_by','-')}\n{detail}"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
