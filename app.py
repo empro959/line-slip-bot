@@ -24,6 +24,9 @@ ADMIN_USER_ID     = os.environ.get("LINE_ADMIN_USER_ID", "")
 PROMPTPAY_API_KEY = os.environ.get("PROMPTPAY_API_KEY", "")
 # กรุ๊ป "บาร์น้ำ+จองโต๊ะล่วงหน้า" สำหรับรับแจ้งเตือนการจอง (ดู Group ID จาก log [GROUP_ID] บน Render)
 BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
+# คีย์เวิร์ดบัญชีรับเงินของร้าน (ชื่อ ไทย/อังกฤษ + เลขบัญชี/เลขท้าย) คั่นด้วยคอมมา
+# ใช้เทียบ "ปลายทาง" บนสลิป ถ้าไม่ตรงสักคำ = เตือนว่าอาจโอนผิดบัญชี (ตั้งบน Render กัน repo public เห็นเลขบัญชี)
+PAYEE_KEYWORDS    = [k.strip().lower() for k in os.environ.get("PAYEE_KEYWORDS", "").split(",") if k.strip()]
 TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 
 line_bot_api = LineBotApi(LINE_TOKEN)
@@ -48,17 +51,23 @@ def init_db():
     with _db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS slips (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                group_id    TEXT,
-                slip_date   TEXT,
-                sender      TEXT,
-                amount      REAL,
-                bank        TEXT,
-                ref_number  TEXT,
-                verdict     TEXT,
-                recorded_at TEXT
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id      TEXT,
+                slip_date     TEXT,
+                sender        TEXT,
+                amount        REAL,
+                bank          TEXT,
+                ref_number    TEXT,
+                slip_datetime TEXT,
+                verdict       TEXT,
+                recorded_at   TEXT
             )
         """)
+        # migration: เพิ่มคอลัมน์ slip_datetime ให้ DB เก่าที่ยังไม่มี (ไว้จับซ้ำด้วยยอด+เวลา)
+        try:
+            conn.execute("ALTER TABLE slips ADD COLUMN slip_datetime TEXT")
+        except Exception:
+            pass
         conn.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS reservations (
@@ -92,9 +101,12 @@ def extract_slip_info(image_bytes: bytes) -> dict:
         "ดูรูปนี้ว่าเป็นสลิป/หลักฐานการโอนเงินจากธนาคารหรือแอปธนาคารหรือไม่ "
         "แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
         '{"is_slip":true,"sender":null,"amount":0.00,"datetime":null,"bank":null,'
-        '"account":null,"ref_number":null,"fraud_score":0,"fraud_reasons":[]}\n\n'
+        '"account":null,"receiver":null,"receiver_account":null,"ref_number":null,"cropped":false,"fraud_score":0,"fraud_reasons":[]}\n\n'
         "is_slip: true ถ้าเป็นสลิปโอนเงินจริง, false ถ้าเป็นรูปอื่น (เช่น รูปคน อาหาร ใบเสร็จ เมนู วิว ฯลฯ)\n"
-        "ถ้า is_slip เป็น false ให้ใส่ค่าที่เหลือเป็น null/0 ได้เลย\n\n"
+        "ถ้า is_slip เป็น false ให้ใส่ค่าที่เหลือเป็น null/0 ได้เลย\n"
+        "receiver: ชื่อบัญชี 'ปลายทาง/ผู้รับเงิน' (ฝั่ง 'ไปยัง') ตามที่เห็นในสลิป (ถ้ามีข้อมูลเพิ่มในวงเล็บก็ใส่ด้วย)\n"
+        "receiver_account: เลขบัญชีปลายทาง/ผู้รับ (ตามที่เห็น แม้ถูกปิดบางส่วน เช่น xxx-x-x4818-x ก็ใส่)\n"
+        "cropped: true ถ้าสลิปถูกตัด/ครอป หรือมีบางส่วนถูกบัง/นิ้วบัง จนข้อมูลสำคัญ (ปลายทาง/ยอดเงิน/เลขอ้างอิง) มองไม่เห็นครบ\n\n"
         "datetime: ดึงวันเวลาจากสลิป แปลงเป็น ค.ศ. รูปแบบ ISO YYYY-MM-DDTHH:MM:SS เสมอ "
         "(สลิปไทยใช้ พ.ศ. เช่น 2569 = ค.ศ. 2026 ให้ลบ 543)\n"
         "⚠️ ห้ามนำเรื่องวันที่ (ว่าเป็นอนาคตหรืออดีต) มาเป็นเหตุผล fraud โดยเด็ดขาด ไม่ว่ากรณีใดๆ — "
@@ -105,6 +117,9 @@ def extract_slip_info(image_bytes: bytes) -> dict:
         "  - ฟอนต์ ขนาด ความหนา หรือช่องไฟของตัวเลข ไม่สม่ำเสมอกับตัวเลขอื่นในสลิปเดียวกัน\n"
         "  - สีพื้นหลัง/เงา/noise รอบตัวเลขไม่กลมกลืน เหมือนถูก copy-paste หรือมีกล่องสีทับ\n"
         "  - ตัวอักษรซ้อนเหลื่อม เส้นบรรทัดเบี้ยว ขอบตัวเลขมีรอยถู/เกลี่ย\n"
+        "❗ จุดที่ถูกปลอมบ่อยสุดคือ 'จำนวนเงิน' — เทียบ ขนาด/ฟอนต์/ความคม/ความหนา ของตัวเลขจำนวนเงิน "
+        "กับตัวเลขอื่นในสลิป (เช่น เลขบัญชี วันเวลา) ถ้าจำนวนเงินขนาดหรือฟอนต์ต่างจากตัวเลขอื่นอย่างเห็นได้ชัด "
+        "= ถูกแก้ไขแน่นอน ให้ fraud_score >= 80\n"
         "fraud_score: 0-100 ยึดสิ่งที่เห็นจริง อย่าเดา:\n"
         "  • 0-39 = ไม่พบร่องรอยตัดต่อ ดูปกติ (สลิปทั่วไปควรอยู่ช่วงนี้)\n"
         "  • 40-69 = พบจุดน่าสงสัยแต่ไม่ฟันธง\n"
@@ -157,22 +172,47 @@ def verify_with_promptpay(image_bytes: bytes) -> dict:
 # LAYER 3 — Duplicate Reference Number Check
 # ══════════════════════════════════════════════════════════════════════════════
 
-def check_duplicate(group_id: str, ref_number: str) -> bool:
-    if not ref_number:
-        return False
+_dup_lock = threading.Lock()   # กัน race ตอนเช็คซ้ำ+บันทึก เมื่อหลาย thread ทำพร้อมกัน
+
+def find_duplicate(group_id: str, info: dict):
+    """หาความซ้ำ/ความผิดปกติเทียบกับใบก่อนหน้าในกรุ๊ป — คืน (type, prev_amount)
+    - ref_mismatch: เลขอ้างอิงเดียวกันแต่ยอดเงินไม่ตรง = ถูกตัดต่อ! (ฟันธง)
+    - ref: เลขอ้างอิงตรง + ยอดตรง = สลิปซ้ำจริง
+    - amount_time: ยอดเงิน + วันเวลาบนสลิปตรงกัน (กันกรณี ref อ่านเพี้ยน)"""
+    ref    = info.get("ref_number")
+    amount = float(info.get("amount") or 0)
+    dt     = info.get("datetime")
     with _db() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM slips WHERE group_id=? AND ref_number=? LIMIT 1",
-            (group_id, ref_number)
-        ).fetchone()
-    return row is not None
+        if ref:
+            row = conn.execute(
+                "SELECT amount FROM slips WHERE group_id=? AND ref_number=? ORDER BY id LIMIT 1",
+                (group_id, ref)).fetchone()
+            if row:
+                prev = float(row["amount"] or 0)
+                if amount and prev and abs(prev - amount) > 0.01:
+                    return ("ref_mismatch", prev)
+                return ("ref", None)
+        if amount and dt:
+            if conn.execute(
+                "SELECT 1 FROM slips WHERE group_id=? AND amount=? AND slip_datetime=? LIMIT 1",
+                (group_id, amount, dt)).fetchone():
+                return ("amount_time", None)
+    return (None, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Verdict Builder
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_verdict(info: dict, promptpay: dict, is_duplicate: bool) -> dict:
+def _payee_matches(info: dict) -> bool:
+    """ปลายทางบนสลิปตรงกับบัญชีร้านไหม (เทียบกับ PAYEE_KEYWORDS) — ถ้าไม่ตั้งค่าไว้ถือว่าผ่าน"""
+    if not PAYEE_KEYWORDS:
+        return True
+    hay = f"{info.get('receiver') or ''} {info.get('receiver_account') or ''} {info.get('bank') or ''}".lower()
+    return any(k in hay for k in PAYEE_KEYWORDS)
+
+
+def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None) -> dict:
     issues = []
     fraud_score = info.get("fraud_score", 0)
 
@@ -193,8 +233,28 @@ def build_verdict(info: dict, promptpay: dict, is_duplicate: bool) -> dict:
         if api_amt and slip_amt and abs(float(api_amt) - float(slip_amt)) > 0.01:
             issues.append(f"🔴 ยอดเงินไม่ตรง: สลิปแสดง {slip_amt} แต่ API พบ {api_amt} บาท")
 
-    if is_duplicate:
+    if dup_type == "ref_mismatch":
+        cur_amt  = f"{float(info.get('amount') or 0):,.2f}"
+        prev_amt = f"{float(prev_amount or 0):,.2f}"
+        issues.append(f"🔴 เลขอ้างอิงเดียวกับสลิปใบก่อน แต่ยอดเงินไม่ตรง! "
+                      f"(ใบก่อน {prev_amt} / ใบนี้ {cur_amt} บาท) → สลิปถูกตัดต่อ!")
+    elif dup_type == "ref":
         issues.append(f"🔴 เลขอ้างอิง {info.get('ref_number')} เคยถูกส่งมาแล้ว! (สลิปซ้ำ)")
+    elif dup_type == "amount_time":
+        issues.append(f"🔴 ยอด {info.get('amount')} บาท + วันเวลาเดียวกับสลิปใบก่อนหน้า → น่าจะเป็นสลิปซ้ำ (โปรดตรวจสอบ)")
+
+    # ข้อมูลไม่ครบ / ถูกตัด-บัง (เคสซ่อนปลายทาง ฯลฯ)
+    receiver_missing = not (info.get("receiver") or info.get("receiver_account"))
+    if info.get("cropped"):
+        issues.append("🟡 สลิปอาจถูกตัด/ครอป หรือมีบางส่วนถูกบัง — โปรดตรวจสอบข้อมูลให้ครบ")
+    if not info.get("amount"):
+        issues.append("🟡 อ่านจำนวนเงินบนสลิปไม่ได้ — โปรดตรวจสอบ")
+
+    # ปลายทาง: ถ้ามองไม่เห็น = อาจถูกบัง / ถ้าเห็นแต่ไม่ตรงบัญชีร้าน = อาจโอนผิดบัญชี
+    if PAYEE_KEYWORDS and receiver_missing:
+        issues.append("🟡 มองไม่เห็นบัญชีปลายทางในสลิป (อาจถูกตัด/บัง) — โปรดตรวจว่าโอนเข้าบัญชีร้านจริง")
+    elif not _payee_matches(info):
+        issues.append(f"🟡 บัญชีปลายทางไม่ตรงกับบัญชีร้าน ({info.get('receiver') or '?'} {info.get('receiver_account') or ''}) — โปรดตรวจสอบก่อนรับเงิน")
 
     critical = sum(1 for i in issues if i.startswith("🔴"))
     warning  = sum(1 for i in issues if i.startswith("🟡"))
@@ -244,10 +304,10 @@ def save_slip(group_id: str, info: dict, verdict_status: str):
     recorded_at = datetime.now(TZ).strftime("%H:%M:%S")
     with _db() as conn:
         conn.execute(
-            "INSERT INTO slips (group_id, slip_date, sender, amount, bank, ref_number, verdict, recorded_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO slips (group_id, slip_date, sender, amount, bank, ref_number, slip_datetime, verdict, recorded_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (group_id, today, info.get("sender"), float(info.get("amount") or 0),
-             info.get("bank"), info.get("ref_number"), verdict_status, recorded_at)
+             info.get("bank"), info.get("ref_number"), info.get("datetime"), verdict_status, recorded_at)
         )
         conn.execute("INSERT OR IGNORE INTO groups (group_id) VALUES (?)", (group_id,))
         conn.commit()
@@ -550,10 +610,16 @@ def _process_image_event(event):
             print(f"[skip] not a slip, group={group_id}", flush=True)
             return
 
+        # normalize เลขอ้างอิง (ตัวพิมพ์ใหญ่ + ตัดช่องว่าง) กันอ่านเพี้ยนเล็กน้อยแล้วเทียบไม่ตรง
+        if info.get("ref_number"):
+            info["ref_number"] = "".join(str(info["ref_number"]).upper().split())
+
         promptpay = verify_with_promptpay(image_bytes)
-        is_dup    = check_duplicate(group_id, info.get("ref_number"))
-        verdict   = build_verdict(info, promptpay, is_dup)
-        save_slip(group_id, info, verdict["status"])
+        # ล็อกช่วงเช็คซ้ำ+บันทึก ให้เป็นจังหวะเดียว กัน race ตอนส่งซ้ำพร้อมกันหลาย thread
+        with _dup_lock:
+            dup_type, prev_amount = find_duplicate(group_id, info)
+            verdict  = build_verdict(info, promptpay, dup_type, prev_amount)
+            save_slip(group_id, info, verdict["status"])
 
         # สลิปผ่าน (PASS) → เงียบไว้ ไม่รกแชท (ยังบันทึกไว้ ดูรวมได้ที่ "สรุป")
         # เตือนในกรุ๊ปเฉพาะที่มีปัญหา (WARN/FAIL)
