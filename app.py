@@ -22,8 +22,10 @@ LINE_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
 ADMIN_USER_ID     = os.environ.get("LINE_ADMIN_USER_ID", "")
 PROMPTPAY_API_KEY = os.environ.get("PROMPTPAY_API_KEY", "")
-# กลุ่มที่ "เปิดรับจองโต๊ะ" (คั่นด้วยคอมมา) — จองในกลุ่มไหน การ์ด+ปุ่มคอนเฟิร์มขึ้นในกลุ่มนั้น / เว้นว่าง = ปิดทุกกลุ่ม
+# กลุ่มที่ "เปิดรับจองโต๊ะ" (คั่นด้วยคอมมา) — จองวันนี้ การ์ด+ปุ่มขึ้นในกลุ่มนั้น / เว้นว่าง = ปิด
 RESV_GROUPS       = [g.strip() for g in os.environ.get("RESV_GROUPS", "").split(",") if g.strip()]
+# กลุ่ม "บาร์น้ำ+จองโต๊ะล่วงหน้า" — จองล่วงหน้าจากกลุ่มไหนก็ตามจะส่งการ์ด+ปุ่มมาที่นี่ (ดู id ด้วยคำสั่ง groupid)
+BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
 # คีย์เวิร์ดบัญชีรับเงินของร้าน (ชื่อ ไทย/อังกฤษ + เลขบัญชี/เลขท้าย) คั่นด้วยคอมมา
 # ใช้เทียบ "ปลายทาง" บนสลิป ถ้าไม่ตรงสักคำ = เตือนว่าอาจโอนผิดบัญชี (ตั้งบน Render กัน repo public เห็นเลขบัญชี)
 PAYEE_KEYWORDS    = [k.strip().lower() for k in os.environ.get("PAYEE_KEYWORDS", "").split(",") if k.strip()]
@@ -406,9 +408,11 @@ def extract_reservation(text: str) -> dict:
     prompt = (
         "ข้อความต่อไปนี้จากแชทพนักงานร้าน เป็นการ 'จองโต๊ะ' ให้ลูกค้าหรือไม่ "
         "(ไม่ใช่การคุยเล่นที่บังเอิญมีคำว่าจอง/โต๊ะ) ตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
-        '{"is_reservation":true,"customer":null,"people":null,"datetime":null,'
+        '{"is_reservation":true,"is_advance":false,"customer":null,"people":null,"datetime":null,'
         '"table":null,"note":null}\n\n'
         "is_reservation: true เฉพาะเมื่อเป็นการจองโต๊ะจริง (มีเจตนานัด/จองที่นั่งให้ลูกค้า)\n"
+        "is_advance: true ถ้าเป็นการจอง 'ล่วงหน้า' (สำหรับวันอื่น/วันข้างหน้า เช่น พรุ่งนี้ เสาร์นี้ วันที่ 25 ฯลฯ), "
+        "false ถ้าจองสำหรับ 'วันนี้/คืนนี้/ตอนนี้'\n"
         "customer: ชื่อลูกค้า/ผู้จอง (ถ้ามี)\n"
         "people: จำนวนคน เช่น '4 คน' (ถ้ามี)\n"
         "datetime: วันและเวลาที่จอง เช่น 'วันนี้ 20:00' (ถ้ามี)\n"
@@ -463,39 +467,42 @@ def mark_reservation_confirmed(resv_id: int, confirmed_by: str):
 
 
 def handle_reservation_text(event, text: str, group_id: str):
-    """ตรวจจับการจองในกลุ่ม แล้วโพสต์การ์ด+ปุ่มคอนเฟิร์ม 'ในกลุ่มเดียวกันนั้น'
-    เปิดรับจองเฉพาะกลุ่มที่อยู่ใน RESV_GROUPS (ถ้าไม่ตั้ง = ปิดทุกกลุ่ม)"""
-    if not RESV_GROUPS or group_id not in RESV_GROUPS:
-        print(f"[resv] skip: group={group_id} ไม่อยู่ใน RESV_GROUPS={RESV_GROUPS}", flush=True)
+    """จองวันนี้ → การ์ด+ปุ่มในกลุ่มเดิม (เฉพาะกลุ่มใน RESV_GROUPS)
+    จองล่วงหน้า → ส่งการ์ด+ปุ่มไปกลุ่มบาร์น้ำ (BAR_GROUP_ID) จากกลุ่มไหนก็ได้"""
+    in_resv = bool(RESV_GROUPS) and group_id in RESV_GROUPS
+    # ทำงานถ้า: เป็นกลุ่มรับจองวันนี้ หรือ ตั้งบาร์น้ำไว้ (เพื่อรับจองล่วงหน้าจากทุกกลุ่ม)
+    if not in_resv and not BAR_GROUP_ID:
         return False
     if not any(h in text.lower() for h in _RESV_HINTS):
-        print(f"[resv] skip: ไม่มีคำใบ้จองใน text", flush=True)
         return False
 
-    print(f"[resv] กำลังเช็คจอง group={group_id} text={text}", flush=True)
+    print(f"[resv] เช็คจอง group={group_id} text={text}", flush=True)
     try:
         info = extract_reservation(text)
     except Exception as e:
         print(f"[resv] extract failed: {e}", flush=True)
         return False
-    print(f"[resv] ผล AI: {info}", flush=True)
     if not info.get("is_reservation"):
-        print(f"[resv] AI ตัดสินว่าไม่ใช่การจอง → ข้าม", flush=True)
+        print(f"[resv] AI ว่าไม่ใช่การจอง → ข้าม", flush=True)
+        return False
+
+    is_advance = bool(info.get("is_advance"))
+    # กลุ่มไม่ได้เปิดรับจองวันนี้ และไม่ใช่จองล่วงหน้า → ไม่ทำอะไร
+    if not in_resv and not is_advance:
+        print(f"[resv] กลุ่มไม่อยู่ใน RESV_GROUPS และไม่ใช่จองล่วงหน้า → ข้าม", flush=True)
         return False
 
     requested_by = get_display_name(event.source)
     resv_id = save_reservation(group_id, requested_by, info, text)
     detail = _resv_detail_lines(info)
-    print(f"[resv] โพสต์การ์ดจอง #{resv_id} ในกลุ่ม {group_id}", flush=True)
+    head = "📅 จองล่วงหน้า" if is_advance else "🔔 จองโต๊ะ"
 
-    # โพสต์ในกลุ่มเดียวกับที่พิมพ์จอง — แยก 2 ข้อความ:
-    # (1) รายละเอียดเต็ม (ข้อความธรรมดา ไม่มีลิมิต) (2) การ์ดปุ่มสั้นๆ (ButtonsTemplate text จำกัด 60 ตัวเมื่อมี title)
     detail_msg = TextSendMessage(
-        text=f"🔔 จองโต๊ะใหม่ #{resv_id}\nจากคุณ {requested_by}\n─────────────────\n{detail}")
+        text=f"{head}ใหม่ #{resv_id}\nจากคุณ {requested_by}\n─────────────────\n{detail}")
     confirm_msg = TemplateSendMessage(
         alt_text=f"ยืนยันการจอง #{resv_id}",
         template=ButtonsTemplate(
-            title=f"จองโต๊ะ #{resv_id}",
+            title=f"{head} #{resv_id}",
             text="กดยืนยันเมื่อรับจองเรียบร้อย",
             actions=[PostbackAction(
                 label="✅ คอนเฟิร์มการจอง",
@@ -504,7 +511,16 @@ def handle_reservation_text(event, text: str, group_id: str):
             )],
         ),
     )
-    line_bot_api.reply_message(event.reply_token, [detail_msg, confirm_msg])
+
+    # ปลายทาง: จองล่วงหน้า → กลุ่มบาร์น้ำ / จองวันนี้ → กลุ่มเดิม
+    dest = BAR_GROUP_ID if (is_advance and BAR_GROUP_ID) else group_id
+    print(f"[resv] จอง #{resv_id} advance={is_advance} → ส่งไป {dest}", flush=True)
+    if dest == group_id:
+        line_bot_api.reply_message(event.reply_token, [detail_msg, confirm_msg])
+    else:
+        line_bot_api.push_message(dest, [detail_msg, confirm_msg])
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"📤 ส่งจองล่วงหน้า #{resv_id} ไปกลุ่มบาร์น้ำแล้ว รอคอนเฟิร์ม\n─────────────────\n{detail}"))
     return True
 
 
@@ -517,6 +533,7 @@ def handle_reservation_confirm(event, resv_id: int):
 
     confirmer = get_display_name(event.source)
     detail = _resv_detail_lines(resv)
+    pressed_group = getattr(event.source, "group_id", getattr(event.source, "user_id", None))
 
     if resv["status"] == "CONFIRMED":
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
@@ -525,10 +542,21 @@ def handle_reservation_confirm(event, resv_id: int):
         return
 
     mark_reservation_confirmed(resv_id, confirmer)
-    # คอนเฟิร์มในกลุ่มเดิม (ที่กดปุ่ม)
+    # ตอบในกลุ่มที่กดปุ่มคอนเฟิร์ม
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
         text=f"✅ การจอง #{resv_id} คอนเฟิร์มแล้ว!\nโดย {confirmer}\n─────────────────\n"
              f"ผู้แจ้งจอง: {resv.get('requested_by','-')}\n{detail}"))
+
+    # แจ้งกลับกลุ่มต้นทาง ถ้าต่างจากกลุ่มที่กด (เคสล่วงหน้า: บาร์น้ำกด → แจ้งกลับกลุ่มที่แจ้ง)
+    # ถ้าต้นทาง = กลุ่มที่กด (จองในกลุ่มเดียวกัน) → ไม่ต้องแจ้งซ้ำ
+    origin = resv.get("origin_group_id")
+    if origin and origin != pressed_group:
+        try:
+            line_bot_api.push_message(origin, TextSendMessage(
+                text=f"✅ จองล่วงหน้า #{resv_id} ที่แจ้งไว้ บาร์น้ำคอนเฟิร์มแล้ว!\n"
+                     f"โดย {confirmer}\n─────────────────\n{detail}"))
+        except Exception as e:
+            print(f"[resv] notify origin failed: {e}", flush=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
