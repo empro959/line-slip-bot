@@ -482,13 +482,15 @@ def handle_reservation_text(event, text: str, group_id: str):
     resv_id = save_reservation(group_id, requested_by, info, text)
     detail = _resv_detail_lines(info)
 
-    # โพสต์การ์ด + ปุ่มคอนเฟิร์ม ในกลุ่มเดียวกับที่พิมพ์จอง
-    body = f"จากคุณ {requested_by}\n─────────────────\n{detail}"
-    template = TemplateSendMessage(
-        alt_text=f"🔔 จองโต๊ะใหม่ #{resv_id}",
+    # โพสต์ในกลุ่มเดียวกับที่พิมพ์จอง — แยก 2 ข้อความ:
+    # (1) รายละเอียดเต็ม (ข้อความธรรมดา ไม่มีลิมิต) (2) การ์ดปุ่มสั้นๆ (ButtonsTemplate text จำกัด 60 ตัวเมื่อมี title)
+    detail_msg = TextSendMessage(
+        text=f"🔔 จองโต๊ะใหม่ #{resv_id}\nจากคุณ {requested_by}\n─────────────────\n{detail}")
+    confirm_msg = TemplateSendMessage(
+        alt_text=f"ยืนยันการจอง #{resv_id}",
         template=ButtonsTemplate(
-            title=f"🔔 จองโต๊ะใหม่ #{resv_id}",
-            text=body[:160],
+            title=f"จองโต๊ะ #{resv_id}",
+            text="กดยืนยันเมื่อรับจองเรียบร้อย",
             actions=[PostbackAction(
                 label="✅ คอนเฟิร์มการจอง",
                 data=f"confirm_resv:{resv_id}",
@@ -496,7 +498,7 @@ def handle_reservation_text(event, text: str, group_id: str):
             )],
         ),
     )
-    line_bot_api.reply_message(event.reply_token, template)
+    line_bot_api.reply_message(event.reply_token, [detail_msg, confirm_msg])
     return True
 
 
