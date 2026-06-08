@@ -73,6 +73,7 @@ def init_db():
         except Exception:
             pass
         conn.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY)")
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS reservations (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -353,35 +354,57 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Midnight Scheduler (00:30 Asia/Bangkok)
+# Daily Report Scheduler (00:30 Asia/Bangkok) — ยิงจากการ ping /health + thread สำรอง (idempotent กันรีสตาร์ท/ส่งซ้ำ)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _seconds_until_next_report() -> float:
-    now    = datetime.now(TZ)
-    target = now.replace(hour=0, minute=30, second=0, microsecond=0)
-    if now >= target:
-        target += timedelta(days=1)
-    return (target - now).total_seconds()
+_report_lock = threading.Lock()
+
+def _get_meta(key: str):
+    with _db() as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+def _set_meta(key: str, value: str):
+    with _db() as conn:
+        conn.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        conn.commit()
 
 
-def midnight_report_loop():
+def maybe_send_daily_report():
+    """ส่งรายงานสรุป 'ของเมื่อวาน' เมื่อเลย 00:30 เวลาไทย วันละครั้ง
+    เรียกได้บ่อย (จากทุก /health ping) — กันส่งซ้ำด้วย last_report_date + lock จึงทนรีสตาร์ท/หลาย worker"""
+    now = datetime.now(TZ)
+    if (now.hour, now.minute) < (0, 30):
+        return
+    today = now.date().isoformat()
+    with _report_lock:
+        if _get_meta("last_report_date") == today:
+            return
+        _set_meta("last_report_date", today)   # มาร์คก่อนส่ง กันยิงซ้ำจากการ ping ถี่ๆ
+    yesterday = (now.date() - timedelta(days=1)).isoformat()
+    with _db() as conn:
+        group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
+    for group_id in group_ids:
+        if SLIP_GROUPS and group_id not in SLIP_GROUPS:
+            continue
+        try:
+            line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
+        except Exception as e:
+            print(f"[report] push failed {group_id}: {e}", flush=True)
+
+
+def _report_backup_loop():
+    """thread สำรอง — เผื่อ UptimeRobot ไม่ ping; เช็คทุก ~5 นาที"""
     while True:
-        time.sleep(_seconds_until_next_report())
-        yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
-        with _db() as conn:
-            group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
-        for group_id in group_ids:
-            # ส่งรายงานเฉพาะกลุ่มที่เปิดเช็คสลิป
-            if SLIP_GROUPS and group_id not in SLIP_GROUPS:
-                continue
-            try:
-                line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
-            except Exception as e:
-                print(f"[midnight] push failed {group_id}: {e}")
-        time.sleep(60)
+        time.sleep(300)
+        try:
+            maybe_send_daily_report()
+        except Exception as e:
+            print(f"[report] backup loop error: {e}", flush=True)
 
 
-threading.Thread(target=midnight_report_loop, daemon=True).start()
+threading.Thread(target=_report_backup_loop, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -807,6 +830,11 @@ def handle_postback(event):
 
 @app.route("/health", methods=["GET"])
 def health():
+    # ทุกครั้งที่ถูก ping (UptimeRobot ทุก 5 นาที) เช็คว่าถึงเวลาส่งรายงานประจำวันไหม
+    try:
+        maybe_send_daily_report()
+    except Exception as e:
+        print(f"[report] health-trigger error: {e}", flush=True)
     with _db() as conn:
         today_count = conn.execute(
             "SELECT COUNT(*) c FROM slips WHERE slip_date=?", (datetime.now(TZ).date().isoformat(),)
