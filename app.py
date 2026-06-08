@@ -22,6 +22,8 @@ LINE_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
 ADMIN_USER_ID     = os.environ.get("LINE_ADMIN_USER_ID", "")
 PROMPTPAY_API_KEY = os.environ.get("PROMPTPAY_API_KEY", "")
+# กลุ่มที่ให้ "เช็คสลิป + เตือน + ส่งรายงาน" เท่านั้น (คั่นด้วยคอมมา) — เว้นว่าง = ทุกกลุ่ม
+SLIP_GROUPS       = [g.strip() for g in os.environ.get("SLIP_GROUPS", "").split(",") if g.strip()]
 # กลุ่มที่ "เปิดรับจองโต๊ะ" (คั่นด้วยคอมมา) — จองวันนี้ การ์ด+ปุ่มขึ้นในกลุ่มนั้น / เว้นว่าง = ปิด
 RESV_GROUPS       = [g.strip() for g in os.environ.get("RESV_GROUPS", "").split(",") if g.strip()]
 # กลุ่ม "บาร์น้ำ+จองโต๊ะล่วงหน้า" — จองล่วงหน้าจากกลุ่มไหนก็ตามจะส่งการ์ด+ปุ่มมาที่นี่ (ดู id ด้วยคำสั่ง groupid)
@@ -369,6 +371,9 @@ def midnight_report_loop():
         with _db() as conn:
             group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
         for group_id in group_ids:
+            # ส่งรายงานเฉพาะกลุ่มที่เปิดเช็คสลิป
+            if SLIP_GROUPS and group_id not in SLIP_GROUPS:
+                continue
             try:
                 line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
             except Exception as e:
@@ -563,6 +568,11 @@ def handle_reservation_confirm(event, resv_id: int):
 # LINE Webhook
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _slip_enabled(group_id: str) -> bool:
+    """เช็คสลิป+เตือน+รายงาน เฉพาะกลุ่มใน SLIP_GROUPS (ถ้าไม่ตั้ง = ทุกกลุ่ม)"""
+    return (not SLIP_GROUPS) or (group_id in SLIP_GROUPS)
+
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
@@ -616,6 +626,8 @@ def handle_image(event):
 
 def _process_image_event(event):
     group_id = getattr(event.source, "group_id", event.source.user_id)
+    if not _slip_enabled(group_id):
+        return   # ไม่ใช่กลุ่มที่เปิดเช็คสลิป → ไม่ยุ่งเลย
     try:
         content     = line_bot_api.get_message_content(event.message.id)
         image_bytes = b"".join(chunk for chunk in content.iter_content())
@@ -737,32 +749,34 @@ def handle_text(event):
     if text.lower().replace(" ", "") == "groupid":
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"🆔 Group ID:\n{group_id}"))
         return
-    if text.lower() in ("สรุป", "รายงาน", "report", "summary"):
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
-        return
+    # คำสั่งเกี่ยวกับสลิป (สรุป/ลบ/ล้าง) → เฉพาะกลุ่มที่เปิดเช็คสลิปเท่านั้น
+    if _slip_enabled(group_id):
+        if text.lower() in ("สรุป", "รายงาน", "report", "summary"):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
+            return
 
-    # สรุปย้อนหลังรายวัน เช่น "สรุป 2026-06-03" (เอาไว้ตรวจเทียบยอด)
-    if text.startswith("สรุป ") or text.startswith("รายงาน "):
-        arg = text.split(" ", 1)[1].strip()
-        try:
-            datetime.strptime(arg, "%Y-%m-%d")
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id, arg)))
-            return
-        except ValueError:
-            pass
+        # สรุปย้อนหลังรายวัน เช่น "สรุป 2026-06-03" (เอาไว้ตรวจเทียบยอด)
+        if text.startswith("สรุป ") or text.startswith("รายงาน "):
+            arg = text.split(" ", 1)[1].strip()
+            try:
+                datetime.strptime(arg, "%Y-%m-%d")
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id, arg)))
+                return
+            except ValueError:
+                pass
 
-    # คำสั่งลบสลิป (กรณีส่งผิด/ซ้ำ)
-    if text in ("ล้างวันนี้", "รีเซ็ตวันนี้", "ล้างสลิปวันนี้", "รีเซ็ต"):
-        send_reset_confirm(event, group_id)
-        return
-    if text.startswith("ลบ"):
-        arg = text[2:].strip()
-        if arg in ("ล่าสุด", "ใบล่าสุด"):
-            delete_latest_slip(event, group_id)
+        # คำสั่งลบสลิป (กรณีส่งผิด/ซ้ำ)
+        if text in ("ล้างวันนี้", "รีเซ็ตวันนี้", "ล้างสลิปวันนี้", "รีเซ็ต"):
+            send_reset_confirm(event, group_id)
             return
-        if arg.isdigit():
-            delete_slip_by_index(event, group_id, int(arg))
-            return
+        if text.startswith("ลบ"):
+            arg = text[2:].strip()
+            if arg in ("ล่าสุด", "ใบล่าสุด"):
+                delete_latest_slip(event, group_id)
+                return
+            if arg.isdigit():
+                delete_slip_by_index(event, group_id, int(arg))
+                return
 
     # ตรวจจับการจองโต๊ะ → แจ้งเตือนไปกรุ๊ปบาร์น้ำ
     try:
