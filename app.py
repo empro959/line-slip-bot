@@ -74,6 +74,16 @@ def init_db():
             pass
         conn.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY)")
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        # นับรูปที่รับเข้ามาแต่ "ไม่ได้บันทึกเป็นสลิป" (อ่านไม่ออก/ไม่ใช่สลิป/error) ไว้กระทบยอดในรายงาน
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS image_misses (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id    TEXT,
+                stat_date   TEXT,
+                reason      TEXT,
+                recorded_at TEXT
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS reservations (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -318,6 +328,21 @@ def save_slip(group_id: str, info: dict, verdict_status: str):
         conn.commit()
 
 
+def record_image_miss(group_id: str, reason: str):
+    """บันทึกรูปที่รับเข้ามาแต่ไม่ได้กลายเป็นสลิป (reason='notslip' อ่านไม่ออก/ไม่ใช่สลิป, 'error' ประมวลผลพัง)
+    ใช้กระทบยอด 'นับมือ' กับ 'บอทนับ' ในรายงาน — ห้าม throw ซ้อน (best-effort)"""
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO image_misses (group_id, stat_date, reason, recorded_at) VALUES (?,?,?,?)",
+                (group_id, datetime.now(TZ).date().isoformat(), reason,
+                 datetime.now(TZ).strftime("%H:%M:%S"))
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[miss] record failed group={group_id}: {e}", flush=True)
+
+
 def build_daily_report(group_id: str, report_date: str = None) -> str:
     report_date = report_date or datetime.now(TZ).date().isoformat()
     with _db() as conn:
@@ -325,8 +350,33 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
             "SELECT * FROM slips WHERE group_id=? AND slip_date=? ORDER BY id",
             (group_id, report_date)
         ).fetchall()
+        miss_rows = conn.execute(
+            "SELECT reason, COUNT(*) c FROM image_misses WHERE group_id=? AND stat_date=? GROUP BY reason",
+            (group_id, report_date)
+        ).fetchall()
     slips = [dict(r) for r in rows]
+    miss_counts = {r["reason"]: r["c"] for r in miss_rows}
+    misses   = sum(miss_counts.values())             # รูปที่รับมาแต่ไม่ได้เป็นสลิป
+    received = len(slips) + misses                    # รับรูปทั้งหมด (ไว้กระทบยอดนับมือ)
+
+    # กระทบยอด: บรรทัดท้ายบอกว่ารับรูปกี่ใบ / อ่านเป็นสลิปได้กี่ใบ / อ่านไม่ออกกี่ใบ
+    def _recon_lines():
+        if misses == 0:
+            return []
+        detail = []
+        if miss_counts.get("notslip"):
+            detail.append(f"อ่านไม่ออก/ไม่ใช่สลิป {miss_counts['notslip']}")
+        if miss_counts.get("error"):
+            detail.append(f"ประมวลผลพลาด {miss_counts['error']}")
+        return ["", "─────────────────",
+                f"ℹ️ รับรูป {received} | อ่านเป็นสลิป {len(slips)} | ตกหล่น {misses}",
+                "   (" + ", ".join(detail) + " — ตามดูในกลุ่มว่าใบไหนบอทไม่ตอบ)"]
+
     if not slips:
+        if misses:
+            return ("\n".join([f"📊 รายงานสรุปประจำวัน {report_date}",
+                               "─────────────────",
+                               "ไม่มีสลิปที่อ่านได้"] + _recon_lines()))
         return f"📊 ไม่มีสลิปวันที่ {report_date}"
 
     total  = sum(float(s.get("amount") or 0) for s in slips)
@@ -350,6 +400,7 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
         amt  = f"{float(s.get('amount', 0)):,.2f}" if s.get("amount") else "?"
         icon = icons.get(s.get("verdict", ""), "❓")
         lines.append(f"{i}. {icon} {s.get('sender','?')} | {amt} บาท | {s.get('recorded_at','')}")
+    lines += _recon_lines()
     return "\n".join(lines)
 
 
@@ -666,9 +717,10 @@ def _process_image_event(event):
         image_bytes = b"".join(chunk for chunk in content.iter_content())
         info        = extract_slip_info(image_bytes)
 
-        # ถ้าไม่ใช่สลิปโอนเงิน → เงียบไว้ ไม่ต้องตอบอะไร
+        # ถ้าไม่ใช่สลิปโอนเงิน → เงียบไว้ ไม่ต้องตอบอะไร (แต่ยังนับไว้กระทบยอด เผื่อ AI อ่านพลาด)
         if not info.get("is_slip", True):
             print(f"[skip] not a slip, group={group_id}", flush=True)
+            record_image_miss(group_id, "notslip")
             return
 
         # normalize เลขอ้างอิง (ตัวพิมพ์ใหญ่ + ตัดช่องว่าง) กันอ่านเพี้ยนเล็กน้อยแล้วเทียบไม่ตรง
@@ -692,6 +744,7 @@ def _process_image_event(event):
         # ประมวลผลสลิปไม่สำเร็จ → เตือนแบบจำกัดความถี่ (สลิปไม่หายเงียบ แต่ไม่สแปม)
         # + เตือน Admin ส่วนตัวด้วย จะได้รู้ว่าระบบมีปัญหา
         print(f"[error] handle_image group={group_id}: {e}", flush=True)
+        record_image_miss(group_id, "error")
         notify_group_error(event, group_id)
         notify_admin_error(group_id, e)
 
@@ -766,6 +819,7 @@ def do_reset_today(event, date_str):
     with _db() as conn:
         cur = conn.execute("DELETE FROM slips WHERE group_id=? AND slip_date=?", (group_id, date_str))
         deleted = cur.rowcount
+        conn.execute("DELETE FROM image_misses WHERE group_id=? AND stat_date=?", (group_id, date_str))
         conn.commit()
     confirmer = get_display_name(event.source)
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
