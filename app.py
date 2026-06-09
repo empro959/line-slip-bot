@@ -373,25 +373,35 @@ def _set_meta(key: str, value: str):
 
 def maybe_send_daily_report():
     """ส่งรายงานสรุป 'ของเมื่อวาน' เมื่อเลย 00:30 เวลาไทย วันละครั้ง
-    เรียกได้บ่อย (จากทุก /health ping) — กันส่งซ้ำด้วย last_report_date + lock จึงทนรีสตาร์ท/หลาย worker"""
+    เรียกได้บ่อย (จากทุก /health ping + thread สำรอง) — กันส่งซ้ำด้วย last_report_date + lock จึงทนรีสตาร์ท/หลาย thread
+    สำคัญ: มาร์ค last_report_date *หลังส่งสำเร็จ* เท่านั้น ถ้า push พลาด (quota/เน็ต) จะ retry รอบ ping ถัดไปแทนที่จะเงียบทั้งวัน"""
     now = datetime.now(TZ)
     if (now.hour, now.minute) < (0, 30):
         return
     today = now.date().isoformat()
+    # ถือ lock ตลอดการส่ง เพื่อกันสอง thread ผ่านเช็ค "ยังไม่ส่ง" พร้อมกันแล้วส่งซ้ำ (ping ถี่ ๆ)
     with _report_lock:
         if _get_meta("last_report_date") == today:
             return
-        _set_meta("last_report_date", today)   # มาร์คก่อนส่ง กันยิงซ้ำจากการ ping ถี่ๆ
-    yesterday = (now.date() - timedelta(days=1)).isoformat()
-    with _db() as conn:
-        group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
-    for group_id in group_ids:
-        if SLIP_GROUPS and group_id not in SLIP_GROUPS:
-            continue
-        try:
-            line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
-        except Exception as e:
-            print(f"[report] push failed {group_id}: {e}", flush=True)
+        yesterday = (now.date() - timedelta(days=1)).isoformat()
+        with _db() as conn:
+            group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
+        targets = [g for g in group_ids if (not SLIP_GROUPS) or g in SLIP_GROUPS]
+        print(f"[report] trigger {today} → ส่งรายงานวันที่ {yesterday} ให้ {len(targets)} กลุ่ม", flush=True)
+        failed = 0
+        for group_id in targets:
+            try:
+                line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
+                print(f"[report] sent OK → {group_id}", flush=True)
+            except Exception as e:
+                failed += 1
+                print(f"[report] push FAILED {group_id}: {e}", flush=True)
+        # มาร์คว่า 'ส่งครบแล้ว' เฉพาะเมื่อไม่มีอันไหนล้มเหลว — ถ้ามี fail ปล่อยไว้ให้ ping รอบหน้า retry
+        if failed == 0:
+            _set_meta("last_report_date", today)
+            print(f"[report] done {today}", flush=True)
+        else:
+            print(f"[report] {failed} กลุ่มส่งไม่สำเร็จ — จะ retry รอบ ping ถัดไป (~5 นาที)", flush=True)
 
 
 def _report_backup_loop():
