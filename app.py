@@ -798,6 +798,19 @@ def handle_text(event):
             except ValueError:
                 pass
 
+        # ทดสอบ/กู้รายงานอัตโนมัติ — push 'รายงานเมื่อวาน' เข้ากลุ่มนี้เดี๋ยวนี้
+        # ใช้เช็คว่าระบบ push ใช้งานได้ไหม (ถ้าพลาดจะโชว์สาเหตุใน LINE เลย) + กู้รายงานที่ 00:30 พลาดไป
+        if text.lower() in ("ทดสอบรายงาน", "รายงานเมื่อวาน", "force report", "test report"):
+            yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+            try:
+                line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text="✅ push รายงานเมื่อวานสำเร็จ — ระบบ push ใช้งานได้ปกติ"))
+            except Exception as e:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text=f"🚨 push ล้มเหลว: {e}\n(นี่คือสาเหตุที่รายงาน 00:30 ไม่เด้ง)"))
+            return
+
         # คำสั่งลบสลิป (กรณีส่งผิด/ซ้ำ)
         if text in ("ล้างวันนี้", "รีเซ็ตวันนี้", "ล้างสลิปวันนี้", "รีเซ็ต"):
             send_reset_confirm(event, group_id)
