@@ -74,6 +74,16 @@ def init_db():
             pass
         conn.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY)")
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        # นับรูปที่รับเข้ามาแต่ "ไม่ได้บันทึกเป็นสลิป" (อ่านไม่ออก/ไม่ใช่สลิป/error) ไว้กระทบยอดในรายงาน
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS image_misses (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id    TEXT,
+                stat_date   TEXT,
+                reason      TEXT,
+                recorded_at TEXT
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS reservations (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -318,6 +328,21 @@ def save_slip(group_id: str, info: dict, verdict_status: str):
         conn.commit()
 
 
+def record_image_miss(group_id: str, reason: str):
+    """บันทึกรูปที่รับเข้ามาแต่ไม่ได้กลายเป็นสลิป (reason='notslip' อ่านไม่ออก/ไม่ใช่สลิป, 'error' ประมวลผลพัง)
+    ใช้กระทบยอด 'นับมือ' กับ 'บอทนับ' ในรายงาน — ห้าม throw ซ้อน (best-effort)"""
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO image_misses (group_id, stat_date, reason, recorded_at) VALUES (?,?,?,?)",
+                (group_id, datetime.now(TZ).date().isoformat(), reason,
+                 datetime.now(TZ).strftime("%H:%M:%S"))
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[miss] record failed group={group_id}: {e}", flush=True)
+
+
 def build_daily_report(group_id: str, report_date: str = None) -> str:
     report_date = report_date or datetime.now(TZ).date().isoformat()
     with _db() as conn:
@@ -325,8 +350,33 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
             "SELECT * FROM slips WHERE group_id=? AND slip_date=? ORDER BY id",
             (group_id, report_date)
         ).fetchall()
+        miss_rows = conn.execute(
+            "SELECT reason, COUNT(*) c FROM image_misses WHERE group_id=? AND stat_date=? GROUP BY reason",
+            (group_id, report_date)
+        ).fetchall()
     slips = [dict(r) for r in rows]
+    miss_counts = {r["reason"]: r["c"] for r in miss_rows}
+    misses   = sum(miss_counts.values())             # รูปที่รับมาแต่ไม่ได้เป็นสลิป
+    received = len(slips) + misses                    # รับรูปทั้งหมด (ไว้กระทบยอดนับมือ)
+
+    # กระทบยอด: บรรทัดท้ายบอกว่ารับรูปกี่ใบ / อ่านเป็นสลิปได้กี่ใบ / อ่านไม่ออกกี่ใบ
+    def _recon_lines():
+        if misses == 0:
+            return []
+        detail = []
+        if miss_counts.get("notslip"):
+            detail.append(f"อ่านไม่ออก/ไม่ใช่สลิป {miss_counts['notslip']}")
+        if miss_counts.get("error"):
+            detail.append(f"ประมวลผลพลาด {miss_counts['error']}")
+        return ["", "─────────────────",
+                f"ℹ️ รับรูป {received} | อ่านเป็นสลิป {len(slips)} | ตกหล่น {misses}",
+                "   (" + ", ".join(detail) + " — ตามดูในกลุ่มว่าใบไหนบอทไม่ตอบ)"]
+
     if not slips:
+        if misses:
+            return ("\n".join([f"📊 รายงานสรุปประจำวัน {report_date}",
+                               "─────────────────",
+                               "ไม่มีสลิปที่อ่านได้"] + _recon_lines()))
         return f"📊 ไม่มีสลิปวันที่ {report_date}"
 
     total  = sum(float(s.get("amount") or 0) for s in slips)
@@ -350,6 +400,7 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
         amt  = f"{float(s.get('amount', 0)):,.2f}" if s.get("amount") else "?"
         icon = icons.get(s.get("verdict", ""), "❓")
         lines.append(f"{i}. {icon} {s.get('sender','?')} | {amt} บาท | {s.get('recorded_at','')}")
+    lines += _recon_lines()
     return "\n".join(lines)
 
 
@@ -373,25 +424,35 @@ def _set_meta(key: str, value: str):
 
 def maybe_send_daily_report():
     """ส่งรายงานสรุป 'ของเมื่อวาน' เมื่อเลย 00:30 เวลาไทย วันละครั้ง
-    เรียกได้บ่อย (จากทุก /health ping) — กันส่งซ้ำด้วย last_report_date + lock จึงทนรีสตาร์ท/หลาย worker"""
+    เรียกได้บ่อย (จากทุก /health ping + thread สำรอง) — กันส่งซ้ำด้วย last_report_date + lock จึงทนรีสตาร์ท/หลาย thread
+    สำคัญ: มาร์ค last_report_date *หลังส่งสำเร็จ* เท่านั้น ถ้า push พลาด (quota/เน็ต) จะ retry รอบ ping ถัดไปแทนที่จะเงียบทั้งวัน"""
     now = datetime.now(TZ)
     if (now.hour, now.minute) < (0, 30):
         return
     today = now.date().isoformat()
+    # ถือ lock ตลอดการส่ง เพื่อกันสอง thread ผ่านเช็ค "ยังไม่ส่ง" พร้อมกันแล้วส่งซ้ำ (ping ถี่ ๆ)
     with _report_lock:
         if _get_meta("last_report_date") == today:
             return
-        _set_meta("last_report_date", today)   # มาร์คก่อนส่ง กันยิงซ้ำจากการ ping ถี่ๆ
-    yesterday = (now.date() - timedelta(days=1)).isoformat()
-    with _db() as conn:
-        group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
-    for group_id in group_ids:
-        if SLIP_GROUPS and group_id not in SLIP_GROUPS:
-            continue
-        try:
-            line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
-        except Exception as e:
-            print(f"[report] push failed {group_id}: {e}", flush=True)
+        yesterday = (now.date() - timedelta(days=1)).isoformat()
+        with _db() as conn:
+            group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
+        targets = [g for g in group_ids if (not SLIP_GROUPS) or g in SLIP_GROUPS]
+        print(f"[report] trigger {today} → ส่งรายงานวันที่ {yesterday} ให้ {len(targets)} กลุ่ม", flush=True)
+        failed = 0
+        for group_id in targets:
+            try:
+                line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
+                print(f"[report] sent OK → {group_id}", flush=True)
+            except Exception as e:
+                failed += 1
+                print(f"[report] push FAILED {group_id}: {e}", flush=True)
+        # มาร์คว่า 'ส่งครบแล้ว' เฉพาะเมื่อไม่มีอันไหนล้มเหลว — ถ้ามี fail ปล่อยไว้ให้ ping รอบหน้า retry
+        if failed == 0:
+            _set_meta("last_report_date", today)
+            print(f"[report] done {today}", flush=True)
+        else:
+            print(f"[report] {failed} กลุ่มส่งไม่สำเร็จ — จะ retry รอบ ping ถัดไป (~5 นาที)", flush=True)
 
 
 def _report_backup_loop():
@@ -656,9 +717,10 @@ def _process_image_event(event):
         image_bytes = b"".join(chunk for chunk in content.iter_content())
         info        = extract_slip_info(image_bytes)
 
-        # ถ้าไม่ใช่สลิปโอนเงิน → เงียบไว้ ไม่ต้องตอบอะไร
+        # ถ้าไม่ใช่สลิปโอนเงิน → เงียบไว้ ไม่ต้องตอบอะไร (แต่ยังนับไว้กระทบยอด เผื่อ AI อ่านพลาด)
         if not info.get("is_slip", True):
             print(f"[skip] not a slip, group={group_id}", flush=True)
+            record_image_miss(group_id, "notslip")
             return
 
         # normalize เลขอ้างอิง (ตัวพิมพ์ใหญ่ + ตัดช่องว่าง) กันอ่านเพี้ยนเล็กน้อยแล้วเทียบไม่ตรง
@@ -682,6 +744,7 @@ def _process_image_event(event):
         # ประมวลผลสลิปไม่สำเร็จ → เตือนแบบจำกัดความถี่ (สลิปไม่หายเงียบ แต่ไม่สแปม)
         # + เตือน Admin ส่วนตัวด้วย จะได้รู้ว่าระบบมีปัญหา
         print(f"[error] handle_image group={group_id}: {e}", flush=True)
+        record_image_miss(group_id, "error")
         notify_group_error(event, group_id)
         notify_admin_error(group_id, e)
 
@@ -756,6 +819,7 @@ def do_reset_today(event, date_str):
     with _db() as conn:
         cur = conn.execute("DELETE FROM slips WHERE group_id=? AND slip_date=?", (group_id, date_str))
         deleted = cur.rowcount
+        conn.execute("DELETE FROM image_misses WHERE group_id=? AND stat_date=?", (group_id, date_str))
         conn.commit()
     confirmer = get_display_name(event.source)
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
@@ -787,6 +851,19 @@ def handle_text(event):
                 return
             except ValueError:
                 pass
+
+        # ทดสอบ/กู้รายงานอัตโนมัติ — push 'รายงานเมื่อวาน' เข้ากลุ่มนี้เดี๋ยวนี้
+        # ใช้เช็คว่าระบบ push ใช้งานได้ไหม (ถ้าพลาดจะโชว์สาเหตุใน LINE เลย) + กู้รายงานที่ 00:30 พลาดไป
+        if text.lower() in ("ทดสอบรายงาน", "รายงานเมื่อวาน", "force report", "test report"):
+            yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+            try:
+                line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text="✅ push รายงานเมื่อวานสำเร็จ — ระบบ push ใช้งานได้ปกติ"))
+            except Exception as e:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text=f"🚨 push ล้มเหลว: {e}\n(นี่คือสาเหตุที่รายงาน 00:30 ไม่เด้ง)"))
+            return
 
         # คำสั่งลบสลิป (กรณีส่งผิด/ซ้ำ)
         if text in ("ล้างวันนี้", "รีเซ็ตวันนี้", "ล้างสลิปวันนี้", "รีเซ็ต"):
