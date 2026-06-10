@@ -107,7 +107,9 @@ def _connect():
 
 def _db():
     # รอ init เสร็จก่อนแตะ DB (กัน webhook ช่วง start ที่ DB ยังไม่พร้อม)
-    if not _storage_ready.wait(timeout=120):
+    # สำคัญ: ต้อง << gunicorn --timeout (120) ไม่งั้นบล็อก worker จน gunicorn ฆ่า → restart วน
+    # Postgres เชื่อมเร็ว (~1-2 วิ) 15 วิเหลือเฟือสำหรับช่วง boot
+    if not _storage_ready.wait(timeout=15):
         raise RuntimeError("storage ยังไม่พร้อม")
     return _connect()
 
