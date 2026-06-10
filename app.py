@@ -4,6 +4,7 @@ import base64
 import requests
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, request, abort
@@ -914,10 +915,16 @@ def notify_admin_error(group_id, err):
         pass
 
 
+# จำกัดอ่านรูปพร้อมกันไม่กี่ใบ (คิวที่เหลือรอ) — กันรูปถล่ม 50-70 ใบรัวๆ ทำ memory พุ่งจน worker OOM/รีเซ็ต
+# (worker ล่ม = storage รีเซ็ต = จอง/สลิปช่วงนั้นพลาด) — ค่าน้อยปลอดภัยกว่าเพราะ Render Starter แรมจำกัด
+_slip_pool = ThreadPoolExecutor(max_workers=int(os.environ.get("SLIP_WORKERS", "2")),
+                                thread_name_prefix="slip")
+
+
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
-    # ประมวลผลแบบ background → ตอบ LINE ทันที (กันคอขวด/โทเค็นหมดอายุตอนส่งรูปทีละหลายๆ รูป)
-    threading.Thread(target=_process_image_event, args=(event,), daemon=True).start()
+    # ส่งเข้า pool (จำกัดจำนวนพร้อมกัน) → ตอบ LINE ทันที, รูปที่เกินจะเข้าคิวไม่ถล่ม memory
+    _slip_pool.submit(_process_image_event, event)
 
 
 def _process_image_event(event):
