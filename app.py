@@ -42,14 +42,25 @@ gemini       = genai.GenerativeModel("gemini-2.5-flash")
 import sqlite3
 
 # ใช้ disk ถาวรถ้ามี (Render Persistent Disk mount ที่ /var/data) ไม่งั้นใช้โฟลเดอร์ปัจจุบัน
-DB_PERSISTENT = os.path.isdir("/var/data")
-DB_DIR  = "/var/data" if DB_PERSISTENT else "."
+# สำคัญ: Render บาง deploy mount disk 'ช้ากว่า' แอป start ไม่กี่วินาที (race) — ถ้าเช็กเร็วไปจะเจอว่า
+# ไม่มี /var/data แล้วตกไปเขียนที่ชั่วคราว ทำให้ข้อมูลหายทุก restart → จึง 'รอ' ให้ disk mount ก่อน
+_DISK_PATH = "/var/data"
+for _i in range(30):
+    if os.path.isdir(_DISK_PATH):
+        break
+    if _i == 0:
+        print(f"[STORAGE] รอ {_DISK_PATH} mount ...", flush=True)
+    time.sleep(1)
+DB_PERSISTENT = os.path.isdir(_DISK_PATH)
+DB_DIR  = _DISK_PATH if DB_PERSISTENT else "."
 DB_PATH = os.path.join(DB_DIR, "slips.db")
 if not DB_PERSISTENT:
     # เตือนดังๆ: ไม่มี persistent disk → ข้อมูลจะถูกล้างทุกครั้งที่ deploy/restart!
-    print("🔴🔴🔴 [STORAGE] /var/data ไม่ถูก mount — DB ใช้ที่เก็บชั่วคราว ('.') "
-          "ข้อมูลสลิปจะหายทุกครั้งที่ deploy/restart! ต้องเพิ่ม Persistent Disk ที่ Render (mount /var/data)",
+    print("🔴🔴🔴 [STORAGE] /var/data ไม่ถูก mount (รอแล้ว 30 วิ) — DB ใช้ที่เก็บชั่วคราว ('.') "
+          "ข้อมูลสลิปจะหายทุกครั้งที่ deploy/restart! ตรวจ Persistent Disk ที่ Render (mount /var/data)",
           flush=True)
+else:
+    print(f"[STORAGE] ✅ ใช้ disk ถาวรที่ {DB_DIR}", flush=True)
 
 def _db():
     # timeout เผื่อหลาย thread เขียนพร้อมกัน (กัน 'database is locked' ตอนรูปเยอะ)
