@@ -42,8 +42,14 @@ gemini       = genai.GenerativeModel("gemini-2.5-flash")
 import sqlite3
 
 # ใช้ disk ถาวรถ้ามี (Render Persistent Disk mount ที่ /var/data) ไม่งั้นใช้โฟลเดอร์ปัจจุบัน
-DB_DIR  = "/var/data" if os.path.isdir("/var/data") else "."
+DB_PERSISTENT = os.path.isdir("/var/data")
+DB_DIR  = "/var/data" if DB_PERSISTENT else "."
 DB_PATH = os.path.join(DB_DIR, "slips.db")
+if not DB_PERSISTENT:
+    # เตือนดังๆ: ไม่มี persistent disk → ข้อมูลจะถูกล้างทุกครั้งที่ deploy/restart!
+    print("🔴🔴🔴 [STORAGE] /var/data ไม่ถูก mount — DB ใช้ที่เก็บชั่วคราว ('.') "
+          "ข้อมูลสลิปจะหายทุกครั้งที่ deploy/restart! ต้องเพิ่ม Persistent Disk ที่ Render (mount /var/data)",
+          flush=True)
 
 def _db():
     # timeout เผื่อหลาย thread เขียนพร้อมกัน (กัน 'database is locked' ตอนรูปเยอะ)
@@ -925,7 +931,8 @@ def health():
             "SELECT COUNT(*) c FROM slips WHERE slip_date=?", (datetime.now(TZ).date().isoformat(),)
         ).fetchone()["c"]
         group_count = conn.execute("SELECT COUNT(*) c FROM groups").fetchone()["c"]
-    return {"status": "ok", "slips_today": today_count, "active_groups": group_count}
+    return {"status": "ok", "slips_today": today_count, "active_groups": group_count,
+            "storage": "persistent" if DB_PERSISTENT else "EPHEMERAL (data lost on restart! add disk at /var/data)"}
 
 
 if __name__ == "__main__":
