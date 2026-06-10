@@ -592,13 +592,15 @@ def extract_reservation(text: str) -> dict:
     prompt = (
         "ข้อความต่อไปนี้จากแชทพนักงานร้าน เป็นการ 'จองโต๊ะ' ให้ลูกค้าหรือไม่ "
         "(ไม่ใช่การคุยเล่นที่บังเอิญมีคำว่าจอง/โต๊ะ) ตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
-        '{"is_reservation":true,"is_advance":false,"customer":null,"people":null,"datetime":null,'
+        '{"is_reservation":true,"is_advance":false,"customer":null,"people":null,"date":null,"datetime":null,'
         '"time_hhmm":null,"table":null,"note":null}\n\n'
         "is_reservation: true เฉพาะเมื่อเป็นการจองโต๊ะจริง (มีเจตนานัด/จองที่นั่งให้ลูกค้า)\n"
         "is_advance: true ถ้าเป็นการจอง 'ล่วงหน้า' (สำหรับวันอื่น/วันข้างหน้า เช่น พรุ่งนี้ เสาร์นี้ วันที่ 25 ฯลฯ), "
         "false ถ้าจองสำหรับ 'วันนี้/คืนนี้/ตอนนี้'\n"
         "customer: ชื่อลูกค้า/ผู้จอง (ถ้ามี)\n"
         "people: จำนวนคน เช่น '4 คน' (ถ้ามี)\n"
+        "date: วันที่จอง เช่น 'วันนี้','พรุ่งนี้','เสาร์นี้','25 มิ.ย.' — ถ้าจองสำหรับวันนี้/คืนนี้ให้ใส่ 'วันนี้'; "
+        "ถ้าเป็นจองล่วงหน้าแต่ไม่ระบุว่าวันไหน ให้เป็น null\n"
         "datetime: วันและเวลาที่จองแบบอ่านง่าย เช่น 'วันนี้ 20:00', 'เสาร์นี้ 19:00' (ถ้ามี)\n"
         "time_hhmm: เฉพาะ 'เวลา' ในรูปแบบ 24 ชม. 'HH:MM' (เช่น '2 ทุ่ม'→'20:00', 'บ่าย 3'→'15:00', "
         "'หกโมงเย็น'→'18:00', '19.00'→'19:00', '1 ทุ่มครึ่ง'→'19:30') ถ้าไม่ระบุเวลาให้เป็น null\n"
@@ -712,13 +714,17 @@ def handle_reservation_text(event, text: str, group_id: str):
     missing = []
     if not info.get("customer"):  missing.append("1. ชื่อผู้จอง")
     if not info.get("people"):    missing.append("2. จำนวนคน")
-    if not info.get("time_hhmm"): missing.append("3. เวลา")
+    # วันและเวลา: ถ้าขาดวันหรือเวลา ให้ถามเฉพาะส่วนที่ขาด (จองวันนี้ AI จะใส่ date='วันนี้' ให้แล้ว)
+    when_missing = []
+    if not info.get("date"):      when_missing.append("วันที่")
+    if not info.get("time_hhmm"): when_missing.append("เวลา")
+    if when_missing:              missing.append("3. " + " + ".join(when_missing))
     if not info.get("table"):     missing.append("4. โซน")
     if missing:
         print(f"[resv] ข้อมูลไม่ครบ ขาด {missing} → ถามกลับ", flush=True)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text="📝 ขอข้อมูลจองเพิ่มครับ ยังขาด:\n" + "\n".join(missing) +
-                 "\n\nรบกวนแจ้งใหม่ให้ครบ: ชื่อ / จำนวนคน / เวลา / โซน"))
+                 "\n\nรบกวนแจ้งใหม่ให้ครบ: ชื่อ / จำนวนคน / วันเวลา / โซน"))
         return True
 
     # ── เช็คเวลาจองอยู่ในเวลาเปิดร้าน (11:00–00:00) ไหม — นอกเวลาแค่ 'เตือน' ไม่บล็อก ──
