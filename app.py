@@ -31,6 +31,10 @@ BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
 # คีย์เวิร์ดบัญชีรับเงินของร้าน (ชื่อ ไทย/อังกฤษ + เลขบัญชี/เลขท้าย) คั่นด้วยคอมมา
 # ใช้เทียบ "ปลายทาง" บนสลิป ถ้าไม่ตรงสักคำ = เตือนว่าอาจโอนผิดบัญชี (ตั้งบน Render กัน repo public เห็นเลขบัญชี)
 PAYEE_KEYWORDS    = [k.strip().lower() for k in os.environ.get("PAYEE_KEYWORDS", "").split(",") if k.strip()]
+# จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
+RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
+# เวลาเปิดร้าน (ชั่วโมง) สำหรับตรวจเวลาจอง — เปิด 11:00 ถึง 00:00 (เที่ยงคืน)
+OPEN_HOUR, CLOSE_HOUR = 11, 24
 TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 
 line_bot_api = LineBotApi(LINE_TOKEN)
@@ -155,9 +159,20 @@ def init_db():
                 status          TEXT,
                 created_at      TEXT,
                 confirmed_by    TEXT,
-                confirmed_at    TEXT
+                confirmed_at    TEXT,
+                notify_group_id TEXT,
+                reminded_at     TEXT
             )
         """)
+        # migration: เพิ่มคอลัมน์ใหม่ให้ตาราง reservations ที่สร้างไว้ก่อนแล้ว (กลุ่มที่ส่งการ์ด + เวลาแจ้งเตือนซ้ำล่าสุด)
+        for _col in ("notify_group_id TEXT", "reminded_at TEXT"):
+            if USE_PG:
+                conn.execute(f"ALTER TABLE reservations ADD COLUMN IF NOT EXISTS {_col}")
+            else:
+                try:
+                    conn.execute(f"ALTER TABLE reservations ADD COLUMN {_col}")
+                except Exception:
+                    pass
         conn.commit()
 
 def _setup_storage():
@@ -578,15 +593,17 @@ def extract_reservation(text: str) -> dict:
         "ข้อความต่อไปนี้จากแชทพนักงานร้าน เป็นการ 'จองโต๊ะ' ให้ลูกค้าหรือไม่ "
         "(ไม่ใช่การคุยเล่นที่บังเอิญมีคำว่าจอง/โต๊ะ) ตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
         '{"is_reservation":true,"is_advance":false,"customer":null,"people":null,"datetime":null,'
-        '"table":null,"note":null}\n\n'
+        '"time_hhmm":null,"table":null,"note":null}\n\n'
         "is_reservation: true เฉพาะเมื่อเป็นการจองโต๊ะจริง (มีเจตนานัด/จองที่นั่งให้ลูกค้า)\n"
         "is_advance: true ถ้าเป็นการจอง 'ล่วงหน้า' (สำหรับวันอื่น/วันข้างหน้า เช่น พรุ่งนี้ เสาร์นี้ วันที่ 25 ฯลฯ), "
         "false ถ้าจองสำหรับ 'วันนี้/คืนนี้/ตอนนี้'\n"
         "customer: ชื่อลูกค้า/ผู้จอง (ถ้ามี)\n"
         "people: จำนวนคน เช่น '4 คน' (ถ้ามี)\n"
-        "datetime: วันและเวลาที่จอง เช่น 'วันนี้ 20:00' (ถ้ามี)\n"
-        "table: โต๊ะ/โซน (ถ้ามี)\n"
-        "note: รายละเอียดเพิ่มเติม (ถ้ามี)\n"
+        "datetime: วันและเวลาที่จองแบบอ่านง่าย เช่น 'วันนี้ 20:00', 'เสาร์นี้ 19:00' (ถ้ามี)\n"
+        "time_hhmm: เฉพาะ 'เวลา' ในรูปแบบ 24 ชม. 'HH:MM' (เช่น '2 ทุ่ม'→'20:00', 'บ่าย 3'→'15:00', "
+        "'หกโมงเย็น'→'18:00', '19.00'→'19:00', '1 ทุ่มครึ่ง'→'19:30') ถ้าไม่ระบุเวลาให้เป็น null\n"
+        "table: โซน/โต๊ะที่นั่ง เช่น 'โซน A', 'ริมน้ำ', 'ห้องแอร์', 'โต๊ะ 5' (ถ้ามี)\n"
+        "note: รายละเอียดเพิ่มเติมอื่นๆ (ถ้ามี)\n"
         "ฟิลด์ที่ไม่มีข้อมูลให้เป็น null\n\n"
         f"ข้อความ: {text}"
     )
@@ -596,24 +613,54 @@ def extract_reservation(text: str) -> dict:
 
 
 def _resv_detail_lines(r: dict) -> str:
+    # รองรับทั้ง dict จาก AI (datetime/table) และแถวจาก DB (resv_datetime/table_no)
+    cust = r.get("customer")
+    ppl  = r.get("people")
+    dt   = r.get("datetime") or r.get("resv_datetime")
+    zone = r.get("table") or r.get("table_no")
+    note = r.get("note")
     parts = []
-    if r.get("customer"): parts.append(f"👤 ลูกค้า: {r['customer']}")
-    if r.get("people"):   parts.append(f"👥 จำนวน: {r['people']}")
-    if r.get("datetime"): parts.append(f"🕗 เวลา: {r['datetime']}")
-    if r.get("table"):    parts.append(f"🪑 โต๊ะ: {r['table']}")
-    if r.get("note"):     parts.append(f"📝 หมายเหตุ: {r['note']}")
+    if cust: parts.append(f"👤 ลูกค้า: {cust}")
+    if ppl:  parts.append(f"👥 จำนวน: {ppl}")
+    if dt:   parts.append(f"🕗 เวลา: {dt}")
+    if zone: parts.append(f"🪑 โซน: {zone}")
+    if note: parts.append(f"📝 หมายเหตุ: {note}")
     return "\n".join(parts) if parts else "(ไม่มีรายละเอียดเพิ่มเติม)"
 
 
-def save_reservation(origin_group_id: str, requested_by: str, info: dict, raw_text: str) -> int:
+def _parse_hhmm(s):
+    """แปลง 'HH:MM' หรือ 'HH.MM' → จำนวนนาทีตั้งแต่เที่ยงคืน (None ถ้าแปลงไม่ได้)"""
+    if not s:
+        return None
+    try:
+        parts = str(s).replace(".", ":").split(":")
+        hh, mm = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+        if 0 <= hh <= 24 and 0 <= mm < 60:
+            return hh * 60 + mm
+        return None
+    except Exception:
+        return None
+
+
+def _within_open_hours(tmin: int) -> bool:
+    """ร้านเปิด 11:00–00:00 → เวลาที่ใช้ได้คือ 11:00–23:59 และ 00:00 (เที่ยงคืน=ปิดพอดี)"""
+    if tmin is None:
+        return True
+    return tmin == 0 or (OPEN_HOUR * 60 <= tmin <= CLOSE_HOUR * 60 - 1)
+
+
+def save_reservation(origin_group_id: str, requested_by: str, info: dict, raw_text: str,
+                     notify_group_id: str) -> int:
     created_at = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     with _db() as conn:
         rid = conn.insert_returning_id(
             "INSERT INTO reservations "
-            "(origin_group_id, requested_by, customer, people, resv_datetime, table_no, note, raw_text, status, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "(origin_group_id, requested_by, customer, people, resv_datetime, table_no, note, raw_text, "
+            "status, created_at, notify_group_id, reminded_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (origin_group_id, requested_by, info.get("customer"), info.get("people"),
-             info.get("datetime"), info.get("table"), info.get("note"), raw_text, "PENDING", created_at)
+             info.get("datetime"), info.get("table"), info.get("note"), raw_text,
+             "PENDING", created_at, notify_group_id, created_at)
         )
         conn.commit()
         return rid
@@ -661,14 +708,48 @@ def handle_reservation_text(event, text: str, group_id: str):
         print(f"[resv] กลุ่มไม่อยู่ใน RESV_GROUPS และไม่ใช่จองล่วงหน้า → ข้าม", flush=True)
         return False
 
+    # ── เช็คข้อมูลให้ครบ: 1.ชื่อ 2.จำนวนคน 3.เวลา 4.โซน — ถ้าขาดให้ถามกลับ ยังไม่บันทึก ──
+    missing = []
+    if not info.get("customer"):  missing.append("1. ชื่อผู้จอง")
+    if not info.get("people"):    missing.append("2. จำนวนคน")
+    if not info.get("time_hhmm"): missing.append("3. เวลา")
+    if not info.get("table"):     missing.append("4. โซน")
+    if missing:
+        print(f"[resv] ข้อมูลไม่ครบ ขาด {missing} → ถามกลับ", flush=True)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text="📝 ขอข้อมูลจองเพิ่มครับ ยังขาด:\n" + "\n".join(missing) +
+                 "\n\nรบกวนแจ้งใหม่ให้ครบ: ชื่อ / จำนวนคน / เวลา / โซน"))
+        return True
+
+    # ── เช็คเวลาจองอยู่ในเวลาเปิดร้าน (11:00–00:00) ไหม — นอกเวลาแค่ 'เตือน' ไม่บล็อก ──
+    tmin = _parse_hhmm(info.get("time_hhmm"))
+    time_warn = "" if _within_open_hours(tmin) else \
+        f"\n⚠️ เวลา {info.get('time_hhmm')} อยู่นอกเวลาเปิดร้าน (11:00–00:00) โปรดตรวจสอบ"
+
     requested_by = get_display_name(event.source)
-    resv_id = save_reservation(group_id, requested_by, info, text)
+    # ปลายทาง: จองล่วงหน้า → กลุ่มบาร์น้ำ / จองวันนี้ → กลุ่มเดิม
+    dest = BAR_GROUP_ID if (is_advance and BAR_GROUP_ID) else group_id
+    resv_id = save_reservation(group_id, requested_by, info, text, dest)
     detail = _resv_detail_lines(info)
     head = "📅 จองล่วงหน้า" if is_advance else "🔔 จองโต๊ะ"
 
     detail_msg = TextSendMessage(
-        text=f"{head}ใหม่ #{resv_id}\nจากคุณ {requested_by}\n─────────────────\n{detail}")
-    confirm_msg = TemplateSendMessage(
+        text=f"{head}ใหม่ #{resv_id}\nจากคุณ {requested_by}\n─────────────────\n{detail}{time_warn}")
+    confirm_msg = _resv_confirm_card(resv_id, head)
+
+    print(f"[resv] จอง #{resv_id} advance={is_advance} → ส่งไป {dest}", flush=True)
+    if dest == group_id:
+        line_bot_api.reply_message(event.reply_token, [detail_msg, confirm_msg])
+    else:
+        line_bot_api.push_message(dest, [detail_msg, confirm_msg])
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"📤 ส่งจองล่วงหน้า #{resv_id} ไปกลุ่มบาร์น้ำแล้ว รอคอนเฟิร์ม\n─────────────────\n{detail}{time_warn}"))
+    return True
+
+
+def _resv_confirm_card(resv_id: int, head: str = "🔔 จองโต๊ะ") -> TemplateSendMessage:
+    """การ์ดปุ่มคอนเฟิร์มการจอง (ใช้ทั้งตอนจองใหม่และตอนแจ้งเตือนซ้ำ)"""
+    return TemplateSendMessage(
         alt_text=f"ยืนยันการจอง #{resv_id}",
         template=ButtonsTemplate(
             title=f"{head} #{resv_id}",
@@ -680,17 +761,6 @@ def handle_reservation_text(event, text: str, group_id: str):
             )],
         ),
     )
-
-    # ปลายทาง: จองล่วงหน้า → กลุ่มบาร์น้ำ / จองวันนี้ → กลุ่มเดิม
-    dest = BAR_GROUP_ID if (is_advance and BAR_GROUP_ID) else group_id
-    print(f"[resv] จอง #{resv_id} advance={is_advance} → ส่งไป {dest}", flush=True)
-    if dest == group_id:
-        line_bot_api.reply_message(event.reply_token, [detail_msg, confirm_msg])
-    else:
-        line_bot_api.push_message(dest, [detail_msg, confirm_msg])
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text=f"📤 ส่งจองล่วงหน้า #{resv_id} ไปกลุ่มบาร์น้ำแล้ว รอคอนเฟิร์ม\n─────────────────\n{detail}"))
-    return True
 
 
 def handle_reservation_confirm(event, resv_id: int):
@@ -726,6 +796,59 @@ def handle_reservation_confirm(event, resv_id: int):
                      f"โดย {confirmer}\n─────────────────\n{detail}"))
         except Exception as e:
             print(f"[resv] notify origin failed: {e}", flush=True)
+
+
+def _touch_reminded(resv_id: int, when: str):
+    with _db() as conn:
+        conn.execute("UPDATE reservations SET reminded_at=? WHERE id=?", (when, resv_id))
+        conn.commit()
+
+
+def _reservation_reminder_loop():
+    """แจ้งเตือนการจองที่ยัง PENDING ซ้ำในกลุ่มที่ส่งการ์ดไว้
+    ทุก 5 นาทีช่วง 18:00–22:00 / ทุก 15 นาทีเวลาอื่น จนกว่าจะคอนเฟิร์ม (หรือเกิน RESV_NAG_MAX_HOURS)"""
+    while True:
+        time.sleep(60)
+        try:
+            now      = datetime.now(TZ)
+            interval = 5 if (18 <= now.hour < 22) else 15      # นาที
+            try:
+                with _db() as conn:
+                    rows = [dict(r) for r in conn.execute(
+                        "SELECT * FROM reservations WHERE status=?", ("PENDING",)).fetchall()]
+            except Exception:
+                continue   # storage ยังไม่พร้อม → ข้ามรอบนี้
+            for r in rows:
+                notify = r.get("notify_group_id")
+                if not notify:
+                    continue
+                last = r.get("reminded_at") or r.get("created_at")
+                created = r.get("created_at")
+                try:
+                    last_dt    = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+                    created_dt = datetime.strptime(created, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+                except Exception:
+                    continue
+                # เกินเวลาตามตื๊อ → หยุดแจ้ง (กันแจ้งไม่รู้จบ)
+                if RESV_NAG_MAX_HOURS and (now - created_dt).total_seconds() > RESV_NAG_MAX_HOURS * 3600:
+                    continue
+                if (now - last_dt).total_seconds() < interval * 60:
+                    continue
+                try:
+                    line_bot_api.push_message(notify, [
+                        TextSendMessage(text=f"⏰ ย้ำเตือน: การจอง #{r['id']} ยังไม่มีใครคอนเฟิร์ม!\n"
+                                             f"─────────────────\n{_resv_detail_lines(r)}"),
+                        _resv_confirm_card(r["id"]),
+                    ])
+                    _touch_reminded(r["id"], now.strftime("%Y-%m-%d %H:%M:%S"))
+                    print(f"[resv] ย้ำเตือนจอง #{r['id']} → {notify} (ทุก {interval} นาที)", flush=True)
+                except Exception as e:
+                    print(f"[resv] reminder push failed #{r['id']}: {e}", flush=True)
+        except Exception as e:
+            print(f"[resv] reminder loop error: {e}", flush=True)
+
+
+threading.Thread(target=_reservation_reminder_loop, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
