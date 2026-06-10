@@ -297,8 +297,8 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None) 
         issue_text = "\n".join(issues)
         group_msg  = (f"⚠️ สลิปผ่าน แต่มีจุดน่าสังเกต\n─────────────────\n{base_info}\n"
                       f"─────────────────\n{issue_text}\nกรุณาแจ้ง Admin ตรวจสอบเพิ่มเติม")
-        admin_msg  = (f"⚠️ [WARN] สลิปจาก {sender} มีจุดน่าสงสัย\n"
-                      f"จำนวน: {amount_str} บาท | อ้างอิง: {ref}\n─────────────────\n{issue_text}")
+        # ไม่ DM admin สำหรับ WARN (กลุ่มเห็น alert ผ่าน reply อยู่แล้ว + ประหยัดโควต้า push)
+        admin_msg  = None
     else:
         issue_text = "\n".join(issues)
         group_msg  = (f"🚨 ตรวจพบสลิปต้องสงสัย!\n─────────────────\n{base_info}\n"
@@ -685,11 +685,11 @@ def notify_group_error(event, group_id):
 
 
 def notify_admin_error(group_id, err):
-    """แจ้ง Admin เวลาบอทอ่านสลิปพลาด แบบจำกัด 1 ครั้ง/10 นาที (กัน Admin โดนสแปม)"""
+    """แจ้ง Admin เวลาบอทอ่านสลิปพลาด แบบจำกัด 1 ครั้ง/30 นาที (กัน Admin โดนสแปม + ประหยัดโควต้า push)"""
     global _last_admin_error_ts
     if not ADMIN_USER_ID:
         return
-    if time.time() - _last_admin_error_ts < 600:
+    if time.time() - _last_admin_error_ts < 1800:
         return
     _last_admin_error_ts = time.time()
     try:
