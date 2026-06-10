@@ -59,19 +59,20 @@ def _connect():
     return conn
 
 def _db():
-    # รอ disk mount + init เสร็จก่อน (Render mount ช้า) — _setup_storage จะ set ภายใน ~5 นาทีเสมอ
-    if not _storage_ready.wait(timeout=300):
+    # รอ disk mount + init เสร็จก่อน (Render mount ช้า) — _setup_storage จะ set ภายใน ~10 นาทีเสมอ
+    if not _storage_ready.wait(timeout=660):
         raise RuntimeError("storage ยังไม่พร้อม (disk ยังไม่ mount)")
     return _connect()
 
 def _setup_storage():
-    """รอ /var/data mount (สูงสุด ~5 นาที) แล้วเลือกที่เก็บ DB + init — รันใน background ไม่ block boot"""
+    """รอ /var/data mount (สูงสุด ~10 นาที) แล้วเลือกที่เก็บ DB + init — รันใน background ไม่ block boot
+    Render ปล่อย/ผูก disk ระหว่าง instance ช้า (โดยเฉพาะตอน deploy ถี่ๆ) จึงต้องใจเย็นรอ"""
     global DB_DIR, DB_PATH, DB_PERSISTENT
-    for _i in range(150):          # 150 รอบ × 2 วิ = สูงสุด 5 นาที
+    for _i in range(300):          # 300 รอบ × 2 วิ = สูงสุด 10 นาที
         if os.path.isdir(_DISK_PATH):
             break
-        if _i == 0:
-            print(f"[STORAGE] รอ {_DISK_PATH} mount (Render mount ช้า) ...", flush=True)
+        if _i % 15 == 0:           # log ทุก ~30 วิ ให้เห็นว่ายังรออยู่
+            print(f"[STORAGE] รอ {_DISK_PATH} mount (Render mount ช้า) ... {_i*2}s", flush=True)
         time.sleep(2)
     DB_PERSISTENT = os.path.isdir(_DISK_PATH)
     DB_DIR  = _DISK_PATH if DB_PERSISTENT else "."
