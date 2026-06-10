@@ -754,7 +754,8 @@ def handle_reservation_text(event, text: str, group_id: str):
 
 
 def _resv_confirm_card(resv_id: int, head: str = "🔔 จองโต๊ะ") -> TemplateSendMessage:
-    """การ์ดปุ่มคอนเฟิร์มการจอง (ใช้ทั้งตอนจองใหม่และตอนแจ้งเตือนซ้ำ)"""
+    """การ์ดปุ่มคอนเฟิร์มการจอง (ใช้ทั้งตอนจองใหม่และตอนแจ้งเตือนซ้ำ)
+    ไม่ใส่ display_text เพราะ LINE จะ echo ทุกครั้งที่กด ทำให้ตอนกดซ้ำดูเหมือนคอนเฟิร์มสำเร็จ"""
     return TemplateSendMessage(
         alt_text=f"ยืนยันการจอง #{resv_id}",
         template=ButtonsTemplate(
@@ -763,7 +764,6 @@ def _resv_confirm_card(resv_id: int, head: str = "🔔 จองโต๊ะ") -
             actions=[PostbackAction(
                 label="✅ คอนเฟิร์มการจอง",
                 data=f"confirm_resv:{resv_id}",
-                display_text="คอนเฟิร์มการจอง"
             )],
         ),
     )
@@ -782,8 +782,9 @@ def handle_reservation_confirm(event, resv_id: int):
 
     if resv["status"] == "CONFIRMED":
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text=f"ℹ️ การจอง #{resv_id} ถูกคอนเฟิร์มไปแล้วโดย {resv['confirmed_by']} "
-                 f"({resv['confirmed_at']})"))
+            text=f"⚠️ การจอง #{resv_id} ถูกคอนเฟิร์มไปแล้ว!\n"
+                 f"โดย {resv['confirmed_by']} ({resv['confirmed_at']})\n"
+                 f"ไม่ต้องกดซ้ำครับ"))
         return
 
     mark_reservation_confirmed(resv_id, confirmer)
