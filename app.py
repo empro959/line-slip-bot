@@ -38,62 +38,84 @@ handler      = WebhookHandler(LINE_SECRET)
 genai.configure(api_key=GEMINI_API_KEY)
 gemini       = genai.GenerativeModel("gemini-2.5-flash")
 
-# ─── Persistent storage (SQLite) ──────────────────────────────────────────────
-import sqlite3
-
-# ใช้ disk ถาวรที่ /var/data (Render Persistent Disk)
-# พิสูจน์แล้ว: Render mount disk 'ช้า' หลายนาทีหลังแอป start (df เห็น /var/data แต่ตอน start ยังไม่ mount)
-# → ห้ามตัดสินที่เก็บ DB ตอน import ครั้งเดียว ไม่งั้นจะตกไปเขียนที่ชั่วคราว '.' แล้วข้อมูลหายทุก restart
-# วิธี: รอ disk แบบ background (นานได้หลายนาที ไม่ block gunicorn boot) แล้วค่อยเลือกที่เก็บ + init
-#       ส่วน _db() จะรอจน storage พร้อมก่อนแตะ DB (กัน webhook ช่วงแรกที่ disk ยังไม่ mount เขียนผิดที่)
-_DISK_PATH     = "/var/data"
-DB_DIR         = None
-DB_PATH        = None
-DB_PERSISTENT  = False
+# ─── Persistent storage (PostgreSQL ถ้ามี DATABASE_URL ไม่งั้น SQLite) ────────
+# ย้ายมาใช้ Postgres (managed) เพราะ Render persistent disk mount ไม่เสถียร (mount ช้า/ไม่ขึ้น → ข้อมูลหาย)
+# Postgres เป็น DB แยก ไม่ผูกกับ instance/disk → deploy/restart/suspend กี่รอบ ข้อมูลอยู่ครบ 100%
+# โค้ดชุดเดียวรองรับทั้งสอง: ตั้ง env DATABASE_URL = ใช้ Postgres / ไม่ตั้ง = SQLite (local/ชั่วคราว)
+DATABASE_URL   = os.environ.get("DATABASE_URL", "")
+USE_PG         = bool(DATABASE_URL)
 _storage_ready = threading.Event()
 
+if USE_PG:
+    import psycopg2
+    import psycopg2.extras
+    STORAGE_DESC = "PostgreSQL (managed)"
+    _PK   = "SERIAL PRIMARY KEY"
+    _REAL = "DOUBLE PRECISION"
+else:
+    import sqlite3
+    DB_PATH = os.path.join("/var/data" if os.path.isdir("/var/data") else ".", "slips.db")
+    STORAGE_DESC = f"SQLite ({DB_PATH}) [ephemeral ถ้าไม่มี disk!]"
+    _PK   = "INTEGER PRIMARY KEY AUTOINCREMENT"
+    _REAL = "REAL"
+
+def _raw_connect():
+    if USE_PG:
+        return psycopg2.connect(DATABASE_URL)
+    c = sqlite3.connect(DB_PATH, timeout=15)   # timeout กัน 'database is locked' ตอนรูปเยอะ
+    c.row_factory = sqlite3.Row
+    return c
+
+class _Conn:
+    """ห่อ connection ให้ใช้เหมือน sqlite3 เดิม (conn.execute(sql,params).fetchone()/fetchall(),
+    row['col'], commit, context manager) — รองรับทั้ง Postgres และ SQLite ด้วยโค้ดชุดเดียว
+    placeholder ในโค้ดใช้ '?' ทั้งหมด แล้วแปลงเป็น '%s' ให้อัตโนมัติเมื่อใช้ Postgres"""
+    def __init__(self, raw):
+        self._raw = raw
+    def execute(self, sql, params=()):
+        if USE_PG:
+            cur = self._raw.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(sql.replace("?", "%s"), params)
+        else:
+            cur = self._raw.cursor()
+            cur.execute(sql, params)
+        return cur
+    def insert_returning_id(self, sql, params):
+        # คืน id แถวที่เพิ่ง insert (Postgres ใช้ RETURNING id, SQLite ใช้ lastrowid)
+        cur = self._raw.cursor()
+        if USE_PG:
+            cur.execute(sql.replace("?", "%s") + " RETURNING id", params)
+            return cur.fetchone()[0]
+        cur.execute(sql, params)
+        return cur.lastrowid
+    def commit(self):
+        self._raw.commit()
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self._raw.commit() if exc_type is None else self._raw.rollback()
+        finally:
+            self._raw.close()
+
 def _connect():
-    # เชื่อม DB ตรงๆ (ใช้ภายใน init / หลัง storage พร้อม) — timeout กัน 'database is locked' ตอนรูปเยอะ
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return _Conn(_raw_connect())
 
 def _db():
-    # รอ disk mount + init เสร็จก่อน (Render mount ช้า) — _setup_storage จะ set ภายใน ~10 นาทีเสมอ
-    if not _storage_ready.wait(timeout=660):
-        raise RuntimeError("storage ยังไม่พร้อม (disk ยังไม่ mount)")
+    # รอ init เสร็จก่อนแตะ DB (กัน webhook ช่วง start ที่ DB ยังไม่พร้อม)
+    if not _storage_ready.wait(timeout=120):
+        raise RuntimeError("storage ยังไม่พร้อม")
     return _connect()
-
-def _setup_storage():
-    """รอ /var/data mount (สูงสุด ~10 นาที) แล้วเลือกที่เก็บ DB + init — รันใน background ไม่ block boot
-    Render ปล่อย/ผูก disk ระหว่าง instance ช้า (โดยเฉพาะตอน deploy ถี่ๆ) จึงต้องใจเย็นรอ"""
-    global DB_DIR, DB_PATH, DB_PERSISTENT
-    for _i in range(300):          # 300 รอบ × 2 วิ = สูงสุด 10 นาที
-        if os.path.isdir(_DISK_PATH):
-            break
-        if _i % 15 == 0:           # log ทุก ~30 วิ ให้เห็นว่ายังรออยู่
-            print(f"[STORAGE] รอ {_DISK_PATH} mount (Render mount ช้า) ... {_i*2}s", flush=True)
-        time.sleep(2)
-    DB_PERSISTENT = os.path.isdir(_DISK_PATH)
-    DB_DIR  = _DISK_PATH if DB_PERSISTENT else "."
-    DB_PATH = os.path.join(DB_DIR, "slips.db")
-    if DB_PERSISTENT:
-        print(f"[STORAGE] ✅ ใช้ disk ถาวรที่ {DB_DIR}", flush=True)
-    else:
-        print("🔴🔴🔴 [STORAGE] /var/data ไม่ mount หลังรอ 5 นาที — ใช้ที่ชั่วคราว '.' "
-              "(ข้อมูลจะหายตอน restart!) ตรวจ Persistent Disk ที่ Render", flush=True)
-    init_db()
-    _storage_ready.set()
 
 def init_db():
     with _connect() as conn:
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS slips (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                id            {_PK},
                 group_id      TEXT,
                 slip_date     TEXT,
                 sender        TEXT,
-                amount        REAL,
+                amount        {_REAL},
                 bank          TEXT,
                 ref_number    TEXT,
                 slip_datetime TEXT,
@@ -101,26 +123,27 @@ def init_db():
                 recorded_at   TEXT
             )
         """)
-        # migration: เพิ่มคอลัมน์ slip_datetime ให้ DB เก่าที่ยังไม่มี (ไว้จับซ้ำด้วยยอด+เวลา)
-        try:
-            conn.execute("ALTER TABLE slips ADD COLUMN slip_datetime TEXT")
-        except Exception:
-            pass
+        if not USE_PG:
+            # migration เฉพาะ SQLite DB เก่าที่ยังไม่มีคอลัมน์ (Postgres สร้างใหม่มีครบแล้ว)
+            try:
+                conn.execute("ALTER TABLE slips ADD COLUMN slip_datetime TEXT")
+            except Exception:
+                pass
         conn.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY)")
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         # นับรูปที่รับเข้ามาแต่ "ไม่ได้บันทึกเป็นสลิป" (อ่านไม่ออก/ไม่ใช่สลิป/error) ไว้กระทบยอดในรายงาน
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS image_misses (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                id          {_PK},
                 group_id    TEXT,
                 stat_date   TEXT,
                 reason      TEXT,
                 recorded_at TEXT
             )
         """)
-        conn.execute("""
+        conn.execute(f"""
             CREATE TABLE IF NOT EXISTS reservations (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                id              {_PK},
                 origin_group_id TEXT,
                 requested_by    TEXT,
                 customer        TEXT,
@@ -137,7 +160,21 @@ def init_db():
         """)
         conn.commit()
 
-# เริ่มรอ disk แบบ background แล้วค่อย init_db (ไม่ block gunicorn boot) — Render mount disk ช้า
+def _setup_storage():
+    """init DB แบบ background (retry เผื่อ Postgres เพิ่งสร้างยัง provisioning) — ไม่ block gunicorn boot"""
+    for _i in range(60):           # retry ~5 นาที
+        try:
+            init_db()
+            print(f"[STORAGE] ✅ ใช้ {STORAGE_DESC}", flush=True)
+            _storage_ready.set()
+            return
+        except Exception as e:
+            if _i % 6 == 0:
+                print(f"[STORAGE] รอ DB พร้อม... ({e})", flush=True)
+            time.sleep(5)
+    print("🔴🔴🔴 [STORAGE] เชื่อม DB ไม่ได้ — ตรวจ env DATABASE_URL ที่ Render", flush=True)
+
+# init DB แบบ background (retry รอ DB พร้อม) — ไม่ block gunicorn boot
 threading.Thread(target=_setup_storage, daemon=True).start()
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -367,7 +404,7 @@ def save_slip(group_id: str, info: dict, verdict_status: str):
             (group_id, today, info.get("sender"), float(info.get("amount") or 0),
              info.get("bank"), info.get("ref_number"), info.get("datetime"), verdict_status, recorded_at)
         )
-        conn.execute("INSERT OR IGNORE INTO groups (group_id) VALUES (?)", (group_id,))
+        conn.execute("INSERT INTO groups (group_id) VALUES (?) ON CONFLICT DO NOTHING", (group_id,))
         conn.commit()
 
 
@@ -571,7 +608,7 @@ def _resv_detail_lines(r: dict) -> str:
 def save_reservation(origin_group_id: str, requested_by: str, info: dict, raw_text: str) -> int:
     created_at = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     with _db() as conn:
-        cur = conn.execute(
+        rid = conn.insert_returning_id(
             "INSERT INTO reservations "
             "(origin_group_id, requested_by, customer, people, resv_datetime, table_no, note, raw_text, status, created_at) "
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -579,7 +616,7 @@ def save_reservation(origin_group_id: str, requested_by: str, info: dict, raw_te
              info.get("datetime"), info.get("table"), info.get("note"), raw_text, "PENDING", created_at)
         )
         conn.commit()
-        return cur.lastrowid
+        return rid
 
 
 def get_reservation(resv_id: int) -> dict:
@@ -950,9 +987,9 @@ def handle_postback(event):
 
 @app.route("/health", methods=["GET"])
 def health():
-    # ช่วง start อาจยังรอ disk mount อยู่ — ตอบเร็วโดยไม่แตะ DB กัน /health ค้าง
+    # ช่วง start อาจยัง init DB ไม่เสร็จ — ตอบเร็วโดยไม่แตะ DB กัน /health ค้าง
     if not _storage_ready.is_set():
-        return {"status": "starting", "storage": "waiting for /var/data mount..."}
+        return {"status": "starting", "storage": f"connecting to {STORAGE_DESC}..."}
     # ทุกครั้งที่ถูก ping (UptimeRobot ทุก 5 นาที) เช็คว่าถึงเวลาส่งรายงานประจำวันไหม
     try:
         maybe_send_daily_report()
@@ -964,7 +1001,7 @@ def health():
         ).fetchone()["c"]
         group_count = conn.execute("SELECT COUNT(*) c FROM groups").fetchone()["c"]
     return {"status": "ok", "slips_today": today_count, "active_groups": group_count,
-            "storage": "persistent" if DB_PERSISTENT else "EPHEMERAL (data lost on restart! add disk at /var/data)"}
+            "storage": STORAGE_DESC}
 
 
 if __name__ == "__main__":
