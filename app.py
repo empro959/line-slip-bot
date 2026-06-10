@@ -41,35 +41,51 @@ gemini       = genai.GenerativeModel("gemini-2.5-flash")
 # ─── Persistent storage (SQLite) ──────────────────────────────────────────────
 import sqlite3
 
-# ใช้ disk ถาวรถ้ามี (Render Persistent Disk mount ที่ /var/data) ไม่งั้นใช้โฟลเดอร์ปัจจุบัน
-# สำคัญ: Render บาง deploy mount disk 'ช้ากว่า' แอป start ไม่กี่วินาที (race) — ถ้าเช็กเร็วไปจะเจอว่า
-# ไม่มี /var/data แล้วตกไปเขียนที่ชั่วคราว ทำให้ข้อมูลหายทุก restart → จึง 'รอ' ให้ disk mount ก่อน
-_DISK_PATH = "/var/data"
-for _i in range(30):
-    if os.path.isdir(_DISK_PATH):
-        break
-    if _i == 0:
-        print(f"[STORAGE] รอ {_DISK_PATH} mount ...", flush=True)
-    time.sleep(1)
-DB_PERSISTENT = os.path.isdir(_DISK_PATH)
-DB_DIR  = _DISK_PATH if DB_PERSISTENT else "."
-DB_PATH = os.path.join(DB_DIR, "slips.db")
-if not DB_PERSISTENT:
-    # เตือนดังๆ: ไม่มี persistent disk → ข้อมูลจะถูกล้างทุกครั้งที่ deploy/restart!
-    print("🔴🔴🔴 [STORAGE] /var/data ไม่ถูก mount (รอแล้ว 30 วิ) — DB ใช้ที่เก็บชั่วคราว ('.') "
-          "ข้อมูลสลิปจะหายทุกครั้งที่ deploy/restart! ตรวจ Persistent Disk ที่ Render (mount /var/data)",
-          flush=True)
-else:
-    print(f"[STORAGE] ✅ ใช้ disk ถาวรที่ {DB_DIR}", flush=True)
+# ใช้ disk ถาวรที่ /var/data (Render Persistent Disk)
+# พิสูจน์แล้ว: Render mount disk 'ช้า' หลายนาทีหลังแอป start (df เห็น /var/data แต่ตอน start ยังไม่ mount)
+# → ห้ามตัดสินที่เก็บ DB ตอน import ครั้งเดียว ไม่งั้นจะตกไปเขียนที่ชั่วคราว '.' แล้วข้อมูลหายทุก restart
+# วิธี: รอ disk แบบ background (นานได้หลายนาที ไม่ block gunicorn boot) แล้วค่อยเลือกที่เก็บ + init
+#       ส่วน _db() จะรอจน storage พร้อมก่อนแตะ DB (กัน webhook ช่วงแรกที่ disk ยังไม่ mount เขียนผิดที่)
+_DISK_PATH     = "/var/data"
+DB_DIR         = None
+DB_PATH        = None
+DB_PERSISTENT  = False
+_storage_ready = threading.Event()
 
-def _db():
-    # timeout เผื่อหลาย thread เขียนพร้อมกัน (กัน 'database is locked' ตอนรูปเยอะ)
+def _connect():
+    # เชื่อม DB ตรงๆ (ใช้ภายใน init / หลัง storage พร้อม) — timeout กัน 'database is locked' ตอนรูปเยอะ
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
 
+def _db():
+    # รอ disk mount + init เสร็จก่อน (Render mount ช้า) — _setup_storage จะ set ภายใน ~5 นาทีเสมอ
+    if not _storage_ready.wait(timeout=300):
+        raise RuntimeError("storage ยังไม่พร้อม (disk ยังไม่ mount)")
+    return _connect()
+
+def _setup_storage():
+    """รอ /var/data mount (สูงสุด ~5 นาที) แล้วเลือกที่เก็บ DB + init — รันใน background ไม่ block boot"""
+    global DB_DIR, DB_PATH, DB_PERSISTENT
+    for _i in range(150):          # 150 รอบ × 2 วิ = สูงสุด 5 นาที
+        if os.path.isdir(_DISK_PATH):
+            break
+        if _i == 0:
+            print(f"[STORAGE] รอ {_DISK_PATH} mount (Render mount ช้า) ...", flush=True)
+        time.sleep(2)
+    DB_PERSISTENT = os.path.isdir(_DISK_PATH)
+    DB_DIR  = _DISK_PATH if DB_PERSISTENT else "."
+    DB_PATH = os.path.join(DB_DIR, "slips.db")
+    if DB_PERSISTENT:
+        print(f"[STORAGE] ✅ ใช้ disk ถาวรที่ {DB_DIR}", flush=True)
+    else:
+        print("🔴🔴🔴 [STORAGE] /var/data ไม่ mount หลังรอ 5 นาที — ใช้ที่ชั่วคราว '.' "
+              "(ข้อมูลจะหายตอน restart!) ตรวจ Persistent Disk ที่ Render", flush=True)
+    init_db()
+    _storage_ready.set()
+
 def init_db():
-    with _db() as conn:
+    with _connect() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS slips (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,7 +136,8 @@ def init_db():
         """)
         conn.commit()
 
-init_db()
+# เริ่มรอ disk แบบ background แล้วค่อย init_db (ไม่ block gunicorn boot) — Render mount disk ช้า
+threading.Thread(target=_setup_storage, daemon=True).start()
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -932,6 +949,9 @@ def handle_postback(event):
 
 @app.route("/health", methods=["GET"])
 def health():
+    # ช่วง start อาจยังรอ disk mount อยู่ — ตอบเร็วโดยไม่แตะ DB กัน /health ค้าง
+    if not _storage_ready.is_set():
+        return {"status": "starting", "storage": "waiting for /var/data mount..."}
     # ทุกครั้งที่ถูก ping (UptimeRobot ทุก 5 นาที) เช็คว่าถึงเวลาส่งรายงานประจำวันไหม
     try:
         maybe_send_daily_report()
