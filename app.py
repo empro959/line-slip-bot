@@ -34,6 +34,8 @@ BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
 PAYEE_KEYWORDS    = [k.strip().lower() for k in os.environ.get("PAYEE_KEYWORDS", "").split(",") if k.strip()]
 # จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
 RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
+# รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด
+RESV_REPORT_DAYS   = int(os.environ.get("RESV_REPORT_DAYS", "7"))
 # เวลาเปิดร้าน (ชั่วโมง) สำหรับตรวจเวลาจอง — เปิด 11:00 ถึง 00:00 (เที่ยงคืน)
 OPEN_HOUR, CLOSE_HOUR = 11, 24
 TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
@@ -506,6 +508,31 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
     return "\n".join(lines)
 
 
+def build_advance_resv_report() -> str:
+    """สรุปจองล่วงหน้า (ที่ส่งเข้ากลุ่มบาร์น้ำ) ที่แจ้งมาภายใน RESV_REPORT_DAYS วันล่าสุด — แยกคอนเฟิร์ม/รอ"""
+    cutoff = (datetime.now(TZ) - timedelta(days=RESV_REPORT_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    with _db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM reservations WHERE notify_group_id=? AND created_at>=? ORDER BY created_at",
+            (BAR_GROUP_ID, cutoff)).fetchall()]
+    title = f"📅 สรุปจองล่วงหน้า (ล่าสุด {RESV_REPORT_DAYS} วัน)"
+    if not rows:
+        return f"{title}\n─────────────────\nไม่มีรายการจองล่วงหน้า"
+    confirmed = [r for r in rows if r.get("status") == "CONFIRMED"]
+    pending   = [r for r in rows if r.get("status") != "CONFIRMED"]
+    lines = [title, "─────────────────",
+             f"ทั้งหมด {len(rows)} | ✅ คอนเฟิร์ม {len(confirmed)} | ⏳ รอคอนเฟิร์ม {len(pending)}", ""]
+    for r in rows:
+        icon = "✅" if r.get("status") == "CONFIRMED" else "⏳"
+        cust = r.get("customer") or "?"
+        ppl  = f" {r['people']}" if r.get("people") else ""
+        when = f" | {r['resv_datetime']}" if r.get("resv_datetime") else ""
+        zone = f" | {r['table_no']}" if r.get("table_no") else ""
+        by   = f" (โดย {r['confirmed_by']})" if r.get("status") == "CONFIRMED" and r.get("confirmed_by") else ""
+        lines.append(f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}")
+    return "\n".join(lines)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Daily Report Scheduler (00:30 Asia/Bangkok) — ยิงจากการ ping /health + thread สำรอง (idempotent กันรีสตาร์ท/ส่งซ้ำ)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -549,6 +576,14 @@ def maybe_send_daily_report():
             except Exception as e:
                 failed += 1
                 print(f"[report] push FAILED {group_id}: {e}", flush=True)
+        # สรุปจองล่วงหน้า → กลุ่มบาร์น้ำ (วันละครั้งพร้อมรายงานสลิป)
+        if BAR_GROUP_ID:
+            try:
+                line_bot_api.push_message(BAR_GROUP_ID, TextSendMessage(text=build_advance_resv_report()))
+                print(f"[report] sent advance-resv → {BAR_GROUP_ID}", flush=True)
+            except Exception as e:
+                failed += 1
+                print(f"[report] push FAILED advance-resv {BAR_GROUP_ID}: {e}", flush=True)
         # มาร์คว่า 'ส่งครบแล้ว' เฉพาะเมื่อไม่มีอันไหนล้มเหลว — ถ้ามี fail ปล่อยไว้ให้ ping รอบหน้า retry
         if failed == 0:
             _set_meta("last_report_date", today)
