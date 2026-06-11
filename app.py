@@ -49,7 +49,8 @@ gemini       = genai.GenerativeModel("gemini-2.5-flash")
 # โค้ดชุดเดียวรองรับทั้งสอง: ตั้ง env DATABASE_URL = ใช้ Postgres / ไม่ตั้ง = SQLite (local/ชั่วคราว)
 DATABASE_URL   = os.environ.get("DATABASE_URL", "")
 USE_PG         = bool(DATABASE_URL)
-_storage_ready = threading.Event()
+_init_lock     = threading.Lock()
+_init_done     = False
 
 if USE_PG:
     import psycopg2
@@ -66,7 +67,7 @@ else:
 
 def _raw_connect():
     if USE_PG:
-        return psycopg2.connect(DATABASE_URL)
+        return psycopg2.connect(DATABASE_URL, connect_timeout=10)  # fail เร็วถ้า DB ล่ม ไม่ค้าง
     c = sqlite3.connect(DB_PATH, timeout=15)   # timeout กัน 'database is locked' ตอนรูปเยอะ
     c.row_factory = sqlite3.Row
     return c
@@ -106,12 +107,20 @@ class _Conn:
 def _connect():
     return _Conn(_raw_connect())
 
+def _ensure_init():
+    """สร้างตารางครั้งแรกที่ใช้ DB (idempotent) — ไม่มี background thread/Event ให้ค้างข้าม worker restart"""
+    global _init_done
+    if _init_done:
+        return
+    with _init_lock:
+        if not _init_done:
+            init_db()
+            _init_done = True
+
 def _db():
-    # รอ init เสร็จก่อนแตะ DB (กัน webhook ช่วง start ที่ DB ยังไม่พร้อม)
-    # สำคัญ: ต้อง << gunicorn --timeout (120) ไม่งั้นบล็อก worker จน gunicorn ฆ่า → restart วน
-    # Postgres เชื่อมเร็ว (~1-2 วิ) 15 วิเหลือเฟือสำหรับช่วง boot
-    if not _storage_ready.wait(timeout=15):
-        raise RuntimeError("storage ยังไม่พร้อม")
+    # เชื่อม DB ตรงๆ ทุกครั้ง (Postgres เชื่อมเร็ว) — DB ล่ม = error เร็วๆ ถูก catch ที่ handler
+    # ไม่มี state รอ/Event ที่ค้างได้อีก; ถ้า DB กลับมา ครั้งถัดไปก็ใช้ได้เลย (self-heal)
+    _ensure_init()
     return _connect()
 
 def init_db():
@@ -178,24 +187,12 @@ def init_db():
                     pass
         conn.commit()
 
-def _setup_storage():
-    """init DB แบบ background — ลองเชื่อมไปเรื่อยๆ ไม่ยอมแพ้ (self-heal เมื่อ Postgres กลับมา/connection ค้างหมดอายุ)
-    ไม่ block gunicorn boot. เดิมลองแค่ 5 นาทีแล้วเลิก ทำให้ storage ค้างไม่พร้อมถาวรถ้า DB ล่มชั่วคราว"""
-    _i = 0
-    while True:
-        try:
-            init_db()
-            print(f"[STORAGE] ✅ ใช้ {STORAGE_DESC}", flush=True)
-            _storage_ready.set()
-            return
-        except Exception as e:
-            if _i % 6 == 0:    # log ทุก ~30 วิ ไม่ให้ท่วม
-                print(f"🔴 [STORAGE] เชื่อม DB ไม่ได้ กำลังลองใหม่... ({e})", flush=True)
-            _i += 1
-            time.sleep(5)
-
-# init DB แบบ background (retry รอ DB พร้อม) — ไม่ block gunicorn boot
-threading.Thread(target=_setup_storage, daemon=True).start()
+# พยายามสร้างตารางตอน start (best-effort) — ถ้า DB ยังไม่พร้อมก็ไม่เป็นไร _db() จะ init เองตอนใช้ครั้งแรก
+try:
+    _ensure_init()
+    print(f"[STORAGE] ✅ ใช้ {STORAGE_DESC}", flush=True)
+except Exception as e:
+    print(f"🔴 [STORAGE] init ตอน start ยังไม่ได้ (จะลองใหม่ตอนมี request): {e}", flush=True)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -1128,21 +1125,22 @@ def handle_postback(event):
 
 @app.route("/health", methods=["GET"])
 def health():
-    # ช่วง start อาจยัง init DB ไม่เสร็จ — ตอบเร็วโดยไม่แตะ DB กัน /health ค้าง
-    if not _storage_ready.is_set():
-        return {"status": "starting", "storage": f"connecting to {STORAGE_DESC}..."}
     # ทุกครั้งที่ถูก ping (UptimeRobot ทุก 5 นาที) เช็คว่าถึงเวลาส่งรายงานประจำวันไหม
     try:
         maybe_send_daily_report()
     except Exception as e:
         print(f"[report] health-trigger error: {e}", flush=True)
-    with _db() as conn:
-        today_count = conn.execute(
-            "SELECT COUNT(*) c FROM slips WHERE slip_date=?", (datetime.now(TZ).date().isoformat(),)
-        ).fetchone()["c"]
-        group_count = conn.execute("SELECT COUNT(*) c FROM groups").fetchone()["c"]
-    return {"status": "ok", "slips_today": today_count, "active_groups": group_count,
-            "storage": STORAGE_DESC}
+    try:
+        with _db() as conn:
+            today_count = conn.execute(
+                "SELECT COUNT(*) c FROM slips WHERE slip_date=?", (datetime.now(TZ).date().isoformat(),)
+            ).fetchone()["c"]
+            group_count = conn.execute("SELECT COUNT(*) c FROM groups").fetchone()["c"]
+        return {"status": "ok", "slips_today": today_count, "active_groups": group_count,
+                "storage": STORAGE_DESC}
+    except Exception as e:
+        # DB ล่ม/เชื่อมไม่ได้ชั่วคราว — ตอบ 200 อยู่ (กัน UptimeRobot รีสตาร์ท) แต่บอกสถานะ
+        return {"status": "db_error", "storage": f"{STORAGE_DESC} — {e}"}
 
 
 if __name__ == "__main__":
