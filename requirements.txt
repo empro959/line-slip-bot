@@ -1,6 +1,6 @@
-flask
-line-bot-sdk
-google-generativeai
-requests
-gunicorn
-psycopg2-binary
+flask==3.1.3
+line-bot-sdk==3.23.0
+google-genai==2.8.0
+requests==2.34.2
+gunicorn==26.0.0
+psycopg2-binary==2.9.12
