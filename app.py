@@ -179,18 +179,20 @@ def init_db():
         conn.commit()
 
 def _setup_storage():
-    """init DB แบบ background (retry เผื่อ Postgres เพิ่งสร้างยัง provisioning) — ไม่ block gunicorn boot"""
-    for _i in range(60):           # retry ~5 นาที
+    """init DB แบบ background — ลองเชื่อมไปเรื่อยๆ ไม่ยอมแพ้ (self-heal เมื่อ Postgres กลับมา/connection ค้างหมดอายุ)
+    ไม่ block gunicorn boot. เดิมลองแค่ 5 นาทีแล้วเลิก ทำให้ storage ค้างไม่พร้อมถาวรถ้า DB ล่มชั่วคราว"""
+    _i = 0
+    while True:
         try:
             init_db()
             print(f"[STORAGE] ✅ ใช้ {STORAGE_DESC}", flush=True)
             _storage_ready.set()
             return
         except Exception as e:
-            if _i % 6 == 0:
-                print(f"[STORAGE] รอ DB พร้อม... ({e})", flush=True)
+            if _i % 6 == 0:    # log ทุก ~30 วิ ไม่ให้ท่วม
+                print(f"🔴 [STORAGE] เชื่อม DB ไม่ได้ กำลังลองใหม่... ({e})", flush=True)
+            _i += 1
             time.sleep(5)
-    print("🔴🔴🔴 [STORAGE] เชื่อม DB ไม่ได้ — ตรวจ env DATABASE_URL ที่ Render", flush=True)
 
 # init DB แบบ background (retry รอ DB พร้อม) — ไม่ block gunicorn boot
 threading.Thread(target=_setup_storage, daemon=True).start()
