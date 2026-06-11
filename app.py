@@ -36,9 +36,10 @@ PAYEE_KEYWORDS    = [k.strip().lower() for k in os.environ.get("PAYEE_KEYWORDS",
 RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
 # รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
 RESV_REPORT_DAYS   = int(os.environ.get("RESV_REPORT_DAYS", "7"))
-# ลบข้อมูลเก่าอัตโนมัติ (วันละครั้ง) กัน DB บวม — จองที่ผ่านวันมาแล้วเกิน N วัน / ตัวนับรูปเก่าเกิน M วัน
-RESV_KEEP_DAYS     = int(os.environ.get("RESV_KEEP_DAYS", "60"))
-MISS_KEEP_DAYS     = int(os.environ.get("MISS_KEEP_DAYS", "45"))
+# ลบข้อมูลเก่าอัตโนมัติ (วันละครั้ง) กัน DB บวม
+RESV_KEEP_DAYS     = int(os.environ.get("RESV_KEEP_DAYS", "15"))  # จองที่ผ่านวันมาแล้ว เก็บ 15 วัน
+MISS_KEEP_DAYS     = int(os.environ.get("MISS_KEEP_DAYS", "14"))  # ตัวนับรูปตกหล่น เก็บ 14 วัน
+SLIP_KEEP_DAYS     = int(os.environ.get("SLIP_KEEP_DAYS", "60"))  # สลิป เก็บ 60 วัน
 # เวลาเปิดร้าน (ชั่วโมง) สำหรับตรวจเวลาจอง — เปิด 11:00 ถึง 00:00 (เที่ยงคืน)
 OPEN_HOUR, CLOSE_HOUR = 11, 24
 TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
@@ -545,22 +546,22 @@ def build_advance_resv_report() -> str:
 def _cleanup_old_data():
     """ลบข้อมูลเก่าที่ไม่จำเป็น (วันละครั้ง) กัน DB บวม:
     - จองที่ผ่านวันมาแล้วเกิน RESV_KEEP_DAYS (ใช้ resv_date ถ้ามี ไม่งั้นใช้วันที่แจ้ง)
-    - ตัวนับรูปตกหล่น (image_misses) เก่าเกิน MISS_KEEP_DAYS (ใช้แค่กระทบยอดรายวัน)
-    สลิป (slips) ไม่ลบ — เป็นบันทึกการเงิน เก็บไว้ดูย้อนหลังได้ (ขนาดเล็กมาก)"""
+    - ตัวนับรูปตกหล่น (image_misses) เก่าเกิน MISS_KEEP_DAYS
+    - สลิป (slips) เก่าเกิน SLIP_KEEP_DAYS"""
     today = datetime.now(TZ).date()
     resv_cutoff = (today - timedelta(days=RESV_KEEP_DAYS)).isoformat()
     miss_cutoff = (today - timedelta(days=MISS_KEEP_DAYS)).isoformat()
+    slip_cutoff = (today - timedelta(days=SLIP_KEEP_DAYS)).isoformat()
     try:
         with _db() as conn:
-            cur = conn.execute(
+            n_resv = conn.execute(
                 "DELETE FROM reservations WHERE COALESCE(resv_date, substr(created_at,1,10)) < ?",
-                (resv_cutoff,))
-            n_resv = cur.rowcount
-            cur = conn.execute("DELETE FROM image_misses WHERE stat_date < ?", (miss_cutoff,))
-            n_miss = cur.rowcount
+                (resv_cutoff,)).rowcount
+            n_miss = conn.execute("DELETE FROM image_misses WHERE stat_date < ?", (miss_cutoff,)).rowcount
+            n_slip = conn.execute("DELETE FROM slips WHERE slip_date < ?", (slip_cutoff,)).rowcount
             conn.commit()
-        if n_resv or n_miss:
-            print(f"[cleanup] ลบจองเก่า {n_resv} + ตัวนับรูปเก่า {n_miss}", flush=True)
+        if n_resv or n_miss or n_slip:
+            print(f"[cleanup] ลบจองเก่า {n_resv} + ตัวนับรูปเก่า {n_miss} + สลิปเก่า {n_slip}", flush=True)
     except Exception as e:
         print(f"[cleanup] error: {e}", flush=True)
 
@@ -809,11 +810,11 @@ def handle_reservation_text(event, text: str, group_id: str):
     missing = []
     if not info.get("customer"):  missing.append("1. ชื่อผู้จอง")
     if not info.get("people"):    missing.append("2. จำนวนคน")
-    # วันและเวลา: ถ้าขาดวันหรือเวลา ให้ถามเฉพาะส่วนที่ขาด (จองวันนี้ AI จะใส่ date='วันนี้' ให้แล้ว)
+    # วันและเวลา: ต้องได้ 'วันที่จริง' (resv_date) — ถ้า AI แปลงวันไม่ได้/ไม่มั่นใจ ให้ถามวันที่ให้ชัด
     when_missing = []
-    if not info.get("date"):      when_missing.append("วันที่")
-    if not info.get("time_hhmm"): when_missing.append("เวลา")
-    if when_missing:              missing.append("3. " + " + ".join(when_missing))
+    if not _valid_ymd(info.get("resv_date")): when_missing.append("วันที่ (ระบุให้ชัด เช่น พรุ่งนี้/25 มิ.ย.)")
+    if not info.get("time_hhmm"):             when_missing.append("เวลา")
+    if when_missing:                          missing.append("3. " + " + ".join(when_missing))
     if not info.get("table"):     missing.append("4. โซน")
     if missing:
         print(f"[resv] ข้อมูลไม่ครบ ขาด {missing} → ถามกลับ", flush=True)
