@@ -14,7 +14,8 @@ from linebot.models import (
     MessageEvent, ImageMessage, TextMessage, TextSendMessage,
     PostbackEvent, TemplateSendMessage, ButtonsTemplate, PostbackAction,
 )
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 
@@ -46,8 +47,12 @@ TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler      = WebhookHandler(LINE_SECRET)
-genai.configure(api_key=GEMINI_API_KEY)
-gemini       = genai.GenerativeModel("gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+def _gemini_generate(contents):
+    """เรียก Gemini (SDK ใหม่ google-genai) — contents เป็น str (ข้อความ) หรือ list [str, รูป]"""
+    return gemini_client.models.generate_content(model=GEMINI_MODEL, contents=contents)
 
 # ─── Persistent storage (PostgreSQL ถ้ามี DATABASE_URL ไม่งั้น SQLite) ────────
 # ย้ายมาใช้ Postgres (managed) เพราะ Render persistent disk mount ไม่เสถียร (mount ช้า/ไม่ขึ้น → ข้อมูลหาย)
@@ -253,12 +258,12 @@ def extract_slip_info(image_bytes: bytes) -> dict:
         "ถ้าไม่แน่ใจ หรือร่องรอยไม่ได้อยู่ที่ 'ตัวเลขจำนวนเงิน' โดยตรง → ให้ fraud_score < 40 เสมอ\n"
         "fraud_reasons: ระบุเฉพาะร่องรอยที่ 'ตัวเลขจำนวนเงิน' ถูกแก้ พร้อมตำแหน่ง (ห้ามพูดเรื่องโลโก้/แบรนด์) ถ้าไม่เจอให้เป็น []"
     )
-    img_part = {"mime_type": "image/jpeg", "data": image_bytes}
+    img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
     # ลองใหม่ได้ 1 ครั้ง เผื่อชนลิมิตชั่วคราว (rate limit ต่อนาที)
     last_err = None
     for attempt in range(2):
         try:
-            response = gemini.generate_content([prompt, img_part])
+            response = _gemini_generate([prompt, img_part])
             raw = response.text.strip().replace("```json", "").replace("```", "").strip()
             return json.loads(raw)
         except Exception as e:
@@ -694,7 +699,7 @@ def extract_reservation(text: str) -> dict:
         "ฟิลด์ที่ไม่มีข้อมูลให้เป็น null\n\n"
         f"ข้อความ: {text}"
     )
-    response = gemini.generate_content(prompt)
+    response = _gemini_generate(prompt)
     raw = response.text.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
