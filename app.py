@@ -1050,11 +1050,47 @@ def do_reset_today(event, date_str):
              "─────────────────\n" + build_daily_report(group_id, date_str)))
 
 
+def build_help(group_id: str) -> str:
+    """เมนูคำสั่ง — แสดงเฉพาะหมวดที่กลุ่มนั้นใช้ได้ (สลิป/จอง)"""
+    lines = ["🤖 คำสั่งบอทเอด", "─────────────────"]
+    if _slip_enabled(group_id):
+        lines += [
+            "📊 สลิป / รายงาน",
+            "• ส่งรูปสลิป → บอทตรวจให้อัตโนมัติ (ผ่าน=เงียบ)",
+            "• สรุป → รายงานสลิปวันนี้",
+            "• สรุป 2026-06-09 → รายงานย้อนหลัง (ตามวันที่)",
+            "• รายงานเมื่อวาน → ส่งรายงานเมื่อวานเข้ากลุ่ม",
+            "• ลบล่าสุด / ลบ 3 → ลบสลิป (เลขดูจาก 'สรุป')",
+            "• ล้างวันนี้ → ล้างสลิปวันนี้ทั้งหมด (มีปุ่มยืนยัน)",
+            "",
+        ]
+    if (RESV_GROUPS and group_id in RESV_GROUPS) or BAR_GROUP_ID:
+        lines += [
+            "🔔 จองโต๊ะ",
+            "• พิมพ์จองปกติ เช่น:",
+            "  จองโต๊ะคุณเอ 4คน วันนี้ 2ทุ่ม โซนA",
+            "• ต้องครบ: ชื่อ / จำนวนคน / วันเวลา / โซน (ขาด=บอทถาม)",
+            "• จองล่วงหน้า: ใส่วัน เช่น พรุ่งนี้/เสาร์นี้",
+            "• กดปุ่ม ✅ คอนเฟิร์มการจอง บนการ์ด",
+            "",
+        ]
+    lines += [
+        "🛠️ ทั่วไป",
+        "• groupid → ดู Group ID ของกลุ่ม",
+        "• help / คำสั่ง → เมนูนี้",
+    ]
+    return "\n".join(lines)
+
+
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     text     = event.message.text.strip()
     group_id = getattr(event.source, "group_id", event.source.user_id)
     print(f"[GROUP_ID] source_type={event.source.type} id={group_id} text={text}", flush=True)
+    # เมนูคำสั่ง
+    if text.lower() in ("help", "คำสั่ง", "ช่วยเหลือ", "เมนู", "menu", "คำสั่งบอท"):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_help(group_id)))
+        return
     # พิมพ์ "groupid" → บอทตอบ Group ID กลับมาในแชท (ไว้ก๊อปไปตั้งค่า RESV_GROUPS/อื่นๆ ได้ง่าย)
     if text.lower().replace(" ", "") == "groupid":
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"🆔 Group ID:\n{group_id}"))
