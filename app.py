@@ -34,8 +34,11 @@ BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
 PAYEE_KEYWORDS    = [k.strip().lower() for k in os.environ.get("PAYEE_KEYWORDS", "").split(",") if k.strip()]
 # จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
 RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
-# รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด
+# รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
 RESV_REPORT_DAYS   = int(os.environ.get("RESV_REPORT_DAYS", "7"))
+# ลบข้อมูลเก่าอัตโนมัติ (วันละครั้ง) กัน DB บวม — จองที่ผ่านวันมาแล้วเกิน N วัน / ตัวนับรูปเก่าเกิน M วัน
+RESV_KEEP_DAYS     = int(os.environ.get("RESV_KEEP_DAYS", "60"))
+MISS_KEEP_DAYS     = int(os.environ.get("MISS_KEEP_DAYS", "45"))
 # เวลาเปิดร้าน (ชั่วโมง) สำหรับตรวจเวลาจอง — เปิด 11:00 ถึง 00:00 (เที่ยงคืน)
 OPEN_HOUR, CLOSE_HOUR = 11, 24
 TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
@@ -178,8 +181,9 @@ def init_db():
                 reminded_at     TEXT
             )
         """)
-        # migration: เพิ่มคอลัมน์ใหม่ให้ตาราง reservations ที่สร้างไว้ก่อนแล้ว (กลุ่มที่ส่งการ์ด + เวลาแจ้งเตือนซ้ำล่าสุด)
-        for _col in ("notify_group_id TEXT", "reminded_at TEXT"):
+        # migration: เพิ่มคอลัมน์ใหม่ให้ตาราง reservations ที่สร้างไว้ก่อนแล้ว
+        # notify_group_id=กลุ่มที่ส่งการ์ด, reminded_at=เวลาเตือนซ้ำล่าสุด, resv_date=วันที่จริงของการจอง (YYYY-MM-DD)
+        for _col in ("notify_group_id TEXT", "reminded_at TEXT", "resv_date TEXT"):
             if USE_PG:
                 conn.execute(f"ALTER TABLE reservations ADD COLUMN IF NOT EXISTS {_col}")
             else:
@@ -509,13 +513,18 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
 
 
 def build_advance_resv_report() -> str:
-    """สรุปจองล่วงหน้า (ที่ส่งเข้ากลุ่มบาร์น้ำ) ที่แจ้งมาภายใน RESV_REPORT_DAYS วันล่าสุด — แยกคอนเฟิร์ม/รอ"""
+    """สรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำ) — แสดงเฉพาะที่ 'ยังไม่ถึงวัน/วันนี้' (resv_date >= วันนี้)
+    จองที่ไม่มีวันที่จริง (resv_date null) ใช้ fallback: แสดงถ้าแจ้งมาภายใน RESV_REPORT_DAYS วัน"""
+    today  = datetime.now(TZ).date().isoformat()
     cutoff = (datetime.now(TZ) - timedelta(days=RESV_REPORT_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
     with _db() as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM reservations WHERE notify_group_id=? AND created_at>=? ORDER BY created_at",
-            (BAR_GROUP_ID, cutoff)).fetchall()]
-    title = f"📅 สรุปจองล่วงหน้า (ล่าสุด {RESV_REPORT_DAYS} วัน)"
+            "SELECT * FROM reservations WHERE notify_group_id=? "
+            "AND ( (resv_date IS NOT NULL AND resv_date >= ?) "
+            "      OR (resv_date IS NULL AND created_at >= ?) ) "
+            "ORDER BY resv_date IS NULL, resv_date, created_at",
+            (BAR_GROUP_ID, today, cutoff)).fetchall()]
+    title = "📅 สรุปจองล่วงหน้า (ที่กำลังจะถึง)"
     if not rows:
         return f"{title}\n─────────────────\nไม่มีรายการจองล่วงหน้า"
     confirmed = [r for r in rows if r.get("status") == "CONFIRMED"]
@@ -531,6 +540,29 @@ def build_advance_resv_report() -> str:
         by   = f" (โดย {r['confirmed_by']})" if r.get("status") == "CONFIRMED" and r.get("confirmed_by") else ""
         lines.append(f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}")
     return "\n".join(lines)
+
+
+def _cleanup_old_data():
+    """ลบข้อมูลเก่าที่ไม่จำเป็น (วันละครั้ง) กัน DB บวม:
+    - จองที่ผ่านวันมาแล้วเกิน RESV_KEEP_DAYS (ใช้ resv_date ถ้ามี ไม่งั้นใช้วันที่แจ้ง)
+    - ตัวนับรูปตกหล่น (image_misses) เก่าเกิน MISS_KEEP_DAYS (ใช้แค่กระทบยอดรายวัน)
+    สลิป (slips) ไม่ลบ — เป็นบันทึกการเงิน เก็บไว้ดูย้อนหลังได้ (ขนาดเล็กมาก)"""
+    today = datetime.now(TZ).date()
+    resv_cutoff = (today - timedelta(days=RESV_KEEP_DAYS)).isoformat()
+    miss_cutoff = (today - timedelta(days=MISS_KEEP_DAYS)).isoformat()
+    try:
+        with _db() as conn:
+            cur = conn.execute(
+                "DELETE FROM reservations WHERE COALESCE(resv_date, substr(created_at,1,10)) < ?",
+                (resv_cutoff,))
+            n_resv = cur.rowcount
+            cur = conn.execute("DELETE FROM image_misses WHERE stat_date < ?", (miss_cutoff,))
+            n_miss = cur.rowcount
+            conn.commit()
+        if n_resv or n_miss:
+            print(f"[cleanup] ลบจองเก่า {n_resv} + ตัวนับรูปเก่า {n_miss}", flush=True)
+    except Exception as e:
+        print(f"[cleanup] error: {e}", flush=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -587,6 +619,7 @@ def maybe_send_daily_report():
         # มาร์คว่า 'ส่งครบแล้ว' เฉพาะเมื่อไม่มีอันไหนล้มเหลว — ถ้ามี fail ปล่อยไว้ให้ ping รอบหน้า retry
         if failed == 0:
             _set_meta("last_report_date", today)
+            _cleanup_old_data()          # ลบข้อมูลเก่าวันละครั้ง กัน DB บวม
             print(f"[report] done {today}", flush=True)
         else:
             print(f"[report] {failed} กลุ่มส่งไม่สำเร็จ — จะ retry รอบ ping ถัดไป (~5 นาที)", flush=True)
@@ -629,20 +662,29 @@ def get_display_name(source) -> str:
         return "ไม่ทราบชื่อ"
 
 
+_TH_WD = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
+
 def extract_reservation(text: str) -> dict:
-    """ให้ Gemini ตัดสินว่าข้อความเป็นการจองโต๊ะหรือไม่ แล้วดึงรายละเอียด"""
+    """ให้ Gemini ตัดสินว่าข้อความเป็นการจองโต๊ะหรือไม่ แล้วดึงรายละเอียด (รวมวันที่จริง resv_date)"""
+    now = datetime.now(TZ)
+    today_str = now.date().isoformat()
+    weekday_th = _TH_WD[now.weekday()]
     prompt = (
+        f"วันนี้คือ วัน{weekday_th} ที่ {today_str} (เวลาไทย)\n"
         "ข้อความต่อไปนี้จากแชทพนักงานร้าน เป็นการ 'จองโต๊ะ' ให้ลูกค้าหรือไม่ "
         "(ไม่ใช่การคุยเล่นที่บังเอิญมีคำว่าจอง/โต๊ะ) ตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
-        '{"is_reservation":true,"is_advance":false,"customer":null,"people":null,"date":null,"datetime":null,'
-        '"time_hhmm":null,"table":null,"note":null}\n\n'
+        '{"is_reservation":true,"is_advance":false,"customer":null,"people":null,"date":null,"resv_date":null,'
+        '"datetime":null,"time_hhmm":null,"table":null,"note":null}\n\n'
         "is_reservation: true เฉพาะเมื่อเป็นการจองโต๊ะจริง (มีเจตนานัด/จองที่นั่งให้ลูกค้า)\n"
         "is_advance: true ถ้าเป็นการจอง 'ล่วงหน้า' (สำหรับวันอื่น/วันข้างหน้า เช่น พรุ่งนี้ เสาร์นี้ วันที่ 25 ฯลฯ), "
         "false ถ้าจองสำหรับ 'วันนี้/คืนนี้/ตอนนี้'\n"
         "customer: ชื่อลูกค้า/ผู้จอง (ถ้ามี)\n"
         "people: จำนวนคน เช่น '4 คน' (ถ้ามี)\n"
-        "date: วันที่จอง เช่น 'วันนี้','พรุ่งนี้','เสาร์นี้','25 มิ.ย.' — ถ้าจองสำหรับวันนี้/คืนนี้ให้ใส่ 'วันนี้'; "
+        "date: วันที่จองแบบอ่านง่าย เช่น 'วันนี้','พรุ่งนี้','เสาร์นี้','25 มิ.ย.' — จองวันนี้/คืนนี้ใส่ 'วันนี้'; "
         "ถ้าเป็นจองล่วงหน้าแต่ไม่ระบุว่าวันไหน ให้เป็น null\n"
+        f"resv_date: วันที่จองเป็นตัวเลข YYYY-MM-DD คำนวณจากวันนี้ ({today_str}) เช่น "
+        "จองวันนี้/คืนนี้=วันนี้, พรุ่งนี้=+1วัน, มะรืน=+2วัน, 'เสาร์นี้/ศุกร์นี้ฯลฯ'=วันนั้นที่จะถึงถัดไป, "
+        "'วันที่ 25'=วันที่ 25 เดือนนี้ (ถ้าผ่านแล้วเป็นเดือนหน้า); ถ้าไม่ระบุวันให้ null\n"
         "datetime: วันและเวลาที่จองแบบอ่านง่าย เช่น 'วันนี้ 20:00', 'เสาร์นี้ 19:00' (ถ้ามี)\n"
         "time_hhmm: เฉพาะ 'เวลา' ในรูปแบบ 24 ชม. 'HH:MM' (เช่น '2 ทุ่ม'→'20:00', 'บ่าย 3'→'15:00', "
         "'หกโมงเย็น'→'18:00', '19.00'→'19:00', '1 ทุ่มครึ่ง'→'19:30') ถ้าไม่ระบุเวลาให้เป็น null\n"
@@ -696,18 +738,29 @@ def _within_open_hours(tmin: int) -> bool:
 def save_reservation(origin_group_id: str, requested_by: str, info: dict, raw_text: str,
                      notify_group_id: str) -> int:
     created_at = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    resv_date = info.get("resv_date") if _valid_ymd(info.get("resv_date")) else None
     with _db() as conn:
         rid = conn.insert_returning_id(
             "INSERT INTO reservations "
             "(origin_group_id, requested_by, customer, people, resv_datetime, table_no, note, raw_text, "
-            "status, created_at, notify_group_id, reminded_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "status, created_at, notify_group_id, reminded_at, resv_date) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (origin_group_id, requested_by, info.get("customer"), info.get("people"),
              info.get("datetime"), info.get("table"), info.get("note"), raw_text,
-             "PENDING", created_at, notify_group_id, created_at)
+             "PENDING", created_at, notify_group_id, created_at, resv_date)
         )
         conn.commit()
         return rid
+
+
+def _valid_ymd(s) -> bool:
+    if not s:
+        return False
+    try:
+        datetime.strptime(str(s), "%Y-%m-%d")
+        return True
+    except Exception:
+        return False
 
 
 def get_reservation(resv_id: int) -> dict:
