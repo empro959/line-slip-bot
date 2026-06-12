@@ -33,6 +33,15 @@ BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
 # คีย์เวิร์ดบัญชีรับเงินของร้าน (ชื่อ ไทย/อังกฤษ + เลขบัญชี/เลขท้าย) คั่นด้วยคอมมา
 # ใช้เทียบ "ปลายทาง" บนสลิป ถ้าไม่ตรงสักคำ = เตือนว่าอาจโอนผิดบัญชี (ตั้งบน Render กัน repo public เห็นเลขบัญชี)
 PAYEE_KEYWORDS    = [k.strip().lower() for k in os.environ.get("PAYEE_KEYWORDS", "").split(",") if k.strip()]
+# แยกบัญชีรับเงิน (ไว้แยกยอดรวมในรายงาน) — รูปแบบ "ป้ายชื่อ:คีย์เวิร์ด,คีย์เวิร์ด;ป้าย2:คีย์A,คีย์B"
+# ตั้งบน Render กัน repo public เห็นเลขบัญชี เช่น "ไส้ย่างซอย4:4818,ไส้ย่าง,บริษัท;พิมนภัทร์&สุวัฒน์:6120,พิมนภัทร,สุวัฒน"
+PAYEE_ACCOUNTS    = []
+for _acc in os.environ.get("PAYEE_ACCOUNTS", "").split(";"):
+    if ":" in _acc:
+        _label, _kws = _acc.split(":", 1)
+        _kwl = [k.strip().lower() for k in _kws.split(",") if k.strip()]
+        if _label.strip() and _kwl:
+            PAYEE_ACCOUNTS.append((_label.strip(), _kwl))
 # จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
 RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
 # รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
@@ -154,6 +163,14 @@ def init_db():
             # migration เฉพาะ SQLite DB เก่าที่ยังไม่มีคอลัมน์ (Postgres สร้างใหม่มีครบแล้ว)
             try:
                 conn.execute("ALTER TABLE slips ADD COLUMN slip_datetime TEXT")
+            except Exception:
+                pass
+        # migration: account_label = บัญชีปลายทางที่จับได้ (ไว้แยกยอดในรายงาน) — ทั้ง PG/SQLite
+        if USE_PG:
+            conn.execute("ALTER TABLE slips ADD COLUMN IF NOT EXISTS account_label TEXT")
+        else:
+            try:
+                conn.execute("ALTER TABLE slips ADD COLUMN account_label TEXT")
             except Exception:
                 pass
         conn.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY)")
@@ -341,6 +358,17 @@ def _payee_matches(info: dict) -> bool:
     return any(k in hay for k in PAYEE_KEYWORDS)
 
 
+def _slip_account_label(info: dict):
+    """จับว่าสลิปโอนเข้าบัญชีไหน (ตาม PAYEE_ACCOUNTS) — คืน label หรือ None ถ้าไม่ตรง/ไม่ได้ตั้งค่า"""
+    if not PAYEE_ACCOUNTS:
+        return None
+    hay = f"{info.get('receiver') or ''} {info.get('receiver_account') or ''} {info.get('bank') or ''}".lower()
+    for label, kws in PAYEE_ACCOUNTS:
+        if any(k in hay for k in kws):
+            return label
+    return None
+
+
 def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None) -> dict:
     issues = []
     fraud_score = info.get("fraud_score", 0)
@@ -433,10 +461,11 @@ def save_slip(group_id: str, info: dict, verdict_status: str):
     recorded_at = datetime.now(TZ).strftime("%H:%M:%S")
     with _db() as conn:
         conn.execute(
-            "INSERT INTO slips (group_id, slip_date, sender, amount, bank, ref_number, slip_datetime, verdict, recorded_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO slips (group_id, slip_date, sender, amount, bank, ref_number, slip_datetime, verdict, recorded_at, account_label) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (group_id, today, info.get("sender"), float(info.get("amount") or 0),
-             info.get("bank"), info.get("ref_number"), info.get("datetime"), verdict_status, recorded_at)
+             info.get("bank"), info.get("ref_number"), info.get("datetime"), verdict_status, recorded_at,
+             _slip_account_label(info))
         )
         conn.execute("INSERT INTO groups (group_id) VALUES (?) ON CONFLICT DO NOTHING", (group_id,))
         conn.commit()
@@ -510,6 +539,19 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
         f"⚠️ น่าสงสัย {warned} รายการ | {warn_amt:,.2f} บาท",
         f"🚨 ปลอม {failed} รายการ | {fail_amt:,.2f} บาท", "",
     ]
+    # แยกยอดตามบัญชีรับเงิน (ไม่รวมสลิปปลอม) — เฉพาะเมื่อตั้ง PAYEE_ACCOUNTS
+    if PAYEE_ACCOUNTS:
+        acct = {}
+        for s in slips:
+            if s.get("verdict") == "FAIL":
+                continue
+            lbl = s.get("account_label") or "ไม่ระบุบัญชี"
+            acct[lbl] = acct.get(lbl, 0.0) + float(s.get("amount") or 0)
+        if acct:
+            lines.append("💳 แยกตามบัญชี (ไม่รวมปลอม):")
+            for lbl, amt in acct.items():
+                lines.append(f"• {lbl}: {amt:,.2f} บาท")
+            lines.append("")
     for i, s in enumerate(slips, 1):
         amt  = f"{float(s.get('amount', 0)):,.2f}" if s.get("amount") else "?"
         icon = icons.get(s.get("verdict", ""), "❓")
@@ -811,6 +853,11 @@ def handle_reservation_text(event, text: str, group_id: str):
         print(f"[resv] กลุ่มไม่อยู่ใน RESV_GROUPS และไม่ใช่จองล่วงหน้า → ข้าม", flush=True)
         return False
 
+    requested_by = get_display_name(event.source)
+    # จองให้ตัวเอง: ไม่มีชื่อลูกค้า แต่ใช้สรรพนามแทนตัว (กู/ผม/ฉัน/เรา/หนู) → ใช้ชื่อคนแจ้งจองเป็นชื่อลูกค้า
+    if not info.get("customer") and any(w in text for w in ("กู", "ผม", "ฉัน", "เรา", "หนู", "ข้า", "ชั้น", "ตัวเอง")):
+        info["customer"] = requested_by
+
     # ── เช็คข้อมูลให้ครบ: 1.ชื่อ 2.จำนวนคน 3.เวลา 4.โซน — ถ้าขาดให้ถามกลับ ยังไม่บันทึก ──
     missing = []
     if not info.get("customer"):  missing.append("1. ชื่อผู้จอง")
@@ -833,7 +880,6 @@ def handle_reservation_text(event, text: str, group_id: str):
     time_warn = "" if _within_open_hours(tmin) else \
         f"\n⚠️ เวลา {info.get('time_hhmm')} อยู่นอกเวลาเปิดร้าน (11:00–00:00) โปรดตรวจสอบ"
 
-    requested_by = get_display_name(event.source)
     # ปลายทาง: จองล่วงหน้า → กลุ่มบาร์น้ำ / จองวันนี้ → กลุ่มเดิม
     dest = BAR_GROUP_ID if (is_advance and BAR_GROUP_ID) else group_id
     resv_id = save_reservation(group_id, requested_by, info, text, dest)
