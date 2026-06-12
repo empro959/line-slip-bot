@@ -42,6 +42,8 @@ for _acc in os.environ.get("PAYEE_ACCOUNTS", "").split(";"):
         _kwl = [k.strip().lower() for k in _kws.split(",") if k.strip()]
         if _label.strip() and _kwl:
             PAYEE_ACCOUNTS.append((_label.strip(), _kwl))
+# อ่านเฉพาะ "รายรับ" (โอนเข้าบัญชีร้าน) — ถ้า =1 จะข้ามสลิปที่ปลายทางไม่ตรงบัญชีร้าน (ร้านจ่ายออก/โอนผิดบัญชี)
+INCOME_ONLY       = os.environ.get("INCOME_ONLY", "0") == "1"
 # จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
 RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
 # รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
@@ -369,6 +371,14 @@ def _slip_account_label(info: dict):
     return None
 
 
+def _is_income(info: dict) -> bool:
+    """สลิปนี้เป็น 'รายรับ' (โอนเข้าบัญชีร้าน) ไหม — ตรง PAYEE_KEYWORDS หรือ PAYEE_ACCOUNTS อย่างใดอย่างหนึ่ง"""
+    hay = f"{info.get('receiver') or ''} {info.get('receiver_account') or ''} {info.get('bank') or ''}".lower()
+    if any(k in hay for k in PAYEE_KEYWORDS):
+        return True
+    return _slip_account_label(info) is not None
+
+
 def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None) -> dict:
     issues = []
     fraud_score = info.get("fraud_score", 0)
@@ -499,21 +509,25 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
         ).fetchall()
     slips = [dict(r) for r in rows]
     miss_counts = {r["reason"]: r["c"] for r in miss_rows}
-    misses   = sum(miss_counts.values())             # รูปที่รับมาแต่ไม่ได้เป็นสลิป
-    received = len(slips) + misses                    # รับรูปทั้งหมด (ไว้กระทบยอดนับมือ)
+    misses    = sum(miss_counts.values())            # รูปที่รับมาแต่ไม่ได้บันทึกเป็นสลิป
+    notincome = miss_counts.get("notincome", 0)      # ข้ามเพราะไม่ใช่รายรับ (ตั้งใจข้าม ไม่ใช่ตกหล่น)
+    lost      = miss_counts.get("notslip", 0) + miss_counts.get("error", 0)  # ตกหล่นจริง
+    received  = len(slips) + misses                  # รับรูปทั้งหมด (ไว้กระทบยอดนับมือ)
 
-    # กระทบยอด: บรรทัดท้ายบอกว่ารับรูปกี่ใบ / อ่านเป็นสลิปได้กี่ใบ / อ่านไม่ออกกี่ใบ
+    # กระทบยอด: รับรูปกี่ใบ / อ่านเป็นสลิป(รายรับ)กี่ใบ / ตกหล่น / ข้ามไม่ใช่รายรับ
     def _recon_lines():
         if misses == 0:
             return []
-        detail = []
-        if miss_counts.get("notslip"):
-            detail.append(f"อ่านไม่ออก/ไม่ใช่สลิป {miss_counts['notslip']}")
-        if miss_counts.get("error"):
-            detail.append(f"ประมวลผลพลาด {miss_counts['error']}")
-        return ["", "─────────────────",
-                f"ℹ️ รับรูป {received} | อ่านเป็นสลิป {len(slips)} | ตกหล่น {misses}",
-                "   (" + ", ".join(detail) + " — ตามดูในกลุ่มว่าใบไหนบอทไม่ตอบ)"]
+        out = ["", "─────────────────",
+               f"ℹ️ รับรูป {received} | บันทึกเป็นรายรับ {len(slips)} | ตกหล่น {lost} | ข้ามไม่ใช่รายรับ {notincome}"]
+        if lost:
+            detail = []
+            if miss_counts.get("notslip"):
+                detail.append(f"อ่านไม่ออก/ไม่ใช่สลิป {miss_counts['notslip']}")
+            if miss_counts.get("error"):
+                detail.append(f"ประมวลผลพลาด {miss_counts['error']}")
+            out.append("   ตกหล่น: " + ", ".join(detail) + " — ตามดูใบที่บอทไม่ตอบ")
+        return out
 
     if not slips:
         if misses:
@@ -1084,6 +1098,12 @@ def _process_image_event(event):
         if not info.get("is_slip", True):
             print(f"[skip] not a slip, group={group_id}", flush=True)
             record_image_miss(group_id, "notslip")
+            return
+
+        # อ่านเฉพาะรายรับ: ปลายทางไม่ตรงบัญชีร้าน (เช่น ร้านจ่ายออก/โอนผิดบัญชี) → ข้าม ไม่ใช่รายรับ
+        if INCOME_ONLY and (PAYEE_KEYWORDS or PAYEE_ACCOUNTS) and not _is_income(info):
+            print(f"[skip] ไม่ใช่รายรับ (ปลายทางไม่ตรงบัญชีร้าน) group={group_id}", flush=True)
+            record_image_miss(group_id, "notincome")
             return
 
         # normalize เลขอ้างอิง (ตัวพิมพ์ใหญ่ + ตัดช่องว่าง) กันอ่านเพี้ยนเล็กน้อยแล้วเทียบไม่ตรง
