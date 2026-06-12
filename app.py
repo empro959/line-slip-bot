@@ -588,15 +588,21 @@ def _resv_line(r: dict) -> str:
     return f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}"
 
 
-def build_resv_summary(notify_group=None, title="📋 สรุปการจอง") -> str:
-    """สรุปการจองที่ 'ยังไม่ถึงวัน/วันนี้' (resv_date >= วันนี้) แยกหัวข้อ วันนี้ / ล่วงหน้า
-    notify_group=None → ทุกการจอง (รวมวันนี้+ล่วงหน้า) / ระบุ group → เฉพาะการจองที่ส่งการ์ดเข้ากลุ่มนั้น
-    จองที่ไม่มีวันที่จริง (resv_date null) ใช้ fallback: แสดงถ้าแจ้งมาภายใน RESV_REPORT_DAYS วัน"""
+def build_resv_summary(notify_group=None, title="📋 สรุปการจองวันนี้", upcoming=False) -> str:
+    """สรุปการจอง
+    upcoming=False (ดีฟอลต์): เฉพาะจอง 'ของวันนี้' (resv_date = วันนี้) — จองล่วงหน้าจะโผล่เฉพาะวันที่ถึง
+    upcoming=True: จองที่กำลังจะถึง (resv_date >= วันนี้) แยกหัวข้อ วันนี้/ล่วงหน้า — ใช้กับ digest ล่วงหน้า
+    notify_group=None → ทุกการจอง / ระบุ group → เฉพาะการจองที่ส่งการ์ดเข้ากลุ่มนั้น"""
     today  = datetime.now(TZ).date().isoformat()
     cutoff = (datetime.now(TZ) - timedelta(days=RESV_REPORT_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-    q = ("SELECT * FROM reservations WHERE "
-         "((resv_date IS NOT NULL AND resv_date >= ?) OR (resv_date IS NULL AND created_at >= ?))")
-    params = [today, cutoff]
+    if upcoming:
+        date_cond = "((resv_date IS NOT NULL AND resv_date >= ?) OR (resv_date IS NULL AND created_at >= ?))"
+        params = [today, cutoff]
+    else:
+        # วันนี้เท่านั้น: resv_date=วันนี้ (จองล่วงหน้าโผล่เฉพาะวันถึง) + จองที่ไม่มีวันชัดแต่แจ้งวันนี้
+        date_cond = "((resv_date = ?) OR (resv_date IS NULL AND substr(created_at,1,10) = ?))"
+        params = [today, today]
+    q = f"SELECT * FROM reservations WHERE {date_cond}"
     if notify_group:
         q += " AND notify_group_id=?"
         params.append(notify_group)
@@ -605,21 +611,24 @@ def build_resv_summary(notify_group=None, title="📋 สรุปการจ�
         rows = [dict(r) for r in conn.execute(q, params).fetchall()]
     if not rows:
         return f"{title}\n─────────────────\nไม่มีการจอง"
-    today_rows = [r for r in rows if r.get("resv_date") == today]
-    later_rows = [r for r in rows if r.get("resv_date") != today]   # ล่วงหน้า + ที่ไม่มีวันชัด
     confirmed = sum(1 for r in rows if r.get("status") == "CONFIRMED")
     lines = [title, "─────────────────",
              f"ทั้งหมด {len(rows)} | ✅ คอนเฟิร์ม {confirmed} | ⏳ รอ {len(rows) - confirmed}"]
-    if today_rows:
-        lines += ["", f"📍 วันนี้ ({len(today_rows)})"] + [_resv_line(r) for r in today_rows]
-    if later_rows:
-        lines += ["", f"📅 ล่วงหน้า ({len(later_rows)})"] + [_resv_line(r) for r in later_rows]
+    if upcoming:
+        today_rows = [r for r in rows if r.get("resv_date") == today]
+        later_rows = [r for r in rows if r.get("resv_date") != today]
+        if today_rows:
+            lines += ["", f"📍 วันนี้ ({len(today_rows)})"] + [_resv_line(r) for r in today_rows]
+        if later_rows:
+            lines += ["", f"📅 ล่วงหน้า ({len(later_rows)})"] + [_resv_line(r) for r in later_rows]
+    else:
+        lines += [""] + [_resv_line(r) for r in rows]
     return "\n".join(lines)
 
 
 def build_advance_resv_report() -> str:
-    """สรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำ) — ใช้ตอนรายงาน 00:30"""
-    return build_resv_summary(BAR_GROUP_ID, "📅 สรุปจองล่วงหน้า (ที่กำลังจะถึง)")
+    """digest จองล่วงหน้าที่กำลังจะถึง (เข้ากลุ่มบาร์น้ำ) — ใช้ตอนรายงาน 00:30"""
+    return build_resv_summary(BAR_GROUP_ID, "📅 จองล่วงหน้าที่กำลังจะถึง", upcoming=True)
 
 
 def _cleanup_old_data():
@@ -719,7 +728,7 @@ def maybe_send_resv_summary():
         if not targets:
             _set_meta("last_resv_summary_date", today)
             return
-        text = build_resv_summary(None, "📋 สรุปการจอง (16:00)")
+        text = build_resv_summary(None, "📋 สรุปการจองวันนี้ (16:00)")
         failed = 0
         for g in targets:
             try:
