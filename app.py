@@ -1253,9 +1253,15 @@ def handle_text(event):
     if text.lower() in ("help", "คำสั่ง", "ช่วยเหลือ", "เมนู", "menu", "คำสั่งบอท"):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_help(group_id)))
         return
-    # พิมพ์ "groupid" → บอทตอบ Group ID กลับมาในแชท (ไว้ก๊อปไปตั้งค่า RESV_GROUPS/อื่นๆ ได้ง่าย)
+    # พิมพ์ "groupid" → บอทตอบ Group ID + บทบาทของกลุ่มนี้ (ไว้เช็ก/ตั้งค่า env)
     if text.lower().replace(" ", "") == "groupid":
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"🆔 Group ID:\n{group_id}"))
+        roles = [
+            "📊 เช็คสลิป/รายงาน: " + ("✅ ใช่" if _slip_enabled(group_id) else "❌ ไม่"),
+            "🔔 รับจองวันนี้: "     + ("✅ ใช่" if (RESV_GROUPS and group_id in RESV_GROUPS) else "❌ ไม่ (ต้องเพิ่มใน RESV_GROUPS)"),
+            "📅 กลุ่มบาร์น้ำ: "      + ("✅ ใช่" if (BAR_GROUP_ID and group_id == BAR_GROUP_ID) else "❌ ไม่"),
+        ]
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"🆔 Group ID:\n{group_id}\n─────────────────\n" + "\n".join(roles)))
         return
     # คำสั่งเกี่ยวกับสลิป (สรุป/ลบ/ล้าง) → เฉพาะกลุ่มที่เปิดเช็คสลิปเท่านั้น
     if _slip_enabled(group_id):
