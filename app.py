@@ -61,9 +61,19 @@ handler      = WebhookHandler(LINE_SECRET)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-def _gemini_generate(contents):
-    """เรียก Gemini (SDK ใหม่ google-genai) — contents เป็น str (ข้อความ) หรือ list [str, รูป]"""
-    return gemini_client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+def _gemini_generate(contents, attempts=4):
+    """เรียก Gemini (SDK google-genai) พร้อม retry + backoff — กัน 503 overload/สะดุดชั่วคราว
+    contents เป็น str (ข้อความ) หรือ list [str, รูป]; รันใน background thread จึงรอ backoff ได้"""
+    last = None
+    for i in range(attempts):
+        try:
+            return gemini_client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+        except Exception as e:
+            last = e
+            if i < attempts - 1:
+                print(f"[gemini] retry {i+1}/{attempts}: {str(e)[:100]}", flush=True)
+                time.sleep(2 * (2 ** i))   # 2, 4, 8 วินาที
+    raise last
 
 # ─── Persistent storage (PostgreSQL ถ้ามี DATABASE_URL ไม่งั้น SQLite) ────────
 # ย้ายมาใช้ Postgres (managed) เพราะ Render persistent disk mount ไม่เสถียร (mount ช้า/ไม่ขึ้น → ข้อมูลหาย)
@@ -278,18 +288,10 @@ def extract_slip_info(image_bytes: bytes) -> dict:
         "fraud_reasons: ระบุเฉพาะร่องรอยที่ 'ตัวเลขจำนวนเงิน' ถูกแก้ พร้อมตำแหน่ง (ห้ามพูดเรื่องโลโก้/แบรนด์) ถ้าไม่เจอให้เป็น []"
     )
     img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-    # ลองใหม่ได้ 1 ครั้ง เผื่อชนลิมิตชั่วคราว (rate limit ต่อนาที)
-    last_err = None
-    for attempt in range(2):
-        try:
-            response = _gemini_generate([prompt, img_part])
-            raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-            return json.loads(raw)
-        except Exception as e:
-            last_err = e
-            if attempt == 0:
-                time.sleep(2)
-    raise last_err
+    # _gemini_generate มี retry+backoff ในตัวแล้ว (กัน 503 overload) — เรียกครั้งเดียวพอ
+    response = _gemini_generate([prompt, img_part])
+    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
