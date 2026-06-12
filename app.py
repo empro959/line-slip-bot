@@ -42,8 +42,10 @@ for _acc in os.environ.get("PAYEE_ACCOUNTS", "").split(";"):
         _kwl = [k.strip().lower() for k in _kws.split(",") if k.strip()]
         if _label.strip() and _kwl:
             PAYEE_ACCOUNTS.append((_label.strip(), _kwl))
-# อ่านเฉพาะ "รายรับ" (โอนเข้าบัญชีร้าน) — ถ้า =1 จะข้ามสลิปที่ปลายทางไม่ตรงบัญชีร้าน (ร้านจ่ายออก/โอนผิดบัญชี)
-INCOME_ONLY       = os.environ.get("INCOME_ONLY", "0") == "1"
+# อ่านเฉพาะ "รายรับ" (โอนเข้าบัญชีร้านที่ระบุใน PAYEE_ACCOUNTS เท่านั้น) — นอกนั้นไม่บันทึก
+# INCOME_ONLY=1 = ทุกกลุ่ม / INCOME_ONLY_GROUPS = เฉพาะกลุ่มที่ระบุ (คั่นคอมมา) เช่นกลุ่ม staff
+INCOME_ONLY        = os.environ.get("INCOME_ONLY", "0") == "1"
+INCOME_ONLY_GROUPS = [g.strip() for g in os.environ.get("INCOME_ONLY_GROUPS", "").split(",") if g.strip()]
 # จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
 RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
 # รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
@@ -576,34 +578,48 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
     return "\n".join(lines)
 
 
-def build_advance_resv_report() -> str:
-    """สรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำ) — แสดงเฉพาะที่ 'ยังไม่ถึงวัน/วันนี้' (resv_date >= วันนี้)
+def _resv_line(r: dict) -> str:
+    icon = "✅" if r.get("status") == "CONFIRMED" else "⏳"
+    cust = r.get("customer") or "?"
+    ppl  = f" {r['people']}" if r.get("people") else ""
+    when = f" | {r['resv_datetime']}" if r.get("resv_datetime") else ""
+    zone = f" | {r['table_no']}" if r.get("table_no") else ""
+    by   = f" (โดย {r['confirmed_by']})" if r.get("status") == "CONFIRMED" and r.get("confirmed_by") else ""
+    return f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}"
+
+
+def build_resv_summary(notify_group=None, title="📋 สรุปการจอง") -> str:
+    """สรุปการจองที่ 'ยังไม่ถึงวัน/วันนี้' (resv_date >= วันนี้) แยกหัวข้อ วันนี้ / ล่วงหน้า
+    notify_group=None → ทุกการจอง (รวมวันนี้+ล่วงหน้า) / ระบุ group → เฉพาะการจองที่ส่งการ์ดเข้ากลุ่มนั้น
     จองที่ไม่มีวันที่จริง (resv_date null) ใช้ fallback: แสดงถ้าแจ้งมาภายใน RESV_REPORT_DAYS วัน"""
     today  = datetime.now(TZ).date().isoformat()
     cutoff = (datetime.now(TZ) - timedelta(days=RESV_REPORT_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    q = ("SELECT * FROM reservations WHERE "
+         "((resv_date IS NOT NULL AND resv_date >= ?) OR (resv_date IS NULL AND created_at >= ?))")
+    params = [today, cutoff]
+    if notify_group:
+        q += " AND notify_group_id=?"
+        params.append(notify_group)
+    q += " ORDER BY resv_date IS NULL, resv_date, created_at"
     with _db() as conn:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM reservations WHERE notify_group_id=? "
-            "AND ( (resv_date IS NOT NULL AND resv_date >= ?) "
-            "      OR (resv_date IS NULL AND created_at >= ?) ) "
-            "ORDER BY resv_date IS NULL, resv_date, created_at",
-            (BAR_GROUP_ID, today, cutoff)).fetchall()]
-    title = "📅 สรุปจองล่วงหน้า (ที่กำลังจะถึง)"
+        rows = [dict(r) for r in conn.execute(q, params).fetchall()]
     if not rows:
-        return f"{title}\n─────────────────\nไม่มีรายการจองล่วงหน้า"
-    confirmed = [r for r in rows if r.get("status") == "CONFIRMED"]
-    pending   = [r for r in rows if r.get("status") != "CONFIRMED"]
+        return f"{title}\n─────────────────\nไม่มีการจอง"
+    today_rows = [r for r in rows if r.get("resv_date") == today]
+    later_rows = [r for r in rows if r.get("resv_date") != today]   # ล่วงหน้า + ที่ไม่มีวันชัด
+    confirmed = sum(1 for r in rows if r.get("status") == "CONFIRMED")
     lines = [title, "─────────────────",
-             f"ทั้งหมด {len(rows)} | ✅ คอนเฟิร์ม {len(confirmed)} | ⏳ รอคอนเฟิร์ม {len(pending)}", ""]
-    for r in rows:
-        icon = "✅" if r.get("status") == "CONFIRMED" else "⏳"
-        cust = r.get("customer") or "?"
-        ppl  = f" {r['people']}" if r.get("people") else ""
-        when = f" | {r['resv_datetime']}" if r.get("resv_datetime") else ""
-        zone = f" | {r['table_no']}" if r.get("table_no") else ""
-        by   = f" (โดย {r['confirmed_by']})" if r.get("status") == "CONFIRMED" and r.get("confirmed_by") else ""
-        lines.append(f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}")
+             f"ทั้งหมด {len(rows)} | ✅ คอนเฟิร์ม {confirmed} | ⏳ รอ {len(rows) - confirmed}"]
+    if today_rows:
+        lines += ["", f"📍 วันนี้ ({len(today_rows)})"] + [_resv_line(r) for r in today_rows]
+    if later_rows:
+        lines += ["", f"📅 ล่วงหน้า ({len(later_rows)})"] + [_resv_line(r) for r in later_rows]
     return "\n".join(lines)
+
+
+def build_advance_resv_report() -> str:
+    """สรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำ) — ใช้ตอนรายงาน 00:30"""
+    return build_resv_summary(BAR_GROUP_ID, "📅 สรุปจองล่วงหน้า (ที่กำลังจะถึง)")
 
 
 def _cleanup_old_data():
@@ -689,11 +705,42 @@ def maybe_send_daily_report():
             print(f"[report] {failed} กลุ่มส่งไม่สำเร็จ — จะ retry รอบ ping ถัดไป (~5 นาที)", flush=True)
 
 
+def maybe_send_resv_summary():
+    """ส่งสรุปการจอง (วันนี้ + ล่วงหน้า) เข้ากลุ่มบาร์น้ำ + กลุ่มรับจอง เวลา 16:00 วันละครั้ง (idempotent)
+    ถ้าไม่มีจองจะส่ง 'ไม่มีการจอง' ตามที่ขอ"""
+    now = datetime.now(TZ)
+    if (now.hour, now.minute) < (16, 0):
+        return
+    today = now.date().isoformat()
+    with _report_lock:
+        if _get_meta("last_resv_summary_date") == today:
+            return
+        targets = list(dict.fromkeys([t for t in ([BAR_GROUP_ID] + list(RESV_GROUPS)) if t]))
+        if not targets:
+            _set_meta("last_resv_summary_date", today)
+            return
+        text = build_resv_summary(None, "📋 สรุปการจอง (16:00)")
+        failed = 0
+        for g in targets:
+            try:
+                line_bot_api.push_message(g, TextSendMessage(text=text))
+                print(f"[resv-summary] sent → {g}", flush=True)
+            except Exception as e:
+                failed += 1
+                print(f"[resv-summary] FAILED {g}: {e}", flush=True)
+        if failed == 0:
+            _set_meta("last_resv_summary_date", today)
+            print(f"[resv-summary] done {today}", flush=True)
+        else:
+            print(f"[resv-summary] {failed} กลุ่มส่งไม่สำเร็จ — retry รอบหน้า", flush=True)
+
+
 def _report_backup_loop():
     """thread สำรอง — เผื่อ UptimeRobot ไม่ ping; เช็คทุก ~5 นาที"""
     while True:
         time.sleep(300)
         try:
+            maybe_send_resv_summary()
             maybe_send_daily_report()
         except Exception as e:
             print(f"[report] backup loop error: {e}", flush=True)
@@ -1104,9 +1151,11 @@ def _process_image_event(event):
             record_image_miss(group_id, "notslip")
             return
 
-        # อ่านเฉพาะรายรับ: ปลายทางไม่ตรงบัญชีร้าน (เช่น ร้านจ่ายออก/โอนผิดบัญชี) → ข้าม ไม่ใช่รายรับ
-        if INCOME_ONLY and (PAYEE_KEYWORDS or PAYEE_ACCOUNTS) and not _is_income(info):
-            print(f"[skip] ไม่ใช่รายรับ (ปลายทางไม่ตรงบัญชีร้าน) group={group_id}", flush=True)
+        # อ่านเฉพาะรายรับ (เฉพาะกลุ่มที่กำหนด): บันทึกเฉพาะสลิปที่โอนเข้า 'บัญชีร้านที่ระบุ' เท่านั้น
+        # บัญชีอื่น (ร้านจ่ายออก/โอนผิดบัญชี/บัญชีที่ไม่ได้ระบุ) → ข้าม ไม่บันทึก
+        income_only = INCOME_ONLY or (group_id in INCOME_ONLY_GROUPS)
+        if income_only and PAYEE_ACCOUNTS and _slip_account_label(info) is None:
+            print(f"[skip] ไม่ใช่รายรับ (ไม่ตรงบัญชีร้านที่ระบุ) group={group_id}", flush=True)
             record_image_miss(group_id, "notincome")
             return
 
@@ -1236,6 +1285,7 @@ def build_help(group_id: str) -> str:
             "• ต้องครบ: ชื่อ / จำนวนคน / วันเวลา / โซน (ขาด=บอทถาม)",
             "• จองล่วงหน้า: ใส่วัน เช่น พรุ่งนี้/เสาร์นี้",
             "• กดปุ่ม ✅ คอนเฟิร์มการจอง บนการ์ด",
+            "• สรุปจอง → ดูรายการจอง (วันนี้+ล่วงหน้า)",
             "",
         ]
     lines += [
@@ -1264,6 +1314,10 @@ def handle_text(event):
         ]
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"🆔 Group ID:\n{group_id}\n─────────────────\n" + "\n".join(roles)))
+        return
+    # สรุปการจอง (วันนี้ + ล่วงหน้า) ของกลุ่มนี้ — ใช้ได้ทุกกลุ่ม
+    if text.lower() in ("สรุปจอง", "สรุปการจอง", "รายการจอง", "จองวันนี้"):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_resv_summary(group_id)))
         return
     # คำสั่งเกี่ยวกับสลิป (สรุป/ลบ/ล้าง) → เฉพาะกลุ่มที่เปิดเช็คสลิปเท่านั้น
     if _slip_enabled(group_id):
@@ -1336,8 +1390,9 @@ def handle_postback(event):
 
 @app.route("/health", methods=["GET"])
 def health():
-    # ทุกครั้งที่ถูก ping (UptimeRobot ทุก 5 นาที) เช็คว่าถึงเวลาส่งรายงานประจำวันไหม
+    # ทุกครั้งที่ถูก ping (UptimeRobot ทุก 5 นาที) เช็คว่าถึงเวลาส่งรายงาน/สรุปจองไหม
     try:
+        maybe_send_resv_summary()
         maybe_send_daily_report()
     except Exception as e:
         print(f"[report] health-trigger error: {e}", flush=True)
