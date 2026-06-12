@@ -715,14 +715,20 @@ def maybe_send_daily_report():
 
 
 def maybe_send_resv_summary():
-    """ส่งสรุปการจอง (วันนี้ + ล่วงหน้า) เข้ากลุ่มบาร์น้ำ + กลุ่มรับจอง เวลา 16:00 วันละครั้ง (idempotent)
-    ถ้าไม่มีจองจะส่ง 'ไม่มีการจอง' ตามที่ขอ"""
+    """ส่งสรุปการจองวันนี้ เข้ากลุ่มบาร์น้ำ + กลุ่มรับจอง ในกรอบ 16:00–18:59 วันละครั้ง (idempotent)
+    ถ้าไม่มีจองจะส่ง 'ไม่มีการจอง' ตามที่ขอ; เลย 19:00 แล้วยังไม่ส่ง = ข้ามวันนี้ (กันส่งดึกไม่มีประโยชน์)"""
     now = datetime.now(TZ)
-    if (now.hour, now.minute) < (16, 0):
+    hm  = (now.hour, now.minute)
+    if hm < (16, 0):
         return
     today = now.date().isoformat()
     with _report_lock:
         if _get_meta("last_resv_summary_date") == today:
+            return
+        if hm >= (19, 0):
+            # เลยกรอบเวลาส่งแล้ว (เช่น บอทเพิ่งตื่น/deploy ดึก) → มาร์คข้ามวันนี้ ไม่ส่งสรุปดึก
+            _set_meta("last_resv_summary_date", today)
+            print("[resv-summary] เลย 19:00 แล้ว ข้ามวันนี้ (พรุ่งนี้ส่ง 16:00)", flush=True)
             return
         targets = list(dict.fromkeys([t for t in ([BAR_GROUP_ID] + list(RESV_GROUPS)) if t]))
         if not targets:
