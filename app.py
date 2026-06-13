@@ -28,6 +28,8 @@ PROMPTPAY_API_KEY = os.environ.get("PROMPTPAY_API_KEY", "")
 SLIP_GROUPS       = [g.strip() for g in os.environ.get("SLIP_GROUPS", "").split(",") if g.strip()]
 # กลุ่มที่ "เปิดรับจองโต๊ะ" (คั่นด้วยคอมมา) — จองวันนี้ การ์ด+ปุ่มขึ้นในกลุ่มนั้น / เว้นว่าง = ปิด
 RESV_GROUPS       = [g.strip() for g in os.environ.get("RESV_GROUPS", "").split(",") if g.strip()]
+# กลุ่มที่ "ปิดการจองโต๊ะ" — ไม่ยุ่งกับการจองเลย (ทั้งจองวันนี้และล่วงหน้า) เช่นกลุ่ม the riches
+RESV_EXCLUDE_GROUPS = [g.strip() for g in os.environ.get("RESV_EXCLUDE_GROUPS", "").split(",") if g.strip()]
 # กลุ่ม "บาร์น้ำ+จองโต๊ะล่วงหน้า" — จองล่วงหน้าจากกลุ่มไหนก็ตามจะส่งการ์ด+ปุ่มมาที่นี่ (ดู id ด้วยคำสั่ง groupid)
 BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
 # คีย์เวิร์ดบัญชีรับเงินของร้าน (ชื่อ ไทย/อังกฤษ + เลขบัญชี/เลขท้าย) คั่นด้วยคอมมา
@@ -909,7 +911,10 @@ def mark_reservation_confirmed(resv_id: int, confirmed_by: str):
 
 def handle_reservation_text(event, text: str, group_id: str):
     """จองวันนี้ → การ์ด+ปุ่มในกลุ่มเดิม (เฉพาะกลุ่มใน RESV_GROUPS)
-    จองล่วงหน้า → ส่งการ์ด+ปุ่มไปกลุ่มบาร์น้ำ (BAR_GROUP_ID) จากกลุ่มไหนก็ได้"""
+    จองล่วงหน้า → ส่งการ์ด+ปุ่มไปกลุ่มบาร์น้ำ (BAR_GROUP_ID) จากกลุ่มไหนก็ได้
+    ยกเว้นกลุ่มใน RESV_EXCLUDE_GROUPS → ไม่ยุ่งกับการจองเลย"""
+    if group_id in RESV_EXCLUDE_GROUPS:
+        return False
     in_resv = bool(RESV_GROUPS) and group_id in RESV_GROUPS
     # ทำงานถ้า: เป็นกลุ่มรับจองวันนี้ หรือ ตั้งบาร์น้ำไว้ (เพื่อรับจองล่วงหน้าจากทุกกลุ่ม)
     if not in_resv and not BAR_GROUP_ID:
@@ -1324,7 +1329,8 @@ def handle_text(event):
     if text.lower().replace(" ", "") == "groupid":
         roles = [
             "📊 เช็คสลิป/รายงาน: " + ("✅ ใช่" if _slip_enabled(group_id) else "❌ ไม่"),
-            "🔔 รับจองวันนี้: "     + ("✅ ใช่" if (RESV_GROUPS and group_id in RESV_GROUPS) else "❌ ไม่ (ต้องเพิ่มใน RESV_GROUPS)"),
+            "🔔 รับจองวันนี้: "     + ("🚫 ปิดจอง (RESV_EXCLUDE_GROUPS)" if group_id in RESV_EXCLUDE_GROUPS
+                                       else ("✅ ใช่" if (RESV_GROUPS and group_id in RESV_GROUPS) else "❌ ไม่ (ต้องเพิ่มใน RESV_GROUPS)")),
             "📅 กลุ่มบาร์น้ำ: "      + ("✅ ใช่" if (BAR_GROUP_ID and group_id == BAR_GROUP_ID) else "❌ ไม่"),
         ]
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
