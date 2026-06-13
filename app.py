@@ -655,6 +655,8 @@ def _cleanup_old_data():
                 (resv_cutoff,)).rowcount
             n_miss = conn.execute("DELETE FROM image_misses WHERE stat_date < ?", (miss_cutoff,)).rowcount
             n_slip = conn.execute("DELETE FROM slips WHERE slip_date < ?", (slip_cutoff,)).rowcount
+            # ตัวจำ 'ส่งรายงานรายกลุ่มแล้ว' (sent:job:date:target) เก็บแค่ของวันนี้พอ — ของเก่าทิ้งกัน meta บวม
+            conn.execute("DELETE FROM meta WHERE key LIKE 'sent:%' AND key NOT LIKE ?", (f"sent:%:{today.isoformat()}:%",))
             conn.commit()
         if n_resv or n_miss or n_slip:
             print(f"[cleanup] ลบจองเก่า {n_resv} + ตัวนับรูปเก่า {n_miss} + สลิปเก่า {n_slip}", flush=True)
@@ -680,6 +682,14 @@ def _set_meta(key: str, value: str):
         conn.commit()
 
 
+def _already_sent(job: str, date: str, target: str) -> bool:
+    """ส่ง job นี้ให้ target นี้ในวันนี้ไปแล้วหรือยัง (กันส่งซ้ำ 'รายกลุ่ม')"""
+    return _get_meta(f"sent:{job}:{date}:{target}") == "1"
+
+def _mark_sent(job: str, date: str, target: str):
+    _set_meta(f"sent:{job}:{date}:{target}", "1")
+
+
 def maybe_send_daily_report():
     """ส่งรายงานสรุป 'ของเมื่อวาน' เมื่อเลย 00:30 เวลาไทย วันละครั้ง
     เรียกได้บ่อย (จากทุก /health ping + thread สำรอง) — กันส่งซ้ำด้วย last_report_date + lock จึงทนรีสตาร์ท/หลาย thread
@@ -698,17 +708,22 @@ def maybe_send_daily_report():
         targets = [g for g in group_ids if (not SLIP_GROUPS) or g in SLIP_GROUPS]
         print(f"[report] trigger {today} → ส่งรายงานวันที่ {yesterday} ให้ {len(targets)} กลุ่ม", flush=True)
         failed = 0
+        # idempotent รายกลุ่ม: กลุ่มที่ส่งสำเร็จแล้ววันนี้จะไม่ส่งซ้ำ แม้กลุ่มอื่นพลาดแล้วต้อง retry
         for group_id in targets:
+            if _already_sent("report", today, group_id):
+                continue
             try:
                 line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
+                _mark_sent("report", today, group_id)
                 print(f"[report] sent OK → {group_id}", flush=True)
             except Exception as e:
                 failed += 1
                 print(f"[report] push FAILED {group_id}: {e}", flush=True)
         # สรุปจองล่วงหน้า → กลุ่มบาร์น้ำ (วันละครั้งพร้อมรายงานสลิป)
-        if BAR_GROUP_ID:
+        if BAR_GROUP_ID and not _already_sent("advance_resv", today, BAR_GROUP_ID):
             try:
                 line_bot_api.push_message(BAR_GROUP_ID, TextSendMessage(text=build_advance_resv_report()))
+                _mark_sent("advance_resv", today, BAR_GROUP_ID)
                 print(f"[report] sent advance-resv → {BAR_GROUP_ID}", flush=True)
             except Exception as e:
                 failed += 1
@@ -744,9 +759,13 @@ def maybe_send_resv_summary():
             return
         text = build_resv_summary(None, "📋 สรุปการจองวันนี้ (16:00)")
         failed = 0
+        # idempotent รายกลุ่ม: กลุ่มที่ส่งสำเร็จแล้ววันนี้จะไม่ส่งซ้ำ แม้กลุ่มอื่นพลาดแล้วต้อง retry
         for g in targets:
+            if _already_sent("resv_summary", today, g):
+                continue
             try:
                 line_bot_api.push_message(g, TextSendMessage(text=text))
+                _mark_sent("resv_summary", today, g)
                 print(f"[resv-summary] sent → {g}", flush=True)
             except Exception as e:
                 failed += 1
