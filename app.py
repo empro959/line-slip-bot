@@ -261,8 +261,10 @@ def extract_slip_info(image_bytes: bytes) -> dict:
         "ให้ใช้ยอดบรรทัด 'ค่าสินค้า/บริการ' (ยอดเต็มที่ร้านได้รับ) เท่านั้น "
         "ห้ามใช้ 'จำนวนเงินที่ชำระ' (ส่วนที่ลูกค้าจ่ายเอง มักติดลบ) หรือ 'จดบันทึก' (ส่วนที่รัฐช่วย)\n"
 
+        "sender: ชื่อบัญชี 'ผู้โอน/ต้นทาง' (ฝั่ง 'จาก') ตามที่เห็นในสลิป\n"
         "receiver: ชื่อบัญชี 'ปลายทาง/ผู้รับเงิน' (ฝั่ง 'ไปยัง') ตามที่เห็นในสลิป (ถ้ามีข้อมูลเพิ่มในวงเล็บก็ใส่ด้วย)\n"
         "receiver_account: เลขบัญชีปลายทาง/ผู้รับ (ตามที่เห็น แม้ถูกปิดบางส่วน เช่น xxx-x-x4818-x ก็ใส่)\n"
+        "bank: ธนาคาร 'ปลายทาง/ผู้รับเงิน' (ฝั่ง 'ไปยัง') เท่านั้น — ⚠️ ห้ามใส่ธนาคารของผู้โอน/ต้นทาง\n"
         "cropped: true ถ้าสลิปถูกตัด/ครอป หรือมีบางส่วนถูกบัง/นิ้วบัง จนข้อมูลสำคัญ (ปลายทาง/ยอดเงิน/เลขอ้างอิง) มองไม่เห็นครบ\n\n"
         "datetime: ดึงวันเวลาจากสลิป แปลงเป็น ค.ศ. รูปแบบ ISO YYYY-MM-DDTHH:MM:SS เสมอ "
         "(สลิปไทยใช้ พ.ศ. เช่น 2569 = ค.ศ. 2026 ให้ลบ 543)\n"
@@ -436,14 +438,18 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None) 
     amount_str = f"{float(info.get('amount', 0)):,.2f}" if info.get("amount") else "?"
     sender = info.get("sender") or "?"
     dt     = info.get("datetime") or "?"
-    bank   = info.get("bank") or "?"
+    bank   = info.get("bank") or ""
+    receiver = info.get("receiver") or ""
     ref    = info.get("ref_number") or "-"
+
+    # ปลายทาง = ชื่อผู้รับ + ธนาคารผู้รับ (อย่างใดอย่างหนึ่งหรือทั้งคู่ ถ้าไม่มีเลย = ?)
+    dest = " / ".join(p for p in (receiver, bank) if p) or "?"
 
     base_info = (
         f"👤 ผู้โอน: {sender}\n"
         f"💰 จำนวน: {amount_str} บาท\n"
         f"📅 วันเวลา: {dt}\n"
-        f"🏦 ปลายทาง: {bank}\n"
+        f"🏦 ปลายทาง: {dest}\n"
         f"🔖 อ้างอิง: {ref}"
     )
 
