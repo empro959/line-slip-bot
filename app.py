@@ -1317,9 +1317,46 @@ def build_help(group_id: str) -> str:
     lines += [
         "🛠️ ทั่วไป",
         "• groupid → ดู Group ID ของกลุ่ม",
+        "• คู่มือ → วิธีใช้แบบละเอียด",
         "• help / คำสั่ง → เมนูนี้",
     ]
     return "\n".join(lines)
+
+
+def build_manual(group_id: str) -> str:
+    """คู่มือใช้งานแบบย่อ (พิมพ์ 'คู่มือ') — แสดงเฉพาะหมวดที่กลุ่มนั้นใช้ได้"""
+    slip_on = _slip_enabled(group_id)
+    resv_on = (RESV_GROUPS and group_id in RESV_GROUPS) and group_id not in RESV_EXCLUDE_GROUPS
+    blocks = ["📖 คู่มือใช้งานบอทเอด"]
+    if slip_on:
+        blocks.append(
+            "\n📊 ตรวจสลิป\n"
+            "• ส่งรูปสลิปในกลุ่ม → บอทตรวจให้อัตโนมัติ\n"
+            "• ✅ ผ่าน = เงียบ (ปกติ)\n"
+            "• ⚠️ น่าสังเกต / 🚨 ต้องสงสัย = บอทเตือน อย่าเพิ่งรับเงินจนกว่าจะตรวจ\n"
+            "คำสั่ง:\n"
+            "• สรุป → รายงานสลิปวันนี้\n"
+            "• สรุป 2026-06-09 → รายงานย้อนหลัง (ปี-เดือน-วัน)\n"
+            "• รายงานเมื่อวาน → ส่งรายงานเมื่อวานอีกครั้ง\n"
+            "• ลบล่าสุด / ลบ 3 → ลบสลิป (เลขดูจาก 'สรุป')\n"
+            "• ล้างวันนี้ → ล้างสลิปวันนี้ทั้งหมด (มีปุ่มยืนยัน)\n"
+            "⏰ บอทส่งสรุปสลิปเมื่อวานให้เองทุก 00:30"
+        )
+    if resv_on:
+        blocks.append(
+            "\n🔔 จองโต๊ะ\n"
+            "พิมพ์จองตามปกติ เช่น\n"
+            "  จองโต๊ะคุณเอ 4คน วันนี้ 2ทุ่ม โซนA\n"
+            "• ต้องครบ: ชื่อ / จำนวนคน / วันเวลา / โซน (ขาด=บอทถาม)\n"
+            "• จองล่วงหน้า ใส่วัน เช่น พรุ่งนี้ / เสาร์นี้\n"
+            "• กดปุ่ม ✅ คอนเฟิร์มการจอง บนการ์ดเมื่อรับจองแล้ว\n"
+            "• ยังไม่กดคอนเฟิร์ม บอทจะย้ำเตือนซ้ำจนกว่าจะกด\n"
+            "คำสั่ง:\n"
+            "• สรุปจอง → ดูรายการจอง (วันนี้ + ล่วงหน้า)\n"
+            "⏰ บอทส่งสรุปจองวันนี้ให้เองทุก 16:00"
+        )
+    blocks.append("\nℹ️ help → เมนูคำสั่ง | groupid → ดูข้อมูลกลุ่ม")
+    return "\n".join(blocks)
 
 
 @handler.add(MessageEvent, message=TextMessage)
@@ -1330,6 +1367,10 @@ def handle_text(event):
     # เมนูคำสั่ง
     if text.lower() in ("help", "คำสั่ง", "ช่วยเหลือ", "เมนู", "menu", "คำสั่งบอท"):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_help(group_id)))
+        return
+    # คู่มือใช้งานแบบย่อ
+    if text.lower() in ("คู่มือ", "วิธีใช้", "manual", "คู่มือการใช้งาน"):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_manual(group_id)))
         return
     # พิมพ์ "groupid" → บอทตอบ Group ID + บทบาทของกลุ่มนี้ (ไว้เช็ก/ตั้งค่า env)
     if text.lower().replace(" ", "") == "groupid":
