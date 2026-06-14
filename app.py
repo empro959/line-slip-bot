@@ -728,13 +728,49 @@ def _payable_outstanding(group_id: str) -> float:
             + _payable_sum("payable_bills", group_id)
             - _payable_sum("payable_payments", group_id))
 
-def save_payable_bill(group_id: str, amount: float, note: str = None) -> int:
-    today = datetime.now(TZ).date().isoformat()
+def _parse_thai_date(token: str):
+    """แปลง 'd/m', 'd/m/yy', 'd/m/yyyy' → ISO 'YYYY-MM-DD' (คืน None ถ้าผิดรูป)
+    - ไม่ใส่ปี → ใช้ปีปัจจุบัน (ถ้าวันที่กลายเป็นอนาคต ถอยไปปีก่อน — กันเคสข้ามปี)
+    - ปี 2 หลัก หรือ ≥2400 → ถือเป็น พ.ศ. แปลงเป็น ค.ศ. ให้อัตโนมัติ"""
+    parts = [p.strip() for p in token.strip().split("/")]
+    if len(parts) < 2 or len(parts) > 3:
+        return None
+    try:
+        day, month = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    today = datetime.now(TZ).date()
+    has_year = len(parts) == 3 and parts[2] != ""
+    if has_year:
+        try:
+            year = int(parts[2])
+        except ValueError:
+            return None
+        if year < 100:        # เลข 2 หลัก → พ.ศ. ย่อ 25xx
+            year = 2500 + year - 543
+        elif year >= 2400:    # พ.ศ. เต็ม
+            year = year - 543
+        # ไม่งั้นถือเป็น ค.ศ. เต็มอยู่แล้ว
+    else:
+        year = today.year
+    try:
+        d = date(year, month, day)
+    except ValueError:
+        return None
+    if not has_year and d > today:    # ไม่ระบุปีแต่ดันเป็นอนาคต → ปีก่อน
+        try:
+            d = date(year - 1, month, day)
+        except ValueError:
+            return None
+    return d.isoformat()
+
+def save_payable_bill(group_id: str, amount: float, note: str = None, doc_date: str = None) -> int:
+    doc_date = doc_date or datetime.now(TZ).date().isoformat()
     now   = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     with _db() as conn:
         rid = conn.insert_returning_id(
             "INSERT INTO payable_bills (group_id, doc_date, amount, note, recorded_at) VALUES (?,?,?,?,?)",
-            (group_id, today, float(amount), note, now))
+            (group_id, doc_date, float(amount), note, now))
         conn.execute("INSERT INTO groups (group_id) VALUES (?) ON CONFLICT DO NOTHING", (group_id,))
         conn.commit()
     return rid
@@ -861,16 +897,31 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                  f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(group_id):,.2f} บาท"))
         return True
 
-    # บันทึกบิลด้วยข้อความ (เผื่อไม่มีรูป) เช่น "บิล 3500"
+    # บันทึกบิลด้วยข้อความ (เผื่อไม่มีรูป) เช่น "บิล 3500" หรือย้อนวันที่ "บิล 6/6 24153"
     if low.startswith("บิล"):
-        arg = text[3:].strip().replace(",", "").replace("บาท", "").strip()
+        rest = text[3:].strip()
+        if not rest:
+            return False
+        toks = rest.split()
+        doc_date = None
+        if toks and "/" in toks[0]:                    # โทเคนแรกเป็นวันที่ → ลงย้อนหลัง
+            doc_date = _parse_thai_date(toks[0])
+            if doc_date is None:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text="❌ วันที่ไม่ถูก เช่น: บิล 6/6 24153 (วัน/เดือน ยอด)"))
+                return True
+            amount_str = " ".join(toks[1:])
+        else:
+            amount_str = rest
+        amount_str = amount_str.replace(",", "").replace("บาท", "").strip()
         try:
-            val = float(arg)
+            val = float(amount_str)
         except ValueError:
             return False
-        rid = save_payable_bill(group_id, val)
+        rid = save_payable_bill(group_id, val, doc_date=doc_date)
+        date_note = f"\n📅 ลงวันที่ {doc_date}" if doc_date else ""
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text=f"📥 บันทึกบิลซื้อ #{rid}\nยอด {val:,.2f} บาท\n─────────────────\n"
+            text=f"📥 บันทึกบิลซื้อ #{rid}\nยอด {val:,.2f} บาท{date_note}\n─────────────────\n"
                  f"💰 ค้างจ่ายสะสม: {_payable_outstanding(group_id):,.2f} บาท"))
         return True
 
@@ -1708,6 +1759,7 @@ def build_help(group_id: str) -> str:
             "• ส่งรูปบิลซื้อ → บอทอ่านยอด เพิ่มหนี้ให้",
             "• ส่งรูปสลิปโอนจ่าย → บอทอ่านยอด ลดหนี้ให้",
             "• บิล 3500 → บันทึกบิลด้วยตัวเลข (กรณีไม่มีรูป)",
+            "• บิล 6/6 24153 → ลงบิลย้อนวันที่ (วัน/เดือน ยอด)",
             "• ตั้งยอดยกมา 12000 → ตั้งยอดค้างเก่า (ครั้งเดียวตอนเริ่ม)",
             "• สรุปหนี้ → ดูยอดค้างวันนี้",
             "• สรุปหนี้ 2026-06-09 → ดูย้อนหลัง (ตามวันที่)",
@@ -1759,7 +1811,8 @@ def build_manual(group_id: str) -> str:
             "• ส่งรูป 'สลิปโอนจ่าย' → บอทอ่านยอด แล้ว 'ลดหนี้' (กันสลิปซ้ำด้วยเลขอ้างอิง)\n"
             "• บอทตอบยอดค้างสะสมล่าสุดให้ทุกครั้ง\n\n"
             "🚀 เริ่มใช้ครั้งแรก\n"
-            "• พิมพ์ 'ตั้งยอดยกมา 12000' ใส่ยอดค้างเก่าที่มีอยู่ (ตั้งครั้งเดียว)\n\n"
+            "• พิมพ์ 'ตั้งยอดยกมา 12000' ใส่ยอดค้างเก่าก้อนเดียว (ตั้งครั้งเดียว)\n"
+            "• หรือลงบิลเก่าทีละใบตามวันที่จริง: 'บิล 6/6 24153'\n\n"
             "📊 ดูยอด\n"
             "• สรุปหนี้ → ยอดค้างวันนี้ (ยกเข้า + บิล − จ่าย = ค้างสะสม)\n"
             "• สรุปหนี้ 2026-06-09 → ดูย้อนหลังตามวันที่\n\n"
