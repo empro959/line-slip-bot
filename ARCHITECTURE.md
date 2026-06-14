@@ -53,6 +53,7 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 - `SLIP_GROUPS`, `RESV_GROUPS`, `RESV_EXCLUDE_GROUPS`, `BAR_GROUP_ID`, `PAYEE_KEYWORDS`
 - `IGNORE_GROUPS` — กลุ่มที่ "บอทเมินทั้งหมด" (ไม่เช็คสลิป/ไม่จอง/ไม่ตอบคำสั่ง/ไม่ส่งรายงาน-เตือน) ใช้กับกลุ่มที่เลิกใช้
 - `PAYABLE_GROUPS` — กลุ่มบัญชีเจ้าหนี้ (เช่น กลุ่มดวงใจ); `PAYABLE_VENDOR` (ดีฟอลต์ "ดวงใจการสุรา"); `PAYABLE_SUMMARY_HOUR` (ดีฟอลต์ 1 = ตี1)
+- `REPORT_REDIRECT` — ส่งรายงานของกลุ่มต้นทางไปเข้ากลุ่มปลายทางแทน (เนื้อหายังเป็นของต้นทาง) ครอบทุกรายงาน (สลิป/จอง/หนี้); รูปแบบ `ต้นทาง:ปลายทาง,ต้นทาง2:ปลายทาง2`
 - `RESV_NAG_MAX_HOURS`(6), `RESV_REPORT_DAYS`(7), `RESV_KEEP_DAYS`(15), `MISS_KEEP_DAYS`(14), `SLIP_KEEP_DAYS`(60), `SLIP_WORKERS`(2)
 - `PROMPTPAY_API_KEY` (SlipOK — ยังไม่เปิด; เปิดได้เพื่อตรวจกับธนาคารจริง 100%)
 

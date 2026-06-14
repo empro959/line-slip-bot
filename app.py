@@ -40,6 +40,15 @@ PAYABLE_VENDOR    = os.environ.get("PAYABLE_VENDOR", "ดวงใจการ�
 PAYABLE_SUMMARY_HOUR = int(os.environ.get("PAYABLE_SUMMARY_HOUR", "1"))  # ส่งสรุปหนี้รายวันหลังกี่โมง (ดีฟอลต์ ตี1)
 # กลุ่ม "บาร์น้ำ+จองโต๊ะล่วงหน้า" — จองล่วงหน้าจากกลุ่มไหนก็ตามจะส่งการ์ด+ปุ่มมาที่นี่ (ดู id ด้วยคำสั่ง groupid)
 BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
+# redirect รายงาน: ส่งรายงานของ "กลุ่มต้นทาง" ไปเข้า "กลุ่มปลายทาง" แทน (เนื้อห้ารายงานยังเป็นของต้นทาง)
+# รูปแบบ "ต้นทาง:ปลายทาง,ต้นทาง2:ปลายทาง2" — ครอบทุกรายงาน (สลิป/จอง/หนี้). ตั้งบน Render กัน repo public เห็น group id
+REPORT_REDIRECT   = {}
+for _pair in os.environ.get("REPORT_REDIRECT", "").split(","):
+    _pair = _pair.strip()
+    if ":" in _pair:
+        _src, _dst = (x.strip() for x in _pair.split(":", 1))
+        if _src and _dst:
+            REPORT_REDIRECT[_src] = _dst
 # คีย์เวิร์ดบัญชีรับเงินของร้าน (ชื่อ ไทย/อังกฤษ + เลขบัญชี/เลขท้าย) คั่นด้วยคอมมา
 # ใช้เทียบ "ปลายทาง" บนสลิป ถ้าไม่ตรงสักคำ = เตือนว่าอาจโอนผิดบัญชี (ตั้งบน Render กัน repo public เห็นเลขบัญชี)
 PAYEE_KEYWORDS    = [k.strip().lower() for k in os.environ.get("PAYEE_KEYWORDS", "").split(",") if k.strip()]
@@ -1081,6 +1090,11 @@ def _is_not_member_error(e: Exception) -> bool:
     return isinstance(e, LineBotApiError) and getattr(e, "status_code", None) == 400
 
 
+def _report_dest(group_id: str) -> str:
+    """ปลายทางจริงของรายงานกลุ่มนี้ — ถ้าตั้ง REPORT_REDIRECT ไว้ ให้ส่งไปกลุ่มปลายทางแทนกลุ่มต้นทาง"""
+    return REPORT_REDIRECT.get(group_id, group_id)
+
+
 def maybe_send_daily_report():
     """ส่งรายงานสรุป 'ของเมื่อวาน' เมื่อเลย 00:30 เวลาไทย วันละครั้ง
     เรียกได้บ่อย (จากทุก /health ping + thread สำรอง) — กันส่งซ้ำด้วย last_report_date + lock จึงทนรีสตาร์ท/หลาย thread
@@ -1106,16 +1120,19 @@ def maybe_send_daily_report():
         for group_id in targets:
             if _already_sent("report", today, group_id):
                 continue
+            dest = _report_dest(group_id)   # อาจ redirect ไปกลุ่มอื่น (เนื้อหายังเป็นของ group_id)
+            if _group_left(dest) or dest in IGNORE_GROUPS:
+                continue
             try:
-                line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
+                line_bot_api.push_message(dest, TextSendMessage(text=build_daily_report(group_id, yesterday)))
                 _mark_sent("report", today, group_id)
-                print(f"[report] sent OK → {group_id}", flush=True)
+                print(f"[report] sent OK → {dest}" + (f" (redirect จาก {group_id})" if dest != group_id else ""), flush=True)
             except Exception as e:
                 if _is_not_member_error(e):
-                    _mark_group_left(group_id)   # บอทไม่ได้อยู่ในกลุ่มแล้ว → เลิก retry (ไม่นับเป็น fail)
+                    _mark_group_left(dest)   # บอทไม่ได้อยู่ในกลุ่มปลายทางแล้ว → เลิก retry (ไม่นับเป็น fail)
                 else:
                     failed += 1
-                print(f"[report] push FAILED {group_id}: {e}", flush=True)
+                print(f"[report] push FAILED {dest}: {e}", flush=True)
         # สรุปจองล่วงหน้า → กลุ่มบาร์น้ำ (วันละครั้งพร้อมรายงานสลิป)
         if BAR_GROUP_ID and not _group_left(BAR_GROUP_ID) and not _already_sent("advance_resv", today, BAR_GROUP_ID):
             try:
@@ -1166,16 +1183,19 @@ def maybe_send_resv_summary():
         for g in targets:
             if _already_sent("resv_summary", today, g):
                 continue
+            dest = _report_dest(g)
+            if _group_left(dest) or dest in IGNORE_GROUPS:
+                continue
             try:
-                line_bot_api.push_message(g, TextSendMessage(text=text))
+                line_bot_api.push_message(dest, TextSendMessage(text=text))
                 _mark_sent("resv_summary", today, g)
-                print(f"[resv-summary] sent → {g}", flush=True)
+                print(f"[resv-summary] sent → {dest}" + (f" (redirect จาก {g})" if dest != g else ""), flush=True)
             except Exception as e:
                 if _is_not_member_error(e):
-                    _mark_group_left(g)
+                    _mark_group_left(dest)
                 else:
                     failed += 1
-                print(f"[resv-summary] FAILED {g}: {e}", flush=True)
+                print(f"[resv-summary] FAILED {dest}: {e}", flush=True)
         if failed == 0:
             _set_meta("last_resv_summary_date", today)
             print(f"[resv-summary] done {today}", flush=True)
@@ -1201,16 +1221,19 @@ def maybe_send_payable_summary():
         for g in targets:
             if _already_sent("payable_summary", today, g):
                 continue
+            dest = _report_dest(g)
+            if _group_left(dest) or dest in IGNORE_GROUPS:
+                continue
             try:
-                line_bot_api.push_message(g, TextSendMessage(text=build_payable_summary(g, yesterday)))
+                line_bot_api.push_message(dest, TextSendMessage(text=build_payable_summary(g, yesterday)))
                 _mark_sent("payable_summary", today, g)
-                print(f"[payable-summary] sent → {g}", flush=True)
+                print(f"[payable-summary] sent → {dest}" + (f" (redirect จาก {g})" if dest != g else ""), flush=True)
             except Exception as e:
                 if _is_not_member_error(e):
-                    _mark_group_left(g)
+                    _mark_group_left(dest)
                 else:
                     failed += 1
-                print(f"[payable-summary] FAILED {g}: {e}", flush=True)
+                print(f"[payable-summary] FAILED {dest}: {e}", flush=True)
         if failed == 0:
             _set_meta("last_payable_summary_date", today)
             print(f"[payable-summary] done {today}", flush=True)
@@ -1975,6 +1998,10 @@ def handle_text(event):
             "📅 กลุ่มบาร์น้ำ: "      + ("✅ ใช่" if (BAR_GROUP_ID and group_id == BAR_GROUP_ID) else "❌ ไม่"),
             f"💰 บัญชีหนี้ {PAYABLE_VENDOR}: " + ("✅ ใช่" if group_id in PAYABLE_GROUPS else "❌ ไม่ (ต้องเพิ่มใน PAYABLE_GROUPS)"),
         ]
+        if group_id in REPORT_REDIRECT:
+            roles.append(f"📤 รายงานส่งต่อไปกลุ่ม: {REPORT_REDIRECT[group_id]}")
+        if group_id in REPORT_REDIRECT.values():
+            roles.append("📥 กลุ่มนี้เป็นปลายทางรับรายงานจากกลุ่มอื่น")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"🆔 Group ID:\n{group_id}\n─────────────────\n" + "\n".join(roles)))
         return
