@@ -2,9 +2,10 @@
 
 LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M)** — Flask ไฟล์เดียว (`app.py`) รันด้วย gunicorn บน Render, เก็บข้อมูลใน PostgreSQL
 
-## ภาพรวม 2 ระบบ
+## ภาพรวม 3 ระบบ
 - **A. ตรวจสลิป** — อ่านสลิปโอนเงินด้วย Gemini AI, จับปลอม/ซ้ำ/โอนผิดบัญชี/ครอป, รายงานสรุป 00:30
 - **B. จองโต๊ะ** — AI จับข้อความจอง → การ์ดปุ่มคอนเฟิร์ม, จองล่วงหน้าส่งกลุ่มบาร์น้ำ, เตือนซ้ำจนคอนเฟิร์ม, รายงานจองล่วงหน้า 00:30
+- **C. บัญชีเจ้าหนี้การค้า (ดวงใจการสุรา)** — ในกลุ่ม `PAYABLE_GROUPS` เท่านั้น: AI แยกรูป "บิลซื้อ"(+หนี้)/"สลิปโอนจ่าย"(−หนี้), ตั้งยอดค้างยกมาครั้งเดียว, สรุปยอดค้างรายวันอัตโนมัติ ตี1 (01:00). กลุ่มนี้ **ไม่** ทำระบบ A/B (route แยกตั้งแต่ image/text handler)
 
 ## Stack
 - **Web:** Flask + gunicorn (`gunicorn.conf.py`: 1 worker / 8 threads / timeout 120) — Render รัน `gunicorn app:app` (ต้องมี `gunicorn.conf.py` เพราะไม่อ่าน Procfile)
@@ -24,11 +25,16 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 - **image_misses** — รูปที่รับแต่ไม่เป็นสลิป (กระทบยอด "รับรูป/อ่านได้/ตกหล่น")
 - **reservations** — การจอง (customer, people, resv_datetime, table_no, resv_date[YYYY-MM-DD], status, notify_group_id, reminded_at, confirmed_by/at)
 - **groups** — group_id ที่บอทเคยเจอ (ไว้ส่งรายงาน)
-- **meta** — key/value: `last_report_date`/`last_resv_summary_date` (กันส่งซ้ำรายวัน), `sent:{job}:{date}:{group}` (กันส่งซ้ำ "รายกลุ่ม" เผื่อบางกลุ่มพลาดต้อง retry — ล้างของเก่าใน cleanup), `left:{group}` (กลุ่มที่บอทถูกเตะออก = เลิกส่ง กันค้าง retry/สแปม)
+- **payable_bills** — บิลซื้อจากเจ้าหนี้ (group_id, doc_date[YYYY-MM-DD = วันที่บันทึก], amount, note, recorded_at) → เพิ่มหนี้
+- **payable_payments** — เงินที่จ่ายเจ้าหนี้ (group_id, doc_date, amount, sender, ref_number, slip_datetime, recorded_at) → ลดหนี้ (กันซ้ำด้วย ref_number)
+- ⚠️ **ห้าม cleanup ตาราง payable_\*** — เป็นบัญชีเดินสะสม ลบแถวเก่า = ยอดค้างเพี้ยน
+- **meta** — key/value: `last_report_date`/`last_resv_summary_date`/`last_payable_summary_date` (กันส่งซ้ำรายวัน), `payable_opening:{group}` (ยอดค้างยกมา ตั้งครั้งเดียว), `sent:{job}:{date}:{group}` (กันส่งซ้ำ "รายกลุ่ม" เผื่อบางกลุ่มพลาดต้อง retry — ล้างของเก่าใน cleanup), `left:{group}` (กลุ่มที่บอทถูกเตะออก = เลิกส่ง กันค้าง retry/สแปม)
+- **สูตรยอดค้าง:** `ค้างสะสม = payable_opening + Σ bills − Σ payments`; สรุปรายวัน = `ยกเข้า(ก่อนวันนั้น) + บิลวันนั้น − จ่ายวันนั้น = ค้างสิ้นวัน`
 
 ## งานเบื้องหลัง (daemon threads)
 - `_report_backup_loop` — เรียก `maybe_send_daily_report()` ทุก 5 นาที (สำรองจาก /health ping)
 - `maybe_send_daily_report` — หลัง 00:30 วันละครั้ง (idempotent ด้วย meta.last_report_date): รายงานสลิป→SLIP_GROUPS, รายงานจองล่วงหน้า→BAR_GROUP, แล้ว `_cleanup_old_data()`
+- `maybe_send_payable_summary` — หลัง `PAYABLE_SUMMARY_HOUR` (ดีฟอลต์ ตี1) วันละครั้ง (idempotent ด้วย meta.last_payable_summary_date + รายกลุ่ม): สรุปหนี้ "เมื่อวาน"→PAYABLE_GROUPS
 - `_reservation_reminder_loop` — เตือนจอง PENDING ทุก 5 นาที (18-22น.)/15 นาที (เวลาอื่น) จนคอนเฟิร์ม/เกิน RESV_NAG_MAX_HOURS
 - รูปสลิป: ประมวลผลผ่าน `_slip_pool` (ThreadPoolExecutor, SLIP_WORKERS=2) กัน burst ทำ memory พุ่ง/OOM
 - **กันสแปมเมื่อบอทถูกเตะออกกลุ่ม:** ส่งรายงาน/สรุปแบบ idempotent "รายกลุ่ม" (กลุ่มที่ส่งสำเร็จแล้วไม่ส่งซ้ำ retry เฉพาะที่พลาด) + `LeaveEvent`→มาร์ค `left:{group}` + push เจอ 400 ("ไม่ใช่สมาชิก") → auto-prune มาร์ค left เอง + `JoinEvent`/มีข้อความเข้ามา → ปลดมาร์ค (self-heal)
@@ -37,6 +43,7 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 - `help`/`คำสั่ง` — เมนู • `groupid` — ดู Group ID
 - สลิป: `สรุป`, `สรุป YYYY-MM-DD`, `รายงานเมื่อวาน`, `ลบล่าสุด`/`ลบ N`, `ล้างวันนี้`
 - จอง: พิมพ์ประโยคจอง (AI จับ) → ต้องครบ ชื่อ/จำนวนคน/วันเวลา(มั่นใจ)/โซน → กดปุ่มคอนเฟิร์ม • `สรุปจอง`
+- บัญชีหนี้ (เฉพาะ PAYABLE_GROUPS): ส่งรูปบิล/สลิป (AI แยกเอง) • `บิล 3500` (บันทึกด้วยเลข) • `ตั้งยอดยกมา 12000` • `สรุปหนี้`/`สรุปหนี้ YYYY-MM-DD` • `ลบบิลล่าสุด`/`ลบจ่ายล่าสุด`
 - `คู่มือ` — บอทส่งคู่มือย่อ • `ล้างทั้งหมด` — ล้างข้อมูลกลุ่มนี้ทั้งหมด (สลิป+จอง ทุกวัน, มีปุ่มยืนยัน)
 
 ## ENV vars (ตั้งที่ Render — repo เป็น public ห้าม hardcode)
@@ -45,6 +52,7 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 - `DATABASE_URL` (Postgres — ต้อง region เดียวกับ web service)
 - `SLIP_GROUPS`, `RESV_GROUPS`, `RESV_EXCLUDE_GROUPS`, `BAR_GROUP_ID`, `PAYEE_KEYWORDS`
 - `IGNORE_GROUPS` — กลุ่มที่ "บอทเมินทั้งหมด" (ไม่เช็คสลิป/ไม่จอง/ไม่ตอบคำสั่ง/ไม่ส่งรายงาน-เตือน) ใช้กับกลุ่มที่เลิกใช้
+- `PAYABLE_GROUPS` — กลุ่มบัญชีเจ้าหนี้ (เช่น กลุ่มดวงใจ); `PAYABLE_VENDOR` (ดีฟอลต์ "ดวงใจการสุรา"); `PAYABLE_SUMMARY_HOUR` (ดีฟอลต์ 1 = ตี1)
 - `RESV_NAG_MAX_HOURS`(6), `RESV_REPORT_DAYS`(7), `RESV_KEEP_DAYS`(15), `MISS_KEEP_DAYS`(14), `SLIP_KEEP_DAYS`(60), `SLIP_WORKERS`(2)
 - `PROMPTPAY_API_KEY` (SlipOK — ยังไม่เปิด; เปิดได้เพื่อตรวจกับธนาคารจริง 100%)
 

@@ -33,6 +33,11 @@ RESV_GROUPS       = [g.strip() for g in os.environ.get("RESV_GROUPS", "").split(
 RESV_EXCLUDE_GROUPS = [g.strip() for g in os.environ.get("RESV_EXCLUDE_GROUPS", "").split(",") if g.strip()]
 # กลุ่มที่ "ให้บอทเมินทั้งหมด" — ไม่ทำอะไรเลย (ไม่เช็คสลิป/ไม่จอง/ไม่ตอบคำสั่ง/ไม่ส่งรายงาน-เตือน) เช่นกลุ่มที่เลิกใช้แล้ว
 IGNORE_GROUPS     = [g.strip() for g in os.environ.get("IGNORE_GROUPS", "").split(",") if g.strip()]
+# กลุ่ม "บัญชีเจ้าหนี้การค้า" (เช่น ดวงใจการสุรา) — ในกลุ่มนี้ บอทไม่ทำระบบสลิป/จองปกติ แต่ทำบัญชีหนี้แทน
+# รูปบิล=เพิ่มหนี้, สลิปโอน=ลดหนี้, สรุปยอดค้างอัตโนมัติ; ตั้ง id กลุ่มด้วยคำสั่ง groupid
+PAYABLE_GROUPS    = [g.strip() for g in os.environ.get("PAYABLE_GROUPS", "").split(",") if g.strip()]
+PAYABLE_VENDOR    = os.environ.get("PAYABLE_VENDOR", "ดวงใจการสุรา")   # ชื่อเจ้าหนี้ (โชว์ในรายงาน)
+PAYABLE_SUMMARY_HOUR = int(os.environ.get("PAYABLE_SUMMARY_HOUR", "1"))  # ส่งสรุปหนี้รายวันหลังกี่โมง (ดีฟอลต์ ตี1)
 # กลุ่ม "บาร์น้ำ+จองโต๊ะล่วงหน้า" — จองล่วงหน้าจากกลุ่มไหนก็ตามจะส่งการ์ด+ปุ่มมาที่นี่ (ดู id ด้วยคำสั่ง groupid)
 BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
 # คีย์เวิร์ดบัญชีรับเงินของร้าน (ชื่อ ไทย/อังกฤษ + เลขบัญชี/เลขท้าย) คั่นด้วยคอมมา
@@ -194,6 +199,29 @@ def init_db():
                 pass
         conn.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY)")
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        # บัญชีเจ้าหนี้การค้า (ดวงใจการสุรา) — บิลซื้อ (เพิ่มหนี้) / เงินจ่าย (ลดหนี้)
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS payable_bills (
+                id          {_PK},
+                group_id    TEXT,
+                doc_date    TEXT,
+                amount      {_REAL},
+                note        TEXT,
+                recorded_at TEXT
+            )
+        """)
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS payable_payments (
+                id            {_PK},
+                group_id      TEXT,
+                doc_date      TEXT,
+                amount        {_REAL},
+                sender        TEXT,
+                ref_number    TEXT,
+                slip_datetime TEXT,
+                recorded_at   TEXT
+            )
+        """)
         # นับรูปที่รับเข้ามาแต่ "ไม่ได้บันทึกเป็นสลิป" (อ่านไม่ออก/ไม่ใช่สลิป/error) ไว้กระทบยอดในรายงาน
         conn.execute(f"""
             CREATE TABLE IF NOT EXISTS image_misses (
@@ -298,6 +326,28 @@ def extract_slip_info(image_bytes: bytes) -> dict:
     )
     img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
     # _gemini_generate มี retry+backoff ในตัวแล้ว (กัน 503 overload) — เรียกครั้งเดียวพอ
+    response = _gemini_generate([prompt, img_part])
+    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+
+def extract_payable_doc(image_bytes: bytes) -> dict:
+    """อ่านรูปในกลุ่มบัญชีเจ้าหนี้ → แยกว่าเป็น 'บิลซื้อ' หรือ 'สลิปโอนจ่าย' พร้อมยอดเงิน
+    คืน JSON: doc_type=bill|payment|other, amount, ref_number(สำหรับสลิป), sender"""
+    prompt = (
+        f"รูปนี้อยู่ในกลุ่มซื้อ-ขายระหว่างร้านอาหารกับร้านขายเครื่องดื่ม/สุรา ({PAYABLE_VENDOR}) "
+        "ช่วยดูว่าเป็นเอกสารแบบไหน แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
+        '{"doc_type":"bill","amount":0.00,"ref_number":null,"sender":null}\n\n'
+        "doc_type:\n"
+        "  - 'bill' = บิล/ใบสั่งซื้อ/ใบส่งของ/ใบกำกับ/บิลเงินสด (มีรายการสินค้า+ยอดรวม) = ของที่ร้านสั่งซื้อ\n"
+        "  - 'payment' = สลิปโอนเงินผ่านธนาคาร/แอปธนาคาร (หลักฐานการจ่ายเงิน)\n"
+        "  - 'other' = อย่างอื่น (รูปคน/อาหาร/ข้อความ ฯลฯ)\n"
+        "amount: ยอดเงินรวมสุทธิ — ถ้าเป็นบิลใช้ 'ยอดรวมทั้งสิ้น/ยอดสุทธิ' ที่ต้องจ่าย; ถ้าเป็นสลิปใช้ยอดที่โอน\n"
+        "ref_number: เลขอ้างอิงรายการ (เฉพาะสลิปโอน ถ้าไม่มีใส่ null)\n"
+        "sender: ชื่อผู้โอน/ชื่อบิล ถ้าอ่านได้ (ไม่มีใส่ null)\n"
+        "ถ้า doc_type='other' ให้ amount=0"
+    )
+    img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
     response = _gemini_generate([prompt, img_part])
     raw = response.text.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
@@ -642,6 +692,219 @@ def build_advance_resv_report() -> str:
     return build_resv_summary(BAR_GROUP_ID, "📅 จองล่วงหน้าที่กำลังจะถึง", upcoming=True)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ระบบที่ 3 — บัญชีเจ้าหนี้การค้า (ดวงใจการสุรา): บิลซื้อ(+) / เงินจ่าย(−) / ยอดค้าง
+# หมายเหตุ: ห้าม cleanup ตาราง payable_* (เป็นบัญชีเดินสะสม ลบแถวเก่า = ยอดเพี้ยน)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _payable_opening(group_id: str) -> float:
+    """ยอดค้างยกมา (ตั้งครั้งเดียวตอนเริ่ม) ของกลุ่มนี้"""
+    v = _get_meta(f"payable_opening:{group_id}")
+    try:
+        return float(v) if v is not None else 0.0
+    except ValueError:
+        return 0.0
+
+def _payable_sum(table: str, group_id: str, before_date=None, on_date=None) -> float:
+    """รวมยอดบิล/เงินจ่ายของกลุ่ม — เลือกกรองทั้งหมด / ก่อนวันที่ / เฉพาะวันที่"""
+    q = f"SELECT COALESCE(SUM(amount),0) s FROM {table} WHERE group_id=?"
+    params = [group_id]
+    if before_date is not None:
+        q += " AND doc_date < ?"; params.append(before_date)
+    if on_date is not None:
+        q += " AND doc_date = ?"; params.append(on_date)
+    with _db() as conn:
+        return float(conn.execute(q, tuple(params)).fetchone()["s"] or 0)
+
+def _payable_outstanding(group_id: str) -> float:
+    """ยอดค้างจ่ายสะสมปัจจุบัน = ยกมา + บิลรวมทั้งหมด − จ่ายรวมทั้งหมด"""
+    return (_payable_opening(group_id)
+            + _payable_sum("payable_bills", group_id)
+            - _payable_sum("payable_payments", group_id))
+
+def save_payable_bill(group_id: str, amount: float, note: str = None) -> int:
+    today = datetime.now(TZ).date().isoformat()
+    now   = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    with _db() as conn:
+        rid = conn.insert_returning_id(
+            "INSERT INTO payable_bills (group_id, doc_date, amount, note, recorded_at) VALUES (?,?,?,?,?)",
+            (group_id, today, float(amount), note, now))
+        conn.execute("INSERT INTO groups (group_id) VALUES (?) ON CONFLICT DO NOTHING", (group_id,))
+        conn.commit()
+    return rid
+
+def save_payable_payment(group_id: str, amount: float, sender=None, ref_number=None, slip_dt=None) -> int:
+    today = datetime.now(TZ).date().isoformat()
+    now   = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    with _db() as conn:
+        rid = conn.insert_returning_id(
+            "INSERT INTO payable_payments (group_id, doc_date, amount, sender, ref_number, slip_datetime, recorded_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (group_id, today, float(amount), sender, ref_number, slip_dt, now))
+        conn.execute("INSERT INTO groups (group_id) VALUES (?) ON CONFLICT DO NOTHING", (group_id,))
+        conn.commit()
+    return rid
+
+def _payment_ref_exists(group_id: str, ref_number: str) -> bool:
+    if not ref_number:
+        return False
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM payable_payments WHERE group_id=? AND ref_number=? LIMIT 1",
+            (group_id, ref_number)).fetchone()
+    return row is not None
+
+def build_payable_summary(group_id: str, date_str=None) -> str:
+    """สรุปยอดค้างจ่าย 'รายวัน': ยกเข้า + บิลวันนั้น − จ่ายวันนั้น = ค้างสิ้นวัน"""
+    d = date_str or datetime.now(TZ).date().isoformat()
+    opening      = _payable_opening(group_id)
+    bills_before = _payable_sum("payable_bills", group_id, before_date=d)
+    pays_before  = _payable_sum("payable_payments", group_id, before_date=d)
+    carry_in     = opening + bills_before - pays_before
+    bills_today  = _payable_sum("payable_bills", group_id, on_date=d)
+    pays_today   = _payable_sum("payable_payments", group_id, on_date=d)
+    carry_out    = carry_in + bills_today - pays_today
+    with _db() as conn:
+        n_bill = conn.execute("SELECT COUNT(*) c FROM payable_bills WHERE group_id=? AND doc_date=?", (group_id, d)).fetchone()["c"]
+        n_pay  = conn.execute("SELECT COUNT(*) c FROM payable_payments WHERE group_id=? AND doc_date=?", (group_id, d)).fetchone()["c"]
+    return (
+        f"📊 สรุปหนี้ {PAYABLE_VENDOR}\n"
+        f"📅 ประจำวันที่ {d}\n"
+        "─────────────────\n"
+        f"ยอดยกเข้า: {carry_in:,.2f} บาท\n"
+        f"📥 บิลซื้อวันนี้: +{bills_today:,.2f} ({n_bill} รายการ)\n"
+        f"💸 จ่ายวันนี้: −{pays_today:,.2f} ({n_pay} รายการ)\n"
+        "─────────────────\n"
+        f"💰 ค้างจ่ายสะสม: {carry_out:,.2f} บาท"
+    )
+
+
+def _process_payable_image(event, group_id: str):
+    """รูปในกลุ่มเจ้าหนี้ → AI แยกบิล(เพิ่มหนี้)/สลิปจ่าย(ลดหนี้) แล้วบันทึก + ตอบยอดค้างสะสม"""
+    try:
+        content     = line_bot_api.get_message_content(event.message.id)
+        image_bytes = b"".join(chunk for chunk in content.iter_content())
+        info        = extract_payable_doc(image_bytes)
+    except Exception as e:
+        print(f"[payable] อ่านรูปไม่สำเร็จ group={group_id}: {e}", flush=True)
+        try:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="⚠️ อ่านรูปไม่สำเร็จ กรุณาส่งใหม่อีกครั้ง"))
+        except Exception:
+            pass
+        return
+
+    doc_type = (info.get("doc_type") or "other").lower()
+    amount   = float(info.get("amount") or 0)
+
+    if doc_type == "bill":
+        if amount <= 0:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="🟡 อ่านยอดเงินบนบิลไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง"))
+            return
+        rid = save_payable_bill(group_id, amount)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"📥 บันทึกบิลซื้อ #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
+                 f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(group_id):,.2f} บาท"))
+        return
+
+    if doc_type == "payment":
+        if amount <= 0:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="🟡 อ่านยอดเงินบนสลิปไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่"))
+            return
+        ref = info.get("ref_number")
+        if _payment_ref_exists(group_id, ref):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"🔁 สลิปนี้ (อ้างอิง {ref}) เคยบันทึกแล้ว — ไม่นับซ้ำ"))
+            return
+        rid = save_payable_payment(group_id, amount, sender=info.get("sender"),
+                                   ref_number=ref, slip_dt=info.get("datetime"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"💸 บันทึกจ่าย {PAYABLE_VENDOR} #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
+                 f"💰 ค้างจ่ายสะสม: {_payable_outstanding(group_id):,.2f} บาท"))
+        return
+
+    # other → เงียบไว้ ไม่รบกวน
+    print(f"[payable] รูปไม่ใช่บิล/สลิป group={group_id}", flush=True)
+
+
+def handle_payable_text(event, text: str, group_id: str) -> bool:
+    """คำสั่งบัญชีเจ้าหนี้ในกลุ่ม PAYABLE_GROUPS — คืน True ถ้าจัดการแล้ว"""
+    low = text.lower().strip()
+    # ตั้งยอดยกมา (ค้างเก่า) — ครั้งเดียวตอนเริ่ม
+    if low.startswith("ตั้งยอดยกมา") or low.startswith("ยอดยกมา") or low.startswith("ตั้งยอดค้าง") or low.startswith("ค้างเก่า"):
+        for kw in ("ตั้งยอดยกมา", "ตั้งยอดค้าง", "ยอดยกมา", "ค้างเก่า"):
+            if low.startswith(kw):
+                arg = text[len(kw):].strip().replace(",", "").replace("บาท", "").strip()
+                break
+        if not arg:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"📌 ยอดยกมาปัจจุบัน: {_payable_opening(group_id):,.2f} บาท\n"
+                     "ตั้งใหม่พิมพ์: ตั้งยอดยกมา 12000"))
+            return True
+        try:
+            val = float(arg)
+        except ValueError:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="❌ ใส่ตัวเลขไม่ถูก เช่น: ตั้งยอดยกมา 12000"))
+            return True
+        _set_meta(f"payable_opening:{group_id}", str(val))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"✅ ตั้งยอดค้างยกมา = {val:,.2f} บาท\n─────────────────\n"
+                 f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(group_id):,.2f} บาท"))
+        return True
+
+    # บันทึกบิลด้วยข้อความ (เผื่อไม่มีรูป) เช่น "บิล 3500"
+    if low.startswith("บิล"):
+        arg = text[3:].strip().replace(",", "").replace("บาท", "").strip()
+        try:
+            val = float(arg)
+        except ValueError:
+            return False
+        rid = save_payable_bill(group_id, val)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"📥 บันทึกบิลซื้อ #{rid}\nยอด {val:,.2f} บาท\n─────────────────\n"
+                 f"💰 ค้างจ่ายสะสม: {_payable_outstanding(group_id):,.2f} บาท"))
+        return True
+
+    # สรุปหนี้ (วันนี้ / ตามวันที่)
+    if low in ("สรุปหนี้", "ยอดค้าง", "หนี้", f"หนี้{PAYABLE_VENDOR}".lower(), "สรุปยอดค้าง"):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_payable_summary(group_id)))
+        return True
+    if low.startswith("สรุปหนี้ "):
+        arg = text.split(" ", 1)[1].strip()
+        try:
+            datetime.strptime(arg, "%Y-%m-%d")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_payable_summary(group_id, arg)))
+            return True
+        except ValueError:
+            pass
+
+    # ลบรายการล่าสุด (แก้บันทึกผิด)
+    if low in ("ลบบิลล่าสุด", "ลบบิล"):
+        _delete_last_payable(event, group_id, "payable_bills", "บิลซื้อ")
+        return True
+    if low in ("ลบจ่ายล่าสุด", "ลบจ่าย", "ลบสลิปล่าสุด"):
+        _delete_last_payable(event, group_id, "payable_payments", "เงินจ่าย")
+        return True
+    return False
+
+
+def _delete_last_payable(event, group_id: str, table: str, label: str):
+    with _db() as conn:
+        row = conn.execute(f"SELECT id, amount FROM {table} WHERE group_id=? ORDER BY id DESC LIMIT 1",
+                           (group_id,)).fetchone()
+        if not row:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📭 ไม่มี{label}ให้ลบ"))
+            return
+        conn.execute(f"DELETE FROM {table} WHERE id=?", (row["id"],))
+        conn.commit()
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text=f"🗑️ ลบ{label}ล่าสุด #{row['id']} ({float(row['amount']):,.2f} บาท) แล้ว\n─────────────────\n"
+             f"💰 ค้างจ่ายสะสม: {_payable_outstanding(group_id):,.2f} บาท"))
+
+
 def _cleanup_old_data():
     """ลบข้อมูลเก่าที่ไม่จำเป็น (วันละครั้ง) กัน DB บวม:
     - จองที่ผ่านวันมาแล้วเกิน RESV_KEEP_DAYS (ใช้ resv_date ถ้ามี ไม่งั้นใช้วันที่แจ้ง)
@@ -820,6 +1083,41 @@ def maybe_send_resv_summary():
             print(f"[resv-summary] {failed} กลุ่มส่งไม่สำเร็จ — retry รอบหน้า", flush=True)
 
 
+def maybe_send_payable_summary():
+    """ส่งสรุปหนี้ 'ของเมื่อวาน' เข้ากลุ่มเจ้าหนี้ เมื่อเลย PAYABLE_SUMMARY_HOUR (ดีฟอลต์ ตี1) วันละครั้ง
+    idempotent ด้วย last_payable_summary_date + รายกลุ่ม → ทนรีสตาร์ท/หลาย thread"""
+    if not PAYABLE_GROUPS:
+        return
+    now = datetime.now(TZ)
+    if now.hour < PAYABLE_SUMMARY_HOUR:
+        return
+    today = now.date().isoformat()
+    with _report_lock:
+        if _get_meta("last_payable_summary_date") == today:
+            return
+        yesterday = (now.date() - timedelta(days=1)).isoformat()
+        targets = [g for g in PAYABLE_GROUPS if not _group_left(g) and g not in IGNORE_GROUPS]
+        failed = 0
+        for g in targets:
+            if _already_sent("payable_summary", today, g):
+                continue
+            try:
+                line_bot_api.push_message(g, TextSendMessage(text=build_payable_summary(g, yesterday)))
+                _mark_sent("payable_summary", today, g)
+                print(f"[payable-summary] sent → {g}", flush=True)
+            except Exception as e:
+                if _is_not_member_error(e):
+                    _mark_group_left(g)
+                else:
+                    failed += 1
+                print(f"[payable-summary] FAILED {g}: {e}", flush=True)
+        if failed == 0:
+            _set_meta("last_payable_summary_date", today)
+            print(f"[payable-summary] done {today}", flush=True)
+        else:
+            print(f"[payable-summary] {failed} กลุ่มส่งไม่สำเร็จ — retry รอบหน้า", flush=True)
+
+
 def _report_backup_loop():
     """thread สำรอง — เผื่อ UptimeRobot ไม่ ping; เช็คทุก ~5 นาที"""
     while True:
@@ -827,6 +1125,7 @@ def _report_backup_loop():
         try:
             maybe_send_resv_summary()
             maybe_send_daily_report()
+            maybe_send_payable_summary()
         except Exception as e:
             print(f"[report] backup loop error: {e}", flush=True)
 
@@ -1231,6 +1530,9 @@ def _process_image_event(event):
     if group_id in IGNORE_GROUPS:
         return   # กลุ่มที่สั่งให้เมินทั้งหมด → ไม่ทำอะไรเลย
     _clear_group_left(group_id)   # มีรูปเข้ามา = บอทยังอยู่ในกลุ่ม → ปลดมาร์ค left ถ้าเคยติด (self-heal)
+    if group_id in PAYABLE_GROUPS:
+        _process_payable_image(event, group_id)   # กลุ่มเจ้าหนี้ → บิล/สลิปจ่าย (ไม่ทำระบบสลิปปกติ)
+        return
     if not _slip_enabled(group_id):
         return   # ไม่ใช่กลุ่มที่เปิดเช็คสลิป → ไม่ยุ่งเลย
     try:
@@ -1390,7 +1692,23 @@ def do_reset_all(event):
 
 
 def build_help(group_id: str) -> str:
-    """เมนูคำสั่ง — แสดงเฉพาะหมวดที่กลุ่มนั้นใช้ได้ (สลิป/จอง)"""
+    """เมนูคำสั่ง — แสดงเฉพาะหมวดที่กลุ่มนั้นใช้ได้ (สลิป/จอง/บัญชีหนี้)"""
+    if group_id in PAYABLE_GROUPS:
+        return "\n".join([
+            f"🤖 คำสั่งบอทเอด — บัญชีหนี้ {PAYABLE_VENDOR}",
+            "─────────────────",
+            "💰 บัญชีเจ้าหนี้",
+            "• ส่งรูปบิลซื้อ → บอทอ่านยอด เพิ่มหนี้ให้",
+            "• ส่งรูปสลิปโอนจ่าย → บอทอ่านยอด ลดหนี้ให้",
+            "• บิล 3500 → บันทึกบิลด้วยตัวเลข (กรณีไม่มีรูป)",
+            "• ตั้งยอดยกมา 12000 → ตั้งยอดค้างเก่า (ครั้งเดียวตอนเริ่ม)",
+            "• สรุปหนี้ → ดูยอดค้างวันนี้",
+            "• สรุปหนี้ 2026-06-09 → ดูย้อนหลัง (ตามวันที่)",
+            "• ลบบิลล่าสุด / ลบจ่ายล่าสุด → แก้กรณีบันทึกผิด",
+            f"⏰ บอทสรุปหนี้เมื่อวานให้เองทุกวัน ตี{PAYABLE_SUMMARY_HOUR}",
+            "─────────────────",
+            "• groupid → ดู Group ID | help → เมนูนี้",
+        ])
     lines = ["🤖 คำสั่งบอทเอด", "─────────────────"]
     if _slip_enabled(group_id):
         lines += [
@@ -1426,6 +1744,23 @@ def build_help(group_id: str) -> str:
 
 def build_manual(group_id: str) -> str:
     """คู่มือใช้งานแบบย่อ (พิมพ์ 'คู่มือ') — แสดงเฉพาะหมวดที่กลุ่มนั้นใช้ได้"""
+    if group_id in PAYABLE_GROUPS:
+        return (
+            f"📖 คู่มือ — บัญชีหนี้ {PAYABLE_VENDOR}\n\n"
+            "💰 หลักการ\n"
+            "• ส่งรูป 'บิลซื้อ' ในกลุ่ม → บอทอ่านยอดรวม แล้ว 'เพิ่มหนี้'\n"
+            "• ส่งรูป 'สลิปโอนจ่าย' → บอทอ่านยอด แล้ว 'ลดหนี้' (กันสลิปซ้ำด้วยเลขอ้างอิง)\n"
+            "• บอทตอบยอดค้างสะสมล่าสุดให้ทุกครั้ง\n\n"
+            "🚀 เริ่มใช้ครั้งแรก\n"
+            "• พิมพ์ 'ตั้งยอดยกมา 12000' ใส่ยอดค้างเก่าที่มีอยู่ (ตั้งครั้งเดียว)\n\n"
+            "📊 ดูยอด\n"
+            "• สรุปหนี้ → ยอดค้างวันนี้ (ยกเข้า + บิล − จ่าย = ค้างสะสม)\n"
+            "• สรุปหนี้ 2026-06-09 → ดูย้อนหลังตามวันที่\n\n"
+            "🧹 แก้ที่ผิด\n"
+            "• ลบบิลล่าสุด / ลบจ่ายล่าสุด\n\n"
+            f"⏰ บอทส่งสรุปหนี้เมื่อวานให้เองทุกวัน ตี{PAYABLE_SUMMARY_HOUR}\n"
+            "ℹ️ help → เมนูคำสั่ง | groupid → ดูข้อมูลกลุ่ม"
+        )
     slip_on = _slip_enabled(group_id)
     resv_on = (RESV_GROUPS and group_id in RESV_GROUPS) and group_id not in RESV_EXCLUDE_GROUPS
     blocks = ["📖 คู่มือใช้งานบอทเอด"]
@@ -1499,9 +1834,14 @@ def handle_text(event):
             "🔔 รับจองวันนี้: "     + ("🚫 ปิดจอง (RESV_EXCLUDE_GROUPS)" if group_id in RESV_EXCLUDE_GROUPS
                                        else ("✅ ใช่" if (RESV_GROUPS and group_id in RESV_GROUPS) else "❌ ไม่ (ต้องเพิ่มใน RESV_GROUPS)")),
             "📅 กลุ่มบาร์น้ำ: "      + ("✅ ใช่" if (BAR_GROUP_ID and group_id == BAR_GROUP_ID) else "❌ ไม่"),
+            f"💰 บัญชีหนี้ {PAYABLE_VENDOR}: " + ("✅ ใช่" if group_id in PAYABLE_GROUPS else "❌ ไม่ (ต้องเพิ่มใน PAYABLE_GROUPS)"),
         ]
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"🆔 Group ID:\n{group_id}\n─────────────────\n" + "\n".join(roles)))
+        return
+    # กลุ่มเจ้าหนี้การค้า → จัดการบัญชีหนี้ (บิล/จ่าย/สรุป) แล้วจบ ไม่ทำระบบสลิป/จองปกติ
+    if group_id in PAYABLE_GROUPS:
+        handle_payable_text(event, text, group_id)
         return
     # สรุปการจอง (วันนี้ + ล่วงหน้า) ของกลุ่มนี้ — ใช้ได้ทุกกลุ่ม
     if text.lower() in ("สรุปจอง", "สรุปการจอง", "รายการจอง", "จองวันนี้"):
@@ -1594,6 +1934,7 @@ def health():
     try:
         maybe_send_resv_summary()
         maybe_send_daily_report()
+        maybe_send_payable_summary()
     except Exception as e:
         print(f"[report] health-trigger error: {e}", flush=True)
     try:
