@@ -1770,7 +1770,7 @@ def send_reset_all_confirm(event, group_id):
         alt_text="ยืนยันล้างข้อมูลทั้งหมดของกลุ่มนี้",
         template=ButtonsTemplate(
             title="⚠️ ล้างข้อมูลทั้งหมด (กลุ่มนี้)",
-            text=f"จะลบสลิป {n_slip} + การจอง {n_resv} รายการทั้งหมด (ทุกวัน เฉพาะกรุ๊ปนี้) กู้คืนไม่ได้ ยืนยันไหม?",
+            text=f"ลบสลิป {n_slip} + จอง {n_resv} ทั้งหมด (กู้คืนไม่ได้)",
             actions=[PostbackAction(label="🗑️ ยืนยันล้างทั้งหมด", data="reset_all")],
         ),
     ))
@@ -1804,7 +1804,7 @@ def send_reset_payable_confirm(event, group_id):
         alt_text="ยืนยันล้างบัญชีหนี้ทั้งหมดของกลุ่มนี้",
         template=ButtonsTemplate(
             title="⚠️ ล้างบัญชีหนี้ (กลุ่มนี้)",
-            text=f"จะลบบิล {n_bill} + จ่าย {n_pay} รายการ และล้างยอดยกมา (เริ่มนับใหม่ที่ 0) กู้คืนไม่ได้ ยืนยันไหม?",
+            text=f"ลบบิล {n_bill} + จ่าย {n_pay} ล้างยอดยกมา (กู้คืนไม่ได้)",
             actions=[PostbackAction(label="🗑️ ยืนยันล้างบัญชีหนี้", data="reset_payable")],
         ),
     ))
