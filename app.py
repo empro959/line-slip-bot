@@ -984,6 +984,20 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         except ValueError:
             pass
 
+    # ทดสอบ: force ส่งสรุปหนี้ 'เมื่อวาน' เข้าปลายทางเดี๋ยวนี้ (ไม่ต้องรอตี1) — เช็ค redirect/push ว่าใช้งานได้
+    if low in ("ทดสอบรายงานหนี้", "ทดสอบสรุปหนี้", "ทดสอบรายงาน", "force payable"):
+        yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+        dest = _report_dest(group_id)
+        try:
+            line_bot_api.push_message(dest, TextSendMessage(text=build_payable_summary(group_id, yesterday)))
+            where = f"กลุ่มปลายทาง\n{dest}" if dest != group_id else "กลุ่มนี้ (ยังไม่ได้ตั้ง REPORT_REDIRECT)"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"✅ ส่งสรุปหนี้ (ของวันที่ {yesterday}) ไปยัง{where} แล้ว"))
+        except Exception as e:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"❌ ส่งไม่สำเร็จ → {dest}\nสาเหตุ: {e}\n(บอทอาจไม่ได้อยู่ในกลุ่มปลายทาง)"))
+        return True
+
     # ลบรายการล่าสุด (แก้บันทึกผิด)
     if low in ("ลบบิลล่าสุด", "ลบบิล"):
         _delete_last_payable(event, group_id, "payable_bills", "บิลซื้อ")
@@ -1864,6 +1878,7 @@ def build_help(group_id: str) -> str:
             "• สรุปหนี้ 2026-06-09 → ดูย้อนหลัง (ตามวันที่)",
             "• ลบบิลล่าสุด / ลบจ่ายล่าสุด → แก้กรณีบันทึกผิด",
             "• ล้างบัญชีหนี้ → ล้างทั้งหมด เริ่มนับใหม่ (มีปุ่มยืนยัน)",
+            "• ทดสอบรายงานหนี้ → ส่งสรุปหนี้เดี๋ยวนี้ (เช็คการส่ง/redirect)",
             f"⏰ บอทสรุปหนี้เมื่อวานให้เองทุกวัน ตี{PAYABLE_SUMMARY_HOUR}",
             "─────────────────",
             "• groupid → ดู Group ID | help → เมนูนี้",
