@@ -1005,7 +1005,8 @@ def maybe_send_daily_report():
             group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
         # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) / สั่งเมิน (IGNORE_GROUPS) — กันค้าง retry/สแปม
         targets = [g for g in group_ids
-                   if ((not SLIP_GROUPS) or g in SLIP_GROUPS) and not _group_left(g) and g not in IGNORE_GROUPS]
+                   if ((not SLIP_GROUPS) or g in SLIP_GROUPS) and not _group_left(g)
+                   and g not in IGNORE_GROUPS and g not in PAYABLE_GROUPS]
         print(f"[report] trigger {today} → ส่งรายงานวันที่ {yesterday} ให้ {len(targets)} กลุ่ม", flush=True)
         failed = 0
         # idempotent รายกลุ่ม: กลุ่มที่ส่งสำเร็จแล้ววันนี้จะไม่ส่งซ้ำ แม้กลุ่มอื่นพลาดแล้วต้อง retry
