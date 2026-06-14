@@ -9,10 +9,11 @@ from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
+from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (
     MessageEvent, ImageMessage, TextMessage, TextSendMessage,
     PostbackEvent, TemplateSendMessage, ButtonsTemplate, PostbackAction,
+    LeaveEvent, JoinEvent,
 )
 from google import genai
 from google.genai import types
@@ -682,12 +683,38 @@ def _set_meta(key: str, value: str):
         conn.commit()
 
 
+def _del_meta(key: str):
+    with _db() as conn:
+        conn.execute("DELETE FROM meta WHERE key=?", (key,))
+        conn.commit()
+
+
 def _already_sent(job: str, date: str, target: str) -> bool:
     """ส่ง job นี้ให้ target นี้ในวันนี้ไปแล้วหรือยัง (กันส่งซ้ำ 'รายกลุ่ม')"""
     return _get_meta(f"sent:{job}:{date}:{target}") == "1"
 
 def _mark_sent(job: str, date: str, target: str):
     _set_meta(f"sent:{job}:{date}:{target}", "1")
+
+
+# ── กลุ่มที่บอทถูกเตะออก/ส่งไม่ได้ (กันสแปม+กันค้าง retry) — มาร์คเมื่อ LeaveEvent หรือ push เจอ 400 ──
+def _group_left(gid: str) -> bool:
+    return _get_meta(f"left:{gid}") == "1"
+
+def _mark_group_left(gid: str):
+    """บอทไม่ได้อยู่ในกลุ่มนี้แล้ว → เลิกส่งรายงาน/สรุปจนกว่าจะกลับเข้ากลุ่ม"""
+    _set_meta(f"left:{gid}", "1")
+    print(f"[group] mark LEFT {gid} — เลิกส่งจนกว่าจะกลับเข้ากลุ่ม", flush=True)
+
+def _clear_group_left(gid: str):
+    """กลับเข้ากลุ่มแล้ว (มีข้อความ/ถูกเชิญใหม่) → ปลดมาร์ค กลับมาส่งปกติ (self-heal)"""
+    if _group_left(gid):
+        _del_meta(f"left:{gid}")
+        print(f"[group] clear LEFT {gid} — กลับมาส่งปกติ", flush=True)
+
+def _is_not_member_error(e: Exception) -> bool:
+    """push เจอ 400 'Failed to send messages' = บอทไม่ได้อยู่ในกลุ่มนั้น (ต่างจาก 429/500 ที่เป็นชั่วคราว)"""
+    return isinstance(e, LineBotApiError) and getattr(e, "status_code", None) == 400
 
 
 def maybe_send_daily_report():
@@ -705,7 +732,8 @@ def maybe_send_daily_report():
         yesterday = (now.date() - timedelta(days=1)).isoformat()
         with _db() as conn:
             group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
-        targets = [g for g in group_ids if (not SLIP_GROUPS) or g in SLIP_GROUPS]
+        # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) — กันค้าง retry/สแปม
+        targets = [g for g in group_ids if ((not SLIP_GROUPS) or g in SLIP_GROUPS) and not _group_left(g)]
         print(f"[report] trigger {today} → ส่งรายงานวันที่ {yesterday} ให้ {len(targets)} กลุ่ม", flush=True)
         failed = 0
         # idempotent รายกลุ่ม: กลุ่มที่ส่งสำเร็จแล้ววันนี้จะไม่ส่งซ้ำ แม้กลุ่มอื่นพลาดแล้วต้อง retry
@@ -717,16 +745,22 @@ def maybe_send_daily_report():
                 _mark_sent("report", today, group_id)
                 print(f"[report] sent OK → {group_id}", flush=True)
             except Exception as e:
-                failed += 1
+                if _is_not_member_error(e):
+                    _mark_group_left(group_id)   # บอทไม่ได้อยู่ในกลุ่มแล้ว → เลิก retry (ไม่นับเป็น fail)
+                else:
+                    failed += 1
                 print(f"[report] push FAILED {group_id}: {e}", flush=True)
         # สรุปจองล่วงหน้า → กลุ่มบาร์น้ำ (วันละครั้งพร้อมรายงานสลิป)
-        if BAR_GROUP_ID and not _already_sent("advance_resv", today, BAR_GROUP_ID):
+        if BAR_GROUP_ID and not _group_left(BAR_GROUP_ID) and not _already_sent("advance_resv", today, BAR_GROUP_ID):
             try:
                 line_bot_api.push_message(BAR_GROUP_ID, TextSendMessage(text=build_advance_resv_report()))
                 _mark_sent("advance_resv", today, BAR_GROUP_ID)
                 print(f"[report] sent advance-resv → {BAR_GROUP_ID}", flush=True)
             except Exception as e:
-                failed += 1
+                if _is_not_member_error(e):
+                    _mark_group_left(BAR_GROUP_ID)
+                else:
+                    failed += 1
                 print(f"[report] push FAILED advance-resv {BAR_GROUP_ID}: {e}", flush=True)
         # มาร์คว่า 'ส่งครบแล้ว' เฉพาะเมื่อไม่มีอันไหนล้มเหลว — ถ้ามี fail ปล่อยไว้ให้ ping รอบหน้า retry
         if failed == 0:
@@ -753,7 +787,8 @@ def maybe_send_resv_summary():
             _set_meta("last_resv_summary_date", today)
             print("[resv-summary] เลย 19:00 แล้ว ข้ามวันนี้ (พรุ่งนี้ส่ง 16:00)", flush=True)
             return
-        targets = list(dict.fromkeys([t for t in ([BAR_GROUP_ID] + list(RESV_GROUPS)) if t]))
+        # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) — กันค้าง retry/สแปม
+        targets = list(dict.fromkeys([t for t in ([BAR_GROUP_ID] + list(RESV_GROUPS)) if t and not _group_left(t)]))
         if not targets:
             _set_meta("last_resv_summary_date", today)
             return
@@ -768,7 +803,10 @@ def maybe_send_resv_summary():
                 _mark_sent("resv_summary", today, g)
                 print(f"[resv-summary] sent → {g}", flush=True)
             except Exception as e:
-                failed += 1
+                if _is_not_member_error(e):
+                    _mark_group_left(g)
+                else:
+                    failed += 1
                 print(f"[resv-summary] FAILED {g}: {e}", flush=True)
         if failed == 0:
             _set_meta("last_resv_summary_date", today)
@@ -1183,6 +1221,7 @@ def handle_image(event):
 
 def _process_image_event(event):
     group_id = getattr(event.source, "group_id", event.source.user_id)
+    _clear_group_left(group_id)   # มีรูปเข้ามา = บอทยังอยู่ในกลุ่ม → ปลดมาร์ค left ถ้าเคยติด (self-heal)
     if not _slip_enabled(group_id):
         return   # ไม่ใช่กลุ่มที่เปิดเช็คสลิป → ไม่ยุ่งเลย
     try:
@@ -1378,11 +1417,28 @@ def build_manual(group_id: str) -> str:
     return "\n".join(blocks)
 
 
+@handler.add(LeaveEvent)
+def handle_leave(event):
+    """บอทถูกเตะออก/ออกจากกลุ่ม → มาร์คเลิกส่งรายงาน-สรุปกลุ่มนั้น (กันค้าง retry/สแปม)"""
+    gid = getattr(event.source, "group_id", None) or getattr(event.source, "room_id", None)
+    if gid:
+        _mark_group_left(gid)
+
+
+@handler.add(JoinEvent)
+def handle_join(event):
+    """บอทถูกเชิญเข้ากลุ่ม (กลับมา) → ปลดมาร์ค กลับมาส่งปกติ"""
+    gid = getattr(event.source, "group_id", None) or getattr(event.source, "room_id", None)
+    if gid:
+        _clear_group_left(gid)
+
+
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     text     = event.message.text.strip()
     group_id = getattr(event.source, "group_id", event.source.user_id)
     print(f"[GROUP_ID] source_type={event.source.type} id={group_id} text={text}", flush=True)
+    _clear_group_left(group_id)   # มีข้อความเข้ามา = บอทยังอยู่ในกลุ่ม → ปลดมาร์ค left ถ้าเคยติด (self-heal)
     # เมนูคำสั่ง
     if text.lower() in ("help", "คำสั่ง", "ช่วยเหลือ", "เมนู", "menu", "คำสั่งบอท"):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_help(group_id)))
