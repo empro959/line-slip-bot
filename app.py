@@ -903,12 +903,12 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                 errors.append(ln); continue
             save_payable_bill(group_id, val, doc_date=doc_date)
             added += 1; total += val
-        msg = (f"📥 นำเข้ายอดค้างเก่า {added} รายการ รวม {total:,.2f} บาท\n"
-               "─────────────────\n"
-               f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(group_id):,.2f} บาท")
-        if errors:
-            msg += "\n⚠️ ข้ามบรรทัดที่อ่านไม่ออก:\n" + "\n".join(errors[:5])
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        if errors:   # บรรทัดที่อ่านไม่ออก (เส้นคั่น/บรรทัดว่าง) → log เงียบ ไม่รบกวนผู้ใช้
+            print(f"[payable-import] ข้าม {len(errors)} บรรทัด: {errors[:5]}", flush=True)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"📥 นำเข้ายอดค้างเก่า {added} รายการ รวม {total:,.2f} บาท\n"
+                 "─────────────────\n"
+                 f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(group_id):,.2f} บาท"))
         return True
 
     # ตั้งยอดยกมา (ค้างเก่า) — ครั้งเดียวตอนเริ่ม
