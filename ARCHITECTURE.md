@@ -36,13 +36,15 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 ## คำสั่งในแชท
 - `help`/`คำสั่ง` — เมนู • `groupid` — ดู Group ID
 - สลิป: `สรุป`, `สรุป YYYY-MM-DD`, `รายงานเมื่อวาน`, `ลบล่าสุด`/`ลบ N`, `ล้างวันนี้`
-- จอง: พิมพ์ประโยคจอง (AI จับ) → ต้องครบ ชื่อ/จำนวนคน/วันเวลา(มั่นใจ)/โซน → กดปุ่มคอนเฟิร์ม
+- จอง: พิมพ์ประโยคจอง (AI จับ) → ต้องครบ ชื่อ/จำนวนคน/วันเวลา(มั่นใจ)/โซน → กดปุ่มคอนเฟิร์ม • `สรุปจอง`
+- `คู่มือ` — บอทส่งคู่มือย่อ • `ล้างทั้งหมด` — ล้างข้อมูลกลุ่มนี้ทั้งหมด (สลิป+จอง ทุกวัน, มีปุ่มยืนยัน)
 
 ## ENV vars (ตั้งที่ Render — repo เป็น public ห้าม hardcode)
 - `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET`, `LINE_ADMIN_USER_ID`
 - `GEMINI_API_KEY`, `GEMINI_MODEL` (ดีฟอลต์ gemini-2.5-flash)
 - `DATABASE_URL` (Postgres — ต้อง region เดียวกับ web service)
-- `SLIP_GROUPS`, `RESV_GROUPS`, `BAR_GROUP_ID`, `PAYEE_KEYWORDS`
+- `SLIP_GROUPS`, `RESV_GROUPS`, `RESV_EXCLUDE_GROUPS`, `BAR_GROUP_ID`, `PAYEE_KEYWORDS`
+- `IGNORE_GROUPS` — กลุ่มที่ "บอทเมินทั้งหมด" (ไม่เช็คสลิป/ไม่จอง/ไม่ตอบคำสั่ง/ไม่ส่งรายงาน-เตือน) ใช้กับกลุ่มที่เลิกใช้
 - `RESV_NAG_MAX_HOURS`(6), `RESV_REPORT_DAYS`(7), `RESV_KEEP_DAYS`(15), `MISS_KEEP_DAYS`(14), `SLIP_KEEP_DAYS`(60), `SLIP_WORKERS`(2)
 - `PROMPTPAY_API_KEY` (SlipOK — ยังไม่เปิด; เปิดได้เพื่อตรวจกับธนาคารจริง 100%)
 

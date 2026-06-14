@@ -31,6 +31,8 @@ SLIP_GROUPS       = [g.strip() for g in os.environ.get("SLIP_GROUPS", "").split(
 RESV_GROUPS       = [g.strip() for g in os.environ.get("RESV_GROUPS", "").split(",") if g.strip()]
 # กลุ่มที่ "ปิดการจองโต๊ะ" — ไม่ยุ่งกับการจองเลย (ทั้งจองวันนี้และล่วงหน้า) เช่นกลุ่ม the riches
 RESV_EXCLUDE_GROUPS = [g.strip() for g in os.environ.get("RESV_EXCLUDE_GROUPS", "").split(",") if g.strip()]
+# กลุ่มที่ "ให้บอทเมินทั้งหมด" — ไม่ทำอะไรเลย (ไม่เช็คสลิป/ไม่จอง/ไม่ตอบคำสั่ง/ไม่ส่งรายงาน-เตือน) เช่นกลุ่มที่เลิกใช้แล้ว
+IGNORE_GROUPS     = [g.strip() for g in os.environ.get("IGNORE_GROUPS", "").split(",") if g.strip()]
 # กลุ่ม "บาร์น้ำ+จองโต๊ะล่วงหน้า" — จองล่วงหน้าจากกลุ่มไหนก็ตามจะส่งการ์ด+ปุ่มมาที่นี่ (ดู id ด้วยคำสั่ง groupid)
 BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
 # คีย์เวิร์ดบัญชีรับเงินของร้าน (ชื่อ ไทย/อังกฤษ + เลขบัญชี/เลขท้าย) คั่นด้วยคอมมา
@@ -732,8 +734,9 @@ def maybe_send_daily_report():
         yesterday = (now.date() - timedelta(days=1)).isoformat()
         with _db() as conn:
             group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
-        # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) — กันค้าง retry/สแปม
-        targets = [g for g in group_ids if ((not SLIP_GROUPS) or g in SLIP_GROUPS) and not _group_left(g)]
+        # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) / สั่งเมิน (IGNORE_GROUPS) — กันค้าง retry/สแปม
+        targets = [g for g in group_ids
+                   if ((not SLIP_GROUPS) or g in SLIP_GROUPS) and not _group_left(g) and g not in IGNORE_GROUPS]
         print(f"[report] trigger {today} → ส่งรายงานวันที่ {yesterday} ให้ {len(targets)} กลุ่ม", flush=True)
         failed = 0
         # idempotent รายกลุ่ม: กลุ่มที่ส่งสำเร็จแล้ววันนี้จะไม่ส่งซ้ำ แม้กลุ่มอื่นพลาดแล้วต้อง retry
@@ -787,8 +790,10 @@ def maybe_send_resv_summary():
             _set_meta("last_resv_summary_date", today)
             print("[resv-summary] เลย 19:00 แล้ว ข้ามวันนี้ (พรุ่งนี้ส่ง 16:00)", flush=True)
             return
-        # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) — กันค้าง retry/สแปม
-        targets = list(dict.fromkeys([t for t in ([BAR_GROUP_ID] + list(RESV_GROUPS)) if t and not _group_left(t)]))
+        # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) / สั่งเมิน (IGNORE_GROUPS) — กันค้าง retry/สแปม
+        targets = list(dict.fromkeys(
+            [t for t in ([BAR_GROUP_ID] + list(RESV_GROUPS))
+             if t and not _group_left(t) and t not in IGNORE_GROUPS]))
         if not targets:
             _set_meta("last_resv_summary_date", today)
             return
@@ -1124,6 +1129,8 @@ def _reservation_reminder_loop():
                 notify = r.get("notify_group_id")
                 if not notify:
                     continue
+                if notify in IGNORE_GROUPS or _group_left(notify):
+                    continue   # กลุ่มที่สั่งเมิน/บอทถูกเตะออก → ไม่ย้ำเตือน
                 last = r.get("reminded_at") or r.get("created_at")
                 created = r.get("created_at")
                 try:
@@ -1221,6 +1228,8 @@ def handle_image(event):
 
 def _process_image_event(event):
     group_id = getattr(event.source, "group_id", event.source.user_id)
+    if group_id in IGNORE_GROUPS:
+        return   # กลุ่มที่สั่งให้เมินทั้งหมด → ไม่ทำอะไรเลย
     _clear_group_left(group_id)   # มีรูปเข้ามา = บอทยังอยู่ในกลุ่ม → ปลดมาร์ค left ถ้าเคยติด (self-heal)
     if not _slip_enabled(group_id):
         return   # ไม่ใช่กลุ่มที่เปิดเช็คสลิป → ไม่ยุ่งเลย
@@ -1347,6 +1356,39 @@ def do_reset_today(event, date_str):
              "─────────────────\n" + build_daily_report(group_id, date_str)))
 
 
+def send_reset_all_confirm(event, group_id):
+    """ยืนยันก่อนล้าง 'ทุกอย่าง' ของกลุ่มนี้ (สลิป+รูปตกหล่น+การจอง ทุกวัน) — ใช้ตอนเลิกใช้/รีเซ็ตกลุ่ม"""
+    with _db() as conn:
+        n_slip = conn.execute("SELECT COUNT(*) c FROM slips WHERE group_id=?", (group_id,)).fetchone()["c"]
+        n_resv = conn.execute("SELECT COUNT(*) c FROM reservations WHERE origin_group_id=?", (group_id,)).fetchone()["c"]
+    if n_slip == 0 and n_resv == 0:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="📭 กลุ่มนี้ไม่มีข้อมูลให้ล้าง"))
+        return
+    line_bot_api.reply_message(event.reply_token, TemplateSendMessage(
+        alt_text="ยืนยันล้างข้อมูลทั้งหมดของกลุ่มนี้",
+        template=ButtonsTemplate(
+            title="⚠️ ล้างข้อมูลทั้งหมด (กลุ่มนี้)",
+            text=f"จะลบสลิป {n_slip} + การจอง {n_resv} รายการทั้งหมด (ทุกวัน เฉพาะกรุ๊ปนี้) กู้คืนไม่ได้ ยืนยันไหม?",
+            actions=[PostbackAction(label="🗑️ ยืนยันล้างทั้งหมด", data="reset_all")],
+        ),
+    ))
+
+
+def do_reset_all(event):
+    """ล้างข้อมูลทั้งหมดของกลุ่มนี้ — สลิป, รูปตกหล่น, การจอง (ที่เกิดในกลุ่มนี้)"""
+    group_id = getattr(event.source, "group_id", event.source.user_id)
+    with _db() as conn:
+        n_slip = conn.execute("DELETE FROM slips WHERE group_id=?", (group_id,)).rowcount
+        conn.execute("DELETE FROM image_misses WHERE group_id=?", (group_id,))
+        n_resv = conn.execute("DELETE FROM reservations WHERE origin_group_id=?", (group_id,)).rowcount
+        conn.commit()
+    confirmer = get_display_name(event.source)
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text=f"🧹 ล้างข้อมูลกลุ่มนี้เรียบร้อย (โดย {confirmer})\n"
+             f"• สลิป {n_slip} รายการ\n• การจอง {n_resv} รายการ\n"
+             "กลุ่มนี้พร้อมเริ่มใหม่แล้ว"))
+
+
 def build_help(group_id: str) -> str:
     """เมนูคำสั่ง — แสดงเฉพาะหมวดที่กลุ่มนั้นใช้ได้ (สลิป/จอง)"""
     lines = ["🤖 คำสั่งบอทเอด", "─────────────────"]
@@ -1376,6 +1418,7 @@ def build_help(group_id: str) -> str:
         "🛠️ ทั่วไป",
         "• groupid → ดู Group ID ของกลุ่ม",
         "• คู่มือ → วิธีใช้แบบละเอียด",
+        "• ล้างทั้งหมด → ล้างข้อมูลกลุ่มนี้ทั้งหมด (สลิป+จอง มีปุ่มยืนยัน)",
         "• help / คำสั่ง → เมนูนี้",
     ]
     return "\n".join(lines)
@@ -1438,6 +1481,8 @@ def handle_text(event):
     text     = event.message.text.strip()
     group_id = getattr(event.source, "group_id", event.source.user_id)
     print(f"[GROUP_ID] source_type={event.source.type} id={group_id} text={text}", flush=True)
+    if group_id in IGNORE_GROUPS:
+        return   # กลุ่มที่สั่งให้เมินทั้งหมด → ไม่ทำอะไรเลย
     _clear_group_left(group_id)   # มีข้อความเข้ามา = บอทยังอยู่ในกลุ่ม → ปลดมาร์ค left ถ้าเคยติด (self-heal)
     # เมนูคำสั่ง
     if text.lower() in ("help", "คำสั่ง", "ช่วยเหลือ", "เมนู", "menu", "คำสั่งบอท"):
@@ -1461,6 +1506,10 @@ def handle_text(event):
     # สรุปการจอง (วันนี้ + ล่วงหน้า) ของกลุ่มนี้ — ใช้ได้ทุกกลุ่ม
     if text.lower() in ("สรุปจอง", "สรุปการจอง", "รายการจอง", "จองวันนี้"):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_resv_summary(group_id)))
+        return
+    # ล้างข้อมูลทั้งหมดของกลุ่มนี้ (สลิป+จอง ทุกวัน) — เตรียมเลิกใช้/รีเซ็ตกลุ่ม (มีปุ่มยืนยัน)
+    if text.lower() in ("ล้างทั้งหมด", "ล้างกลุ่มนี้", "ล้างข้อมูลทั้งหมด", "รีเซ็ตทั้งหมด"):
+        send_reset_all_confirm(event, group_id)
         return
     # คำสั่งเกี่ยวกับสลิป (สรุป/ลบ/ล้าง) → เฉพาะกลุ่มที่เปิดเช็คสลิปเท่านั้น
     if _slip_enabled(group_id):
@@ -1515,6 +1564,9 @@ def handle_text(event):
 def handle_postback(event):
     data = event.postback.data or ""
     print(f"[POSTBACK] source_type={event.source.type} data={data}", flush=True)
+    pb_group = getattr(event.source, "group_id", None)
+    if pb_group and pb_group in IGNORE_GROUPS:
+        return   # กลุ่มที่สั่งให้เมินทั้งหมด → ไม่ทำอะไรเลย
     if data.startswith("confirm_resv:"):
         try:
             resv_id = int(data.split(":", 1)[1])
@@ -1529,6 +1581,11 @@ def handle_postback(event):
             do_reset_today(event, data.split(":", 1)[1])
         except Exception as e:
             print(f"[reset] error: {e}", flush=True)
+    elif data == "reset_all":
+        try:
+            do_reset_all(event)
+        except Exception as e:
+            print(f"[reset] reset_all error: {e}", flush=True)
 
 
 @app.route("/health", methods=["GET"])
