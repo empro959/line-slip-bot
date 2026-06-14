@@ -945,6 +945,11 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     if low in ("ลบจ่ายล่าสุด", "ลบจ่าย", "ลบสลิปล่าสุด"):
         _delete_last_payable(event, group_id, "payable_payments", "เงินจ่าย")
         return True
+
+    # ล้างบัญชีหนี้ทั้งหมด (รีเซ็ตเริ่มนับใหม่) — มีปุ่มยืนยัน
+    if low in ("ล้างบัญชีหนี้", "ล้างหนี้", "ล้างบัญชี", "รีเซ็ตหนี้", "ล้างทั้งหมด"):
+        send_reset_payable_confirm(event, group_id)
+        return True
     return False
 
 
@@ -1749,6 +1754,40 @@ def do_reset_all(event):
              "กลุ่มนี้พร้อมเริ่มใหม่แล้ว"))
 
 
+def send_reset_payable_confirm(event, group_id):
+    """ยืนยันก่อนล้าง 'บัญชีหนี้ทั้งหมด' ของกลุ่มนี้ (บิล+จ่าย+ยอดยกมา) — ใช้รีเซ็ตเริ่มนับใหม่"""
+    with _db() as conn:
+        n_bill = conn.execute("SELECT COUNT(*) c FROM payable_bills WHERE group_id=?", (group_id,)).fetchone()["c"]
+        n_pay  = conn.execute("SELECT COUNT(*) c FROM payable_payments WHERE group_id=?", (group_id,)).fetchone()["c"]
+    opening = _payable_opening(group_id)
+    if n_bill == 0 and n_pay == 0 and opening == 0:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="📭 บัญชีหนี้กลุ่มนี้ว่างอยู่แล้ว"))
+        return
+    line_bot_api.reply_message(event.reply_token, TemplateSendMessage(
+        alt_text="ยืนยันล้างบัญชีหนี้ทั้งหมดของกลุ่มนี้",
+        template=ButtonsTemplate(
+            title="⚠️ ล้างบัญชีหนี้ (กลุ่มนี้)",
+            text=f"จะลบบิล {n_bill} + จ่าย {n_pay} รายการ และล้างยอดยกมา (เริ่มนับใหม่ที่ 0) กู้คืนไม่ได้ ยืนยันไหม?",
+            actions=[PostbackAction(label="🗑️ ยืนยันล้างบัญชีหนี้", data="reset_payable")],
+        ),
+    ))
+
+
+def do_reset_payable(event):
+    """ล้างบัญชีหนี้ทั้งหมดของกลุ่มนี้ — บิล + เงินจ่าย + ยอดยกมา (เริ่มนับใหม่)"""
+    group_id = getattr(event.source, "group_id", event.source.user_id)
+    with _db() as conn:
+        n_bill = conn.execute("DELETE FROM payable_bills WHERE group_id=?", (group_id,)).rowcount
+        n_pay  = conn.execute("DELETE FROM payable_payments WHERE group_id=?", (group_id,)).rowcount
+        conn.commit()
+    _set_meta(f"payable_opening:{group_id}", "0")
+    confirmer = get_display_name(event.source)
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text=f"🧹 ล้างบัญชีหนี้กลุ่มนี้เรียบร้อย (โดย {confirmer})\n"
+             f"• บิลซื้อ {n_bill} รายการ\n• เงินจ่าย {n_pay} รายการ\n• ยอดยกมา → 0\n"
+             "พร้อมเริ่มนับใหม่แล้ว"))
+
+
 def build_help(group_id: str) -> str:
     """เมนูคำสั่ง — แสดงเฉพาะหมวดที่กลุ่มนั้นใช้ได้ (สลิป/จอง/บัญชีหนี้)"""
     if group_id in PAYABLE_GROUPS:
@@ -1764,6 +1803,7 @@ def build_help(group_id: str) -> str:
             "• สรุปหนี้ → ดูยอดค้างวันนี้",
             "• สรุปหนี้ 2026-06-09 → ดูย้อนหลัง (ตามวันที่)",
             "• ลบบิลล่าสุด / ลบจ่ายล่าสุด → แก้กรณีบันทึกผิด",
+            "• ล้างบัญชีหนี้ → ล้างทั้งหมด เริ่มนับใหม่ (มีปุ่มยืนยัน)",
             f"⏰ บอทสรุปหนี้เมื่อวานให้เองทุกวัน ตี{PAYABLE_SUMMARY_HOUR}",
             "─────────────────",
             "• groupid → ดู Group ID | help → เมนูนี้",
@@ -1817,7 +1857,8 @@ def build_manual(group_id: str) -> str:
             "• สรุปหนี้ → ยอดค้างวันนี้ (ยกเข้า + บิล − จ่าย = ค้างสะสม)\n"
             "• สรุปหนี้ 2026-06-09 → ดูย้อนหลังตามวันที่\n\n"
             "🧹 แก้ที่ผิด\n"
-            "• ลบบิลล่าสุด / ลบจ่ายล่าสุด\n\n"
+            "• ลบบิลล่าสุด / ลบจ่ายล่าสุด\n"
+            "• ล้างบัญชีหนี้ → ล้างทั้งหมด เริ่มนับใหม่ (มีปุ่มยืนยัน)\n\n"
             f"⏰ บอทส่งสรุปหนี้เมื่อวานให้เองทุกวัน ตี{PAYABLE_SUMMARY_HOUR}\n"
             "ℹ️ help → เมนูคำสั่ง | groupid → ดูข้อมูลกลุ่ม"
         )
@@ -1986,6 +2027,11 @@ def handle_postback(event):
             do_reset_all(event)
         except Exception as e:
             print(f"[reset] reset_all error: {e}", flush=True)
+    elif data == "reset_payable":
+        try:
+            do_reset_payable(event)
+        except Exception as e:
+            print(f"[reset] reset_payable error: {e}", flush=True)
 
 
 @app.route("/health", methods=["GET"])
