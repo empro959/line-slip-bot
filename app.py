@@ -874,6 +874,43 @@ def _process_payable_image(event, group_id: str):
 def handle_payable_text(event, text: str, group_id: str) -> bool:
     """คำสั่งบัญชีเจ้าหนี้ในกลุ่ม PAYABLE_GROUPS — คืน True ถ้าจัดการแล้ว"""
     low = text.lower().strip()
+
+    # นำเข้ายอดค้างเก่าหลายบรรทัดทีเดียว — วางบล็อก:
+    #   ค้าง
+    #   6/6=24153
+    #   8/6 18504
+    lines = text.splitlines()
+    if len(lines) > 1 and lines[0].strip().lower() in ("ค้าง", "ยอดค้าง", "รายการค้าง", "บิลค้าง"):
+        added, total, errors = 0, 0.0, []
+        for ln in lines[1:]:
+            ln = ln.strip()
+            if not ln:
+                continue
+            if "=" in ln:
+                dpart, apart = ln.split("=", 1)
+            else:
+                parts = ln.split()
+                if len(parts) < 2:
+                    errors.append(ln); continue
+                dpart, apart = parts[0], " ".join(parts[1:])
+            doc_date = _parse_thai_date(dpart.strip())
+            apart = apart.strip().replace(",", "").replace("บาท", "").strip()
+            try:
+                val = float(apart)
+            except ValueError:
+                errors.append(ln); continue
+            if doc_date is None or val <= 0:
+                errors.append(ln); continue
+            save_payable_bill(group_id, val, doc_date=doc_date)
+            added += 1; total += val
+        msg = (f"📥 นำเข้ายอดค้างเก่า {added} รายการ รวม {total:,.2f} บาท\n"
+               "─────────────────\n"
+               f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(group_id):,.2f} บาท")
+        if errors:
+            msg += "\n⚠️ ข้ามบรรทัดที่อ่านไม่ออก:\n" + "\n".join(errors[:5])
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        return True
+
     # ตั้งยอดยกมา (ค้างเก่า) — ครั้งเดียวตอนเริ่ม
     if low.startswith("ตั้งยอดยกมา") or low.startswith("ยอดยกมา") or low.startswith("ตั้งยอดค้าง") or low.startswith("ค้างเก่า"):
         for kw in ("ตั้งยอดยกมา", "ตั้งยอดค้าง", "ยอดยกมา", "ค้างเก่า"):
@@ -1852,7 +1889,8 @@ def build_manual(group_id: str) -> str:
             "• บอทตอบยอดค้างสะสมล่าสุดให้ทุกครั้ง\n\n"
             "🚀 เริ่มใช้ครั้งแรก\n"
             "• พิมพ์ 'ตั้งยอดยกมา 12000' ใส่ยอดค้างเก่าก้อนเดียว (ตั้งครั้งเดียว)\n"
-            "• หรือลงบิลเก่าทีละใบตามวันที่จริง: 'บิล 6/6 24153'\n\n"
+            "• หรือลงบิลเก่าทีละใบตามวันที่จริง: 'บิล 6/6 24153'\n"
+            "• หรือวางทีเดียวหลายใบ: บรรทัดแรก 'ค้าง' แล้วบรรทัดถัดไป '6/6=24153'\n\n"
             "📊 ดูยอด\n"
             "• สรุปหนี้ → ยอดค้างวันนี้ (ยกเข้า + บิล − จ่าย = ค้างสะสม)\n"
             "• สรุปหนี้ 2026-06-09 → ดูย้อนหลังตามวันที่\n\n"
