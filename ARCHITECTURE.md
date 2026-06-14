@@ -24,13 +24,14 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 - **image_misses** — รูปที่รับแต่ไม่เป็นสลิป (กระทบยอด "รับรูป/อ่านได้/ตกหล่น")
 - **reservations** — การจอง (customer, people, resv_datetime, table_no, resv_date[YYYY-MM-DD], status, notify_group_id, reminded_at, confirmed_by/at)
 - **groups** — group_id ที่บอทเคยเจอ (ไว้ส่งรายงาน)
-- **meta** — key/value (เช่น last_report_date กันส่งรายงานซ้ำ)
+- **meta** — key/value: `last_report_date`/`last_resv_summary_date` (กันส่งซ้ำรายวัน), `sent:{job}:{date}:{group}` (กันส่งซ้ำ "รายกลุ่ม" เผื่อบางกลุ่มพลาดต้อง retry — ล้างของเก่าใน cleanup), `left:{group}` (กลุ่มที่บอทถูกเตะออก = เลิกส่ง กันค้าง retry/สแปม)
 
 ## งานเบื้องหลัง (daemon threads)
 - `_report_backup_loop` — เรียก `maybe_send_daily_report()` ทุก 5 นาที (สำรองจาก /health ping)
 - `maybe_send_daily_report` — หลัง 00:30 วันละครั้ง (idempotent ด้วย meta.last_report_date): รายงานสลิป→SLIP_GROUPS, รายงานจองล่วงหน้า→BAR_GROUP, แล้ว `_cleanup_old_data()`
 - `_reservation_reminder_loop` — เตือนจอง PENDING ทุก 5 นาที (18-22น.)/15 นาที (เวลาอื่น) จนคอนเฟิร์ม/เกิน RESV_NAG_MAX_HOURS
 - รูปสลิป: ประมวลผลผ่าน `_slip_pool` (ThreadPoolExecutor, SLIP_WORKERS=2) กัน burst ทำ memory พุ่ง/OOM
+- **กันสแปมเมื่อบอทถูกเตะออกกลุ่ม:** ส่งรายงาน/สรุปแบบ idempotent "รายกลุ่ม" (กลุ่มที่ส่งสำเร็จแล้วไม่ส่งซ้ำ retry เฉพาะที่พลาด) + `LeaveEvent`→มาร์ค `left:{group}` + push เจอ 400 ("ไม่ใช่สมาชิก") → auto-prune มาร์ค left เอง + `JoinEvent`/มีข้อความเข้ามา → ปลดมาร์ค (self-heal)
 
 ## คำสั่งในแชท
 - `help`/`คำสั่ง` — เมนู • `groupid` — ดู Group ID
