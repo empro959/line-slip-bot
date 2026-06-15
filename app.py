@@ -670,10 +670,10 @@ def build_resv_summary(notify_group=None, title="📋 สรุปการจ�
     upcoming=True: จองที่กำลังจะถึง (resv_date >= วันนี้) แยกหัวข้อ วันนี้/ล่วงหน้า — ใช้กับ digest ล่วงหน้า
     notify_group=None → ทุกการจอง / ระบุ group → เฉพาะการจองที่ส่งการ์ดเข้ากลุ่มนั้น"""
     today  = datetime.now(TZ).date().isoformat()
-    cutoff = (datetime.now(TZ) - timedelta(days=RESV_REPORT_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
     if upcoming:
-        date_cond = "((resv_date IS NOT NULL AND resv_date >= ?) OR (resv_date IS NULL AND created_at >= ?))"
-        params = [today, cutoff]
+        # "วันงานจริง" ต้อง >= วันนี้ — ใช้ resv_date ถ้ามี ไม่งั้น fallback วันที่แจ้ง (กันจองที่เลยวันไปแล้วค้างในรายการล่วงหน้า)
+        date_cond = "(COALESCE(resv_date, substr(created_at,1,10)) >= ?)"
+        params = [today]
     else:
         # วันนี้เท่านั้น: resv_date=วันนี้ (จองล่วงหน้าโผล่เฉพาะวันถึง) + จองที่ไม่มีวันชัดแต่แจ้งวันนี้
         date_cond = "((resv_date = ?) OR (resv_date IS NULL AND substr(created_at,1,10) = ?))"
