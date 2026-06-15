@@ -189,7 +189,8 @@ def init_db():
                 ref_number    TEXT,
                 slip_datetime TEXT,
                 verdict       TEXT,
-                recorded_at   TEXT
+                recorded_at   TEXT,
+                message_id    TEXT
             )
         """)
         if not USE_PG:
@@ -204,6 +205,14 @@ def init_db():
         else:
             try:
                 conn.execute("ALTER TABLE slips ADD COLUMN account_label TEXT")
+            except Exception:
+                pass
+        # migration: message_id = id ข้อความ LINE ของรูป (กันประมวลผล/นับรูปเดียวกันซ้ำ) — ทั้ง PG/SQLite
+        if USE_PG:
+            conn.execute("ALTER TABLE slips ADD COLUMN IF NOT EXISTS message_id TEXT")
+        else:
+            try:
+                conn.execute("ALTER TABLE slips ADD COLUMN message_id TEXT")
             except Exception:
                 pass
         conn.execute("CREATE TABLE IF NOT EXISTS groups (group_id TEXT PRIMARY KEY)")
@@ -546,19 +555,29 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None) 
 # Storage & Report
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_slip(group_id: str, info: dict, verdict_status: str):
+def save_slip(group_id: str, info: dict, verdict_status: str, message_id: str = None):
     today       = datetime.now(TZ).date().isoformat()
     recorded_at = datetime.now(TZ).strftime("%H:%M:%S")
     with _db() as conn:
         conn.execute(
-            "INSERT INTO slips (group_id, slip_date, sender, amount, bank, ref_number, slip_datetime, verdict, recorded_at, account_label) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO slips (group_id, slip_date, sender, amount, bank, ref_number, slip_datetime, verdict, recorded_at, account_label, message_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (group_id, today, info.get("sender"), float(info.get("amount") or 0),
              info.get("bank"), info.get("ref_number"), info.get("datetime"), verdict_status, recorded_at,
-             _slip_account_label(info))
+             _slip_account_label(info), message_id)
         )
         conn.execute("INSERT INTO groups (group_id) VALUES (?) ON CONFLICT DO NOTHING", (group_id,))
         conn.commit()
+
+
+def _slip_message_seen(group_id: str, message_id: str) -> bool:
+    """รูปนี้ (message_id เดียวกัน) เคยถูกบันทึกเป็นสลิปในกรุ๊ปนี้แล้วหรือยัง — กัน LINE ส่ง webhook ซ้ำ/รีสตาร์ทแล้วนับซ้ำ"""
+    if not message_id:
+        return False
+    with _db() as conn:
+        return conn.execute(
+            "SELECT 1 FROM slips WHERE group_id=? AND message_id=? LIMIT 1",
+            (group_id, message_id)).fetchone() is not None
 
 
 def record_image_miss(group_id: str, reason: str):
@@ -1672,6 +1691,11 @@ def _process_image_event(event):
         return
     if not _slip_enabled(group_id):
         return   # ไม่ใช่กลุ่มที่เปิดเช็คสลิป → ไม่ยุ่งเลย
+    msg_id = getattr(event.message, "id", None)
+    # กันประมวลผลรูปเดิมซ้ำ (LINE ส่ง webhook ซ้ำ / บอทรีสตาร์ทแล้ว retry) → ไม่งั้นจะเจอ ref ตัวเองแล้วหาว่า 'สลิปซ้ำ'
+    if _slip_message_seen(group_id, msg_id):
+        print(f"[skip] รูปนี้ประมวลผลแล้ว (message_id ซ้ำ) group={group_id} msg={msg_id}", flush=True)
+        return
     try:
         content     = line_bot_api.get_message_content(event.message.id)
         image_bytes = b"".join(chunk for chunk in content.iter_content())
@@ -1698,9 +1722,13 @@ def _process_image_event(event):
         promptpay = verify_with_promptpay(image_bytes)
         # ล็อกช่วงเช็คซ้ำ+บันทึก ให้เป็นจังหวะเดียว กัน race ตอนส่งซ้ำพร้อมกันหลาย thread
         with _dup_lock:
+            # เช็ค message_id ซ้ำอีกครั้งแบบ atomic ในล็อก (กันสองรอบที่ผ่านเช็คต้นทางพร้อมกัน)
+            if _slip_message_seen(group_id, msg_id):
+                print(f"[skip] รูปนี้ประมวลผลแล้ว (message_id ซ้ำ, in-lock) group={group_id} msg={msg_id}", flush=True)
+                return
             dup_type, prev_amount = find_duplicate(group_id, info)
             verdict  = build_verdict(info, promptpay, dup_type, prev_amount)
-            save_slip(group_id, info, verdict["status"])
+            save_slip(group_id, info, verdict["status"], message_id=msg_id)
 
         # สลิปผ่าน (PASS) → เงียบไว้ ไม่รกแชท (ยังบันทึกไว้ ดูรวมได้ที่ "สรุป")
         # เตือนในกรุ๊ปเฉพาะที่มีปัญหา (WARN/FAIL)
