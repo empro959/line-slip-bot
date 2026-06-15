@@ -837,7 +837,8 @@ def build_payable_summary(group_id: str, date_str=None) -> str:
     with _db() as conn:
         n_bill = conn.execute("SELECT COUNT(*) c FROM payable_bills WHERE group_id=? AND doc_date=?", (group_id, d)).fetchone()["c"]
         n_pay  = conn.execute("SELECT COUNT(*) c FROM payable_payments WHERE group_id=? AND doc_date=?", (group_id, d)).fetchone()["c"]
-    return (
+        n_unread = conn.execute("SELECT COUNT(*) c FROM image_misses WHERE group_id=? AND stat_date=? AND reason='payable_unread'", (group_id, d)).fetchone()["c"]
+    msg = (
         f"📊 สรุปหนี้ {PAYABLE_VENDOR}\n"
         f"📅 ประจำวันที่ {d}\n"
         "─────────────────\n"
@@ -847,6 +848,9 @@ def build_payable_summary(group_id: str, date_str=None) -> str:
         "─────────────────\n"
         f"💰 ค้างจ่ายสะสม: {carry_out:,.2f} บาท"
     )
+    if n_unread:
+        msg += f"\n⚠️ มีรูปที่อ่านไม่ออก/ยังไม่ได้บันทึก {n_unread} ใบ — โปรดส่งใหม่หรือพิมพ์ยอดเอง"
+    return msg
 
 
 def _process_payable_image(event, group_id: str):
@@ -869,6 +873,7 @@ def _process_payable_image(event, group_id: str):
 
     if doc_type == "bill":
         if amount <= 0:
+            record_image_miss(group_id, "payable_unread")
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
                 text="🟡 อ่านยอดเงินบนบิลไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง"))
             return
@@ -880,6 +885,7 @@ def _process_payable_image(event, group_id: str):
 
     if doc_type == "payment":
         if amount <= 0:
+            record_image_miss(group_id, "payable_unread")
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
                 text="🟡 อ่านยอดเงินบนสลิปไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่"))
             return
@@ -895,8 +901,15 @@ def _process_payable_image(event, group_id: str):
                  f"💰 ค้างจ่ายสะสม: {_payable_outstanding(group_id):,.2f} บาท"))
         return
 
-    # other → เงียบไว้ ไม่รบกวน
+    # other → อ่านไม่ออกว่าเป็นบิล/สลิป — ห้ามทิ้งเงียบ (กันบัญชีคลาดเคลื่อน) ตอบเตือน + นับไว้ให้เห็นในสรุป
+    record_image_miss(group_id, "payable_unread")
     print(f"[payable] รูปไม่ใช่บิล/สลิป group={group_id}", flush=True)
+    try:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text="🟡 อ่านรูปนี้ไม่ออกว่าเป็นบิลซื้อหรือสลิปจ่าย — ยังไม่ได้บันทึก\n"
+                 "ถ้าเป็นบิล/สลิปจริง โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง"))
+    except Exception:
+        pass
 
 
 def handle_payable_text(event, text: str, group_id: str) -> bool:
