@@ -1097,13 +1097,13 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     acct = _payable_account_key(group_id)   # บัญชีร่วม (primary/mirror ใช้ข้อมูลชุดเดียวกัน)
     out  = _payable_output_group(group_id)  # ผลการ 'บันทึก' เด้งที่ไหน (primary→mirror เงียบในกลุ่มต้นทาง)
 
-    # นำเข้ายอดค้างเก่าหลายบรรทัดทีเดียว — วางบล็อก:
+    # บล็อก 'ค้าง' = บันทึกยอดค้างรายวัน (วันที่=ยอดค้าง ณ วันนั้น) — ใช้ "วันล่าสุด" เป็น 'ยอดยกมา' ตั้งต้น
     #   ค้าง
     #   6/6=24153
-    #   8/6 18504
+    #   13/6=8074   ← เอาอันนี้ (วันล่าสุด) เป็นยอดยกมา ไม่รวมทุกบรรทัด ไม่ลงเป็นบิล
     lines = text.splitlines()
     if len(lines) > 1 and lines[0].strip().lower() in ("ค้าง", "ยอดค้าง", "รายการค้าง", "บิลค้าง"):
-        added, total, dup, errors = 0, 0.0, 0, []
+        entries, errors = [], []   # entries: (doc_date, amount) ตามลำดับที่อ่านได้
         for ln in lines[1:]:
             ln = ln.strip()
             if not ln:
@@ -1121,18 +1121,25 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                 val = float(apart)
             except ValueError:
                 errors.append(ln); continue
-            if doc_date is None or val <= 0:
+            if doc_date is None or val < 0:
                 errors.append(ln); continue
-            # กันวางบล็อกซ้ำ → นับเบิ้ล: ถ้ามีบิลวันที่+ยอดเดียวกันอยู่แล้ว ให้ข้าม (นับครั้งเดียว)
-            if _payable_bill_exists(acct, doc_date, val):
-                dup += 1; continue
-            save_payable_bill(acct, val, note="block", doc_date=doc_date)
-            added += 1; total += val
-        if errors:   # บรรทัดที่อ่านไม่ออก (เส้นคั่น/บรรทัดว่าง) → log เงียบ ไม่รบกวนผู้ใช้
+            entries.append((doc_date, val))
+        if errors:
             print(f"[payable-import] ข้าม {len(errors)} บรรทัด: {errors[:5]}", flush=True)
-        note = f"\n🔁 ข้ามรายการซ้ำ (มีอยู่แล้ว) {dup} รายการ" if dup else ""
+        if not entries:
+            _payable_send(event, group_id, out, "❌ อ่านบล็อกค้างไม่ได้ — รูปแบบควรเป็น  วัน/เดือน=ยอด")
+            return True
+        # เลือก 'วันล่าสุด' (ถ้าวันเดียวกันมีหลายบรรทัด เอาบรรทัดท้ายสุดของวันนั้น)
+        latest_date = max(d for d, _ in entries)
+        latest_val  = [v for d, v in entries if d == latest_date][-1]
+        _set_meta(f"payable_opening:{acct}", str(latest_val))   # ตั้งยอดยกมา (idempotent — วางซ้ำได้ ไม่เบิ้ล)
+        try:
+            dlabel = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%d/%m/%y")
+        except (ValueError, TypeError):
+            dlabel = latest_date
         _payable_send(event, group_id, out,
-            f"📥 นำเข้ายอดค้างเก่า {added} รายการ รวม {total:,.2f} บาท{note}\n"
+            f"📌 ตั้งยอดค้างยกมา = {latest_val:,.2f} บาท (จากบันทึกล่าสุด {dlabel})\n"
+            f"ℹ️ บล็อกค้าง = บันทึกยอดค้างรายวัน → ใช้เฉพาะ 'วันล่าสุด' เป็นยอดตั้งต้น (ไม่รวมทุกบรรทัด)\n"
             "─────────────────\n"
             f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
         return True
@@ -2206,9 +2213,9 @@ def build_manual(group_id: str) -> str:
             "• ส่งรูป 'สลิปโอนจ่าย' → บอทอ่านยอด แล้ว 'ลดหนี้' (กันสลิปซ้ำด้วยเลขอ้างอิง)\n"
             "• บอทตอบยอดค้างสะสมล่าสุดให้ทุกครั้ง\n\n"
             "🚀 เริ่มใช้ครั้งแรก\n"
-            "• พิมพ์ 'ตั้งยอดยกมา 12000' ใส่ยอดค้างเก่าก้อนเดียว (ตั้งครั้งเดียว)\n"
-            "• หรือลงบิลเก่าทีละใบตามวันที่จริง: 'บิล 6/6 24153'\n"
-            "• หรือวางทีเดียวหลายใบ: บรรทัดแรก 'ค้าง' แล้วบรรทัดถัดไป '6/6=24153'\n\n"
+            "• พิมพ์ 'ตั้งยอดยกมา 12000' ใส่ยอดค้างเก่าก้อนเดียว\n"
+            "• หรือวางบล็อก 'ค้าง' (บันทึกยอดค้างรายวัน) → บอทใช้ 'วันล่าสุด' เป็นยอดยกมา:\n"
+            "   ค้าง / 6/6=24153 / 13/6=8074 → ยอดยกมา = 8,074\n\n"
             "📊 ดูยอด\n"
             "• สรุปหนี้ → ยอดค้างวันนี้ (ยกเข้า + บิล − จ่าย = ค้างสะสม)\n"
             "• สรุปหนี้ 2026-06-09 → ดูย้อนหลังตามวันที่\n\n"
