@@ -65,6 +65,8 @@ for _acc in os.environ.get("PAYEE_ACCOUNTS", "").split(";"):
 # INCOME_ONLY=1 = ทุกกลุ่ม / INCOME_ONLY_GROUPS = เฉพาะกลุ่มที่ระบุ (คั่นคอมมา) เช่นกลุ่ม staff
 INCOME_ONLY        = os.environ.get("INCOME_ONLY", "0") == "1"
 INCOME_ONLY_GROUPS = [g.strip() for g in os.environ.get("INCOME_ONLY_GROUPS", "").split(",") if g.strip()]
+# เตือนในกลุ่มเมื่อบอท "อ่านรูปไม่ออกว่าเป็นสลิป" (หลังลองอ่านซ้ำแล้วยังไม่ผ่าน) — ตั้ง 0 เพื่อปิดถ้ากลุ่มมีรูปอื่นเยอะจนรก
+SLIP_WARN_UNREAD   = os.environ.get("SLIP_WARN_UNREAD", "1") == "1"
 # จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
 RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
 # รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
@@ -294,8 +296,14 @@ except Exception as e:
 # LAYER 1 — AI Visual Analysis (Gemini)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_slip_info(image_bytes: bytes) -> dict:
+def extract_slip_info(image_bytes: bytes, retry: bool = False) -> dict:
+    retry_note = (
+        "🔁 นี่คือการอ่าน 'รอบสอง' — รอบแรกตอบว่าไม่ใช่สลิป แต่รูปนี้ถูกส่งในกลุ่มรับสลิป "
+        "จึงมีโอกาสสูงที่จะเป็นสลิป หรือมี 'สลิปโอน' อยู่ในรูป (อาจถ่ายคู่กับใบบิลร้าน/ถ่ายจากหน้าจอ/เอียง/เบลอ/แสงน้อย) "
+        "โปรดเพ่งดูให้ละเอียดที่สุด ถ้าพอเห็นจำนวนเงิน + ร่องรอยการโอน/จ่ายสำเร็จ ให้ is_slip=true ไว้ก่อน\n\n"
+    ) if retry else ""
     prompt = (
+        retry_note +
         "ดูรูปนี้ว่าเป็นสลิป/หลักฐานการชำระเงินให้ร้านหรือไม่ "
         "(โอนผ่านธนาคาร/แอปธนาคาร หรือจ่ายผ่านเป๋าตัง/G-Wallet/รัฐช่วยจ่าย เช่น ไทยช่วยไทย คนละครึ่ง เราชนะ) "
         "แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
@@ -1723,10 +1731,27 @@ def _process_image_event(event):
         image_bytes = b"".join(chunk for chunk in content.iter_content())
         info        = extract_slip_info(image_bytes)
 
-        # ถ้าไม่ใช่สลิปโอนเงิน → เงียบไว้ ไม่ต้องตอบอะไร (แต่ยังนับไว้กระทบยอด เผื่อ AI อ่านพลาด)
+        # รอบแรกว่า 'ไม่ใช่สลิป' → ลองอ่านซ้ำอีกรอบด้วยคำสั่งเข้มขึ้น (กู้ใบก้ำกึ่ง: บิลคู่สลิป/ถ่ายจอ/เอียง/มืด)
+        if not info.get("is_slip", True):
+            try:
+                info_retry = extract_slip_info(image_bytes, retry=True)
+                if info_retry.get("is_slip"):
+                    info = info_retry
+                    print(f"[slip] retry กู้สลิปได้ group={group_id}", flush=True)
+            except Exception as e:
+                print(f"[slip] retry อ่านซ้ำพลาด group={group_id}: {e}", flush=True)
+
+        # ยังไม่ใช่สลิปหลังอ่านซ้ำ → นับตกหล่น + เตือนในกลุ่ม (ถ้าเปิด) เพื่อให้รู้ว่าใบไหนบอทอ่านไม่ออก
         if not info.get("is_slip", True):
             print(f"[skip] not a slip, group={group_id}", flush=True)
             record_image_miss(group_id, "notslip")
+            if SLIP_WARN_UNREAD:
+                try:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                        text="🟡 บอทอ่านรูปนี้ไม่ออกว่าเป็นสลิป — ยังไม่นับให้\n"
+                             "ถ้าเป็นสลิปโอน โปรดส่งใหม่ให้ชัดขึ้น (แนะนำเป็นภาพ screenshot จะแม่นสุด)"))
+                except Exception:
+                    pass
             return
 
         # อ่านเฉพาะรายรับ (เฉพาะกลุ่มที่กำหนด): บันทึกเฉพาะสลิปที่โอนเข้า 'บัญชีร้านที่ระบุ' เท่านั้น
