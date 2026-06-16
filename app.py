@@ -963,6 +963,7 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     บัญชีเดียว 2 กลุ่ม (mirror): ทุกคำสั่งทำงานบน acct (บัญชีร่วม) แต่ตอบในกลุ่มที่พิมพ์"""
     low = text.lower().strip()
     acct = _payable_account_key(group_id)   # บัญชีร่วม (primary/mirror ใช้ข้อมูลชุดเดียวกัน)
+    out  = _payable_output_group(group_id)  # ผลการ 'บันทึก' เด้งที่ไหน (primary→mirror เงียบในกลุ่มต้นทาง)
 
     # นำเข้ายอดค้างเก่าหลายบรรทัดทีเดียว — วางบล็อก:
     #   ค้าง
@@ -994,10 +995,10 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             added += 1; total += val
         if errors:   # บรรทัดที่อ่านไม่ออก (เส้นคั่น/บรรทัดว่าง) → log เงียบ ไม่รบกวนผู้ใช้
             print(f"[payable-import] ข้าม {len(errors)} บรรทัด: {errors[:5]}", flush=True)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text=f"📥 นำเข้ายอดค้างเก่า {added} รายการ รวม {total:,.2f} บาท\n"
-                 "─────────────────\n"
-                 f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท"))
+        _payable_send(event, group_id, out,
+            f"📥 นำเข้ายอดค้างเก่า {added} รายการ รวม {total:,.2f} บาท\n"
+            "─────────────────\n"
+            f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
         return True
 
     # ตั้งยอดยกมา (ค้างเก่า) — ครั้งเดียวตอนเริ่ม
@@ -1018,9 +1019,9 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                 text="❌ ใส่ตัวเลขไม่ถูก เช่น: ตั้งยอดยกมา 12000"))
             return True
         _set_meta(f"payable_opening:{acct}", str(val))
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text=f"✅ ตั้งยอดค้างยกมา = {val:,.2f} บาท\n─────────────────\n"
-                 f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท"))
+        _payable_send(event, group_id, out,
+            f"✅ ตั้งยอดค้างยกมา = {val:,.2f} บาท\n─────────────────\n"
+            f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
         return True
 
     # บันทึกบิลด้วยข้อความ (เผื่อไม่มีรูป) เช่น "บิล 3500" หรือย้อนวันที่ "บิล 6/6 24153"
@@ -1046,9 +1047,9 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             return False
         rid = save_payable_bill(acct, val, doc_date=doc_date)
         date_note = f"\n📅 ลงวันที่ {doc_date}" if doc_date else ""
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text=f"📥 บันทึกบิลซื้อ #{rid}\nยอด {val:,.2f} บาท{date_note}\n─────────────────\n"
-                 f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท"))
+        _payable_send(event, group_id, out,
+            f"📥 บันทึกบิลซื้อ #{rid}\nยอด {val:,.2f} บาท{date_note}\n─────────────────\n"
+            f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท")
         return True
 
     # สรุปหนี้ (วันนี้ / ตามวันที่)
