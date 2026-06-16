@@ -39,6 +39,8 @@ IGNORE_GROUPS     = [g.strip() for g in os.environ.get("IGNORE_GROUPS", "").spli
 PAYABLE_GROUPS    = [g.strip() for g in os.environ.get("PAYABLE_GROUPS", "").split(",") if g.strip()]
 PAYABLE_VENDOR    = os.environ.get("PAYABLE_VENDOR", "ดวงใจการสุรา")   # ชื่อเจ้าหนี้ (โชว์ในรายงาน)
 PAYABLE_SUMMARY_HOUR = int(os.environ.get("PAYABLE_SUMMARY_HOUR", "1"))  # ส่งสรุปหนี้รายวันหลังกี่โมง (ดีฟอลต์ ตี1)
+# รับวันที่ที่ AI อ่านจากบิล/สลิป(รูป) เฉพาะที่ไม่เก่าเกินกี่วัน (กัน AI อ่านวันที่บนบิลเพี้ยน) — เกินช่วงนี้ใช้วันที่ส่งแทน
+PAYABLE_DATE_MAX_DAYS = int(os.environ.get("PAYABLE_DATE_MAX_DAYS", "3"))
 # บัญชีหนี้แบบ "บัญชีเดียว 2 กลุ่ม" (mirror) — รูปแบบ "primary:mirror,primary2:mirror2"
 #   primary = กลุ่มส่งบิล/สลิป (เงียบ ไม่ตอบในกลุ่ม) + เป็นที่เก็บข้อมูลจริง
 #   mirror  = กลุ่มที่บอทเด้งผล/ดูยอด/สรุป (ใช้ข้อมูลชุดเดียวกับ primary)
@@ -78,8 +80,8 @@ for _acc in os.environ.get("PAYEE_ACCOUNTS", "").split(";"):
 # INCOME_ONLY=1 = ทุกกลุ่ม / INCOME_ONLY_GROUPS = เฉพาะกลุ่มที่ระบุ (คั่นคอมมา) เช่นกลุ่ม staff
 INCOME_ONLY        = os.environ.get("INCOME_ONLY", "0") == "1"
 INCOME_ONLY_GROUPS = [g.strip() for g in os.environ.get("INCOME_ONLY_GROUPS", "").split(",") if g.strip()]
-# เตือนในกลุ่มเมื่อบอท "อ่านรูปไม่ออกว่าเป็นสลิป" (หลังลองอ่านซ้ำแล้วยังไม่ผ่าน) — ตั้ง 0 เพื่อปิดถ้ากลุ่มมีรูปอื่นเยอะจนรก
-SLIP_WARN_UNREAD   = os.environ.get("SLIP_WARN_UNREAD", "1") == "1"
+# เตือนในกลุ่มเมื่อบอท "อ่านรูปไม่ออกว่าเป็นสลิป" — ดีฟอลต์ปิด (กันเด้งรกกับรูปทั่วไป/รูปอาหาร); ตั้ง 1 เพื่อเปิด
+SLIP_WARN_UNREAD   = os.environ.get("SLIP_WARN_UNREAD", "0") == "1"
 # จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
 RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
 # รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
@@ -765,6 +767,21 @@ def build_advance_resv_report() -> str:
     return build_resv_summary(BAR_GROUP_ID, "📅 จองล่วงหน้าที่กำลังจะถึง", upcoming=True)
 
 
+def _sane_doc_date(doc_date):
+    """รับวันที่ที่ AI อ่านจากเอกสารเฉพาะที่ 'สมเหตุผล' — ไม่เป็นอนาคต และไม่เก่าเกิน PAYABLE_DATE_MAX_DAYS วัน
+    กัน AI อ่านวันที่บนบิลเพี้ยน (หยิบเลขที่บิล/วันครบกำหนดมาเป็นวันที่) → คืน None = ให้ใช้วันที่ส่ง(วันนี้)แทน"""
+    if not _valid_ymd(doc_date):
+        return None
+    try:
+        d = datetime.strptime(str(doc_date), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    today = datetime.now(TZ).date()
+    if d > today or (today - d).days > PAYABLE_DATE_MAX_DAYS:
+        return None
+    return doc_date
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ระบบที่ 3 — บัญชีเจ้าหนี้การค้า (ดวงใจการสุรา): บิลซื้อ(+) / เงินจ่าย(−) / ยอดค้าง
 # หมายเหตุ: ห้าม cleanup ตาราง payable_* (เป็นบัญชีเดินสะสม ลบแถวเก่า = ยอดเพี้ยน)
@@ -1004,7 +1021,7 @@ def _process_payable_image(event, group_id: str):
 
     doc_type = (info.get("doc_type") or "other").lower()
     amount   = float(info.get("amount") or 0)
-    doc_date = info.get("doc_date") if _valid_ymd(info.get("doc_date")) else None   # ใช้วันที่บนเอกสาร ถ้าอ่านได้ ไม่งั้น = วันนี้
+    doc_date = _sane_doc_date(info.get("doc_date"))   # ใช้วันที่บนเอกสารเฉพาะที่สมเหตุผล (กัน AI อ่านเพี้ยน) ไม่งั้น = วันนี้
 
     if doc_type == "bill":
         if amount <= 0:
