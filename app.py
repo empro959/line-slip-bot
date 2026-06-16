@@ -38,6 +38,18 @@ IGNORE_GROUPS     = [g.strip() for g in os.environ.get("IGNORE_GROUPS", "").spli
 PAYABLE_GROUPS    = [g.strip() for g in os.environ.get("PAYABLE_GROUPS", "").split(",") if g.strip()]
 PAYABLE_VENDOR    = os.environ.get("PAYABLE_VENDOR", "ดวงใจการสุรา")   # ชื่อเจ้าหนี้ (โชว์ในรายงาน)
 PAYABLE_SUMMARY_HOUR = int(os.environ.get("PAYABLE_SUMMARY_HOUR", "1"))  # ส่งสรุปหนี้รายวันหลังกี่โมง (ดีฟอลต์ ตี1)
+# บัญชีหนี้แบบ "บัญชีเดียว 2 กลุ่ม" (mirror) — รูปแบบ "primary:mirror,primary2:mirror2"
+#   primary = กลุ่มส่งบิล/สลิป (เงียบ ไม่ตอบในกลุ่ม) + เป็นที่เก็บข้อมูลจริง
+#   mirror  = กลุ่มที่บอทเด้งผล/ดูยอด/สรุป (ใช้ข้อมูลชุดเดียวกับ primary)
+PAYABLE_MIRROR      = {}        # primary -> mirror
+_PAYABLE_PRIMARY_OF = {}        # mirror  -> primary
+for _pair in os.environ.get("PAYABLE_MIRROR", "").split(","):
+    _pair = _pair.strip()
+    if ":" in _pair:
+        _p, _m = (x.strip() for x in _pair.split(":", 1))
+        if _p and _m and _p != _m:
+            PAYABLE_MIRROR[_p] = _m
+            _PAYABLE_PRIMARY_OF[_m] = _p
 # กลุ่ม "บาร์น้ำ+จองโต๊ะล่วงหน้า" — จองล่วงหน้าจากกลุ่มไหนก็ตามจะส่งการ์ด+ปุ่มมาที่นี่ (ดู id ด้วยคำสั่ง groupid)
 BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
 # redirect รายงาน: ส่งรายงานของ "กลุ่มต้นทาง" ไปเข้า "กลุ่มปลายทาง" แทน (เนื้อห้ารายงานยังเป็นของต้นทาง)
@@ -748,6 +760,27 @@ def build_advance_resv_report() -> str:
 # หมายเหตุ: ห้าม cleanup ตาราง payable_* (เป็นบัญชีเดินสะสม ลบแถวเก่า = ยอดเพี้ยน)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _payable_account_key(group_id: str) -> str:
+    """คีย์บัญชี (ที่เก็บข้อมูลจริง) ของกลุ่มนี้ — ถ้าเป็นกลุ่ม mirror ให้ใช้คีย์ของ primary (บัญชีเดียวกัน)"""
+    return _PAYABLE_PRIMARY_OF.get(group_id, group_id)
+
+
+def _payable_output_group(group_id: str) -> str:
+    """กลุ่มที่ควร 'เด้งผล' บิล/สลิป — ถ้ากลุ่มนี้เป็น primary ที่มี mirror → ส่งไป mirror (primary เงียบ); ไม่งั้นตอบกลุ่มเดิม"""
+    return PAYABLE_MIRROR.get(group_id, group_id)
+
+
+def _payable_send(event, source_group: str, dest_group: str, text: str):
+    """ส่งผลบันทึกบิล/สลิป — ถ้าปลายทางต่างจากกลุ่มต้นทาง ให้ push (กลุ่มต้นทางเงียบ) ไม่งั้น reply ตามปกติ"""
+    try:
+        if dest_group and dest_group != source_group:
+            line_bot_api.push_message(dest_group, TextSendMessage(text=text))
+        else:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
+    except Exception as e:
+        print(f"[payable] ส่งผลไม่สำเร็จ dest={dest_group}: {e}", flush=True)
+
+
 def _payable_opening(group_id: str) -> float:
     """ยอดค้างยกมา (ตั้งครั้งเดียวตอนเริ่ม) ของกลุ่มนี้"""
     v = _get_meta(f"payable_opening:{group_id}")
@@ -871,18 +904,17 @@ def build_payable_summary(group_id: str, date_str=None) -> str:
 
 
 def _process_payable_image(event, group_id: str):
-    """รูปในกลุ่มเจ้าหนี้ → AI แยกบิล(เพิ่มหนี้)/สลิปจ่าย(ลดหนี้) แล้วบันทึก + ตอบยอดค้างสะสม"""
+    """รูปในกลุ่มเจ้าหนี้ → AI แยกบิล(เพิ่มหนี้)/สลิปจ่าย(ลดหนี้) แล้วบันทึก + ตอบยอดค้างสะสม
+    บัญชีเดียว 2 กลุ่ม (mirror): เก็บข้อมูลที่ acct (primary), เด้งผลที่ out (mirror) — กลุ่ม primary เงียบ"""
+    acct = _payable_account_key(group_id)   # ที่เก็บข้อมูลจริง (บัญชีเดียวกันสำหรับ primary/mirror)
+    out  = _payable_output_group(group_id)  # ที่เด้งผล (primary→mirror, ไม่งั้นกลุ่มเดิม)
     try:
         content     = line_bot_api.get_message_content(event.message.id)
         image_bytes = b"".join(chunk for chunk in content.iter_content())
         info        = extract_payable_doc(image_bytes)
     except Exception as e:
         print(f"[payable] อ่านรูปไม่สำเร็จ group={group_id}: {e}", flush=True)
-        try:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="⚠️ อ่านรูปไม่สำเร็จ กรุณาส่งใหม่อีกครั้ง"))
-        except Exception:
-            pass
+        _payable_send(event, group_id, out, "⚠️ อ่านรูปไม่สำเร็จ กรุณาส่งใหม่อีกครั้ง")
         return
 
     doc_type = (info.get("doc_type") or "other").lower()
@@ -890,48 +922,47 @@ def _process_payable_image(event, group_id: str):
 
     if doc_type == "bill":
         if amount <= 0:
-            record_image_miss(group_id, "payable_unread")
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="🟡 อ่านยอดเงินบนบิลไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง"))
+            record_image_miss(acct, "payable_unread")
+            _payable_send(event, group_id, out,
+                "🟡 อ่านยอดเงินบนบิลไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง")
             return
-        rid = save_payable_bill(group_id, amount)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text=f"📥 บันทึกบิลซื้อ #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
-                 f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(group_id):,.2f} บาท"))
+        rid = save_payable_bill(acct, amount)
+        _payable_send(event, group_id, out,
+            f"📥 บันทึกบิลซื้อ #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
+            f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
         return
 
     if doc_type == "payment":
         if amount <= 0:
-            record_image_miss(group_id, "payable_unread")
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text="🟡 อ่านยอดเงินบนสลิปไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่"))
+            record_image_miss(acct, "payable_unread")
+            _payable_send(event, group_id, out,
+                "🟡 อ่านยอดเงินบนสลิปไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่")
             return
         ref = info.get("ref_number")
-        if _payment_ref_exists(group_id, ref):
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text=f"🔁 สลิปนี้ (อ้างอิง {ref}) เคยบันทึกแล้ว — ไม่นับซ้ำ"))
+        if _payment_ref_exists(acct, ref):
+            _payable_send(event, group_id, out,
+                f"🔁 สลิปนี้ (อ้างอิง {ref}) เคยบันทึกแล้ว — ไม่นับซ้ำ")
             return
-        rid = save_payable_payment(group_id, amount, sender=info.get("sender"),
+        rid = save_payable_payment(acct, amount, sender=info.get("sender"),
                                    ref_number=ref, slip_dt=info.get("datetime"))
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text=f"💸 บันทึกจ่าย {PAYABLE_VENDOR} #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
-                 f"💰 ค้างจ่ายสะสม: {_payable_outstanding(group_id):,.2f} บาท"))
+        _payable_send(event, group_id, out,
+            f"💸 บันทึกจ่าย {PAYABLE_VENDOR} #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
+            f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท")
         return
 
     # other → อ่านไม่ออกว่าเป็นบิล/สลิป — ห้ามทิ้งเงียบ (กันบัญชีคลาดเคลื่อน) ตอบเตือน + นับไว้ให้เห็นในสรุป
-    record_image_miss(group_id, "payable_unread")
+    record_image_miss(acct, "payable_unread")
     print(f"[payable] รูปไม่ใช่บิล/สลิป group={group_id}", flush=True)
-    try:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text="🟡 อ่านรูปนี้ไม่ออกว่าเป็นบิลซื้อหรือสลิปจ่าย — ยังไม่ได้บันทึก\n"
-                 "ถ้าเป็นบิล/สลิปจริง โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง"))
-    except Exception:
-        pass
+    _payable_send(event, group_id, out,
+        "🟡 อ่านรูปนี้ไม่ออกว่าเป็นบิลซื้อหรือสลิปจ่าย — ยังไม่ได้บันทึก\n"
+        "ถ้าเป็นบิล/สลิปจริง โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง")
 
 
 def handle_payable_text(event, text: str, group_id: str) -> bool:
-    """คำสั่งบัญชีเจ้าหนี้ในกลุ่ม PAYABLE_GROUPS — คืน True ถ้าจัดการแล้ว"""
+    """คำสั่งบัญชีเจ้าหนี้ในกลุ่ม PAYABLE_GROUPS — คืน True ถ้าจัดการแล้ว
+    บัญชีเดียว 2 กลุ่ม (mirror): ทุกคำสั่งทำงานบน acct (บัญชีร่วม) แต่ตอบในกลุ่มที่พิมพ์"""
     low = text.lower().strip()
+    acct = _payable_account_key(group_id)   # บัญชีร่วม (primary/mirror ใช้ข้อมูลชุดเดียวกัน)
 
     # นำเข้ายอดค้างเก่าหลายบรรทัดทีเดียว — วางบล็อก:
     #   ค้าง
@@ -959,14 +990,14 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                 errors.append(ln); continue
             if doc_date is None or val <= 0:
                 errors.append(ln); continue
-            save_payable_bill(group_id, val, doc_date=doc_date)
+            save_payable_bill(acct, val, doc_date=doc_date)
             added += 1; total += val
         if errors:   # บรรทัดที่อ่านไม่ออก (เส้นคั่น/บรรทัดว่าง) → log เงียบ ไม่รบกวนผู้ใช้
             print(f"[payable-import] ข้าม {len(errors)} บรรทัด: {errors[:5]}", flush=True)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"📥 นำเข้ายอดค้างเก่า {added} รายการ รวม {total:,.2f} บาท\n"
                  "─────────────────\n"
-                 f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(group_id):,.2f} บาท"))
+                 f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท"))
         return True
 
     # ตั้งยอดยกมา (ค้างเก่า) — ครั้งเดียวตอนเริ่ม
@@ -977,7 +1008,7 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                 break
         if not arg:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text=f"📌 ยอดยกมาปัจจุบัน: {_payable_opening(group_id):,.2f} บาท\n"
+                text=f"📌 ยอดยกมาปัจจุบัน: {_payable_opening(acct):,.2f} บาท\n"
                      "ตั้งใหม่พิมพ์: ตั้งยอดยกมา 12000"))
             return True
         try:
@@ -986,10 +1017,10 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
                 text="❌ ใส่ตัวเลขไม่ถูก เช่น: ตั้งยอดยกมา 12000"))
             return True
-        _set_meta(f"payable_opening:{group_id}", str(val))
+        _set_meta(f"payable_opening:{acct}", str(val))
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"✅ ตั้งยอดค้างยกมา = {val:,.2f} บาท\n─────────────────\n"
-                 f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(group_id):,.2f} บาท"))
+                 f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท"))
         return True
 
     # บันทึกบิลด้วยข้อความ (เผื่อไม่มีรูป) เช่น "บิล 3500" หรือย้อนวันที่ "บิล 6/6 24153"
@@ -1013,33 +1044,33 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             val = float(amount_str)
         except ValueError:
             return False
-        rid = save_payable_bill(group_id, val, doc_date=doc_date)
+        rid = save_payable_bill(acct, val, doc_date=doc_date)
         date_note = f"\n📅 ลงวันที่ {doc_date}" if doc_date else ""
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"📥 บันทึกบิลซื้อ #{rid}\nยอด {val:,.2f} บาท{date_note}\n─────────────────\n"
-                 f"💰 ค้างจ่ายสะสม: {_payable_outstanding(group_id):,.2f} บาท"))
+                 f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท"))
         return True
 
     # สรุปหนี้ (วันนี้ / ตามวันที่)
     if low in ("สรุปหนี้", "ยอดค้าง", "หนี้", f"หนี้{PAYABLE_VENDOR}".lower(), "สรุปยอดค้าง"):
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_payable_summary(group_id)))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_payable_summary(acct)))
         return True
     if low.startswith("สรุปหนี้ "):
         arg = text.split(" ", 1)[1].strip()
         try:
             datetime.strptime(arg, "%Y-%m-%d")
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_payable_summary(group_id, arg)))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_payable_summary(acct, arg)))
             return True
         except ValueError:
             pass
 
-    # ทดสอบ: force ส่งสรุปหนี้ 'เมื่อวาน' เข้าปลายทางเดี๋ยวนี้ (ไม่ต้องรอตี1) — เช็ค redirect/push ว่าใช้งานได้
+    # ทดสอบ: force ส่งสรุปหนี้ 'เมื่อวาน' เข้าปลายทางเดี๋ยวนี้ (ไม่ต้องรอตี1) — เช็คการส่ง/mirror
     if low in ("ทดสอบรายงานหนี้", "ทดสอบสรุปหนี้", "ทดสอบรายงาน", "force payable"):
         yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
-        dest = _report_dest(group_id)
+        dest = _report_dest(_payable_output_group(group_id))
         try:
-            line_bot_api.push_message(dest, TextSendMessage(text=build_payable_summary(group_id, yesterday)))
-            where = f"กลุ่มปลายทาง\n{dest}" if dest != group_id else "กลุ่มนี้ (ยังไม่ได้ตั้ง REPORT_REDIRECT)"
+            line_bot_api.push_message(dest, TextSendMessage(text=build_payable_summary(acct, yesterday)))
+            where = f"กลุ่มปลายทาง\n{dest}" if dest != group_id else "กลุ่มนี้"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
                 text=f"✅ ส่งสรุปหนี้ (ของวันที่ {yesterday}) ไปยัง{where} แล้ว"))
         except Exception as e:
@@ -1049,15 +1080,15 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
 
     # ลบรายการล่าสุด (แก้บันทึกผิด)
     if low in ("ลบบิลล่าสุด", "ลบบิล"):
-        _delete_last_payable(event, group_id, "payable_bills", "บิลซื้อ")
+        _delete_last_payable(event, acct, "payable_bills", "บิลซื้อ")
         return True
     if low in ("ลบจ่ายล่าสุด", "ลบจ่าย", "ลบสลิปล่าสุด"):
-        _delete_last_payable(event, group_id, "payable_payments", "เงินจ่าย")
+        _delete_last_payable(event, acct, "payable_payments", "เงินจ่าย")
         return True
 
     # ล้างบัญชีหนี้ทั้งหมด (รีเซ็ตเริ่มนับใหม่) — มีปุ่มยืนยัน
     if low in ("ล้างบัญชีหนี้", "ล้างหนี้", "ล้างบัญชี", "รีเซ็ตหนี้", "ล้างทั้งหมด"):
-        send_reset_payable_confirm(event, group_id)
+        send_reset_payable_confirm(event, acct)
         return True
     return False
 
@@ -1281,16 +1312,21 @@ def maybe_send_payable_summary():
         yesterday = (now.date() - timedelta(days=1)).isoformat()
         targets = [g for g in PAYABLE_GROUPS if not _group_left(g) and g not in IGNORE_GROUPS]
         failed = 0
+        seen_acct = set()   # บัญชีเดียว 2 กลุ่ม (mirror) → ส่งสรุปครั้งเดียวต่อบัญชี ไปที่กลุ่มแสดงผล
         for g in targets:
-            if _already_sent("payable_summary", today, g):
+            acct = _payable_account_key(g)
+            if acct in seen_acct:
                 continue
-            dest = _report_dest(g)
+            seen_acct.add(acct)
+            if _already_sent("payable_summary", today, acct):
+                continue
+            dest = _report_dest(_payable_output_group(g))   # primary→mirror, ไม่งั้นกลุ่มเดิม
             if _group_left(dest) or dest in IGNORE_GROUPS:
                 continue
             try:
-                line_bot_api.push_message(dest, TextSendMessage(text=build_payable_summary(g, yesterday)))
-                _mark_sent("payable_summary", today, g)
-                print(f"[payable-summary] sent → {dest}" + (f" (redirect จาก {g})" if dest != g else ""), flush=True)
+                line_bot_api.push_message(dest, TextSendMessage(text=build_payable_summary(acct, yesterday)))
+                _mark_sent("payable_summary", today, acct)
+                print(f"[payable-summary] sent → {dest} (acct {acct})", flush=True)
             except Exception as e:
                 if _is_not_member_error(e):
                     _mark_group_left(dest)
@@ -1924,7 +1960,7 @@ def send_reset_payable_confirm(event, group_id):
 
 def do_reset_payable(event):
     """ล้างบัญชีหนี้ทั้งหมดของกลุ่มนี้ — บิล + เงินจ่าย + ยอดยกมา (เริ่มนับใหม่)"""
-    group_id = getattr(event.source, "group_id", event.source.user_id)
+    group_id = _payable_account_key(getattr(event.source, "group_id", event.source.user_id))
     with _db() as conn:
         n_bill = conn.execute("DELETE FROM payable_bills WHERE group_id=?", (group_id,)).rowcount
         n_pay  = conn.execute("DELETE FROM payable_payments WHERE group_id=?", (group_id,)).rowcount
@@ -2092,6 +2128,10 @@ def handle_text(event):
             roles.append(f"📤 รายงานส่งต่อไปกลุ่ม: {REPORT_REDIRECT[group_id]}")
         if group_id in REPORT_REDIRECT.values():
             roles.append("📥 กลุ่มนี้เป็นปลายทางรับรายงานจากกลุ่มอื่น")
+        if group_id in PAYABLE_MIRROR:
+            roles.append(f"🪞 บัญชีหนี้แบบ mirror: กลุ่มนี้=ส่งบิล/สลิป(เงียบ) เด้งผลที่ {PAYABLE_MIRROR[group_id]}")
+        if group_id in _PAYABLE_PRIMARY_OF:
+            roles.append("🪞 บัญชีหนี้แบบ mirror: กลุ่มนี้=กระจกเงา (ดูผล/ยอดของบัญชีร่วม)")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"🆔 Group ID:\n{group_id}\n─────────────────\n" + "\n".join(roles)))
         return
