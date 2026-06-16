@@ -378,7 +378,7 @@ def extract_payable_doc(image_bytes: bytes) -> dict:
     prompt = (
         f"รูปนี้อยู่ในกลุ่มซื้อ-ขายระหว่างร้านอาหารกับร้านขายเครื่องดื่ม/สุรา ({PAYABLE_VENDOR}) "
         "ช่วยดูว่าเป็นเอกสารแบบไหน แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
-        '{"doc_type":"bill","amount":0.00,"ref_number":null,"sender":null}\n\n'
+        '{"doc_type":"bill","amount":0.00,"ref_number":null,"sender":null,"doc_date":null}\n\n'
         "doc_type:\n"
         "  - 'bill' = บิล/ใบสั่งซื้อ/ใบส่งของ/ใบกำกับ/บิลเงินสด (มีรายการสินค้า+ราคา) = ของที่ร้านสั่งซื้อ\n"
         "  - 'payment' = สลิปโอนเงินผ่านธนาคาร/แอปธนาคาร (หลักฐานการจ่ายเงิน)\n"
@@ -392,6 +392,8 @@ def extract_payable_doc(image_bytes: bytes) -> dict:
         "  • ถ้าเป็น 'payment': ใช้ยอดเงินที่โอนจริง\n"
         "ref_number: เลขอ้างอิงรายการ (เฉพาะสลิปโอน ถ้าไม่มีใส่ null)\n"
         "sender: ชื่อผู้โอน/ชื่อบิล ถ้าอ่านได้ (ไม่มีใส่ null)\n"
+        "doc_date: วันที่บนเอกสาร (บิล=วันที่ในบิล, สลิป=วันที่โอน) แปลงเป็น ค.ศ. รูปแบบ YYYY-MM-DD "
+        "(สลิป/บิลไทยใช้ พ.ศ. เช่น 2569 = ค.ศ. 2026 ให้ลบ 543); ถ้าอ่านวันที่ไม่ได้ใส่ null\n"
         "ถ้า doc_type='other' ให้ amount=0"
     )
     img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
@@ -847,14 +849,14 @@ def save_payable_bill(group_id: str, amount: float, note: str = None, doc_date: 
         conn.commit()
     return rid
 
-def save_payable_payment(group_id: str, amount: float, sender=None, ref_number=None, slip_dt=None) -> int:
-    today = datetime.now(TZ).date().isoformat()
+def save_payable_payment(group_id: str, amount: float, sender=None, ref_number=None, slip_dt=None, doc_date: str = None) -> int:
+    doc_date = doc_date or datetime.now(TZ).date().isoformat()
     now   = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     with _db() as conn:
         rid = conn.insert_returning_id(
             "INSERT INTO payable_payments (group_id, doc_date, amount, sender, ref_number, slip_datetime, recorded_at) "
             "VALUES (?,?,?,?,?,?,?)",
-            (group_id, today, float(amount), sender, ref_number, slip_dt, now))
+            (group_id, doc_date, float(amount), sender, ref_number, slip_dt, now))
         conn.execute("INSERT INTO groups (group_id) VALUES (?) ON CONFLICT DO NOTHING", (group_id,))
         conn.commit()
     return rid
@@ -980,6 +982,7 @@ def _process_payable_image(event, group_id: str):
 
     doc_type = (info.get("doc_type") or "other").lower()
     amount   = float(info.get("amount") or 0)
+    doc_date = info.get("doc_date") if _valid_ymd(info.get("doc_date")) else None   # ใช้วันที่บนเอกสาร ถ้าอ่านได้ ไม่งั้น = วันนี้
 
     if doc_type == "bill":
         if amount <= 0:
@@ -987,7 +990,7 @@ def _process_payable_image(event, group_id: str):
             _payable_send(event, group_id, out,
                 "🟡 อ่านยอดเงินบนบิลไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง")
             return
-        rid = save_payable_bill(acct, amount)
+        rid = save_payable_bill(acct, amount, doc_date=doc_date)
         _payable_send(event, group_id, out,
             f"📥 บันทึกบิลซื้อ #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
             f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
@@ -1005,7 +1008,7 @@ def _process_payable_image(event, group_id: str):
                 f"🔁 สลิปนี้ (อ้างอิง {ref}) เคยบันทึกแล้ว — ไม่นับซ้ำ")
             return
         rid = save_payable_payment(acct, amount, sender=info.get("sender"),
-                                   ref_number=ref, slip_dt=info.get("datetime"))
+                                   ref_number=ref, slip_dt=info.get("datetime"), doc_date=doc_date)
         _payable_send(event, group_id, out,
             f"💸 บันทึกจ่าย {PAYABLE_VENDOR} #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
             f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท")
