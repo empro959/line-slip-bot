@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import base64
 import uuid
@@ -1097,49 +1098,43 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     acct = _payable_account_key(group_id)   # บัญชีร่วม (primary/mirror ใช้ข้อมูลชุดเดียวกัน)
     out  = _payable_output_group(group_id)  # ผลการ 'บันทึก' เด้งที่ไหน (primary→mirror เงียบในกลุ่มต้นทาง)
 
-    # บล็อก 'ค้าง' = บันทึกยอดค้างรายวัน (วันที่=ยอดค้าง ณ วันนั้น) — ใช้ "วันล่าสุด" เป็น 'ยอดยกมา' ตั้งต้น
+    # บล็อก 'ค้าง' = บันทึกบิลค้างแต่ละวัน → รวมทุกบรรทัด = ยอดหนี้ค้างตั้งต้น (ยอดยกมา)
     #   ค้าง
-    #   6/6=24153
-    #   13/6=8074   ← เอาอันนี้ (วันล่าสุด) เป็นยอดยกมา ไม่รวมทุกบรรทัด ไม่ลงเป็นบิล
+    #   6/6=24153 (ค้าง 14153)   ← มีวงเล็บ = จ่ายบางส่วน ใช้เลขในวงเล็บ
+    #   8/6=18504                ← ไม่มีวงเล็บ ใช้เลขปกติ
+    # วางบล็อกใหม่ = แทนที่ยอดยกมาเดิม (ไม่บวกเพิ่ม)
     lines = text.splitlines()
     if len(lines) > 1 and lines[0].strip().lower() in ("ค้าง", "ยอดค้าง", "รายการค้าง", "บิลค้าง"):
-        entries, errors = [], []   # entries: (doc_date, amount) ตามลำดับที่อ่านได้
+        total, n, errors = 0.0, 0, []
         for ln in lines[1:]:
             ln = ln.strip()
-            if not ln:
-                continue
-            if "=" in ln:
-                dpart, apart = ln.split("=", 1)
-            else:
-                parts = ln.split()
-                if len(parts) < 2:
-                    errors.append(ln); continue
-                dpart, apart = parts[0], " ".join(parts[1:])
-            doc_date = _parse_thai_date(dpart.strip())
-            apart = apart.strip().replace(",", "").replace("บาท", "").strip()
+            if not ln or "=" not in ln:
+                continue   # ข้ามเส้นคั่น/บรรทัดว่าง (ไม่มี '=')
+            dpart, apart = ln.split("=", 1)
+            if _parse_thai_date(dpart.strip()) is None:
+                errors.append(ln); continue
+            # มีวงเล็บ → ใช้ยอดในวงเล็บ (ค้างจริงหลังจ่ายบางส่วน); ไม่มี → ใช้ยอดปกติ (เลขก่อนวงเล็บ)
+            paren = re.search(r"\(([^)]*)\)", apart)
+            target = paren.group(1) if paren else apart.split("(")[0]
+            num = re.search(r"\d[\d,]*(?:\.\d+)?", target)
+            if not num:
+                errors.append(ln); continue
             try:
-                val = float(apart)
+                val = float(num.group(0).replace(",", ""))
             except ValueError:
                 errors.append(ln); continue
-            if doc_date is None or val < 0:
+            if val < 0:
                 errors.append(ln); continue
-            entries.append((doc_date, val))
+            total += val; n += 1
         if errors:
             print(f"[payable-import] ข้าม {len(errors)} บรรทัด: {errors[:5]}", flush=True)
-        if not entries:
-            _payable_send(event, group_id, out, "❌ อ่านบล็อกค้างไม่ได้ — รูปแบบควรเป็น  วัน/เดือน=ยอด")
+        if n == 0:
+            _payable_send(event, group_id, out, "❌ อ่านบล็อกค้างไม่ได้ — รูปแบบควรเป็น  วัน/เดือน=ยอด (ค้าง xxxx)")
             return True
-        # เลือก 'วันล่าสุด' (ถ้าวันเดียวกันมีหลายบรรทัด เอาบรรทัดท้ายสุดของวันนั้น)
-        latest_date = max(d for d, _ in entries)
-        latest_val  = [v for d, v in entries if d == latest_date][-1]
-        _set_meta(f"payable_opening:{acct}", str(latest_val))   # ตั้งยอดยกมา (idempotent — วางซ้ำได้ ไม่เบิ้ล)
-        try:
-            dlabel = datetime.strptime(latest_date, "%Y-%m-%d").strftime("%d/%m/%y")
-        except (ValueError, TypeError):
-            dlabel = latest_date
+        _set_meta(f"payable_opening:{acct}", str(total))   # แทนที่ยอดยกมา (วางบล็อกใหม่ทับของเก่า ไม่เบิ้ล)
         _payable_send(event, group_id, out,
-            f"📌 ตั้งยอดค้างยกมา = {latest_val:,.2f} บาท (จากบันทึกล่าสุด {dlabel})\n"
-            f"ℹ️ บล็อกค้าง = บันทึกยอดค้างรายวัน → ใช้เฉพาะ 'วันล่าสุด' เป็นยอดตั้งต้น (ไม่รวมทุกบรรทัด)\n"
+            f"📌 ตั้งยอดค้างยกมา = {total:,.2f} บาท (รวม {n} รายการ)\n"
+            f"ℹ️ บล็อกค้าง = รวมทุกบรรทัด (มีวงเล็บใช้เลขในวงเล็บ) → เป็นยอดตั้งต้น แทนที่ของเดิม\n"
             "─────────────────\n"
             f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
         return True
