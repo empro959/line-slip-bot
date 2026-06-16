@@ -898,41 +898,60 @@ def build_payable_summary(group_id: str, date_str=None) -> str:
 
 
 def build_payable_ledger(acct: str, with_total: bool = True) -> str:
-    """สรุปหนี้แบบ 'รายวัน' (วันที่ = ยอด) เหมือนบล็อก ค้าง — บิล(+)/จ่าย(−) แยกตามวัน
-    with_total=True → ใส่บรรทัดยอดค้างรวมท้ายสุด (กลุ่ม mirror), False → ไม่ใส่ (กลุ่ม primary)"""
+    """สรุปหนี้แบบ 'รายวัน' — แยก 📥 บิลซื้อ และ 💸 จ่าย เป็นรายวันคนละส่วน
+    with_total=True → ใส่ยอดรวม (รวมซื้อ/รวมจ่าย/ค้างจ่ายสะสม) ท้ายแต่ละส่วน (กลุ่ม mirror)
+    with_total=False → ไม่ใส่ยอดรวมเลย แสดงเฉพาะรายวัน (กลุ่ม primary)"""
     with _db() as conn:
         bill_rows = conn.execute(
-            "SELECT doc_date, COALESCE(SUM(amount),0) s FROM payable_bills WHERE group_id=? GROUP BY doc_date",
-            (acct,)).fetchall()
+            "SELECT doc_date, COALESCE(SUM(amount),0) s, COUNT(*) c FROM payable_bills "
+            "WHERE group_id=? GROUP BY doc_date ORDER BY doc_date", (acct,)).fetchall()
         pay_rows = conn.execute(
-            "SELECT doc_date, COALESCE(SUM(amount),0) s FROM payable_payments WHERE group_id=? GROUP BY doc_date",
-            (acct,)).fetchall()
-    days = {}
-    for r in bill_rows:
-        days.setdefault(r["doc_date"], {})["bill"] = float(r["s"] or 0)
-    for r in pay_rows:
-        days.setdefault(r["doc_date"], {})["pay"] = float(r["s"] or 0)
+            "SELECT doc_date, COALESCE(SUM(amount),0) s, COUNT(*) c FROM payable_payments "
+            "WHERE group_id=? GROUP BY doc_date ORDER BY doc_date", (acct,)).fetchall()
     opening = _payable_opening(acct)
-    head = f"📊 สรุปหนี้ {PAYABLE_VENDOR} — รายวัน"
-    if not days and not opening:
-        return f"{head}\n─────────────────\nยังไม่มีรายการ"
-    lines = [head, "─────────────────"]
-    if opening:
-        lines.append(f"ยอดยกมา: {opening:,.2f}")
-    for d in sorted(days.keys()):
+    bar = "━━━━━━━━━━━━━"
+
+    def fdate(d):
         try:
-            dlabel = datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m")
+            return datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m/%y")
         except (ValueError, TypeError):
-            dlabel = d or "-"
-        parts = []
-        if days[d].get("bill"):
-            parts.append(f"+{days[d]['bill']:,.2f}")
-        if days[d].get("pay"):
-            parts.append(f"−{days[d]['pay']:,.2f}")
-        lines.append(f"{dlabel}  " + "  ".join(parts))
+            return d or "-"
+
+    if not bill_rows and not pay_rows and not opening:
+        return f"📋 สรุปหนี้ {PAYABLE_VENDOR} — รายวัน\n{bar}\nยังไม่มีรายการ"
+
+    lines = [f"📋 สรุปหนี้ {PAYABLE_VENDOR} — รายวัน"]
+    if opening:
+        lines += [bar, f"📌 ยอดยกมา   {opening:,.2f}"]
+
+    # ── บิลซื้อ (เพิ่มหนี้) รายวัน ──
+    lines += [bar, "📥 บิลซื้อ (รายวัน)"]
+    if bill_rows:
+        bsum = 0.0
+        for r in bill_rows:
+            amt = float(r["s"] or 0); bsum += amt
+            cnt = f"  ×{r['c']}" if (r["c"] or 0) > 1 else ""
+            lines.append(f"  {fdate(r['doc_date'])}   +{amt:,.2f}{cnt}")
+        if with_total:
+            lines.append(f"  รวมซื้อ   {bsum:,.2f}")
+    else:
+        lines.append("  — ไม่มี")
+
+    # ── จ่าย (ลดหนี้) รายวัน ──
+    lines += [bar, "💸 ชำระจ่าย (รายวัน)"]
+    if pay_rows:
+        psum = 0.0
+        for r in pay_rows:
+            amt = float(r["s"] or 0); psum += amt
+            cnt = f"  ×{r['c']}" if (r["c"] or 0) > 1 else ""
+            lines.append(f"  {fdate(r['doc_date'])}   −{amt:,.2f}{cnt}")
+        if with_total:
+            lines.append(f"  รวมจ่าย   {psum:,.2f}")
+    else:
+        lines.append("  — ไม่มี")
+
     if with_total:
-        lines.append("─────────────────")
-        lines.append(f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท")
+        lines += [bar, f"💰 ค้างจ่ายสะสม   {_payable_outstanding(acct):,.2f} บาท"]
     return "\n".join(lines)
 
 
