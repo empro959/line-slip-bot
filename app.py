@@ -1008,6 +1008,27 @@ def _payable_report_recipients(acct: str):
     return [(acct, True)]
 
 
+_PAYABLE_SRC = {"block": "บล็อกค้าง", "พิมพ์": "พิมพ์เอง", "รูป": "รูปบิล"}
+
+def build_payable_bill_list(acct: str, limit: int = 40) -> str:
+    """รายการบิลซื้อ — โชว์ #id | วันที่ | ยอด | มาจากไหน | เวลาที่ลง (ไว้เช็กที่มาของแต่ละบิล)"""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT id, doc_date, amount, note, recorded_at FROM payable_bills "
+            "WHERE group_id=? ORDER BY doc_date, id LIMIT ?", (acct, limit)).fetchall()
+    if not rows:
+        return "📋 ยังไม่มีบิลซื้อในบัญชีนี้"
+    lines = [f"📋 รายการบิลซื้อ ({len(rows)} ใบ)", "━━━━━━━━━━━━━"]
+    for r in rows:
+        try:
+            d = datetime.strptime(r["doc_date"], "%Y-%m-%d").strftime("%d/%m/%y")
+        except (ValueError, TypeError):
+            d = r["doc_date"] or "-"
+        src = _PAYABLE_SRC.get(r["note"], r["note"] or "ไม่ระบุ")
+        lines.append(f"#{r['id']}  {d}  {float(r['amount'] or 0):,.2f}  [{src}]  ลง {r['recorded_at'] or '-'}")
+    return "\n".join(lines)
+
+
 def _process_payable_image(event, group_id: str):
     """รูปในกลุ่มเจ้าหนี้ → AI แยกบิล(เพิ่มหนี้)/สลิปจ่าย(ลดหนี้) แล้วบันทึก + ตอบยอดค้างสะสม
     บัญชีเดียว 2 กลุ่ม (mirror): เก็บข้อมูลที่ acct (primary), เด้งผลที่ out (mirror) — กลุ่ม primary เงียบ"""
@@ -1037,7 +1058,7 @@ def _process_payable_image(event, group_id: str):
             _payable_send(event, group_id, out,
                 f"🔁 บิลนี้ (วันที่ {eff_date} ยอด {amount:,.2f}) เคยบันทึกแล้ว — ไม่นับซ้ำ")
             return
-        rid = save_payable_bill(acct, amount, doc_date=doc_date)
+        rid = save_payable_bill(acct, amount, note="รูป", doc_date=doc_date)
         _payable_send(event, group_id, out,
             f"📥 บันทึกบิลซื้อ #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
             f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
@@ -1105,7 +1126,7 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             # กันวางบล็อกซ้ำ → นับเบิ้ล: ถ้ามีบิลวันที่+ยอดเดียวกันอยู่แล้ว ให้ข้าม (นับครั้งเดียว)
             if _payable_bill_exists(acct, doc_date, val):
                 dup += 1; continue
-            save_payable_bill(acct, val, doc_date=doc_date)
+            save_payable_bill(acct, val, note="block", doc_date=doc_date)
             added += 1; total += val
         if errors:   # บรรทัดที่อ่านไม่ออก (เส้นคั่น/บรรทัดว่าง) → log เงียบ ไม่รบกวนผู้ใช้
             print(f"[payable-import] ข้าม {len(errors)} บรรทัด: {errors[:5]}", flush=True)
@@ -1160,7 +1181,7 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             val = float(amount_str)
         except ValueError:
             return False
-        rid = save_payable_bill(acct, val, doc_date=doc_date)
+        rid = save_payable_bill(acct, val, note="พิมพ์", doc_date=doc_date)
         date_note = f"\n📅 ลงวันที่ {doc_date}" if doc_date else ""
         _payable_send(event, group_id, out,
             f"📥 บันทึกบิลซื้อ #{rid}\nยอด {val:,.2f} บาท{date_note}\n─────────────────\n"
@@ -1179,6 +1200,28 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             return True
         except ValueError:
             pass
+
+    # ดูรายการบิลซื้อ + ที่มา (เช็กว่าบิลก่อนวันที่ X มาจากไหน: บล็อกค้าง/พิมพ์/รูป + เวลาที่ลง)
+    if low in ("รายการบิล", "ดูบิล", "บิลทั้งหมด", "เช็กบิล"):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_payable_bill_list(acct)))
+        return True
+
+    # ลบทุกบิล/จ่ายของวันที่ที่ระบุ เช่น "ลบวันที่ 6/6" — ใช้เคลียร์รายการที่ลงผิดวัน
+    if low.startswith("ลบวันที่"):
+        arg = text[len("ลบวันที่"):].strip()
+        d = _parse_thai_date(arg)
+        if not d:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="❌ วันที่ไม่ถูก เช่น: ลบวันที่ 6/6"))
+            return True
+        with _db() as conn:
+            nb = conn.execute("DELETE FROM payable_bills WHERE group_id=? AND doc_date=?", (acct, d)).rowcount
+            np = conn.execute("DELETE FROM payable_payments WHERE group_id=? AND doc_date=?", (acct, d)).rowcount
+            conn.commit()
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"🗑️ ลบรายการวันที่ {d}: บิล {nb} + จ่าย {np} รายการ\n─────────────────\n"
+                 f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท"))
+        return True
 
     # ทดสอบ: force ส่ง 'สรุปหนี้รายวัน' เข้ากลุ่มผู้รับเดี๋ยวนี้ (เหมือนตี1) — เช็คการส่ง/mirror/ยอดรวม
     if low in ("ทดสอบรายงานหนี้", "ทดสอบสรุปหนี้", "ทดสอบรายงาน", "force payable"):
@@ -2111,7 +2154,9 @@ def build_help(group_id: str) -> str:
             "• ตั้งยอดยกมา 12000 → ตั้งยอดค้างเก่า (ครั้งเดียวตอนเริ่ม)",
             "• สรุปหนี้ → ดูยอดค้างวันนี้",
             "• สรุปหนี้ 2026-06-09 → ดูย้อนหลัง (ตามวันที่)",
+            "• รายการบิล → ดูบิลทั้งหมด + ที่มา (เช็กว่ามาจากไหน)",
             "• ลบบิลล่าสุด / ลบจ่ายล่าสุด → แก้กรณีบันทึกผิด",
+            "• ลบวันที่ 6/6 → ลบทุกบิล/จ่ายของวันนั้น",
             "• ล้างบัญชีหนี้ → ล้างทั้งหมด เริ่มนับใหม่ (มีปุ่มยืนยัน)",
             "• ทดสอบรายงานหนี้ → ส่งสรุปหนี้เดี๋ยวนี้ (เช็คการส่ง/redirect)",
             f"⏰ บอทสรุปหนี้เมื่อวานให้เองทุกวัน ตี{PAYABLE_SUMMARY_HOUR}",
