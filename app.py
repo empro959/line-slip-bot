@@ -1,6 +1,7 @@
 import os
 import json
 import base64
+import uuid
 import requests
 import threading
 import time
@@ -431,6 +432,19 @@ def verify_with_promptpay(image_bytes: bytes) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _dup_lock = threading.Lock()   # กัน race ตอนเช็คซ้ำ+บันทึก เมื่อหลาย thread ทำพร้อมกัน
+_postback_lock = threading.Lock()   # กันกดปุ่มยืนยันซ้ำ (atomic check-then-mark)
+
+
+def _postback_once(token: str) -> bool:
+    """คืน True ถ้าเป็นการกดปุ่มครั้งแรก (ควรทำงาน), False ถ้ากดซ้ำ (เคยทำแล้ว)
+    ใช้ meta เก็บถาวร + lock ให้ atomic → กันกดรัว/หลายคนกดพร้อมกันแล้วทำงานซ้ำ (ทนรีสตาร์ท/หลาย worker)"""
+    if not token:
+        return True
+    with _postback_lock:
+        if _get_meta(f"pb_done:{token}"):
+            return False
+        _set_meta(f"pb_done:{token}", datetime.now(TZ).date().isoformat())   # เก็บวันที่ไว้ให้ cleanup ลบทีหลัง
+        return True
 
 def find_duplicate(group_id: str, info: dict):
     """หาความซ้ำ/ความผิดปกติเทียบกับใบก่อนหน้าในกรุ๊ป — คืน (type, prev_amount)
@@ -1191,6 +1205,9 @@ def _cleanup_old_data():
             n_slip = conn.execute("DELETE FROM slips WHERE slip_date < ?", (slip_cutoff,)).rowcount
             # ตัวจำ 'ส่งรายงานรายกลุ่มแล้ว' (sent:job:date:target) เก็บแค่ของวันนี้พอ — ของเก่าทิ้งกัน meta บวม
             conn.execute("DELETE FROM meta WHERE key LIKE 'sent:%' AND key NOT LIKE ?", (f"sent:%:{today.isoformat()}:%",))
+            # ตัวกันกดปุ่มยืนยันซ้ำ (pb_done:*) เก่าเกิน 30 วัน → ลบทิ้ง (ปุ่มหมดอายุไปนานแล้ว)
+            conn.execute("DELETE FROM meta WHERE key LIKE 'pb_done:%' AND value < ?",
+                         ((today - timedelta(days=30)).isoformat(),))
             conn.commit()
         if n_resv or n_miss or n_slip:
             print(f"[cleanup] ลบจองเก่า {n_resv} + ตัวนับรูปเก่า {n_miss} + สลิปเก่า {n_slip}", flush=True)
@@ -1956,7 +1973,7 @@ def send_reset_confirm(event, group_id):
             title="⚠️ ล้างสลิปวันนี้",
             text=f"จะลบสลิปวันนี้ทั้งหมด {cnt} รายการ (เฉพาะกรุ๊ปนี้) ยืนยันไหม?",
             actions=[PostbackAction(label="🗑️ ยืนยันล้าง",
-                                    data=f"reset_today:{today}",
+                                    data=f"reset_today:{today}:{uuid.uuid4().hex[:8]}",
                                     display_text="ยืนยันล้างสลิปวันนี้")],
         ),
     )
@@ -1989,7 +2006,7 @@ def send_reset_all_confirm(event, group_id):
         template=ButtonsTemplate(
             title="⚠️ ล้างข้อมูลทั้งหมด (กลุ่มนี้)",
             text=f"ลบสลิป {n_slip} + จอง {n_resv} ทั้งหมด (กู้คืนไม่ได้)",
-            actions=[PostbackAction(label="🗑️ ยืนยันล้าง", data="reset_all")],
+            actions=[PostbackAction(label="🗑️ ยืนยันล้าง", data=f"reset_all:{uuid.uuid4().hex[:8]}")],
         ),
     ))
 
@@ -2023,7 +2040,7 @@ def send_reset_payable_confirm(event, group_id):
         template=ButtonsTemplate(
             title="⚠️ ล้างบัญชีหนี้ (กลุ่มนี้)",
             text=f"ลบบิล {n_bill} + จ่าย {n_pay} ล้างยอดยกมา (กู้คืนไม่ได้)",
-            actions=[PostbackAction(label="🗑️ ยืนยันล้าง", data="reset_payable")],
+            actions=[PostbackAction(label="🗑️ ยืนยันล้าง", data=f"reset_payable:{uuid.uuid4().hex[:8]}")],
         ),
     ))
 
@@ -2273,26 +2290,46 @@ def handle_postback(event):
     pb_group = getattr(event.source, "group_id", None)
     if pb_group and pb_group in IGNORE_GROUPS:
         return   # กลุ่มที่สั่งให้เมินทั้งหมด → ไม่ทำอะไรเลย
-    if data.startswith("confirm_resv:"):
+    parts = data.split(":")
+    action = parts[0]
+
+    def _already(msg="⚠️ ทำรายการนี้ไปแล้ว ไม่ต้องกดซ้ำครับ"):
+        """กดปุ่มซ้ำ → ตอบเตือนสั้นๆ ไม่ทำงานซ้ำ"""
+        print(f"[postback] กดซ้ำ data={data} — ข้าม", flush=True)
         try:
-            resv_id = int(data.split(":", 1)[1])
-        except ValueError:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        except Exception:
+            pass
+
+    if action == "confirm_resv":
+        try:
+            resv_id = int(parts[1])
+        except (IndexError, ValueError):
+            return
+        if not _postback_once(f"resv:{resv_id}"):
+            _already(f"⚠️ การจอง #{resv_id} ทำรายการไปแล้ว ไม่ต้องกดซ้ำครับ")
             return
         try:
             handle_reservation_confirm(event, resv_id)
         except Exception as e:
             print(f"[resv] confirm error: {e}", flush=True)
-    elif data.startswith("reset_today:"):
+    elif action == "reset_today":
+        if not _postback_once(f"pb:{data}"):
+            _already(); return
         try:
-            do_reset_today(event, data.split(":", 1)[1])
+            do_reset_today(event, parts[1])
         except Exception as e:
             print(f"[reset] error: {e}", flush=True)
-    elif data == "reset_all":
+    elif action == "reset_all":
+        if not _postback_once(f"pb:{data}"):
+            _already(); return
         try:
             do_reset_all(event)
         except Exception as e:
             print(f"[reset] reset_all error: {e}", flush=True)
-    elif data == "reset_payable":
+    elif action == "reset_payable":
+        if not _postback_once(f"pb:{data}"):
+            _already(); return
         try:
             do_reset_payable(event)
         except Exception as e:
