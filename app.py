@@ -903,6 +903,54 @@ def build_payable_summary(group_id: str, date_str=None) -> str:
     return msg
 
 
+def build_payable_ledger(acct: str, with_total: bool = True) -> str:
+    """สรุปหนี้แบบ 'รายวัน' (วันที่ = ยอด) เหมือนบล็อก ค้าง — บิล(+)/จ่าย(−) แยกตามวัน
+    with_total=True → ใส่บรรทัดยอดค้างรวมท้ายสุด (กลุ่ม mirror), False → ไม่ใส่ (กลุ่ม primary)"""
+    with _db() as conn:
+        bill_rows = conn.execute(
+            "SELECT doc_date, COALESCE(SUM(amount),0) s FROM payable_bills WHERE group_id=? GROUP BY doc_date",
+            (acct,)).fetchall()
+        pay_rows = conn.execute(
+            "SELECT doc_date, COALESCE(SUM(amount),0) s FROM payable_payments WHERE group_id=? GROUP BY doc_date",
+            (acct,)).fetchall()
+    days = {}
+    for r in bill_rows:
+        days.setdefault(r["doc_date"], {})["bill"] = float(r["s"] or 0)
+    for r in pay_rows:
+        days.setdefault(r["doc_date"], {})["pay"] = float(r["s"] or 0)
+    opening = _payable_opening(acct)
+    head = f"📊 สรุปหนี้ {PAYABLE_VENDOR} — รายวัน"
+    if not days and not opening:
+        return f"{head}\n─────────────────\nยังไม่มีรายการ"
+    lines = [head, "─────────────────"]
+    if opening:
+        lines.append(f"ยอดยกมา: {opening:,.2f}")
+    for d in sorted(days.keys()):
+        try:
+            dlabel = datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m")
+        except (ValueError, TypeError):
+            dlabel = d or "-"
+        parts = []
+        if days[d].get("bill"):
+            parts.append(f"+{days[d]['bill']:,.2f}")
+        if days[d].get("pay"):
+            parts.append(f"−{days[d]['pay']:,.2f}")
+        lines.append(f"{dlabel}  " + "  ".join(parts))
+    if with_total:
+        lines.append("─────────────────")
+        lines.append(f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท")
+    return "\n".join(lines)
+
+
+def _payable_report_recipients(acct: str):
+    """คืน [(group, with_total), ...] ที่ต้องส่งสรุปหนี้รายวันของบัญชี acct ตอนตี1
+    - บัญชี mirror: ส่ง 2 กลุ่ม → primary (ไม่ใส่ยอดรวม) + mirror (ใส่ยอดรวม)
+    - บัญชีปกติ: ส่งกลุ่มเดียว (ใส่ยอดรวม)"""
+    if acct in PAYABLE_MIRROR:
+        return [(acct, False), (PAYABLE_MIRROR[acct], True)]
+    return [(acct, True)]
+
+
 def _process_payable_image(event, group_id: str):
     """รูปในกลุ่มเจ้าหนี้ → AI แยกบิล(เพิ่มหนี้)/สลิปจ่าย(ลดหนี้) แล้วบันทึก + ตอบยอดค้างสะสม
     บัญชีเดียว 2 กลุ่ม (mirror): เก็บข้อมูลที่ acct (primary), เด้งผลที่ out (mirror) — กลุ่ม primary เงียบ"""
@@ -1065,18 +1113,19 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         except ValueError:
             pass
 
-    # ทดสอบ: force ส่งสรุปหนี้ 'เมื่อวาน' เข้าปลายทางเดี๋ยวนี้ (ไม่ต้องรอตี1) — เช็คการส่ง/mirror
+    # ทดสอบ: force ส่ง 'สรุปหนี้รายวัน' เข้ากลุ่มผู้รับเดี๋ยวนี้ (เหมือนตี1) — เช็คการส่ง/mirror/ยอดรวม
     if low in ("ทดสอบรายงานหนี้", "ทดสอบสรุปหนี้", "ทดสอบรายงาน", "force payable"):
-        yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
-        dest = _report_dest(_payable_output_group(group_id))
-        try:
-            line_bot_api.push_message(dest, TextSendMessage(text=build_payable_summary(acct, yesterday)))
-            where = f"กลุ่มปลายทาง\n{dest}" if dest != group_id else "กลุ่มนี้"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text=f"✅ ส่งสรุปหนี้ (ของวันที่ {yesterday}) ไปยัง{where} แล้ว"))
-        except Exception as e:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text=f"❌ ส่งไม่สำเร็จ → {dest}\nสาเหตุ: {e}\n(บอทอาจไม่ได้อยู่ในกลุ่มปลายทาง)"))
+        sent, errs = [], []
+        for grp, with_total in _payable_report_recipients(acct):
+            try:
+                line_bot_api.push_message(grp, TextSendMessage(text=build_payable_ledger(acct, with_total)))
+                sent.append(f"{grp} ({'มียอดรวม' if with_total else 'ไม่มียอดรวม'})")
+            except Exception as e:
+                errs.append(f"{grp}: {e}")
+        msg = f"✅ ส่งสรุปหนี้รายวันแล้ว {len(sent)} กลุ่ม"
+        if errs:
+            msg += "\n❌ ส่งไม่สำเร็จ:\n" + "\n".join(errs)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return True
 
     # ลบรายการล่าสุด (แก้บันทึกผิด)
@@ -1310,30 +1359,28 @@ def maybe_send_payable_summary():
     with _report_lock:
         if _get_meta("last_payable_summary_date") == today:
             return
-        yesterday = (now.date() - timedelta(days=1)).isoformat()
-        targets = [g for g in PAYABLE_GROUPS if not _group_left(g) and g not in IGNORE_GROUPS]
         failed = 0
-        seen_acct = set()   # บัญชีเดียว 2 กลุ่ม (mirror) → ส่งสรุปครั้งเดียวต่อบัญชี ไปที่กลุ่มแสดงผล
-        for g in targets:
+        seen_acct = set()   # ส่งสรุปรายวันครั้งเดียวต่อบัญชี → กระจายให้กลุ่มผู้รับ (mirror: 2 กลุ่ม)
+        for g in PAYABLE_GROUPS:
             acct = _payable_account_key(g)
             if acct in seen_acct:
                 continue
             seen_acct.add(acct)
-            if _already_sent("payable_summary", today, acct):
-                continue
-            dest = _report_dest(_payable_output_group(g))   # primary→mirror, ไม่งั้นกลุ่มเดิม
-            if _group_left(dest) or dest in IGNORE_GROUPS:
-                continue
-            try:
-                line_bot_api.push_message(dest, TextSendMessage(text=build_payable_summary(acct, yesterday)))
-                _mark_sent("payable_summary", today, acct)
-                print(f"[payable-summary] sent → {dest} (acct {acct})", flush=True)
-            except Exception as e:
-                if _is_not_member_error(e):
-                    _mark_group_left(dest)
-                else:
-                    failed += 1
-                print(f"[payable-summary] FAILED {dest}: {e}", flush=True)
+            for grp, with_total in _payable_report_recipients(acct):
+                if _group_left(grp) or grp in IGNORE_GROUPS:
+                    continue
+                if _already_sent("payable_summary", today, grp):   # idempotent รายกลุ่มผู้รับ
+                    continue
+                try:
+                    line_bot_api.push_message(grp, TextSendMessage(text=build_payable_ledger(acct, with_total)))
+                    _mark_sent("payable_summary", today, grp)
+                    print(f"[payable-summary] sent → {grp} (acct {acct}, total={with_total})", flush=True)
+                except Exception as e:
+                    if _is_not_member_error(e):
+                        _mark_group_left(grp)
+                    else:
+                        failed += 1
+                    print(f"[payable-summary] FAILED {grp}: {e}", flush=True)
         if failed == 0:
             _set_meta("last_payable_summary_date", today)
             print(f"[payable-summary] done {today}", flush=True)
