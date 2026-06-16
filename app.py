@@ -852,6 +852,14 @@ def _parse_thai_date(token: str):
             return None
     return d.isoformat()
 
+def _payable_bill_exists(group_id: str, doc_date: str, amount: float) -> bool:
+    """มีบิลวันที่+ยอดเดียวกันอยู่แล้วไหม — กันวางบล็อก 'ค้าง' ซ้ำแล้วนับเบิ้ล"""
+    with _db() as conn:
+        return conn.execute(
+            "SELECT 1 FROM payable_bills WHERE group_id=? AND doc_date=? AND ABS(amount-?)<0.01 LIMIT 1",
+            (group_id, doc_date, float(amount))).fetchone() is not None
+
+
 def save_payable_bill(group_id: str, amount: float, note: str = None, doc_date: str = None) -> int:
     doc_date = doc_date or datetime.now(TZ).date().isoformat()
     now   = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -1049,7 +1057,7 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     #   8/6 18504
     lines = text.splitlines()
     if len(lines) > 1 and lines[0].strip().lower() in ("ค้าง", "ยอดค้าง", "รายการค้าง", "บิลค้าง"):
-        added, total, errors = 0, 0.0, []
+        added, total, dup, errors = 0, 0.0, 0, []
         for ln in lines[1:]:
             ln = ln.strip()
             if not ln:
@@ -1069,12 +1077,16 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                 errors.append(ln); continue
             if doc_date is None or val <= 0:
                 errors.append(ln); continue
+            # กันวางบล็อกซ้ำ → นับเบิ้ล: ถ้ามีบิลวันที่+ยอดเดียวกันอยู่แล้ว ให้ข้าม (นับครั้งเดียว)
+            if _payable_bill_exists(acct, doc_date, val):
+                dup += 1; continue
             save_payable_bill(acct, val, doc_date=doc_date)
             added += 1; total += val
         if errors:   # บรรทัดที่อ่านไม่ออก (เส้นคั่น/บรรทัดว่าง) → log เงียบ ไม่รบกวนผู้ใช้
             print(f"[payable-import] ข้าม {len(errors)} บรรทัด: {errors[:5]}", flush=True)
+        note = f"\n🔁 ข้ามรายการซ้ำ (มีอยู่แล้ว) {dup} รายการ" if dup else ""
         _payable_send(event, group_id, out,
-            f"📥 นำเข้ายอดค้างเก่า {added} รายการ รวม {total:,.2f} บาท\n"
+            f"📥 นำเข้ายอดค้างเก่า {added} รายการ รวม {total:,.2f} บาท{note}\n"
             "─────────────────\n"
             f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
         return True
