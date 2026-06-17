@@ -1958,11 +1958,11 @@ def _process_image_event(event):
         image_bytes = b"".join(chunk for chunk in content.iter_content())
         info        = extract_slip_info(image_bytes)
 
-        # รอบแรกว่า 'ไม่ใช่สลิป' → ลองอ่านซ้ำอีกรอบด้วยคำสั่งเข้มขึ้น (กู้ใบก้ำกึ่ง: บิลคู่สลิป/ถ่ายจอ/เอียง/มืด)
-        if not info.get("is_slip", True):
+        # รอบแรก 'ไม่ใช่สลิป' หรือ 'อ่านยอดเงินไม่ได้' → อ่านซ้ำด้วย pro (กู้ทั้งใบที่อ่านไม่ออก + ใบที่รู้ว่าสลิปแต่ยอดเพี้ยน)
+        if not info.get("is_slip", True) or float(info.get("amount") or 0) <= 0:
             try:
                 info_retry = extract_slip_info(image_bytes, retry=True)
-                # รอบสองดีกว่าถ้า is_slip=true หรืออ่านยอดเงินได้
+                # รอบสองดีกว่าถ้า is_slip=true และ/หรืออ่านยอดเงินได้
                 if info_retry.get("is_slip") or float(info_retry.get("amount") or 0) > 0:
                     info = info_retry
                     print(f"[slip] retry กู้สลิปได้ group={group_id}", flush=True)
