@@ -269,9 +269,18 @@ def init_db():
                 group_id    TEXT,
                 stat_date   TEXT,
                 reason      TEXT,
-                recorded_at TEXT
+                recorded_at TEXT,
+                detail      TEXT
             )
         """)
+        # migration: detail = ยอด/ปลายทางของใบที่ถูกข้าม (ไว้ดูว่า 'ข้ามไม่ใช่รายรับ' เข้าบัญชีอะไร) — ทั้ง PG/SQLite
+        if USE_PG:
+            conn.execute("ALTER TABLE image_misses ADD COLUMN IF NOT EXISTS detail TEXT")
+        else:
+            try:
+                conn.execute("ALTER TABLE image_misses ADD COLUMN detail TEXT")
+            except Exception:
+                pass
         conn.execute(f"""
             CREATE TABLE IF NOT EXISTS reservations (
                 id              {_PK},
@@ -631,19 +640,36 @@ def _slip_message_seen(group_id: str, message_id: str) -> bool:
             (group_id, message_id)).fetchone() is not None
 
 
-def record_image_miss(group_id: str, reason: str):
-    """บันทึกรูปที่รับเข้ามาแต่ไม่ได้กลายเป็นสลิป (reason='notslip' อ่านไม่ออก/ไม่ใช่สลิป, 'error' ประมวลผลพัง)
-    ใช้กระทบยอด 'นับมือ' กับ 'บอทนับ' ในรายงาน — ห้าม throw ซ้อน (best-effort)"""
+def record_image_miss(group_id: str, reason: str, detail: str = None):
+    """บันทึกรูปที่รับเข้ามาแต่ไม่ได้กลายเป็นสลิป (reason='notslip' อ่านไม่ออก/ไม่ใช่สลิป, 'error' พัง, 'notincome' ข้ามไม่ใช่รายรับ)
+    detail = ยอด/ปลายทาง (ไว้ดูใบที่ถูกข้าม) — ห้าม throw ซ้อน (best-effort)"""
     try:
         with _db() as conn:
             conn.execute(
-                "INSERT INTO image_misses (group_id, stat_date, reason, recorded_at) VALUES (?,?,?,?)",
+                "INSERT INTO image_misses (group_id, stat_date, reason, recorded_at, detail) VALUES (?,?,?,?,?)",
                 (group_id, datetime.now(TZ).date().isoformat(), reason,
-                 datetime.now(TZ).strftime("%H:%M:%S"))
+                 datetime.now(TZ).strftime("%H:%M:%S"), detail)
             )
             conn.commit()
     except Exception as e:
         print(f"[miss] record failed group={group_id}: {e}", flush=True)
+
+
+def build_skipped_list(group_id: str, report_date: str = None) -> str:
+    """รายการใบที่ถูกข้าม 'ไม่ใช่รายรับ' (โอนเข้าบัญชีที่ไม่ตรง PAYEE) พร้อมยอด+ปลายทาง
+    ไว้เช็กว่าใบที่ข้ามเป็นเงินร้านจริงไหม (ถ้าใช่ = ต้องเพิ่มบัญชีใน PAYEE_ACCOUNTS)"""
+    d = report_date or datetime.now(TZ).date().isoformat()
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT recorded_at, detail FROM image_misses "
+            "WHERE group_id=? AND stat_date=? AND reason='notincome' ORDER BY id", (group_id, d)).fetchall()
+    if not rows:
+        return f"📭 วันที่ {d} ไม่มีใบที่ถูกข้าม (ไม่ใช่รายรับ)"
+    lines = [f"⏭️ ใบที่ถูกข้าม — ไม่ตรงบัญชีร้าน ({d})", f"ทั้งหมด {len(rows)} ใบ", "━━━━━━━━━━━━━"]
+    for r in rows:
+        lines.append(f"{r['recorded_at'] or '-'}  {r['detail'] or '(ไม่มีรายละเอียด)'}")
+    lines += ["━━━━━━━━━━━━━", "ℹ️ ใบไหนเป็นบัญชีร้านจริง → แจ้งเพิ่มใน PAYEE_ACCOUNTS จะได้นับเป็นรายรับ"]
+    return "\n".join(lines)
 
 
 def build_daily_report(group_id: str, report_date: str = None) -> str:
@@ -1966,7 +1992,9 @@ def _process_image_event(event):
         income_only = INCOME_ONLY or (group_id in INCOME_ONLY_GROUPS)
         if income_only and PAYEE_ACCOUNTS and _slip_account_label(info) is None:
             print(f"[skip] ไม่ใช่รายรับ (ไม่ตรงบัญชีร้านที่ระบุ) group={group_id}", flush=True)
-            record_image_miss(group_id, "notincome")
+            _amt = f"{float(info.get('amount') or 0):,.2f}"
+            _dest = " / ".join(p for p in (info.get("receiver"), info.get("receiver_account"), info.get("bank")) if p) or "?"
+            record_image_miss(group_id, "notincome", detail=f"{_amt} → {_dest}")
             return
 
         # normalize เลขอ้างอิง (ตัวพิมพ์ใหญ่ + ตัดช่องว่าง) กันอ่านเพี้ยนเล็กน้อยแล้วเทียบไม่ตรง
@@ -2325,6 +2353,19 @@ def handle_text(event):
         if text.lower() in ("สรุป", "รายงาน", "report", "summary"):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
             return
+
+        # ดูใบที่ถูกข้าม 'ไม่ใช่รายรับ' (โชว์ยอด+ปลายทาง) — เช็กว่าโดนกรองทิ้งเป็นเงินร้านจริงไหม
+        if text.lower() in ("ดูที่ข้าม", "รายการข้าม", "ใบที่ข้าม", "สรุปข้าม", "ที่ข้าม"):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_skipped_list(group_id)))
+            return
+        if text.startswith("ดูที่ข้าม ") or text.startswith("รายการข้าม "):
+            arg = text.split(" ", 1)[1].strip()
+            try:
+                datetime.strptime(arg, "%Y-%m-%d")
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_skipped_list(group_id, arg)))
+                return
+            except ValueError:
+                pass
 
         # สรุปย้อนหลังรายวัน เช่น "สรุป 2026-06-03" (เอาไว้ตรวจเทียบยอด)
         if text.startswith("สรุป ") or text.startswith("รายงาน "):
