@@ -98,15 +98,19 @@ TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler      = WebhookHandler(LINE_SECRET)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# โมเดลสำหรับ 'อ่านซ้ำ' เมื่อรอบแรกอ่านไม่ออก — ใช้ตัวเก่งขึ้น (pro) เฉพาะใบยาก กู้สลิปที่ flash แพ้
+GEMINI_MODEL_RETRY = os.environ.get("GEMINI_MODEL_RETRY", "gemini-2.5-pro")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-def _gemini_generate(contents, attempts=4):
+def _gemini_generate(contents, attempts=4, model=None):
     """เรียก Gemini (SDK google-genai) พร้อม retry + backoff — กัน 503 overload/สะดุดชั่วคราว
-    contents เป็น str (ข้อความ) หรือ list [str, รูป]; รันใน background thread จึงรอ backoff ได้"""
+    contents เป็น str (ข้อความ) หรือ list [str, รูป]; รันใน background thread จึงรอ backoff ได้
+    model=None → ใช้ GEMINI_MODEL (flash); ระบุได้เพื่ออ่านซ้ำด้วยตัวเก่งขึ้น (pro)"""
+    use_model = model or GEMINI_MODEL
     last = None
     for i in range(attempts):
         try:
-            return gemini_client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+            return gemini_client.models.generate_content(model=use_model, contents=contents)
         except Exception as e:
             last = e
             if i < attempts - 1:
@@ -370,15 +374,16 @@ def extract_slip_info(image_bytes: bytes, retry: bool = False) -> dict:
         "fraud_reasons: ระบุเฉพาะร่องรอยที่ 'ตัวเลขจำนวนเงิน' ถูกแก้ พร้อมตำแหน่ง (ห้ามพูดเรื่องโลโก้/แบรนด์) ถ้าไม่เจอให้เป็น []"
     )
     img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-    # _gemini_generate มี retry+backoff ในตัวแล้ว (กัน 503 overload) — เรียกครั้งเดียวพอ
-    response = _gemini_generate([prompt, img_part])
+    # รอบแรกใช้ flash; รอบสอง (retry) ใช้โมเดลเก่งขึ้น (pro) เพื่อกู้สลิปที่ flash อ่านไม่ออก
+    response = _gemini_generate([prompt, img_part], model=(GEMINI_MODEL_RETRY if retry else None))
     raw = response.text.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 
-def extract_payable_doc(image_bytes: bytes) -> dict:
+def extract_payable_doc(image_bytes: bytes, retry: bool = False) -> dict:
     """อ่านรูปในกลุ่มบัญชีเจ้าหนี้ → แยกว่าเป็น 'บิลซื้อ' หรือ 'สลิปโอนจ่าย' พร้อมยอดเงิน
-    คืน JSON: doc_type=bill|payment|other, amount, ref_number(สำหรับสลิป), sender"""
+    คืน JSON: doc_type=bill|payment|other, amount, ref_number(สำหรับสลิป), sender
+    retry=True → อ่านซ้ำด้วยโมเดลเก่งขึ้น (pro) เมื่อรอบแรกอ่านไม่ออก"""
     prompt = (
         f"รูปนี้อยู่ในกลุ่มซื้อ-ขายระหว่างร้านอาหารกับร้านขายเครื่องดื่ม/สุรา ({PAYABLE_VENDOR}) "
         "ช่วยดูว่าเป็นเอกสารแบบไหน แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
@@ -405,7 +410,7 @@ def extract_payable_doc(image_bytes: bytes) -> dict:
         "ถ้า doc_type='other' ให้ amount=0"
     )
     img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-    response = _gemini_generate([prompt, img_part])
+    response = _gemini_generate([prompt, img_part], model=(GEMINI_MODEL_RETRY if retry else None))
     raw = response.text.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
@@ -1027,6 +1032,15 @@ def _process_payable_image(event, group_id: str):
         content     = line_bot_api.get_message_content(event.message.id)
         image_bytes = b"".join(chunk for chunk in content.iter_content())
         info        = extract_payable_doc(image_bytes)
+        # อ่านไม่ออก (other) หรืออ่านยอดไม่ได้ → ลองซ้ำด้วย pro (กู้ใบยาก/รูปมืด)
+        if (info.get("doc_type") or "other").lower() == "other" or float(info.get("amount") or 0) <= 0:
+            try:
+                info2 = extract_payable_doc(image_bytes, retry=True)
+                if (info2.get("doc_type") or "other").lower() in ("bill", "payment") and float(info2.get("amount") or 0) > 0:
+                    info = info2
+                    print(f"[payable] pro-retry กู้ได้ group={group_id}", flush=True)
+            except Exception as e:
+                print(f"[payable] pro-retry พลาด group={group_id}: {e}", flush=True)
     except Exception as e:
         print(f"[payable] อ่านรูปไม่สำเร็จ group={group_id}: {e}", flush=True)
         _payable_send(event, group_id, out, "⚠️ อ่านรูปไม่สำเร็จ กรุณาส่งใหม่อีกครั้ง")
