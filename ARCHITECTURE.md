@@ -26,10 +26,13 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 - **reservations** — การจอง (customer, people, resv_datetime, table_no, resv_date[YYYY-MM-DD], status, notify_group_id, reminded_at, confirmed_by/at)
 - **groups** — group_id ที่บอทเคยเจอ (ไว้ส่งรายงาน)
 - **payable_bills** — บิลซื้อจากเจ้าหนี้ (group_id, doc_date[YYYY-MM-DD = วันที่บันทึก], amount, note, recorded_at) → เพิ่มหนี้
-- **payable_payments** — เงินที่จ่ายเจ้าหนี้ (group_id, doc_date, amount, sender, ref_number, slip_datetime, recorded_at) → ลดหนี้ (กันซ้ำด้วย ref_number)
+  - บล็อก `ค้าง` ลงเป็นบิลรายวัน `note='ยอดค้างยกมา'` (กระจายทุกบรรทัดในรายงาน) — วางบล็อกใหม่ = ลบ carry เดิม + ล้าง opening แล้วลงใหม่
+- **payable_payments** — เงินที่จ่ายเจ้าหนี้ (group_id, doc_date, amount, sender, ref_number, slip_datetime, recorded_at, **allocated**) → ลดหนี้ (กันซ้ำด้วย ref_number)
+  - `allocated` = ส่วนของยอดจ่ายที่ถูก "ตัดเข้าบรรทัดบิล/ค้างโดยตรง" (อ่านวันที่จากโน้ตบนสลิป เช่น '6/6' → ถ้าไม่มีจับจากยอดที่ตรง) จ่ายครบ=ลบบรรทัดบิล, บางส่วน=ลดยอดบรรทัด
 - ⚠️ **ห้าม cleanup ตาราง payable_\*** — เป็นบัญชีเดินสะสม ลบแถวเก่า = ยอดค้างเพี้ยน
-- **meta** — key/value: `last_report_date`/`last_resv_summary_date`/`last_payable_summary_date` (กันส่งซ้ำรายวัน), `payable_opening:{group}` (ยอดค้างยกมา ตั้งครั้งเดียว), `sent:{job}:{date}:{group}` (กันส่งซ้ำ "รายกลุ่ม" เผื่อบางกลุ่มพลาดต้อง retry — ล้างของเก่าใน cleanup), `left:{group}` (กลุ่มที่บอทถูกเตะออก = เลิกส่ง กันค้าง retry/สแปม)
-- **สูตรยอดค้าง:** `ค้างสะสม = payable_opening + Σ bills − Σ payments`; สรุปรายวัน = `ยกเข้า(ก่อนวันนั้น) + บิลวันนั้น − จ่ายวันนั้น = ค้างสิ้นวัน`
+- ⚠️ **undo สลิปที่ถูกตัด (allocated>0):** `ลบจ่ายล่าสุด` ลบแถวจ่ายแต่ไม่คืนยอดบิลที่ถูกตัด → ถ้าตัดผิด ให้วางบล็อก `ค้าง` ใหม่ (รีสร้างบรรทัดค้างทั้งหมด)
+- **meta** — key/value: `last_report_date`/`last_resv_summary_date`/`last_payable_summary_date` (กันส่งซ้ำรายวัน), `payable_opening:{group}` (ยอดค้างยกมา 'ก้อนเดียว' เฉพาะคำสั่ง `ตั้งยอดยกมา`; บล็อก `ค้าง` ใช้บิลรายวันแทน), `sent:{job}:{date}:{group}` (กันส่งซ้ำ "รายกลุ่ม" เผื่อบางกลุ่มพลาดต้อง retry — ล้างของเก่าใน cleanup), `left:{group}` (กลุ่มที่บอทถูกเตะออก = เลิกส่ง กันค้าง retry/สแปม)
+- **สูตรยอดค้าง:** `ค้างสะสม = payable_opening + Σ bills − Σ(payments.amount − payments.allocated)`; สรุปรายวัน = `ยกเข้า(ก่อนวันนั้น) + บิลวันนั้น − จ่ายวันนั้น = ค้างสิ้นวัน`
 
 ## งานเบื้องหลัง (daemon threads)
 - `_report_backup_loop` — เรียก `maybe_send_daily_report()` ทุก 5 นาที (สำรองจาก /health ping)
