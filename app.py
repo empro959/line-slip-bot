@@ -2070,6 +2070,18 @@ def delete_slip_by_index(event, group_id, n):
              "─────────────────\n" + build_daily_report(group_id)))
 
 
+def add_manual_slip(event, group_id, amount: float, note: str = None):
+    """กรอกสลิปด้วยมือ (เมื่อบอทอ่านรูปไม่ออก เช่น ถ่ายจอเบลอ/มืด/มี noise) เพื่อให้ยอดวันนี้ตรง
+    บันทึกเป็นสลิป PASS ของวันนี้ ป้ายชื่อ '✍️ กรอกมือ' ให้เห็นชัดว่าเป็นการเติมเอง ไม่ใช่ AI อ่าน"""
+    sender = f"✍️ กรอกมือ{(' ' + note) if note else ''}"
+    info = {"sender": sender, "amount": amount}
+    save_slip(group_id, info, "PASS")
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text=f"✍️ เพิ่มสลิปด้วยมือแล้ว: {amount:,.2f} บาท"
+             f"{(' (' + note + ')') if note else ''}\n"
+             "─────────────────\n" + build_daily_report(group_id)))
+
+
 def send_reset_confirm(event, group_id):
     today = _today_iso()
     with _db() as conn:
@@ -2203,6 +2215,7 @@ def build_help(group_id: str) -> str:
             "• สรุป → รายงานสลิปวันนี้",
             "• สรุป 2026-06-09 → รายงานย้อนหลัง (ตามวันที่)",
             "• รายงานเมื่อวาน → ส่งรายงานเมื่อวานเข้ากลุ่ม",
+            "• เพิ่มสลิป 114 → กรอกยอดเองเมื่อบอทอ่านรูปไม่ออก",
             "• ลบล่าสุด / ลบ 3 → ลบสลิป (เลขดูจาก 'สรุป')",
             "• ล้างวันนี้ → ล้างสลิปวันนี้ทั้งหมด (มีปุ่มยืนยัน)",
             "",
@@ -2263,6 +2276,7 @@ def build_manual(group_id: str) -> str:
             "• สรุป → รายงานสลิปวันนี้\n"
             "• สรุป 2026-06-09 → รายงานย้อนหลัง (ปี-เดือน-วัน)\n"
             "• รายงานเมื่อวาน → ส่งรายงานเมื่อวานอีกครั้ง\n"
+            "• เพิ่มสลิป 114 → กรอกยอดเอง (ใช้ตอนบอทอ่านรูปไม่ออก เช่น ถ่ายจอเบลอ/มืด) ใส่โน๊ตได้: เพิ่มสลิป 114 โต๊ะ5\n"
             "• ลบล่าสุด / ลบ 3 → ลบสลิป (เลขดูจาก 'สรุป')\n"
             "• ล้างวันนี้ → ล้างสลิปวันนี้ทั้งหมด (มีปุ่มยืนยัน)\n"
             "⏰ บอทส่งสรุปสลิปเมื่อวานให้เองทุก 00:30"
@@ -2389,6 +2403,23 @@ def handle_text(event):
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(
                     text=f"🚨 push ล้มเหลว: {e}\n(นี่คือสาเหตุที่รายงาน 00:30 ไม่เด้ง)"))
             return
+
+        # กรอกสลิปด้วยมือ — ใช้เมื่อบอทอ่านรูปไม่ออก (ถ่ายจอเบลอ/มืด/มี noise) ให้ยอดวันนี้ตรง
+        # รูปแบบ: "เพิ่มสลิป 114" หรือ "เพิ่มสลิป 114 ลูกค้าโต๊ะ5" (ใส่โน๊ตได้)
+        for _kw in ("เพิ่มสลิป", "กรอกสลิป", "เติมสลิป", "บวกสลิป"):
+            if text.startswith(_kw):
+                rest = text[len(_kw):].strip()
+                m = re.match(r"^([\d,]+(?:\.\d+)?)\s*(.*)$", rest)
+                if not m:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                        text="✍️ พิมพ์: เพิ่มสลิป <ยอด> [โน๊ต]\nเช่น  เพิ่มสลิป 114  หรือ  เพิ่มสลิป 114 โต๊ะ5"))
+                    return
+                amt = float(m.group(1).replace(",", ""))
+                if amt <= 0:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ ยอดต้องมากกว่า 0"))
+                    return
+                add_manual_slip(event, group_id, amt, (m.group(2).strip() or None))
+                return
 
         # คำสั่งลบสลิป (กรณีส่งผิด/ซ้ำ)
         if text in ("ล้างวันนี้", "รีเซ็ตวันนี้", "ล้างสลิปวันนี้", "รีเซ็ต"):
