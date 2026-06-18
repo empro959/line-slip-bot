@@ -1903,7 +1903,8 @@ def notify_group_error(event, group_id):
     _last_group_error_ts[group_id] = time.time()
     try:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text="⚠️ มีสลิปบางรายการที่ระบบอ่านไม่ทัน กรุณาส่งสลิปนั้นใหม่อีกครั้ง"))
+            text="⚠️ บอทประมวลผลรูปเมื่อกี้ไม่สำเร็จ\n"
+                 "ถ้าเป็น 'สลิปโอน' โปรดส่งใหม่อีกครั้ง (ถ้าเป็นรูปอื่น เช่น รูปอาหาร/โน๊ต ข้ามได้เลย)"))
     except Exception:
         pass
 
