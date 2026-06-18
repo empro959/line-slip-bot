@@ -1177,6 +1177,7 @@ def _process_payable_image(event, group_id: str):
     บัญชีเดียว 2 กลุ่ม (mirror): เก็บข้อมูลที่ acct (primary), เด้งผลที่ out (mirror) — กลุ่ม primary เงียบ"""
     acct = _payable_account_key(group_id)   # ที่เก็บข้อมูลจริง (บัญชีเดียวกันสำหรับ primary/mirror)
     out  = _payable_output_group(group_id)  # ที่เด้งผล (primary→mirror, ไม่งั้นกลุ่มเดิม)
+    concise = group_id in PAYABLE_MIRROR    # กลุ่ม 1 (mirror primary): ยืนยันสั้นข้อความเดียว ไม่โชว์ยอดค้างสะสม
     try:
         content     = line_bot_api.get_message_content(event.message.id)
         image_bytes = b"".join(chunk for chunk in content.iter_content())
@@ -1211,9 +1212,12 @@ def _process_payable_image(event, group_id: str):
                 f"🔁 บิลนี้ (วันที่ {eff_date} ยอด {amount:,.2f}) เคยบันทึกแล้ว — ไม่นับซ้ำ")
             return
         rid = save_payable_bill(acct, amount, note="รูป", doc_date=doc_date)
-        _payable_send(event, group_id, out,
-            f"📥 บันทึกบิลซื้อ #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
-            f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
+        if concise:   # กลุ่ม 1 (mirror primary): สรุปสั้น ไม่โชว์ยอดค้างสะสม (ดูยอดรวมที่สรุปรายวันกลุ่ม 2)
+            _payable_send(event, group_id, out, f"📥 บันทึกบิลซื้อ #{rid} — {amount:,.2f} บาท")
+        else:
+            _payable_send(event, group_id, out,
+                f"📥 บันทึกบิลซื้อ #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
+                f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
         return
 
     if doc_type == "payment":
@@ -1233,10 +1237,14 @@ def _process_payable_image(event, group_id: str):
         rid = save_payable_payment(acct, amount, sender=info.get("sender"),
                                    ref_number=ref, slip_dt=info.get("datetime"),
                                    doc_date=doc_date, allocated=allocated, settle_note=settle_note)
-        msg = f"💸 บันทึกจ่าย {PAYABLE_VENDOR} #{rid}\nยอด {amount:,.2f} บาท"
+        if concise:   # กลุ่ม 1 (mirror primary): สรุปสั้น ไม่โชว์ยอดค้างสะสม
+            msg = f"💸 บันทึกจ่าย #{rid} — {amount:,.2f} บาท"
+        else:
+            msg = f"💸 บันทึกจ่าย {PAYABLE_VENDOR} #{rid}\nยอด {amount:,.2f} บาท"
         if settled:
             msg += "\n✅ ตัดยอดค้าง: " + ", ".join(settled)
-        msg += f"\n─────────────────\n💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท"
+        if not concise:
+            msg += f"\n─────────────────\n💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท"
         _payable_send(event, group_id, out, msg)
         return
 
