@@ -636,8 +636,8 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None) 
 # Storage & Report
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_slip(group_id: str, info: dict, verdict_status: str, message_id: str = None):
-    today       = datetime.now(TZ).date().isoformat()
+def save_slip(group_id: str, info: dict, verdict_status: str, message_id: str = None, slip_date: str = None):
+    today       = slip_date or datetime.now(TZ).date().isoformat()
     recorded_at = datetime.now(TZ).strftime("%H:%M:%S")
     with _db() as conn:
         conn.execute(
@@ -2092,16 +2092,19 @@ def delete_slip_by_index(event, group_id, n):
              "─────────────────\n" + build_daily_report(group_id)))
 
 
-def add_manual_slip(event, group_id, amount: float, note: str = None):
-    """กรอกสลิปด้วยมือ (เมื่อบอทอ่านรูปไม่ออก เช่น ถ่ายจอเบลอ/มืด/มี noise) เพื่อให้ยอดวันนี้ตรง
-    บันทึกเป็นสลิป PASS ของวันนี้ ป้ายชื่อ '✍️ กรอกมือ' ให้เห็นชัดว่าเป็นการเติมเอง ไม่ใช่ AI อ่าน"""
+def add_manual_slip(event, group_id, amount: float, note: str = None, slip_date: str = None):
+    """กรอกสลิปด้วยมือ (เมื่อบอทอ่านรูปไม่ออก เช่น ถ่ายจอเบลอ/มืด/มี noise) เพื่อให้ยอดตรง
+    บันทึกเป็นสลิป PASS ป้ายชื่อ '✍️ กรอกมือ' ให้เห็นชัดว่าเป็นการเติมเอง ไม่ใช่ AI อ่าน
+    slip_date=None → ลงวันนี้; ระบุ ISO ได้ (เช่นเคลียร์ยอดหลังเที่ยงคืน ให้ลงเป็นเมื่อวาน)"""
     sender = f"✍️ กรอกมือ{(' ' + note) if note else ''}"
     info = {"sender": sender, "amount": amount}
-    save_slip(group_id, info, "PASS")
+    save_slip(group_id, info, "PASS", slip_date=slip_date)
+    d = slip_date or _today_iso()
+    date_note = "" if slip_date is None else f" [ลงวันที่ {slip_date}]"
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
-        text=f"✍️ เพิ่มสลิปด้วยมือแล้ว: {amount:,.2f} บาท"
+        text=f"✍️ เพิ่มสลิปด้วยมือแล้ว: {amount:,.2f} บาท{date_note}"
              f"{(' (' + note + ')') if note else ''}\n"
-             "─────────────────\n" + build_daily_report(group_id)))
+             "─────────────────\n" + build_daily_report(group_id, d)))
 
 
 def send_reset_confirm(event, group_id):
@@ -2238,6 +2241,7 @@ def build_help(group_id: str) -> str:
             "• สรุป 2026-06-09 → รายงานย้อนหลัง (ตามวันที่)",
             "• รายงานเมื่อวาน → ส่งรายงานเมื่อวานเข้ากลุ่ม",
             "• เพิ่มสลิป 114 → กรอกยอดเองเมื่อบอทอ่านรูปไม่ออก",
+            "  (ย้อนวัน: เพิ่มสลิปเมื่อวาน 114 / เพิ่มสลิป 6/6 114)",
             "• ลบล่าสุด / ลบ 3 → ลบสลิป (เลขดูจาก 'สรุป')",
             "• ล้างวันนี้ → ล้างสลิปวันนี้ทั้งหมด (มีปุ่มยืนยัน)",
             "",
@@ -2299,6 +2303,7 @@ def build_manual(group_id: str) -> str:
             "• สรุป 2026-06-09 → รายงานย้อนหลัง (ปี-เดือน-วัน)\n"
             "• รายงานเมื่อวาน → ส่งรายงานเมื่อวานอีกครั้ง\n"
             "• เพิ่มสลิป 114 → กรอกยอดเอง (ใช้ตอนบอทอ่านรูปไม่ออก เช่น ถ่ายจอเบลอ/มืด) ใส่โน๊ตได้: เพิ่มสลิป 114 โต๊ะ5\n"
+            "   ย้อนวัน (กรณีเคลียร์ยอดหลังเที่ยงคืน): เพิ่มสลิปเมื่อวาน 114 หรือ เพิ่มสลิป 6/6 114\n"
             "• ลบล่าสุด / ลบ 3 → ลบสลิป (เลขดูจาก 'สรุป')\n"
             "• ล้างวันนี้ → ล้างสลิปวันนี้ทั้งหมด (มีปุ่มยืนยัน)\n"
             "⏰ บอทส่งสรุปสลิปเมื่อวานให้เองทุก 00:30"
@@ -2426,21 +2431,36 @@ def handle_text(event):
                     text=f"🚨 push ล้มเหลว: {e}\n(นี่คือสาเหตุที่รายงาน 00:30 ไม่เด้ง)"))
             return
 
-        # กรอกสลิปด้วยมือ — ใช้เมื่อบอทอ่านรูปไม่ออก (ถ่ายจอเบลอ/มืด/มี noise) ให้ยอดวันนี้ตรง
-        # รูปแบบ: "เพิ่มสลิป 114" หรือ "เพิ่มสลิป 114 ลูกค้าโต๊ะ5" (ใส่โน๊ตได้)
+        # กรอกสลิปด้วยมือ — ใช้เมื่อบอทอ่านรูปไม่ออก (ถ่ายจอเบลอ/มืด/มี noise) ให้ยอดตรง
+        # รูปแบบ: "เพิ่มสลิป 114" (วันนี้) | "เพิ่มสลิปเมื่อวาน 114" | "เพิ่มสลิป 6/6 114" (ย้อนวัน) | +โน๊ตท้ายได้
+        _help_add = ("✍️ พิมพ์: เพิ่มสลิป <ยอด> [โน๊ต]\n"
+                     "เช่น  เพิ่มสลิป 114  |  เพิ่มสลิป 114 โต๊ะ5\n"
+                     "ย้อนวัน:  เพิ่มสลิปเมื่อวาน 114  |  เพิ่มสลิป 6/6 114")
         for _kw in ("เพิ่มสลิป", "กรอกสลิป", "เติมสลิป", "บวกสลิป"):
             if text.startswith(_kw):
                 rest = text[len(_kw):].strip()
+                target_date = None   # None = วันนี้ (save_slip ใส่วันนี้ให้เอง)
+                if rest.startswith("เมื่อวาน"):
+                    target_date = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+                    rest = rest[len("เมื่อวาน"):].strip()
+                else:
+                    dm = re.match(r"^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s+(.*)$", rest)
+                    if dm:
+                        target_date = _parse_thai_date(dm.group(1))
+                        if target_date is None:
+                            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                                text="❌ วันที่ไม่ถูก เช่น: เพิ่มสลิป 6/6 114 (วัน/เดือน ยอด)"))
+                            return
+                        rest = dm.group(2).strip()
                 m = re.match(r"^([\d,]+(?:\.\d+)?)\s*(.*)$", rest)
                 if not m:
-                    line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                        text="✍️ พิมพ์: เพิ่มสลิป <ยอด> [โน๊ต]\nเช่น  เพิ่มสลิป 114  หรือ  เพิ่มสลิป 114 โต๊ะ5"))
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=_help_add))
                     return
                 amt = float(m.group(1).replace(",", ""))
                 if amt <= 0:
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ ยอดต้องมากกว่า 0"))
                     return
-                add_manual_slip(event, group_id, amt, (m.group(2).strip() or None))
+                add_manual_slip(event, group_id, amt, (m.group(2).strip() or None), slip_date=target_date)
                 return
 
         # คำสั่งลบสลิป (กรณีส่งผิด/ซ้ำ)
