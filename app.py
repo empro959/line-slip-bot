@@ -281,7 +281,8 @@ def init_db():
                 ref_number    TEXT,
                 slip_datetime TEXT,
                 recorded_at   TEXT,
-                allocated     {_REAL} DEFAULT 0
+                allocated     {_REAL} DEFAULT 0,
+                settle_note   TEXT
             )
         """)
         # นับรูปที่รับเข้ามาแต่ "ไม่ได้บันทึกเป็นสลิป" (อ่านไม่ออก/ไม่ใช่สลิป/error) ไว้กระทบยอดในรายงาน
@@ -333,13 +334,15 @@ def init_db():
                 except Exception:
                     pass
         # migration: allocated = ยอดของสลิปจ่ายที่ถูก 'ตัด' เข้ากับบรรทัดบิล/ค้างโดยตรง (กันนับซ้ำ — ส่วนที่เหลือถึงลดยอดรวม)
-        if USE_PG:
-            conn.execute(f"ALTER TABLE payable_payments ADD COLUMN IF NOT EXISTS allocated {_REAL} DEFAULT 0")
-        else:
-            try:
-                conn.execute(f"ALTER TABLE payable_payments ADD COLUMN allocated {_REAL} DEFAULT 0")
-            except Exception:
-                pass
+        #            settle_note = วันที่ของบรรทัดค้างที่สลิปนี้ไปตัด (ไว้โชว์ในรายงานว่า 'จ่ายตัดของวันไหน' กันจับผิดเงียบ)
+        for _pcol in (f"allocated {_REAL} DEFAULT 0", "settle_note TEXT"):
+            if USE_PG:
+                conn.execute(f"ALTER TABLE payable_payments ADD COLUMN IF NOT EXISTS {_pcol}")
+            else:
+                try:
+                    conn.execute(f"ALTER TABLE payable_payments ADD COLUMN {_pcol}")
+                except Exception:
+                    pass
         conn.commit()
 try:
     _ensure_init()
@@ -966,14 +969,14 @@ def save_payable_bill(group_id: str, amount: float, note: str = None, doc_date: 
         conn.commit()
     return rid
 
-def save_payable_payment(group_id: str, amount: float, sender=None, ref_number=None, slip_dt=None, doc_date: str = None, allocated: float = 0) -> int:
+def save_payable_payment(group_id: str, amount: float, sender=None, ref_number=None, slip_dt=None, doc_date: str = None, allocated: float = 0, settle_note: str = None) -> int:
     doc_date = doc_date or datetime.now(TZ).date().isoformat()
     now   = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     with _db() as conn:
         rid = conn.insert_returning_id(
-            "INSERT INTO payable_payments (group_id, doc_date, amount, sender, ref_number, slip_datetime, recorded_at, allocated) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (group_id, doc_date, float(amount), sender, ref_number, slip_dt, now, float(allocated or 0)))
+            "INSERT INTO payable_payments (group_id, doc_date, amount, sender, ref_number, slip_datetime, recorded_at, allocated, settle_note) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (group_id, doc_date, float(amount), sender, ref_number, slip_dt, now, float(allocated or 0), settle_note))
         conn.execute("INSERT INTO groups (group_id) VALUES (?) ON CONFLICT DO NOTHING", (group_id,))
         conn.commit()
     return rid
@@ -982,14 +985,22 @@ def save_payable_payment(group_id: str, amount: float, sender=None, ref_number=N
 def _payable_settle(group_id: str, pay_for_date: str, amount: float):
     """ตัดยอดจ่ายเข้ากับ 'บรรทัดบิล/ค้าง' โดยตรง (ดูจากวันที่บนสลิป → ถ้าไม่มี ดูยอดเงินที่ตรง)
     จ่ายครบ = ลบบรรทัดนั้น, จ่ายบางส่วน = ลดยอดบรรทัดเหลือเท่าที่ค้าง (เรียงค้างยกมาก่อน แล้ว FIFO)
-    คืน (allocated_total, [ข้อความสรุปบรรทัดที่ตัด]) — ส่วนที่ตัดได้จะถูกหักจาก amount ที่ลดยอดรวม กันนับซ้ำ"""
+    คืน (allocated_total, [ข้อความสรุปบรรทัดที่ตัด], settle_note) — ส่วนที่ตัดได้จะถูกหักจาก amount ที่ลดยอดรวม กันนับซ้ำ
+    settle_note = วันที่ของบรรทัดที่ถูกตัด (แบบสั้น คั่นด้วย ,) ไว้โชว์ในรายงานว่า 'จ่ายตัดของวันไหน'"""
     remaining = float(amount)
     allocated_total = 0.0
     settled = []
+    settle_dates = []
 
     def fdate(d):
         try:
             return datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m/%y")
+        except (ValueError, TypeError):
+            return d or "-"
+
+    def fdate_short(d):
+        try:
+            return datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m")
         except (ValueError, TypeError):
             return d or "-"
 
@@ -1015,8 +1026,9 @@ def _payable_settle(group_id: str, pay_for_date: str, amount: float):
             remaining -= take
             allocated_total += take
             settled.append(f"{fdate(r['doc_date'])} −{take:,.2f}" + (" (ครบ)" if new_amt <= 0.01 else f" (เหลือ {new_amt:,.2f})"))
+            settle_dates.append(fdate_short(r["doc_date"]))
         conn.commit()
-    return allocated_total, settled
+    return allocated_total, settled, (",".join(settle_dates) or None)
 
 def _payment_ref_exists(group_id: str, ref_number: str) -> bool:
     if not ref_number:
@@ -1070,6 +1082,10 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
         pay_rows = conn.execute(
             "SELECT doc_date, COALESCE(SUM(amount - COALESCE(allocated,0)),0) s FROM payable_payments "
             "WHERE group_id=? GROUP BY doc_date", (acct,)).fetchall()
+        # สลิปที่ถูก 'ตัดเข้ายอดค้าง' (allocated>0) → ไว้โชว์ร่องรอยว่าจ่ายตัดของวันไหน (กันจับผิดเงียบ)
+        alloc_rows = conn.execute(
+            "SELECT doc_date, allocated, settle_note FROM payable_payments "
+            "WHERE group_id=? AND COALESCE(allocated,0)>0 ORDER BY doc_date, id", (acct,)).fetchall()
     opening = _payable_opening(acct)
     bar = "━━━━━━━━━━━━━"
 
@@ -1082,7 +1098,15 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
     carries = {r["doc_date"]: float(r["s"] or 0) for r in carry_rows}
     bills   = {r["doc_date"]: float(r["s"] or 0) for r in bill_rows}
     pays    = {r["doc_date"]: float(r["s"] or 0) for r in pay_rows}
-    all_dates = sorted(set(carries) | set(bills) | set(pays))
+    # รวมยอด 'ตัดค้าง' ต่อวันจ่าย + เก็บว่าตัดของวันไหนบ้าง (ไม่กระทบยอดเดิน เพราะไปลดบรรทัดค้างแล้ว)
+    allocs = {}
+    for r in alloc_rows:
+        a, notes = allocs.get(r["doc_date"], (0.0, []))
+        a += float(r["allocated"] or 0)
+        if r["settle_note"]:
+            notes = notes + [r["settle_note"]]
+        allocs[r["doc_date"]] = (a, notes)
+    all_dates = sorted(set(carries) | set(bills) | set(pays) | set(allocs))
     if not all_dates and not opening:
         return f"📋 สรุปหนี้ {PAYABLE_VENDOR} — รายวัน\n{bar}\nยังไม่มีรายการ"
 
@@ -1093,7 +1117,8 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
     sep_added = False   # คั่นบล็อก 'ยอดค้างยกมา' ออกจากบิล/จ่ายปกติ 1 เส้น
     for d in all_dates:
         c, b, p = carries.get(d, 0.0), bills.get(d, 0.0), pays.get(d, 0.0)
-        running += c + b - p
+        a, notes = allocs.get(d, (0.0, []))
+        running += c + b - p   # 'ตัดค้าง' (a) ไม่กระทบยอดเดิน เพราะไปลดบรรทัดค้างที่วันเดิมแล้ว
         parts = []
         if c:
             parts.append(f"ยกมา {c:,.2f}")
@@ -1101,12 +1126,15 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
             parts.append(f"📥+{b:,.2f}")
         if p:
             parts.append(f"💸−{p:,.2f}")
+        if a:   # โชว์ว่าจ่ายตัดยอดค้างของวันไหน (กันจับผิดแบบเงียบ) — ไม่กระทบยอดรวม
+            parts.append(f"✅ จ่ายตัดค้าง {a:,.2f}" + (f" ของ {','.join(notes)}" if notes else ""))
         if not parts:
-            continue   # วันที่จ่ายแล้วถูกตัดเข้ายอดค้างเต็มจำนวน (สุทธิ 0) — ไม่ต้องโชว์แถวว่าง
+            continue   # ไม่มีอะไรต้องโชว์จริงๆ
         if carries and not sep_added and c == 0:   # แถวแรกที่ไม่ใช่ยกมา → ใส่เส้นคั่นก่อน
             lines.append(bar); sep_added = True
         line = f"{fdate(d)}  " + "  ".join(parts)
-        if with_total:
+        # โชว์ยอดค้างคงเหลือเฉพาะบรรทัดที่กระทบยอด (c/b/p) — บรรทัด 'ตัดค้างล้วน' ไม่โชว์ กันงงว่าจ่ายแล้วค้างไม่ลด
+        if with_total and (c or b or p):
             line += f"  → ค้าง {running:,.2f}"
         lines.append(line)
     if with_total:
@@ -1201,10 +1229,10 @@ def _process_payable_image(event, group_id: str):
             return
         # ตัดยอดเข้ากับบรรทัดค้าง: ดูวันที่ที่โน้ตบนสลิป → ถ้าไม่มี ลองจับยอดที่ตรงกับบรรทัดเดียว
         pay_for = _sane_doc_date(info.get("pay_for_date"))
-        allocated, settled = _payable_settle(acct, pay_for, amount)
+        allocated, settled, settle_note = _payable_settle(acct, pay_for, amount)
         rid = save_payable_payment(acct, amount, sender=info.get("sender"),
                                    ref_number=ref, slip_dt=info.get("datetime"),
-                                   doc_date=doc_date, allocated=allocated)
+                                   doc_date=doc_date, allocated=allocated, settle_note=settle_note)
         msg = f"💸 บันทึกจ่าย {PAYABLE_VENDOR} #{rid}\nยอด {amount:,.2f} บาท"
         if settled:
             msg += "\n✅ ตัดยอดค้าง: " + ", ".join(settled)
