@@ -865,14 +865,18 @@ def _payable_output_group(group_id: str) -> str:
 
 
 def _payable_send(event, source_group: str, dest_group: str, text: str):
-    """ส่งผลบันทึกบิล/สลิป — ถ้าปลายทางต่างจากกลุ่มต้นทาง ให้ push (กลุ่มต้นทางเงียบ) ไม่งั้น reply ตามปกติ"""
+    """ตอบยืนยันบิล/สลิป 'ในกลุ่มที่ส่ง' ด้วย reply (ฟรี ไม่กินโควต้า push)
+    กลุ่ม mirror (กลุ่ม 2) จะรับ 'เฉพาะสรุปรายวัน' ไม่เด้งทุกบิล/สลิป — ประหยัดโควต้า
+    (dest_group เก็บไว้เพื่อความเข้ากันได้ของ signature เดิม ไม่ได้ใช้ push แล้ว)"""
     try:
-        if dest_group and dest_group != source_group:
-            line_bot_api.push_message(dest_group, TextSendMessage(text=text))
-        else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
     except Exception as e:
-        print(f"[payable] ส่งผลไม่สำเร็จ dest={dest_group}: {e}", flush=True)
+        # reply token หมดอายุ/ใช้แล้ว (เช่นประมวลผลนาน) → fallback push เข้ากลุ่มที่ส่งเอง กันยืนยันหาย
+        print(f"[payable] reply ไม่สำเร็จ src={source_group}: {e} — ลอง push สำรอง", flush=True)
+        try:
+            line_bot_api.push_message(source_group, TextSendMessage(text=text))
+        except Exception as e2:
+            print(f"[payable] push สำรองไม่สำเร็จ src={source_group}: {e2}", flush=True)
 
 
 # marker note สำหรับ 'ยอดค้างยกมา' ที่กระจายเป็นบิลรายวัน (จากบล็อก 'ค้าง') — แยกจากบิลซื้อปกติในรายงาน
@@ -1090,8 +1094,6 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
     for d in all_dates:
         c, b, p = carries.get(d, 0.0), bills.get(d, 0.0), pays.get(d, 0.0)
         running += c + b - p
-        if carries and not sep_added and c == 0:   # แถวแรกที่ไม่ใช่ยกมา → ใส่เส้นคั่นก่อน
-            lines.append(bar); sep_added = True
         parts = []
         if c:
             parts.append(f"ยกมา {c:,.2f}")
@@ -1099,6 +1101,10 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
             parts.append(f"📥+{b:,.2f}")
         if p:
             parts.append(f"💸−{p:,.2f}")
+        if not parts:
+            continue   # วันที่จ่ายแล้วถูกตัดเข้ายอดค้างเต็มจำนวน (สุทธิ 0) — ไม่ต้องโชว์แถวว่าง
+        if carries and not sep_added and c == 0:   # แถวแรกที่ไม่ใช่ยกมา → ใส่เส้นคั่นก่อน
+            lines.append(bar); sep_added = True
         line = f"{fdate(d)}  " + "  ".join(parts)
         if with_total:
             line += f"  → ค้าง {running:,.2f}"
@@ -1110,10 +1116,10 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
 
 def _payable_report_recipients(acct: str):
     """คืน [(group, with_total), ...] ที่ต้องส่งสรุปหนี้รายวันของบัญชี acct ตอนตี1
-    - บัญชี mirror: ส่ง 2 กลุ่ม → primary (ไม่ใส่ยอดรวม) + mirror (ใส่ยอดรวม)
+    - บัญชี mirror: ส่ง 'กลุ่ม 2 (mirror) ที่เดียว' พร้อมยอดรวม (กลุ่ม 1 เห็นยืนยันรายตัวระหว่างวันอยู่แล้ว — ประหยัด push)
     - บัญชีปกติ: ส่งกลุ่มเดียว (ใส่ยอดรวม)"""
     if acct in PAYABLE_MIRROR:
-        return [(acct, False), (PAYABLE_MIRROR[acct], True)]
+        return [(PAYABLE_MIRROR[acct], True)]
     return [(acct, True)]
 
 
@@ -2456,9 +2462,9 @@ def handle_text(event):
         if group_id in REPORT_REDIRECT.values():
             roles.append("📥 กลุ่มนี้เป็นปลายทางรับรายงานจากกลุ่มอื่น")
         if group_id in PAYABLE_MIRROR:
-            roles.append(f"🪞 บัญชีหนี้แบบ mirror: กลุ่มนี้=ส่งบิล/สลิป(เงียบ) เด้งผลที่ {PAYABLE_MIRROR[group_id]}")
+            roles.append(f"🪞 บัญชีหนี้แบบ mirror: กลุ่มนี้=กลุ่มทำงาน (ส่งบิล/สลิป + ยืนยันรายตัวที่นี่); สรุปรายวันไปที่ {PAYABLE_MIRROR[group_id]}")
         if group_id in _PAYABLE_PRIMARY_OF:
-            roles.append("🪞 บัญชีหนี้แบบ mirror: กลุ่มนี้=กระจกเงา (ดูผล/ยอดของบัญชีร่วม)")
+            roles.append("🪞 บัญชีหนี้แบบ mirror: กลุ่มนี้=กลุ่มดูสรุป (รับเฉพาะสรุปรายวันของบัญชีร่วม ไม่เด้งทุกบิล/สลิป)")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"🆔 Group ID:\n{group_id}\n─────────────────\n" + "\n".join(roles)))
         return
