@@ -1086,9 +1086,9 @@ def build_payable_summary(group_id: str, date_str=None) -> str:
 
 
 def build_payable_ledger(acct: str, with_total: bool = True) -> str:
-    """สรุปหนี้แบบ 'รายวัน' (ยอดเดินบัญชี) — โชว์ทุกบิล/สลิปเป็นบรรทัดของตัวเอง (ไม่รวมวันเดียวกัน) + ยอดค้างคงเหลือต่อท้าย
-    with_total=True → โชว์ยอดค้างคงเหลือทุกบรรทัด + รวมท้าย (กลุ่ม mirror)
-    with_total=False → โชว์เฉพาะ +/− รายวัน ไม่มียอดค้าง/ยอดรวม (กลุ่ม primary)"""
+    """สรุปหนี้แบบ 'รายวัน' — โชว์ทุกบิล/สลิปเป็นบรรทัดของตัวเอง (ไม่รวมวันเดียวกัน); ไม่โชว์ยอดค้างรายบรรทัด
+    with_total=True → ต่อท้ายด้วย 'ยอดค้างสะสมรวม' บรรทัดเดียว (กลุ่ม 2 mirror)
+    with_total=False → ไม่มียอดรวม (กลุ่ม 1 primary)"""
     with _db() as conn:
         bill_rows = conn.execute(
             "SELECT doc_date, amount, COALESCE(paid,0) paid, note FROM payable_bills "
@@ -1141,11 +1141,8 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
             part = f"💸−{amt:,.2f}";                          running -= amt
         if has_carry and not sep_added and kind != "carry":   # แถวแรกที่ไม่ใช่ยกมา → เส้นคั่น
             lines.append(bar); sep_added = True
-        line = f"{fdate(d)}  {part}"
-        if with_total:
-            line += f"  → ค้าง {running:,.2f}"
-        lines.append(line)
-    if with_total:
+        lines.append(f"{fdate(d)}  {part}")
+    if with_total:   # กลุ่ม 2: โชว์เฉพาะ 'บรรทัดสุดท้าย' (ยอดค้างสะสมรวม) ไม่โชว์ยอดค้างรายบรรทัด
         lines += [bar, f"💰 ค้างจ่ายสะสม   {running:,.2f} บาท"]
     return "\n".join(lines)
 
