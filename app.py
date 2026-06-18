@@ -102,21 +102,42 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_MODEL_RETRY = os.environ.get("GEMINI_MODEL_RETRY", "gemini-2.5-pro")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-def _gemini_generate(contents, attempts=4, model=None):
+def _gemini_generate(contents, attempts=4, model=None, json_mode=False):
     """เรียก Gemini (SDK google-genai) พร้อม retry + backoff — กัน 503 overload/สะดุดชั่วคราว
     contents เป็น str (ข้อความ) หรือ list [str, รูป]; รันใน background thread จึงรอ backoff ได้
-    model=None → ใช้ GEMINI_MODEL (flash); ระบุได้เพื่ออ่านซ้ำด้วยตัวเก่งขึ้น (pro)"""
+    model=None → ใช้ GEMINI_MODEL (flash); ระบุได้เพื่ออ่านซ้ำด้วยตัวเก่งขึ้น (pro)
+    json_mode=True → บังคับให้ตอบเป็น JSON (กันโมเดลตอบเป็นข้อความบรรยายแล้ว parse พัง)"""
     use_model = model or GEMINI_MODEL
+    config = types.GenerateContentConfig(response_mime_type="application/json") if json_mode else None
     last = None
     for i in range(attempts):
         try:
-            return gemini_client.models.generate_content(model=use_model, contents=contents)
+            return gemini_client.models.generate_content(model=use_model, contents=contents, config=config)
         except Exception as e:
             last = e
             if i < attempts - 1:
                 print(f"[gemini] retry {i+1}/{attempts}: {str(e)[:100]}", flush=True)
                 time.sleep(2 * (2 ** i))   # 2, 4, 8 วินาที
     raise last
+
+
+def _parse_gemini_json(response, fallback: dict) -> dict:
+    """แปลงผลลัพธ์ Gemini เป็น dict อย่างทนทาน — กันเคสโมเดลตอบไม่เป็น JSON (เช่น โน๊ตเขียนมือ/รูปกำกวม
+    ทำให้ตอบเป็นข้อความบรรยาย) แล้ว json.loads โยน error หลุดไป 'error path' → เตือนผิดว่า 'ส่งสลิปใหม่'
+    ถ้า parse ตรงๆ ไม่ได้ จะลองดึงบล็อก {...} แรกออกมา; ถ้ายังไม่ได้คืน fallback (ถือว่าไม่ใช่สลิป — เงียบ)"""
+    raw = (getattr(response, "text", None) or "").strip().replace("```json", "").replace("```", "").strip()
+    if raw:
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            m = re.search(r"\{.*\}", raw, re.S)
+            if m:
+                try:
+                    return json.loads(m.group(0))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+    print(f"[gemini] parse JSON ไม่ได้ → ใช้ fallback: {raw[:120]!r}", flush=True)
+    return dict(fallback)
 
 # ─── Persistent storage (PostgreSQL ถ้ามี DATABASE_URL ไม่งั้น SQLite) ────────
 # ย้ายมาใช้ Postgres (managed) เพราะ Render persistent disk mount ไม่เสถียร (mount ช้า/ไม่ขึ้น → ข้อมูลหาย)
@@ -384,9 +405,9 @@ def extract_slip_info(image_bytes: bytes, retry: bool = False) -> dict:
     )
     img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
     # รอบแรกใช้ flash; รอบสอง (retry) ใช้โมเดลเก่งขึ้น (pro) เพื่อกู้สลิปที่ flash อ่านไม่ออก
-    response = _gemini_generate([prompt, img_part], model=(GEMINI_MODEL_RETRY if retry else None))
-    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    response = _gemini_generate([prompt, img_part], model=(GEMINI_MODEL_RETRY if retry else None), json_mode=True)
+    # parse แบบทนทาน: ถ้าโมเดลตอบไม่เป็น JSON ให้ถือว่า 'ไม่ใช่สลิป' (เงียบ) แทนที่จะ error → เตือนผิด
+    return _parse_gemini_json(response, {"is_slip": False})
 
 
 def extract_payable_doc(image_bytes: bytes, retry: bool = False) -> dict:
@@ -419,9 +440,9 @@ def extract_payable_doc(image_bytes: bytes, retry: bool = False) -> dict:
         "ถ้า doc_type='other' ให้ amount=0"
     )
     img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-    response = _gemini_generate([prompt, img_part], model=(GEMINI_MODEL_RETRY if retry else None))
-    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    response = _gemini_generate([prompt, img_part], model=(GEMINI_MODEL_RETRY if retry else None), json_mode=True)
+    # parse แบบทนทาน: ถ้าโมเดลตอบไม่เป็น JSON ให้ถือว่า 'อื่นๆ' (ไม่ใช่บิล/สลิป) แทนที่จะ error
+    return _parse_gemini_json(response, {"doc_type": "other", "amount": 0})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -615,8 +636,8 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None) 
 # Storage & Report
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_slip(group_id: str, info: dict, verdict_status: str, message_id: str = None):
-    today       = datetime.now(TZ).date().isoformat()
+def save_slip(group_id: str, info: dict, verdict_status: str, message_id: str = None, slip_date: str = None):
+    today       = slip_date or datetime.now(TZ).date().isoformat()
     recorded_at = datetime.now(TZ).strftime("%H:%M:%S")
     with _db() as conn:
         conn.execute(
@@ -1603,9 +1624,9 @@ def extract_reservation(text: str) -> dict:
         "ฟิลด์ที่ไม่มีข้อมูลให้เป็น null\n\n"
         f"ข้อความ: {text}"
     )
-    response = _gemini_generate(prompt)
-    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    response = _gemini_generate(prompt, json_mode=True)
+    # parse แบบทนทาน: ถ้าโมเดลตอบไม่เป็น JSON ให้ถือว่า 'ไม่ใช่การจอง' (เงียบ) แทนที่จะ error
+    return _parse_gemini_json(response, {"is_reservation": False})
 
 
 def _resv_detail_lines(r: dict) -> str:
@@ -1903,7 +1924,8 @@ def notify_group_error(event, group_id):
     _last_group_error_ts[group_id] = time.time()
     try:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text="⚠️ มีสลิปบางรายการที่ระบบอ่านไม่ทัน กรุณาส่งสลิปนั้นใหม่อีกครั้ง"))
+            text="⚠️ บอทประมวลผลรูปเมื่อกี้ไม่สำเร็จ\n"
+                 "ถ้าเป็น 'สลิปโอน' โปรดส่งใหม่อีกครั้ง (ถ้าเป็นรูปอื่น เช่น รูปอาหาร/โน๊ต ข้ามได้เลย)"))
     except Exception:
         pass
 
@@ -2070,6 +2092,21 @@ def delete_slip_by_index(event, group_id, n):
              "─────────────────\n" + build_daily_report(group_id)))
 
 
+def add_manual_slip(event, group_id, amount: float, note: str = None, slip_date: str = None):
+    """กรอกสลิปด้วยมือ (เมื่อบอทอ่านรูปไม่ออก เช่น ถ่ายจอเบลอ/มืด/มี noise) เพื่อให้ยอดตรง
+    บันทึกเป็นสลิป PASS ป้ายชื่อ '✍️ กรอกมือ' ให้เห็นชัดว่าเป็นการเติมเอง ไม่ใช่ AI อ่าน
+    slip_date=None → ลงวันนี้; ระบุ ISO ได้ (เช่นเคลียร์ยอดหลังเที่ยงคืน ให้ลงเป็นเมื่อวาน)"""
+    sender = f"✍️ กรอกมือ{(' ' + note) if note else ''}"
+    info = {"sender": sender, "amount": amount}
+    save_slip(group_id, info, "PASS", slip_date=slip_date)
+    d = slip_date or _today_iso()
+    date_note = "" if slip_date is None else f" [ลงวันที่ {slip_date}]"
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text=f"✍️ เพิ่มสลิปด้วยมือแล้ว: {amount:,.2f} บาท{date_note}"
+             f"{(' (' + note + ')') if note else ''}\n"
+             "─────────────────\n" + build_daily_report(group_id, d)))
+
+
 def send_reset_confirm(event, group_id):
     today = _today_iso()
     with _db() as conn:
@@ -2203,6 +2240,8 @@ def build_help(group_id: str) -> str:
             "• สรุป → รายงานสลิปวันนี้",
             "• สรุป 2026-06-09 → รายงานย้อนหลัง (ตามวันที่)",
             "• รายงานเมื่อวาน → ส่งรายงานเมื่อวานเข้ากลุ่ม",
+            "• เพิ่มสลิป 114 → กรอกยอดเองเมื่อบอทอ่านรูปไม่ออก",
+            "  (ย้อนวัน: เพิ่มสลิปเมื่อวาน 114 / เพิ่มสลิป 6/6 114)",
             "• ลบล่าสุด / ลบ 3 → ลบสลิป (เลขดูจาก 'สรุป')",
             "• ล้างวันนี้ → ล้างสลิปวันนี้ทั้งหมด (มีปุ่มยืนยัน)",
             "",
@@ -2263,6 +2302,8 @@ def build_manual(group_id: str) -> str:
             "• สรุป → รายงานสลิปวันนี้\n"
             "• สรุป 2026-06-09 → รายงานย้อนหลัง (ปี-เดือน-วัน)\n"
             "• รายงานเมื่อวาน → ส่งรายงานเมื่อวานอีกครั้ง\n"
+            "• เพิ่มสลิป 114 → กรอกยอดเอง (ใช้ตอนบอทอ่านรูปไม่ออก เช่น ถ่ายจอเบลอ/มืด) ใส่โน๊ตได้: เพิ่มสลิป 114 โต๊ะ5\n"
+            "   ย้อนวัน (กรณีเคลียร์ยอดหลังเที่ยงคืน): เพิ่มสลิปเมื่อวาน 114 หรือ เพิ่มสลิป 6/6 114\n"
             "• ลบล่าสุด / ลบ 3 → ลบสลิป (เลขดูจาก 'สรุป')\n"
             "• ล้างวันนี้ → ล้างสลิปวันนี้ทั้งหมด (มีปุ่มยืนยัน)\n"
             "⏰ บอทส่งสรุปสลิปเมื่อวานให้เองทุก 00:30"
@@ -2389,6 +2430,38 @@ def handle_text(event):
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(
                     text=f"🚨 push ล้มเหลว: {e}\n(นี่คือสาเหตุที่รายงาน 00:30 ไม่เด้ง)"))
             return
+
+        # กรอกสลิปด้วยมือ — ใช้เมื่อบอทอ่านรูปไม่ออก (ถ่ายจอเบลอ/มืด/มี noise) ให้ยอดตรง
+        # รูปแบบ: "เพิ่มสลิป 114" (วันนี้) | "เพิ่มสลิปเมื่อวาน 114" | "เพิ่มสลิป 6/6 114" (ย้อนวัน) | +โน๊ตท้ายได้
+        _help_add = ("✍️ พิมพ์: เพิ่มสลิป <ยอด> [โน๊ต]\n"
+                     "เช่น  เพิ่มสลิป 114  |  เพิ่มสลิป 114 โต๊ะ5\n"
+                     "ย้อนวัน:  เพิ่มสลิปเมื่อวาน 114  |  เพิ่มสลิป 6/6 114")
+        for _kw in ("เพิ่มสลิป", "กรอกสลิป", "เติมสลิป", "บวกสลิป"):
+            if text.startswith(_kw):
+                rest = text[len(_kw):].strip()
+                target_date = None   # None = วันนี้ (save_slip ใส่วันนี้ให้เอง)
+                if rest.startswith("เมื่อวาน"):
+                    target_date = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+                    rest = rest[len("เมื่อวาน"):].strip()
+                else:
+                    dm = re.match(r"^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s+(.*)$", rest)
+                    if dm:
+                        target_date = _parse_thai_date(dm.group(1))
+                        if target_date is None:
+                            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                                text="❌ วันที่ไม่ถูก เช่น: เพิ่มสลิป 6/6 114 (วัน/เดือน ยอด)"))
+                            return
+                        rest = dm.group(2).strip()
+                m = re.match(r"^([\d,]+(?:\.\d+)?)\s*(.*)$", rest)
+                if not m:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=_help_add))
+                    return
+                amt = float(m.group(1).replace(",", ""))
+                if amt <= 0:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ ยอดต้องมากกว่า 0"))
+                    return
+                add_manual_slip(event, group_id, amt, (m.group(2).strip() or None), slip_date=target_date)
+                return
 
         # คำสั่งลบสลิป (กรณีส่งผิด/ซ้ำ)
         if text in ("ล้างวันนี้", "รีเซ็ตวันนี้", "ล้างสลิปวันนี้", "รีเซ็ต"):
