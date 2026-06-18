@@ -268,7 +268,8 @@ def init_db():
                 doc_date    TEXT,
                 amount      {_REAL},
                 note        TEXT,
-                recorded_at TEXT
+                recorded_at TEXT,
+                paid        {_REAL} DEFAULT 0
             )
         """)
         conn.execute(f"""
@@ -343,6 +344,14 @@ def init_db():
                     conn.execute(f"ALTER TABLE payable_payments ADD COLUMN {_pcol}")
                 except Exception:
                     pass
+        # migration: paid = ยอดที่ถูกจ่ายตัดของบรรทัดบิล/ค้างนั้น (ไม่ลบบรรทัด — โชว์ในรายงานรอบนี้ แล้วลบบรรทัดที่จ่ายครบตอนสรุปรอบถัดไป)
+        if USE_PG:
+            conn.execute(f"ALTER TABLE payable_bills ADD COLUMN IF NOT EXISTS paid {_REAL} DEFAULT 0")
+        else:
+            try:
+                conn.execute(f"ALTER TABLE payable_bills ADD COLUMN paid {_REAL} DEFAULT 0")
+            except Exception:
+                pass
         conn.commit()
 try:
     _ensure_init()
@@ -894,11 +903,17 @@ def _payable_opening(group_id: str) -> float:
     except ValueError:
         return 0.0
 
-def _payable_sum(table: str, group_id: str, before_date=None, on_date=None, net_allocated=False) -> float:
+def _payable_sum(table: str, group_id: str, before_date=None, on_date=None, net_allocated=False, net_paid=False) -> float:
     """รวมยอดบิล/เงินจ่ายของกลุ่ม — เลือกกรองทั้งหมด / ก่อนวันที่ / เฉพาะวันที่
-    net_allocated=True (ใช้กับ payable_payments): รวมเฉพาะ 'ส่วนที่ยังไม่ถูกตัดเข้าบิล' (amount − allocated)
-    เพราะส่วน allocated ไปลดยอดบิลโดยตรงแล้ว — กันนับซ้ำ"""
-    col = "amount - COALESCE(allocated,0)" if net_allocated else "amount"
+    net_allocated=True (payable_payments): รวมเฉพาะ 'ส่วนที่ยังไม่ถูกตัดเข้าบิล' (amount − allocated)
+    net_paid=True (payable_bills): รวมเฉพาะ 'ส่วนที่ยังค้างจริง' (amount − paid)
+    — กันนับซ้ำ เพราะส่วน allocated/paid คือเงินก้อนเดียวกัน (สลิปไปตัดบรรทัดบิล)"""
+    if net_allocated:
+        col = "amount - COALESCE(allocated,0)"
+    elif net_paid:
+        col = "amount - COALESCE(paid,0)"
+    else:
+        col = "amount"
     q = f"SELECT COALESCE(SUM({col}),0) s FROM {table} WHERE group_id=?"
     params = [group_id]
     if before_date is not None:
@@ -909,9 +924,10 @@ def _payable_sum(table: str, group_id: str, before_date=None, on_date=None, net_
         return float(conn.execute(q, tuple(params)).fetchone()["s"] or 0)
 
 def _payable_outstanding(group_id: str) -> float:
-    """ยอดค้างจ่ายสะสมปัจจุบัน = ยกมา + บิลรวมทั้งหมด − จ่ายที่ยังไม่ถูกตัดเข้าบิล"""
+    """ยอดค้างจ่ายสะสมปัจจุบัน = ยกมา + บิลที่ยังค้าง(amount−paid) − จ่ายที่ยังไม่ถูกตัดเข้าบิล(amount−allocated)
+    [Σpaid = Σallocated เป็นเงินก้อนเดียวกัน → สูตรนี้ = ยกมา + Σบิล − Σจ่าย พอดี ไม่นับซ้ำ]"""
     return (_payable_opening(group_id)
-            + _payable_sum("payable_bills", group_id)
+            + _payable_sum("payable_bills", group_id, net_paid=True)
             - _payable_sum("payable_payments", group_id, net_allocated=True))
 
 def _parse_thai_date(token: str):
@@ -1005,27 +1021,28 @@ def _payable_settle(group_id: str, pay_for_date: str, amount: float):
             return d or "-"
 
     with _db() as conn:
-        if pay_for_date:   # มีวันที่บนสลิป → ตัดบิล/ค้างของวันนั้น (ค้างยกมาก่อน)
+        # เลือกบรรทัดที่ 'ยังค้างจริง' (amount − paid > 0); ค้างยกมาก่อน
+        if pay_for_date:   # มีวันที่บนสลิป → ตัดบิล/ค้างของวันนั้น
             rows = conn.execute(
-                "SELECT id, doc_date, amount FROM payable_bills WHERE group_id=? AND doc_date=? AND amount>0 "
+                "SELECT id, doc_date, amount, COALESCE(paid,0) paid FROM payable_bills "
+                "WHERE group_id=? AND doc_date=? AND (amount - COALESCE(paid,0))>0.01 "
                 "ORDER BY CASE WHEN note=? THEN 0 ELSE 1 END, id", (group_id, pay_for_date, _PAYABLE_CARRY_NOTE)).fetchall()
-        else:              # ไม่มีวันที่ → จับยอดที่ตรงกับบรรทัดเดียว (ค้างยกมาก่อน)
+        else:              # ไม่มีวันที่ → จับยอดค้างคงเหลือที่ตรงกับบรรทัดเดียว
             rows = conn.execute(
-                "SELECT id, doc_date, amount FROM payable_bills WHERE group_id=? AND amount>0 AND ABS(amount-?)<0.01 "
+                "SELECT id, doc_date, amount, COALESCE(paid,0) paid FROM payable_bills "
+                "WHERE group_id=? AND ABS((amount - COALESCE(paid,0)) - ?)<0.01 AND (amount - COALESCE(paid,0))>0.01 "
                 "ORDER BY CASE WHEN note=? THEN 0 ELSE 1 END, id LIMIT 1", (group_id, float(amount), _PAYABLE_CARRY_NOTE)).fetchall()
         for r in rows:
             if remaining <= 0.01:
                 break
-            bill_amt = float(r["amount"] or 0)
-            take = min(remaining, bill_amt)
-            new_amt = bill_amt - take
-            if new_amt <= 0.01:
-                conn.execute("DELETE FROM payable_bills WHERE id=?", (r["id"],))
-            else:
-                conn.execute("UPDATE payable_bills SET amount=? WHERE id=?", (new_amt, r["id"]))
+            line_remaining = float(r["amount"] or 0) - float(r["paid"] or 0)
+            take = min(remaining, line_remaining)
+            # ไม่ลบบรรทัด — แค่บวก 'paid' (บรรทัดยังอยู่ในรายงานรอบนี้ โชว์ว่าจ่ายแล้ว; ลบตอนสรุปรอบถัดไป)
+            conn.execute("UPDATE payable_bills SET paid=COALESCE(paid,0)+? WHERE id=?", (take, r["id"]))
             remaining -= take
             allocated_total += take
-            settled.append(f"{fdate(r['doc_date'])} −{take:,.2f}" + (" (ครบ)" if new_amt <= 0.01 else f" (เหลือ {new_amt:,.2f})"))
+            full = (line_remaining - take) <= 0.01
+            settled.append(f"{fdate(r['doc_date'])} −{take:,.2f}" + (" (ครบ)" if full else f" (เหลือ {line_remaining - take:,.2f})"))
             settle_dates.append(fdate_short(r["doc_date"]))
         conn.commit()
     return allocated_total, settled, (",".join(settle_dates) or None)
@@ -1043,10 +1060,10 @@ def build_payable_summary(group_id: str, date_str=None) -> str:
     """สรุปยอดค้างจ่าย 'รายวัน': ยกเข้า + บิลวันนั้น − จ่ายวันนั้น = ค้างสิ้นวัน"""
     d = date_str or datetime.now(TZ).date().isoformat()
     opening      = _payable_opening(group_id)
-    bills_before = _payable_sum("payable_bills", group_id, before_date=d)
+    bills_before = _payable_sum("payable_bills", group_id, before_date=d, net_paid=True)
     pays_before  = _payable_sum("payable_payments", group_id, before_date=d, net_allocated=True)
     carry_in     = opening + bills_before - pays_before
-    bills_today  = _payable_sum("payable_bills", group_id, on_date=d)
+    bills_today  = _payable_sum("payable_bills", group_id, on_date=d, net_paid=True)
     pays_today   = _payable_sum("payable_payments", group_id, on_date=d, net_allocated=True)
     carry_out    = carry_in + bills_today - pays_today
     with _db() as conn:
@@ -1074,18 +1091,15 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
     with_total=False → โชว์เฉพาะ +/− รายวัน ไม่มียอดค้าง/ยอดรวม (กลุ่ม primary)"""
     with _db() as conn:
         carry_rows = conn.execute(
-            "SELECT doc_date, COALESCE(SUM(amount),0) s FROM payable_bills "
+            "SELECT doc_date, COALESCE(SUM(amount),0) g, COALESCE(SUM(COALESCE(paid,0)),0) p FROM payable_bills "
             "WHERE group_id=? AND note=? GROUP BY doc_date", (acct, _PAYABLE_CARRY_NOTE)).fetchall()
         bill_rows = conn.execute(
-            "SELECT doc_date, COALESCE(SUM(amount),0) s FROM payable_bills "
+            "SELECT doc_date, COALESCE(SUM(amount),0) g, COALESCE(SUM(COALESCE(paid,0)),0) p FROM payable_bills "
             "WHERE group_id=? AND (note IS NULL OR note<>?) GROUP BY doc_date", (acct, _PAYABLE_CARRY_NOTE)).fetchall()
+        # เงินจ่าย 'ส่วนที่ยังไม่ถูกตัดเข้าบิล' (amount − allocated) — ส่วนที่ตัดแล้วไปโชว์เป็น 'จ่ายแล้ว' บนบรรทัดบิล
         pay_rows = conn.execute(
             "SELECT doc_date, COALESCE(SUM(amount - COALESCE(allocated,0)),0) s FROM payable_payments "
             "WHERE group_id=? GROUP BY doc_date", (acct,)).fetchall()
-        # สลิปที่ถูก 'ตัดเข้ายอดค้าง' (allocated>0) → ไว้โชว์ร่องรอยว่าจ่ายตัดของวันไหน (กันจับผิดเงียบ)
-        alloc_rows = conn.execute(
-            "SELECT doc_date, allocated, settle_note FROM payable_payments "
-            "WHERE group_id=? AND COALESCE(allocated,0)>0 ORDER BY doc_date, id", (acct,)).fetchall()
     opening = _payable_opening(acct)
     bar = "━━━━━━━━━━━━━"
 
@@ -1095,18 +1109,17 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
         except (ValueError, TypeError):
             return d or "-"
 
-    carries = {r["doc_date"]: float(r["s"] or 0) for r in carry_rows}
-    bills   = {r["doc_date"]: float(r["s"] or 0) for r in bill_rows}
+    def paid_tag(gross, paid):   # ป้ายต่อท้ายบรรทัดบิล/ค้าง บอกว่าจ่ายไปเท่าไหร่
+        if paid >= gross - 0.01:
+            return "  ✅ จ่ายครบ"
+        if paid > 0.01:
+            return f"  💸 จ่าย {paid:,.2f} (เหลือ {gross - paid:,.2f})"
+        return ""
+
+    carries = {r["doc_date"]: (float(r["g"] or 0), float(r["p"] or 0)) for r in carry_rows}
+    bills   = {r["doc_date"]: (float(r["g"] or 0), float(r["p"] or 0)) for r in bill_rows}
     pays    = {r["doc_date"]: float(r["s"] or 0) for r in pay_rows}
-    # รวมยอด 'ตัดค้าง' ต่อวันจ่าย + เก็บว่าตัดของวันไหนบ้าง (ไม่กระทบยอดเดิน เพราะไปลดบรรทัดค้างแล้ว)
-    allocs = {}
-    for r in alloc_rows:
-        a, notes = allocs.get(r["doc_date"], (0.0, []))
-        a += float(r["allocated"] or 0)
-        if r["settle_note"]:
-            notes = notes + [r["settle_note"]]
-        allocs[r["doc_date"]] = (a, notes)
-    all_dates = sorted(set(carries) | set(bills) | set(pays) | set(allocs))
+    all_dates = sorted(set(carries) | set(bills) | set(pays))
     if not all_dates and not opening:
         return f"📋 สรุปหนี้ {PAYABLE_VENDOR} — รายวัน\n{bar}\nยังไม่มีรายการ"
 
@@ -1116,25 +1129,23 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
     running = opening
     sep_added = False   # คั่นบล็อก 'ยอดค้างยกมา' ออกจากบิล/จ่ายปกติ 1 เส้น
     for d in all_dates:
-        c, b, p = carries.get(d, 0.0), bills.get(d, 0.0), pays.get(d, 0.0)
-        a, notes = allocs.get(d, (0.0, []))
-        running += c + b - p   # 'ตัดค้าง' (a) ไม่กระทบยอดเดิน เพราะไปลดบรรทัดค้างที่วันเดิมแล้ว
+        cg, cp = carries.get(d, (0.0, 0.0))
+        bg, bp = bills.get(d, (0.0, 0.0))
+        p = pays.get(d, 0.0)
+        running += (cg - cp) + (bg - bp) - p   # ยอดค้างคงเหลือ = ยกมา/บิล 'หักที่จ่ายแล้ว' − จ่ายที่ยังไม่ตัด
         parts = []
-        if c:
-            parts.append(f"ยกมา {c:,.2f}")
-        if b:
-            parts.append(f"📥+{b:,.2f}")
+        if cg:
+            parts.append(f"ยกมา {cg:,.2f}" + paid_tag(cg, cp))
+        if bg:
+            parts.append(f"📥+{bg:,.2f}" + paid_tag(bg, bp))
         if p:
             parts.append(f"💸−{p:,.2f}")
-        if a:   # โชว์ว่าจ่ายตัดยอดค้างของวันไหน (กันจับผิดแบบเงียบ) — ไม่กระทบยอดรวม
-            parts.append(f"✅ จ่ายตัดค้าง {a:,.2f}" + (f" ของ {','.join(notes)}" if notes else ""))
         if not parts:
-            continue   # ไม่มีอะไรต้องโชว์จริงๆ
-        if carries and not sep_added and c == 0:   # แถวแรกที่ไม่ใช่ยกมา → ใส่เส้นคั่นก่อน
+            continue
+        if carries and not sep_added and cg == 0:   # แถวแรกที่ไม่ใช่ยกมา → ใส่เส้นคั่นก่อน
             lines.append(bar); sep_added = True
         line = f"{fdate(d)}  " + "  ".join(parts)
-        # โชว์ยอดค้างคงเหลือเฉพาะบรรทัดที่กระทบยอด (c/b/p) — บรรทัด 'ตัดค้างล้วน' ไม่โชว์ กันงงว่าจ่ายแล้วค้างไม่ลด
-        if with_total and (c or b or p):
+        if with_total:
             line += f"  → ค้าง {running:,.2f}"
         lines.append(line)
     if with_total:
@@ -1150,6 +1161,34 @@ def _payable_report_recipients(acct: str):
     if acct in PAYABLE_MIRROR:
         return [(acct, False), (PAYABLE_MIRROR[acct], True)]
     return [(acct, True)]
+
+
+def _payable_push_summary(event, source_group: str, acct: str):
+    """เด้ง 'สรุปหนี้รายวัน' ให้กลุ่มผู้รับ (กลุ่ม 1 ไม่มียอดรวม / กลุ่ม 2 มียอดรวม)
+    กลุ่มต้นทาง = reply (ฟรี), กลุ่มอื่น = push — ใช้ตอน 'มีการจ่าย' (ไม่ใช้กับบิลซื้อ)"""
+    replied = False
+    for grp, with_total in _payable_report_recipients(acct):
+        if _group_left(grp) or grp in IGNORE_GROUPS:
+            continue
+        text = build_payable_ledger(acct, with_total)
+        try:
+            if grp == source_group and not replied and getattr(event, "reply_token", None):
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
+                replied = True
+            else:
+                line_bot_api.push_message(grp, TextSendMessage(text=text))
+        except Exception as e:
+            print(f"[payable] ส่งสรุปไม่สำเร็จ grp={grp}: {e}", flush=True)
+
+
+def _payable_cleanup_paid(acct: str):
+    """ลบบรรทัดบิล/ค้างที่ 'จ่ายครบแล้ว' (amount−paid ≤ 0) — เรียกหลังเด้งสรุป → รอบถัดไปบรรทัดนั้นหาย
+    ปลอดภัยต่อยอดรวม: บรรทัดที่จ่ายครบมี (amount−paid)=0 อยู่แล้ว ลบทิ้งยอดค้างไม่เปลี่ยน"""
+    with _db() as conn:
+        conn.execute(
+            "DELETE FROM payable_bills WHERE group_id=? AND COALESCE(paid,0)>0.01 AND (amount - COALESCE(paid,0))<=0.01",
+            (acct,))
+        conn.commit()
 
 
 _PAYABLE_SRC = {"block": "บล็อกค้าง", "พิมพ์": "พิมพ์เอง", "รูป": "รูปบิล"}
@@ -1216,9 +1255,9 @@ def _process_payable_image(event, group_id: str):
         if _payable_bill_exists(acct, eff_date, amount):   # กันส่งบิลซ้ำ (วันที่+ยอดเดียวกันมีแล้ว)
             notify(f"🔁 บิลนี้ (วันที่ {eff_date} ยอด {amount:,.2f}) เคยบันทึกแล้ว — ไม่นับซ้ำ")
             return
+        # บิลซื้อ: บันทึกเงียบ 'ไม่เด้งสรุป' (จะไปโผล่ในสรุปรอบที่มีการจ่ายถัดไป) — กลุ่ม 1 เงียบอยู่แล้ว
         rid = save_payable_bill(acct, amount, note="รูป", doc_date=doc_date)
-        notify(f"📥 บันทึกบิลซื้อ #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
-               f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
+        notify(f"📥 บันทึกบิลซื้อ #{rid} — {amount:,.2f} บาท")
         return
 
     if doc_type == "payment":
@@ -1233,14 +1272,12 @@ def _process_payable_image(event, group_id: str):
         # ตัดยอดเข้ากับบรรทัดค้าง: ดูวันที่ที่โน้ตบนสลิป → ถ้าไม่มี ลองจับยอดที่ตรงกับบรรทัดเดียว
         pay_for = _sane_doc_date(info.get("pay_for_date"))
         allocated, settled, settle_note = _payable_settle(acct, pay_for, amount)
-        rid = save_payable_payment(acct, amount, sender=info.get("sender"),
-                                   ref_number=ref, slip_dt=info.get("datetime"),
-                                   doc_date=doc_date, allocated=allocated, settle_note=settle_note)
-        msg = f"💸 บันทึกจ่าย {PAYABLE_VENDOR} #{rid}\nยอด {amount:,.2f} บาท"
-        if settled:
-            msg += "\n✅ ตัดยอดค้าง: " + ", ".join(settled)
-        msg += f"\n─────────────────\n💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท"
-        notify(msg)
+        save_payable_payment(acct, amount, sender=info.get("sender"),
+                             ref_number=ref, slip_dt=info.get("datetime"),
+                             doc_date=doc_date, allocated=allocated, settle_note=settle_note)
+        # มีการจ่าย → เด้ง 'สรุปหนี้' ทุกครั้ง (กลุ่ม 1 ไม่มียอดรวม / กลุ่ม 2 มียอดรวม) แล้วลบบรรทัดที่จ่ายครบ (รอบหน้าหาย)
+        _payable_push_summary(event, group_id, acct)
+        _payable_cleanup_paid(acct)
         return
 
     # other → อ่านไม่ออกว่าเป็นบิล/สลิป — ห้ามทิ้งเงียบ (กันบัญชีคลาดเคลื่อน) ตอบเตือน + นับไว้ให้เห็นในสรุป
@@ -1630,8 +1667,9 @@ def maybe_send_resv_summary():
 
 
 def maybe_send_payable_summary():
-    """ส่งสรุปหนี้ 'ของเมื่อวาน' เข้ากลุ่มเจ้าหนี้ เมื่อเลย PAYABLE_SUMMARY_HOUR (ดีฟอลต์ ตี1) วันละครั้ง
-    idempotent ด้วย last_payable_summary_date + รายกลุ่ม → ทนรีสตาร์ท/หลาย thread"""
+    """[ปิดการใช้งาน] เดิมส่งสรุปหนี้รายวันตอนตี1 — เปลี่ยนเป็น 'เด้งสรุปทุกครั้งที่มีการจ่าย' แทน
+    (ดู _payable_push_summary ใน payment branch) จึงไม่ส่งอัตโนมัติตามเวลาแล้ว"""
+    return
     if not PAYABLE_GROUPS:
         return
     now = datetime.now(TZ)
@@ -2347,7 +2385,7 @@ def build_help(group_id: str) -> str:
             "• ลบวันที่ 6/6 → ลบทุกบิล/จ่ายของวันนั้น",
             "• ล้างบัญชีหนี้ → ล้างทั้งหมด เริ่มนับใหม่ (มีปุ่มยืนยัน)",
             "• ทดสอบรายงานหนี้ → ส่งสรุปหนี้เดี๋ยวนี้ (เช็คการส่ง/redirect)",
-            f"⏰ บอทสรุปหนี้เมื่อวานให้เองทุกวัน ตี{PAYABLE_SUMMARY_HOUR}",
+            "⏰ บอทเด้งสรุปหนี้ให้เองทุกครั้งที่มี 'การจ่าย' (บิลซื้อไม่เด้ง)",
             "─────────────────",
             "• groupid → ดู Group ID | help → เมนูนี้",
         ])
@@ -2407,7 +2445,7 @@ def build_manual(group_id: str) -> str:
             "🧹 แก้ที่ผิด\n"
             "• ลบบิลล่าสุด / ลบจ่ายล่าสุด\n"
             "• ล้างบัญชีหนี้ → ล้างทั้งหมด เริ่มนับใหม่ (มีปุ่มยืนยัน)\n\n"
-            f"⏰ บอทส่งสรุปหนี้เมื่อวานให้เองทุกวัน ตี{PAYABLE_SUMMARY_HOUR}\n"
+            "⏰ บอทเด้งสรุปหนี้ให้เองทุกครั้งที่มี 'การจ่าย' (บิลซื้อไม่เด้ง; บรรทัดจ่ายครบโชว์รอบนั้นแล้วรอบถัดไปหาย)\n"
             "ℹ️ help → เมนูคำสั่ง | groupid → ดูข้อมูลกลุ่ม"
         )
     slip_on = _slip_enabled(group_id)
