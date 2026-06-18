@@ -102,21 +102,42 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_MODEL_RETRY = os.environ.get("GEMINI_MODEL_RETRY", "gemini-2.5-pro")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-def _gemini_generate(contents, attempts=4, model=None):
+def _gemini_generate(contents, attempts=4, model=None, json_mode=False):
     """เรียก Gemini (SDK google-genai) พร้อม retry + backoff — กัน 503 overload/สะดุดชั่วคราว
     contents เป็น str (ข้อความ) หรือ list [str, รูป]; รันใน background thread จึงรอ backoff ได้
-    model=None → ใช้ GEMINI_MODEL (flash); ระบุได้เพื่ออ่านซ้ำด้วยตัวเก่งขึ้น (pro)"""
+    model=None → ใช้ GEMINI_MODEL (flash); ระบุได้เพื่ออ่านซ้ำด้วยตัวเก่งขึ้น (pro)
+    json_mode=True → บังคับให้ตอบเป็น JSON (กันโมเดลตอบเป็นข้อความบรรยายแล้ว parse พัง)"""
     use_model = model or GEMINI_MODEL
+    config = types.GenerateContentConfig(response_mime_type="application/json") if json_mode else None
     last = None
     for i in range(attempts):
         try:
-            return gemini_client.models.generate_content(model=use_model, contents=contents)
+            return gemini_client.models.generate_content(model=use_model, contents=contents, config=config)
         except Exception as e:
             last = e
             if i < attempts - 1:
                 print(f"[gemini] retry {i+1}/{attempts}: {str(e)[:100]}", flush=True)
                 time.sleep(2 * (2 ** i))   # 2, 4, 8 วินาที
     raise last
+
+
+def _parse_gemini_json(response, fallback: dict) -> dict:
+    """แปลงผลลัพธ์ Gemini เป็น dict อย่างทนทาน — กันเคสโมเดลตอบไม่เป็น JSON (เช่น โน๊ตเขียนมือ/รูปกำกวม
+    ทำให้ตอบเป็นข้อความบรรยาย) แล้ว json.loads โยน error หลุดไป 'error path' → เตือนผิดว่า 'ส่งสลิปใหม่'
+    ถ้า parse ตรงๆ ไม่ได้ จะลองดึงบล็อก {...} แรกออกมา; ถ้ายังไม่ได้คืน fallback (ถือว่าไม่ใช่สลิป — เงียบ)"""
+    raw = (getattr(response, "text", None) or "").strip().replace("```json", "").replace("```", "").strip()
+    if raw:
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            m = re.search(r"\{.*\}", raw, re.S)
+            if m:
+                try:
+                    return json.loads(m.group(0))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+    print(f"[gemini] parse JSON ไม่ได้ → ใช้ fallback: {raw[:120]!r}", flush=True)
+    return dict(fallback)
 
 # ─── Persistent storage (PostgreSQL ถ้ามี DATABASE_URL ไม่งั้น SQLite) ────────
 # ย้ายมาใช้ Postgres (managed) เพราะ Render persistent disk mount ไม่เสถียร (mount ช้า/ไม่ขึ้น → ข้อมูลหาย)
@@ -384,9 +405,9 @@ def extract_slip_info(image_bytes: bytes, retry: bool = False) -> dict:
     )
     img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
     # รอบแรกใช้ flash; รอบสอง (retry) ใช้โมเดลเก่งขึ้น (pro) เพื่อกู้สลิปที่ flash อ่านไม่ออก
-    response = _gemini_generate([prompt, img_part], model=(GEMINI_MODEL_RETRY if retry else None))
-    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    response = _gemini_generate([prompt, img_part], model=(GEMINI_MODEL_RETRY if retry else None), json_mode=True)
+    # parse แบบทนทาน: ถ้าโมเดลตอบไม่เป็น JSON ให้ถือว่า 'ไม่ใช่สลิป' (เงียบ) แทนที่จะ error → เตือนผิด
+    return _parse_gemini_json(response, {"is_slip": False})
 
 
 def extract_payable_doc(image_bytes: bytes, retry: bool = False) -> dict:
@@ -419,9 +440,9 @@ def extract_payable_doc(image_bytes: bytes, retry: bool = False) -> dict:
         "ถ้า doc_type='other' ให้ amount=0"
     )
     img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
-    response = _gemini_generate([prompt, img_part], model=(GEMINI_MODEL_RETRY if retry else None))
-    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    response = _gemini_generate([prompt, img_part], model=(GEMINI_MODEL_RETRY if retry else None), json_mode=True)
+    # parse แบบทนทาน: ถ้าโมเดลตอบไม่เป็น JSON ให้ถือว่า 'อื่นๆ' (ไม่ใช่บิล/สลิป) แทนที่จะ error
+    return _parse_gemini_json(response, {"doc_type": "other", "amount": 0})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1603,9 +1624,9 @@ def extract_reservation(text: str) -> dict:
         "ฟิลด์ที่ไม่มีข้อมูลให้เป็น null\n\n"
         f"ข้อความ: {text}"
     )
-    response = _gemini_generate(prompt)
-    raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    response = _gemini_generate(prompt, json_mode=True)
+    # parse แบบทนทาน: ถ้าโมเดลตอบไม่เป็น JSON ให้ถือว่า 'ไม่ใช่การจอง' (เงียบ) แทนที่จะ error
+    return _parse_gemini_json(response, {"is_reservation": False})
 
 
 def _resv_detail_lines(r: dict) -> str:
