@@ -2060,21 +2060,6 @@ def callback():
 
 
 _last_admin_error_ts = 0.0
-_last_group_error_ts = {}   # group_id -> เวลาที่เตือน error ในกรุ๊ปล่าสุด
-
-def notify_group_error(event, group_id):
-    """เตือนในกรุ๊ปว่ามีสลิปอ่านไม่สำเร็จ แบบจำกัด 1 ครั้ง/5 นาที/กรุ๊ป
-    (สลิปที่พลาดจะไม่หายเงียบ คนส่งรู้ว่าต้องส่งใหม่ แต่ไม่สแปม)"""
-    if time.time() - _last_group_error_ts.get(group_id, 0) < 300:
-        return
-    _last_group_error_ts[group_id] = time.time()
-    try:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text="⚠️ บอทประมวลผลรูปเมื่อกี้ไม่สำเร็จ\n"
-                 "ถ้าเป็น 'สลิปโอน' โปรดส่งใหม่อีกครั้ง (ถ้าเป็นรูปอื่น เช่น รูปอาหาร/โน๊ต ข้ามได้เลย)"))
-    except Exception:
-        pass
-
 
 def notify_admin_error(group_id, err):
     """แจ้ง Admin เวลาบอทอ่านสลิปพลาด แบบจำกัด 1 ครั้ง/30 นาที (กัน Admin โดนสแปม + ประหยัดโควต้า push)"""
@@ -2121,28 +2106,45 @@ def _process_image_event(event):
     if _slip_message_seen(group_id, msg_id):
         print(f"[skip] รูปนี้ประมวลผลแล้ว (message_id ซ้ำ) group={group_id} msg={msg_id}", flush=True)
         return
+    # ดาวน์โหลดรูป — ถ้าโหลดไม่ได้ (เน็ต/LINE สะดุด) เงียบในกลุ่ม เตือนเฉพาะแอดมิน
     try:
         content     = line_bot_api.get_message_content(event.message.id)
         image_bytes = b"".join(chunk for chunk in content.iter_content())
-        info        = extract_slip_info(image_bytes)
+    except Exception as e:
+        print(f"[error] โหลดรูปไม่สำเร็จ group={group_id}: {e}", flush=True)
+        record_image_miss(group_id, "error")
+        notify_admin_error(group_id, e)
+        return
 
-        # รอบแรก 'ไม่ใช่สลิป' หรือ 'อ่านยอดเงินไม่ได้' → อ่านซ้ำด้วย pro (กู้ทั้งใบที่อ่านไม่ออก + ใบที่รู้ว่าสลิปแต่ยอดเพี้ยน)
-        if not info.get("is_slip", True) or float(info.get("amount") or 0) <= 0:
-            try:
-                info_retry = extract_slip_info(image_bytes, retry=True)
-                # รอบสองดีกว่าถ้า is_slip=true และ/หรืออ่านยอดเงินได้
-                if info_retry.get("is_slip") or float(info_retry.get("amount") or 0) > 0:
-                    info = info_retry
-                    print(f"[slip] retry กู้สลิปได้ group={group_id}", flush=True)
-            except Exception as e:
-                print(f"[slip] retry อ่านซ้ำพลาด group={group_id}: {e}", flush=True)
+    # อ่านสลิป: รอบแรก flash; ถ้า 'พัง/ไม่ใช่สลิป/ยอด<=0' ลองซ้ำด้วย pro (กู้ทั้งใบอ่านยาก + กรณี Gemini ล้มชั่วคราว)
+    info = None
+    try:
+        info = extract_slip_info(image_bytes)
+    except Exception as e:
+        print(f"[slip] flash อ่านพลาด group={group_id}: {e}", flush=True)
+    if info is None or not info.get("is_slip", True) or float(info.get("amount") or 0) <= 0:
+        try:
+            info_retry = extract_slip_info(image_bytes, retry=True)
+            if info is None or info_retry.get("is_slip") or float(info_retry.get("amount") or 0) > 0:
+                info = info_retry
+                print(f"[slip] retry กู้สลิปได้ group={group_id}", flush=True)
+        except Exception as e:
+            print(f"[slip] retry อ่านซ้ำพลาด group={group_id}: {e}", flush=True)
 
+    # อ่านไม่สำเร็จทั้ง flash+pro (มักเพราะ Gemini ล้มชั่วคราวช่วงพีค) → ข้ามเงียบ ไม่เด้งกวนกลุ่ม + เตือนเฉพาะแอดมิน
+    if info is None:
+        print(f"[slip] อ่านไม่สำเร็จทั้ง flash+pro group={group_id}", flush=True)
+        record_image_miss(group_id, "error")
+        notify_admin_error(group_id, "extract_slip_info ล้มทั้ง flash+pro (อาจ rate-limit ช่วงพีค)")
+        return
+
+    try:
         # กันพลาดสำคัญ: ถ้า AI อ่าน 'จำนวนเงิน' ได้ ให้ถือเป็นสลิปเสมอ แม้ is_slip จะตอบ false (AI ขัดแย้งในตัว)
         if not info.get("is_slip", True) and float(info.get("amount") or 0) > 0:
             info["is_slip"] = True
             print(f"[slip] is_slip=false แต่มียอด {info.get('amount')} → ถือเป็นสลิป group={group_id}", flush=True)
 
-        # ยังไม่ใช่สลิปหลังอ่านซ้ำ → นับตกหล่น + เตือนในกลุ่ม (ถ้าเปิด) เพื่อให้รู้ว่าใบไหนบอทอ่านไม่ออก
+        # ยังไม่ใช่สลิปหลังอ่านซ้ำ → นับตกหล่น (เงียบ เว้นแต่เปิด SLIP_WARN_UNREAD) — ไม่เด้ง error กวน
         if not info.get("is_slip", True):
             print(f"[skip] not a slip, group={group_id}", flush=True)
             record_image_miss(group_id, "notslip")
@@ -2187,11 +2189,9 @@ def _process_image_event(event):
         if verdict["admin_msg"] and ADMIN_USER_ID:
             line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
     except Exception as e:
-        # ประมวลผลสลิปไม่สำเร็จ → เตือนแบบจำกัดความถี่ (สลิปไม่หายเงียบ แต่ไม่สแปม)
-        # + เตือน Admin ส่วนตัวด้วย จะได้รู้ว่าระบบมีปัญหา
+        # ประมวลผล/บันทึกพลาด (หลังอ่านสลิปได้แล้ว) → เงียบในกลุ่ม เตือนเฉพาะแอดมิน (ไม่เด้งกวน)
         print(f"[error] handle_image group={group_id}: {e}", flush=True)
         record_image_miss(group_id, "error")
-        notify_group_error(event, group_id)
         notify_admin_error(group_id, e)
 
 
