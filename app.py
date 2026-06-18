@@ -865,6 +865,10 @@ def _payable_send(event, source_group: str, dest_group: str, text: str):
         print(f"[payable] ส่งผลไม่สำเร็จ dest={dest_group}: {e}", flush=True)
 
 
+# marker note สำหรับ 'ยอดค้างยกมา' ที่กระจายเป็นบิลรายวัน (จากบล็อก 'ค้าง') — แยกจากบิลซื้อปกติในรายงาน
+_PAYABLE_CARRY_NOTE = "ยอดค้างยกมา"
+
+
 def _payable_opening(group_id: str) -> float:
     """ยอดค้างยกมา (ตั้งครั้งเดียวตอนเริ่ม) ของกลุ่มนี้"""
     v = _get_meta(f"payable_opening:{group_id}")
@@ -1000,9 +1004,12 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
     with_total=True → โชว์ยอดค้างคงเหลือทุกบรรทัด + รวมท้าย (กลุ่ม mirror)
     with_total=False → โชว์เฉพาะ +/− รายวัน ไม่มียอดค้าง/ยอดรวม (กลุ่ม primary)"""
     with _db() as conn:
+        carry_rows = conn.execute(
+            "SELECT doc_date, COALESCE(SUM(amount),0) s FROM payable_bills "
+            "WHERE group_id=? AND note=? GROUP BY doc_date", (acct, _PAYABLE_CARRY_NOTE)).fetchall()
         bill_rows = conn.execute(
             "SELECT doc_date, COALESCE(SUM(amount),0) s FROM payable_bills "
-            "WHERE group_id=? GROUP BY doc_date", (acct,)).fetchall()
+            "WHERE group_id=? AND (note IS NULL OR note<>?) GROUP BY doc_date", (acct, _PAYABLE_CARRY_NOTE)).fetchall()
         pay_rows = conn.execute(
             "SELECT doc_date, COALESCE(SUM(amount),0) s FROM payable_payments "
             "WHERE group_id=? GROUP BY doc_date", (acct,)).fetchall()
@@ -1015,18 +1022,26 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
         except (ValueError, TypeError):
             return d or "-"
 
-    bills = {r["doc_date"]: float(r["s"] or 0) for r in bill_rows}
-    pays  = {r["doc_date"]: float(r["s"] or 0) for r in pay_rows}
-    all_dates = sorted(set(bills) | set(pays))
+    carries = {r["doc_date"]: float(r["s"] or 0) for r in carry_rows}
+    bills   = {r["doc_date"]: float(r["s"] or 0) for r in bill_rows}
+    pays    = {r["doc_date"]: float(r["s"] or 0) for r in pay_rows}
+    all_dates = sorted(set(carries) | set(bills) | set(pays))
     if not all_dates and not opening:
         return f"📋 สรุปหนี้ {PAYABLE_VENDOR} — รายวัน\n{bar}\nยังไม่มีรายการ"
 
-    lines = [f"📋 สรุปหนี้ {PAYABLE_VENDOR} — รายวัน", bar, f"📌 ยอดยกมา   {opening:,.2f}", bar]
+    lines = [f"📋 สรุปหนี้ {PAYABLE_VENDOR} — รายวัน", bar]
+    if opening:   # โชว์ยอดยกมา 'ก้อนเดียว' เฉพาะกรณีตั้งด้วยคำสั่ง 'ตั้งยอดยกมา' (บล็อกค้างจะกระจายเป็นรายวันแทน)
+        lines += [f"📌 ยอดยกมา   {opening:,.2f}", bar]
     running = opening
+    sep_added = False   # คั่นบล็อก 'ยอดค้างยกมา' ออกจากบิล/จ่ายปกติ 1 เส้น
     for d in all_dates:
-        b, p = bills.get(d, 0.0), pays.get(d, 0.0)
-        running += b - p
+        c, b, p = carries.get(d, 0.0), bills.get(d, 0.0), pays.get(d, 0.0)
+        running += c + b - p
+        if carries and not sep_added and c == 0:   # แถวแรกที่ไม่ใช่ยกมา → ใส่เส้นคั่นก่อน
+            lines.append(bar); sep_added = True
         parts = []
+        if c:
+            parts.append(f"ยกมา {c:,.2f}")
         if b:
             parts.append(f"📥+{b:,.2f}")
         if p:
@@ -1147,20 +1162,21 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     acct = _payable_account_key(group_id)   # บัญชีร่วม (primary/mirror ใช้ข้อมูลชุดเดียวกัน)
     out  = _payable_output_group(group_id)  # ผลการ 'บันทึก' เด้งที่ไหน (primary→mirror เงียบในกลุ่มต้นทาง)
 
-    # บล็อก 'ค้าง' = บันทึกบิลค้างแต่ละวัน → รวมทุกบรรทัด = ยอดหนี้ค้างตั้งต้น (ยอดยกมา)
+    # บล็อก 'ค้าง' = ยอดค้างยกมาแต่ละวัน → ลงเป็น 'บิลรายวัน' (กระจายทุกบรรทัดในรายงาน แล้วเดินยอดต่อ)
     #   ค้าง
     #   6/6=24153 (ค้าง 14153)   ← มีวงเล็บ = จ่ายบางส่วน ใช้เลขในวงเล็บ
     #   8/6=18504                ← ไม่มีวงเล็บ ใช้เลขปกติ
-    # วางบล็อกใหม่ = แทนที่ยอดยกมาเดิม (ไม่บวกเพิ่ม)
+    # วางบล็อกใหม่ = แทนที่ยอดค้างยกมาเดิมทั้งหมด (ไม่บวกเพิ่ม); วันที่ซ้ำ = บวกรวม
     lines = text.splitlines()
     if len(lines) > 1 and lines[0].strip().lower() in ("ค้าง", "ยอดค้าง", "รายการค้าง", "บิลค้าง"):
-        total, n, errors = 0.0, 0, []
+        entries, errors = [], []
         for ln in lines[1:]:
             ln = ln.strip()
             if not ln or "=" not in ln:
                 continue   # ข้ามเส้นคั่น/บรรทัดว่าง (ไม่มี '=')
             dpart, apart = ln.split("=", 1)
-            if _parse_thai_date(dpart.strip()) is None:
+            diso = _parse_thai_date(dpart.strip())
+            if diso is None:
                 errors.append(ln); continue
             # มีวงเล็บ → ใช้ยอดในวงเล็บ (ค้างจริงหลังจ่ายบางส่วน); ไม่มี → ใช้ยอดปกติ (เลขก่อนวงเล็บ)
             paren = re.search(r"\(([^)]*)\)", apart)
@@ -1174,16 +1190,23 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                 errors.append(ln); continue
             if val < 0:
                 errors.append(ln); continue
-            total += val; n += 1
+            entries.append((diso, val))
         if errors:
             print(f"[payable-import] ข้าม {len(errors)} บรรทัด: {errors[:5]}", flush=True)
-        if n == 0:
+        if not entries:
             _payable_send(event, group_id, out, "❌ อ่านบล็อกค้างไม่ได้ — รูปแบบควรเป็น  วัน/เดือน=ยอด (ค้าง xxxx)")
             return True
-        _set_meta(f"payable_opening:{acct}", str(total))   # แทนที่ยอดยกมา (วางบล็อกใหม่ทับของเก่า ไม่เบิ้ล)
+        # วางบล็อกใหม่ = ลบยอดค้างยกมาเดิม + ล้าง opening ก้อนเก่า (กันนับเบิ้ล) แล้วลงใหม่เป็นบิลรายวัน
+        with _db() as conn:
+            conn.execute("DELETE FROM payable_bills WHERE group_id=? AND note=?", (acct, _PAYABLE_CARRY_NOTE))
+            conn.commit()
+        _set_meta(f"payable_opening:{acct}", "0")
+        for diso, val in entries:
+            save_payable_bill(acct, val, note=_PAYABLE_CARRY_NOTE, doc_date=diso)
+        total = sum(v for _, v in entries)
         _payable_send(event, group_id, out,
-            f"📌 ตั้งยอดค้างยกมา = {total:,.2f} บาท (รวม {n} รายการ)\n"
-            f"ℹ️ บล็อกค้าง = รวมทุกบรรทัด (มีวงเล็บใช้เลขในวงเล็บ) → เป็นยอดตั้งต้น แทนที่ของเดิม\n"
+            f"📌 ลงยอดค้างยกมา {len(entries)} รายการ (รวม {total:,.2f} บาท) แบบรายวัน\n"
+            f"ℹ️ แต่ละบรรทัดจะโชว์เป็นยอดค้างของวันนั้นในรายงาน แล้วเดินยอดต่อ (มีวงเล็บใช้เลขในวงเล็บ)\n"
             "─────────────────\n"
             f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
         return True
@@ -2278,8 +2301,9 @@ def build_manual(group_id: str) -> str:
             "• บอทตอบยอดค้างสะสมล่าสุดให้ทุกครั้ง\n\n"
             "🚀 เริ่มใช้ครั้งแรก\n"
             "• พิมพ์ 'ตั้งยอดยกมา 12000' ใส่ยอดค้างเก่าก้อนเดียว\n"
-            "• หรือวางบล็อก 'ค้าง' (บันทึกยอดค้างรายวัน) → บอทใช้ 'วันล่าสุด' เป็นยอดยกมา:\n"
-            "   ค้าง / 6/6=24153 / 13/6=8074 → ยอดยกมา = 8,074\n\n"
+            "• หรือวางบล็อก 'ค้าง' (ยอดค้างยกมารายวัน) → บอทลงเป็นบิลรายวัน กระจายทุกบรรทัดในรายงาน:\n"
+            "   ค้าง / 6/6=24153 (ค้าง 14153) / 13/6=8074\n"
+            "   (มีวงเล็บใช้เลขในวงเล็บ; วางบล็อกใหม่ = แทนที่ของเดิม)\n\n"
             "📊 ดูยอด\n"
             "• สรุปหนี้ → ยอดค้างวันนี้ (ยกเข้า + บิล − จ่าย = ค้างสะสม)\n"
             "• สรุปหนี้ 2026-06-09 → ดูย้อนหลังตามวันที่\n\n"
