@@ -1144,10 +1144,11 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
 
 def _payable_report_recipients(acct: str):
     """คืน [(group, with_total), ...] ที่ต้องส่งสรุปหนี้รายวันของบัญชี acct ตอนตี1
-    - บัญชี mirror: ส่ง 'กลุ่ม 2 (mirror) ที่เดียว' พร้อมยอดรวม (กลุ่ม 1 เห็นยืนยันรายตัวระหว่างวันอยู่แล้ว — ประหยัด push)
+    - บัญชี mirror: ส่ง 2 กลุ่ม → กลุ่ม 1 (primary, 'ไม่มียอดรวม') + กลุ่ม 2 (mirror, 'มียอดรวม')
+      กลุ่ม 1 ไม่แจ้งเตือนรายตัว แต่ได้สรุปรายวันแบบไม่มียอดค้างสะสม
     - บัญชีปกติ: ส่งกลุ่มเดียว (ใส่ยอดรวม)"""
     if acct in PAYABLE_MIRROR:
-        return [(PAYABLE_MIRROR[acct], True)]
+        return [(acct, False), (PAYABLE_MIRROR[acct], True)]
     return [(acct, True)]
 
 
@@ -1177,7 +1178,13 @@ def _process_payable_image(event, group_id: str):
     บัญชีเดียว 2 กลุ่ม (mirror): เก็บข้อมูลที่ acct (primary), เด้งผลที่ out (mirror) — กลุ่ม primary เงียบ"""
     acct = _payable_account_key(group_id)   # ที่เก็บข้อมูลจริง (บัญชีเดียวกันสำหรับ primary/mirror)
     out  = _payable_output_group(group_id)  # ที่เด้งผล (primary→mirror, ไม่งั้นกลุ่มเดิม)
-    concise = group_id in PAYABLE_MIRROR    # กลุ่ม 1 (mirror primary): ยืนยันสั้นข้อความเดียว ไม่โชว์ยอดค้างสะสม
+    silent = group_id in PAYABLE_MIRROR     # กลุ่ม 1 (mirror primary): ไม่แจ้งเตือนรายตัว — เห็นผลที่ 'สรุปรายวัน' พอ
+
+    def notify(text):
+        """แจ้งผลบิล/สลิป — กลุ่ม mirror primary (กลุ่ม 1) เงียบ (ดูสรุปรายวันแทน); กลุ่มอื่นตอบปกติ"""
+        if not silent:
+            _payable_send(event, group_id, out, text)
+
     try:
         content     = line_bot_api.get_message_content(event.message.id)
         image_bytes = b"".join(chunk for chunk in content.iter_content())
@@ -1193,7 +1200,7 @@ def _process_payable_image(event, group_id: str):
                 print(f"[payable] pro-retry พลาด group={group_id}: {e}", flush=True)
     except Exception as e:
         print(f"[payable] อ่านรูปไม่สำเร็จ group={group_id}: {e}", flush=True)
-        _payable_send(event, group_id, out, "⚠️ อ่านรูปไม่สำเร็จ กรุณาส่งใหม่อีกครั้ง")
+        notify("⚠️ อ่านรูปไม่สำเร็จ กรุณาส่งใหม่อีกครั้ง")
         return
 
     doc_type = (info.get("doc_type") or "other").lower()
@@ -1203,33 +1210,25 @@ def _process_payable_image(event, group_id: str):
     if doc_type == "bill":
         if amount <= 0:
             record_image_miss(acct, "payable_unread")
-            _payable_send(event, group_id, out,
-                "🟡 อ่านยอดเงินบนบิลไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง")
+            notify("🟡 อ่านยอดเงินบนบิลไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง")
             return
         eff_date = doc_date or datetime.now(TZ).date().isoformat()
         if _payable_bill_exists(acct, eff_date, amount):   # กันส่งบิลซ้ำ (วันที่+ยอดเดียวกันมีแล้ว)
-            _payable_send(event, group_id, out,
-                f"🔁 บิลนี้ (วันที่ {eff_date} ยอด {amount:,.2f}) เคยบันทึกแล้ว — ไม่นับซ้ำ")
+            notify(f"🔁 บิลนี้ (วันที่ {eff_date} ยอด {amount:,.2f}) เคยบันทึกแล้ว — ไม่นับซ้ำ")
             return
         rid = save_payable_bill(acct, amount, note="รูป", doc_date=doc_date)
-        if concise:   # กลุ่ม 1 (mirror primary): สรุปสั้น ไม่โชว์ยอดค้างสะสม (ดูยอดรวมที่สรุปรายวันกลุ่ม 2)
-            _payable_send(event, group_id, out, f"📥 บันทึกบิลซื้อ #{rid} — {amount:,.2f} บาท")
-        else:
-            _payable_send(event, group_id, out,
-                f"📥 บันทึกบิลซื้อ #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
-                f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
+        notify(f"📥 บันทึกบิลซื้อ #{rid}\nยอด {amount:,.2f} บาท\n─────────────────\n"
+               f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {_payable_outstanding(acct):,.2f} บาท")
         return
 
     if doc_type == "payment":
         if amount <= 0:
             record_image_miss(acct, "payable_unread")
-            _payable_send(event, group_id, out,
-                "🟡 อ่านยอดเงินบนสลิปไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่")
+            notify("🟡 อ่านยอดเงินบนสลิปไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่")
             return
         ref = info.get("ref_number")
         if _payment_ref_exists(acct, ref):
-            _payable_send(event, group_id, out,
-                f"🔁 สลิปนี้ (อ้างอิง {ref}) เคยบันทึกแล้ว — ไม่นับซ้ำ")
+            notify(f"🔁 สลิปนี้ (อ้างอิง {ref}) เคยบันทึกแล้ว — ไม่นับซ้ำ")
             return
         # ตัดยอดเข้ากับบรรทัดค้าง: ดูวันที่ที่โน้ตบนสลิป → ถ้าไม่มี ลองจับยอดที่ตรงกับบรรทัดเดียว
         pay_for = _sane_doc_date(info.get("pay_for_date"))
@@ -1237,23 +1236,18 @@ def _process_payable_image(event, group_id: str):
         rid = save_payable_payment(acct, amount, sender=info.get("sender"),
                                    ref_number=ref, slip_dt=info.get("datetime"),
                                    doc_date=doc_date, allocated=allocated, settle_note=settle_note)
-        if concise:   # กลุ่ม 1 (mirror primary): สรุปสั้น ไม่โชว์ยอดค้างสะสม
-            msg = f"💸 บันทึกจ่าย #{rid} — {amount:,.2f} บาท"
-        else:
-            msg = f"💸 บันทึกจ่าย {PAYABLE_VENDOR} #{rid}\nยอด {amount:,.2f} บาท"
+        msg = f"💸 บันทึกจ่าย {PAYABLE_VENDOR} #{rid}\nยอด {amount:,.2f} บาท"
         if settled:
             msg += "\n✅ ตัดยอดค้าง: " + ", ".join(settled)
-        if not concise:
-            msg += f"\n─────────────────\n💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท"
-        _payable_send(event, group_id, out, msg)
+        msg += f"\n─────────────────\n💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท"
+        notify(msg)
         return
 
     # other → อ่านไม่ออกว่าเป็นบิล/สลิป — ห้ามทิ้งเงียบ (กันบัญชีคลาดเคลื่อน) ตอบเตือน + นับไว้ให้เห็นในสรุป
     record_image_miss(acct, "payable_unread")
     print(f"[payable] รูปไม่ใช่บิล/สลิป group={group_id}", flush=True)
-    _payable_send(event, group_id, out,
-        "🟡 อ่านรูปนี้ไม่ออกว่าเป็นบิลซื้อหรือสลิปจ่าย — ยังไม่ได้บันทึก\n"
-        "ถ้าเป็นบิล/สลิปจริง โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง")
+    notify("🟡 อ่านรูปนี้ไม่ออกว่าเป็นบิลซื้อหรือสลิปจ่าย — ยังไม่ได้บันทึก\n"
+           "ถ้าเป็นบิล/สลิปจริง โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง")
 
 
 def handle_payable_text(event, text: str, group_id: str) -> bool:
