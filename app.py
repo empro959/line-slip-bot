@@ -813,11 +813,12 @@ def _resv_line(r: dict) -> str:
     return f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}"
 
 
-def build_resv_summary(notify_group=None, title="📋 สรุปการจองวันนี้", upcoming=False) -> str:
+def build_resv_summary(notify_group=None, title="📋 สรุปการจองวันนี้", upcoming=False, skip_if_empty=False) -> str:
     """สรุปการจอง
     upcoming=False (ดีฟอลต์): เฉพาะจอง 'ของวันนี้' (resv_date = วันนี้) — จองล่วงหน้าจะโผล่เฉพาะวันที่ถึง
-    upcoming=True: จองที่กำลังจะถึง (resv_date >= วันนี้) แยกหัวข้อ วันนี้/ล่วงหน้า — ใช้กับ digest ล่วงหน้า
-    notify_group=None → ทุกการจอง / ระบุ group → เฉพาะการจองที่ส่งการ์ดเข้ากลุ่มนั้น"""
+    upcoming=True: จองที่กำลังจะถึง (resv_date >= วันนี้) แยกหัวข้อ วันนี/ล่วงหน้า — ใช้กับ digest ล่วงหน้า
+    notify_group=None → ทุกการจอง / ระบุ group → เฉพาะการจองที่ส่งการ์ดเข้ากลุ่มนั้น
+    skip_if_empty=True → ถ้าไม่มีจองคืน None (ไว้ให้รายงานอัตโนมัติ 'ไม่ส่ง' วันที่ไม่มีจอง — ประหยัด push)"""
     today  = datetime.now(TZ).date().isoformat()
     if upcoming:
         # "วันงานจริง" ต้อง >= วันนี้ — ใช้ resv_date ถ้ามี ไม่งั้น fallback วันที่แจ้ง (กันจองที่เลยวันไปแล้วค้างในรายการล่วงหน้า)
@@ -835,7 +836,7 @@ def build_resv_summary(notify_group=None, title="📋 สรุปการจ�
     with _db() as conn:
         rows = [dict(r) for r in conn.execute(q, params).fetchall()]
     if not rows:
-        return f"{title}\n─────────────────\nไม่มีการจอง"
+        return None if skip_if_empty else f"{title}\n─────────────────\nไม่มีการจอง"
     confirmed = sum(1 for r in rows if r.get("status") == "CONFIRMED")
     lines = [title, "─────────────────",
              f"ทั้งหมด {len(rows)} | ✅ คอนเฟิร์ม {confirmed} | ⏳ รอ {len(rows) - confirmed}"]
@@ -851,9 +852,10 @@ def build_resv_summary(notify_group=None, title="📋 สรุปการจ�
     return "\n".join(lines)
 
 
-def build_advance_resv_report() -> str:
-    """digest จองล่วงหน้าที่กำลังจะถึง (เข้ากลุ่มบาร์น้ำ) — ใช้ตอนรายงาน 00:30"""
-    return build_resv_summary(BAR_GROUP_ID, "📅 จองล่วงหน้าที่กำลังจะถึง", upcoming=True)
+def build_advance_resv_report(skip_if_empty=False) -> str:
+    """digest จองล่วงหน้าที่กำลังจะถึง (เข้ากลุ่มบาร์น้ำ) — ใช้ตอนรายงาน 00:30
+    skip_if_empty=True → ไม่มีจองล่วงหน้าคืน None (ไม่ส่ง)"""
+    return build_resv_summary(BAR_GROUP_ID, "📅 จองล่วงหน้าที่กำลังจะถึง", upcoming=True, skip_if_empty=skip_if_empty)
 
 
 def _sane_doc_date(doc_date):
@@ -1596,10 +1598,11 @@ def maybe_send_daily_report():
                 else:
                     failed += 1
                 print(f"[report] push FAILED {dest}: {e}", flush=True)
-        # สรุปจองล่วงหน้า → กลุ่มบาร์น้ำ (วันละครั้งพร้อมรายงานสลิป)
-        if BAR_GROUP_ID and not _group_left(BAR_GROUP_ID) and not _already_sent("advance_resv", today, BAR_GROUP_ID):
+        # สรุปจองล่วงหน้า → กลุ่มบาร์น้ำ (วันละครั้งพร้อมรายงานสลิป) — ไม่มีจองล่วงหน้า = ไม่ส่ง (ประหยัด)
+        _adv = build_advance_resv_report(skip_if_empty=True)
+        if _adv and BAR_GROUP_ID and not _group_left(BAR_GROUP_ID) and not _already_sent("advance_resv", today, BAR_GROUP_ID):
             try:
-                line_bot_api.push_message(BAR_GROUP_ID, TextSendMessage(text=build_advance_resv_report()))
+                line_bot_api.push_message(BAR_GROUP_ID, TextSendMessage(text=_adv))
                 _mark_sent("advance_resv", today, BAR_GROUP_ID)
                 print(f"[report] sent advance-resv → {BAR_GROUP_ID}", flush=True)
             except Exception as e:
@@ -1619,7 +1622,7 @@ def maybe_send_daily_report():
 
 def maybe_send_resv_summary():
     """ส่งสรุปการจองวันนี้ เข้ากลุ่มบาร์น้ำ + กลุ่มรับจอง ในกรอบ 16:00–18:59 วันละครั้ง (idempotent)
-    ถ้าไม่มีจองจะส่ง 'ไม่มีการจอง' ตามที่ขอ; เลย 19:00 แล้วยังไม่ส่ง = ข้ามวันนี้ (กันส่งดึกไม่มีประโยชน์)"""
+    วันไหน 'ไม่มีจอง' = ไม่ส่งเลย (ประหยัด push); เลย 19:00 แล้วยังไม่ส่ง = ข้ามวันนี้ (กันส่งดึกไม่มีประโยชน์)"""
     now = datetime.now(TZ)
     hm  = (now.hour, now.minute)
     if hm < (16, 0):
@@ -1640,7 +1643,12 @@ def maybe_send_resv_summary():
         if not targets:
             _set_meta("last_resv_summary_date", today)
             return
-        text = build_resv_summary(None, "📋 สรุปการจองวันนี้ (16:00)")
+        # วันไหนไม่มีจอง = ไม่ส่งเลย (ประหยัด push) — ตามที่ขอ
+        text = build_resv_summary(None, "📋 สรุปการจองวันนี้ (16:00)", skip_if_empty=True)
+        if text is None:
+            _set_meta("last_resv_summary_date", today)
+            print("[resv-summary] วันนี้ไม่มีจอง — ไม่ส่ง (ประหยัด)", flush=True)
+            return
         failed = 0
         # idempotent รายกลุ่ม: กลุ่มที่ส่งสำเร็จแล้ววันนี้จะไม่ส่งซ้ำ แม้กลุ่มอื่นพลาดแล้วต้อง retry
         for g in targets:
