@@ -409,20 +409,31 @@ except Exception as e:
 # LAYER 1 — AI Visual Analysis (Gemini)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_slip_info(image_bytes: bytes, retry: bool = False) -> dict:
+def extract_slip_info(image_bytes: bytes, retry: bool = False, dining: bool = False) -> dict:
     retry_note = (
         "🔁 นี่คือการอ่าน 'รอบสอง' — รอบแรกตอบว่าไม่ใช่สลิป แต่รูปนี้ถูกส่งในกลุ่มรับสลิป "
         "จึงมีโอกาสสูงที่จะเป็นสลิป หรือมี 'สลิปโอน' อยู่ในรูป (อาจถ่ายคู่กับใบบิลร้าน/ถ่ายจากหน้าจอ/เอียง/เบลอ/แสงน้อย) "
         "โปรดเพ่งดูให้ละเอียดที่สุด ถ้าพอเห็นจำนวนเงิน + ร่องรอยการโอน/จ่ายสำเร็จ ให้ is_slip=true ไว้ก่อน\n\n"
     ) if retry else ""
+    # คำสั่ง 'อ่านบิลร้าน' ใส่เฉพาะกลุ่มที่เปิดระบบกระทบบิล-สลิป (DINING_GROUPS) เท่านั้น
+    # → กลุ่มสลิปอื่นได้ prompt เดิมเป๊ะ ไม่กระทบการอ่านสลิปปกติ
+    _bill_json = ',"is_bill":false,"bill_total":0.00,"bill_table":null' if dining else ''
+    _bill_instr = (
+        "📋 บิลร้านอาหาร (ใบแจ้งรายการ): ถ้าในรูปมี 'บิลร้าน' (มีเลขโต๊ะ + รายการอาหาร + ยอดรวม/สุทธิ) ให้ดึงเพิ่ม:\n"
+        "  - bill_total: ยอด 'สุทธิ' หรือ 'ยอดรวมที่ต้องจ่าย' บนบิลร้าน (เลขรวมสุดท้ายที่ลูกค้าต้องจ่าย — ไม่ใช่ยอดก่อน VAT/ยอดย่อยรายหมวด)\n"
+        "  - bill_table: เลขโต๊ะบนบิล (เช่น B16, A3) ถ้ามี ไม่งั้น null\n"
+        "  - is_bill: true 'เฉพาะ' เมื่อรูปนี้เป็นบิลร้านล้วนๆ ไม่มีสลิปโอน/หลักฐานจ่ายเงินในรูป "
+        "(กรณีนี้ is_slip=false); ถ้ามีสลิปโอนในรูปด้วย (เดี่ยวหรือคู่กับบิล) → is_slip=true, is_bill=false ตามเดิม "
+        "แต่ยังคงดึง bill_total/bill_table จากบิลที่เห็นในรูปมาด้วย\n"
+    ) if dining else ''
     prompt = (
         retry_note +
         "ดูรูปนี้ว่าเป็นสลิป/หลักฐานการชำระเงินให้ร้านหรือไม่ "
         "(โอนผ่านธนาคาร/แอปธนาคาร หรือจ่ายผ่านเป๋าตัง/G-Wallet/รัฐช่วยจ่าย เช่น ไทยช่วยไทย คนละครึ่ง เราชนะ) "
         "แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
         '{"is_slip":true,"sender":null,"amount":0.00,"datetime":null,"bank":null,'
-        '"account":null,"receiver":null,"receiver_account":null,"ref_number":null,"cropped":false,"fraud_score":0,"fraud_reasons":[],'
-        '"is_bill":false,"bill_total":0.00,"bill_table":null}\n\n'
+        '"account":null,"receiver":null,"receiver_account":null,"ref_number":null,"cropped":false,"fraud_score":0,"fraud_reasons":[]'
+        + _bill_json + '}\n\n'
         "is_slip: true ถ้าเป็นหลักฐานการชำระเงิน/โอนเงิน/เติมเงินสำเร็จ "
         "(สลิปโอนทุกธนาคาร, เติมเงินพร้อมเพย์/วอลเล็ต, เป๋าตัง/รัฐช่วยจ่าย). "
         "ตีความกว้างไว้ก่อน: เห็นจำนวนเงิน + คำว่าสำเร็จ/วันเวลา/เลขอ้างอิง แม้ถ่ายจากจอ/เอียง/เบลอ → true. "
@@ -433,12 +444,7 @@ def extract_slip_info(image_bytes: bytes, retry: bool = False) -> dict:
         "  - สลิปที่มี 'ลายตกแต่ง/ธีมการ์ตูน/ดอกไม้/เทศกาล' เป็นพื้นหลัง (เช่น K+ ธีม My Melody/Sanrio, 'มีสุข สมหวัง') = ยังเป็นสลิป ไม่ใช่สติกเกอร์ → อ่านข้อความรายการ (ยอด/ผู้รับ/เลขที่รายการ) ตามปกติ\n"
         "  - ถ้ามี 'แถบแจ้งเตือน/ป๊อปอัป' เด้งทับด้านบนจอ (เช่น 'บันทึกสลิป/eSlip saved', 'เงินออก -xxx', ปุ่ม Mute/Reply) ให้ 'มองข้ามแถบนั้น' แล้วอ่านสลิปที่อยู่ข้างล่าง — แถบเด้งไม่ทำให้ไม่ใช่สลิป\n"
         "ถ้ารูปมีทั้งใบบิลร้านและสลิปโอนคู่กัน → true และอ่านยอดจาก 'สลิปโอน' (ไม่ใช่ยอดบนบิลร้าน)\n"
-        "📋 บิลร้านอาหาร (ใบแจ้งรายการ): ถ้าในรูปมี 'บิลร้าน' (มีเลขโต๊ะ + รายการอาหาร + ยอดรวม/สุทธิ) ให้ดึงเพิ่ม:\n"
-        "  - bill_total: ยอด 'สุทธิ' หรือ 'ยอดรวมที่ต้องจ่าย' บนบิลร้าน (เลขรวมสุดท้ายที่ลูกค้าต้องจ่าย — ไม่ใช่ยอดก่อน VAT/ยอดย่อยรายหมวด)\n"
-        "  - bill_table: เลขโต๊ะบนบิล (เช่น B16, A3) ถ้ามี ไม่งั้น null\n"
-        "  - is_bill: true 'เฉพาะ' เมื่อรูปนี้เป็นบิลร้านล้วนๆ ไม่มีสลิปโอน/หลักฐานจ่ายเงินในรูป "
-        "(กรณีนี้ is_slip=false); ถ้ามีสลิปโอนในรูปด้วย (เดี่ยวหรือคู่กับบิล) → is_slip=true, is_bill=false ตามเดิม "
-        "แต่ยังคงดึง bill_total/bill_table จากบิลที่เห็นในรูปมาด้วย\n"
+        + _bill_instr +
         "สำคัญ: ถ้าเห็นจำนวนเงินบนรูป ให้อ่าน amount มาเสมอ แม้ไม่แน่ใจว่าเป็นสลิป (อย่าใส่ 0 ทั้งที่เห็นยอด)\n"
         "amount: จำนวนเงินที่ 'ร้านได้รับจริง' (อ่านจากสลิปโอน ไม่ใช่จากบิลร้าน)\n"
         "  - สลิปโอนธนาคารทั่วไป = ยอดที่โอน\n"
@@ -2437,9 +2443,11 @@ def _process_image_event(event):
         return
 
     # อ่านสลิป: รอบแรก flash; ถ้า 'พัง/ไม่ใช่สลิป/ยอด<=0' ลองซ้ำด้วย pro (กู้ทั้งใบอ่านยาก + กรณี Gemini ล้มชั่วคราว)
+    # dining=True เฉพาะกลุ่ม DINING_GROUPS → ใส่คำสั่งอ่านบิลใน prompt เฉพาะกลุ่มนั้น (กลุ่มอื่นได้ prompt เดิมเป๊ะ)
+    _dining = _dining_enabled(group_id)
     info = None
     try:
-        info = extract_slip_info(image_bytes)
+        info = extract_slip_info(image_bytes, dining=_dining)
     except Exception as e:
         print(f"[slip] flash อ่านพลาด group={group_id}: {e}", flush=True)
     # บิลร้านล้วน (ใบแจ้งรายการ ไม่มีสลิป) ในกลุ่ม dining → ไม่ต้องอ่านซ้ำด้วย pro (ประหยัดโควต้า)
@@ -2448,7 +2456,7 @@ def _process_image_event(event):
                        and float(info.get("bill_total") or 0) > 0)
     if not _is_dining_bill and (info is None or not info.get("is_slip", True) or float(info.get("amount") or 0) <= 0):
         try:
-            info_retry = extract_slip_info(image_bytes, retry=True)
+            info_retry = extract_slip_info(image_bytes, retry=True, dining=_dining)
             if info is None or info_retry.get("is_slip") or float(info_retry.get("amount") or 0) > 0:
                 info = info_retry
                 print(f"[slip] retry กู้สลิปได้ group={group_id}", flush=True)
