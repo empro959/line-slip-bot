@@ -552,29 +552,40 @@ def find_duplicate(group_id: str, info: dict):
 # Verdict Builder
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _norm_match_text(s: str) -> str:
+    """normalize ข้อความ/เลขบัญชี ก่อนเทียบ PAYEE — กัน OCR เพี้ยนทำให้เทียบไม่ตรง:
+    lower + แปลง ใ→ไ (OCR สับสนไม้ม้วน/ไม้มลายบ่อย) + ตัดช่องว่าง/ขีด/จุด/วงเล็บ/สแลช
+    เช่น 'ไส้ ย่างซอย 4' / 'ใส้ย่าง' / '460-5949' → เทียบ substring กับ keyword ได้ทนขึ้น"""
+    return re.sub(r"[\s\-\.\(\)/]", "", (s or "").lower().replace("ใ", "ไ"))
+
+
+def _payee_hay(info: dict) -> str:
+    return _norm_match_text(f"{info.get('receiver') or ''} {info.get('receiver_account') or ''} {info.get('bank') or ''}")
+
+
 def _payee_matches(info: dict) -> bool:
     """ปลายทางบนสลิปตรงกับบัญชีร้านไหม (เทียบกับ PAYEE_KEYWORDS) — ถ้าไม่ตั้งค่าไว้ถือว่าผ่าน"""
     if not PAYEE_KEYWORDS:
         return True
-    hay = f"{info.get('receiver') or ''} {info.get('receiver_account') or ''} {info.get('bank') or ''}".lower()
-    return any(k in hay for k in PAYEE_KEYWORDS)
+    hay = _payee_hay(info)
+    return any(_norm_match_text(k) in hay for k in PAYEE_KEYWORDS)
 
 
 def _slip_account_label(info: dict):
     """จับว่าสลิปโอนเข้าบัญชีไหน (ตาม PAYEE_ACCOUNTS) — คืน label หรือ None ถ้าไม่ตรง/ไม่ได้ตั้งค่า"""
     if not PAYEE_ACCOUNTS:
         return None
-    hay = f"{info.get('receiver') or ''} {info.get('receiver_account') or ''} {info.get('bank') or ''}".lower()
+    hay = _payee_hay(info)
     for label, kws in PAYEE_ACCOUNTS:
-        if any(k in hay for k in kws):
+        if any(_norm_match_text(k) in hay for k in kws):
             return label
     return None
 
 
 def _is_income(info: dict) -> bool:
     """สลิปนี้เป็น 'รายรับ' (โอนเข้าบัญชีร้าน) ไหม — ตรง PAYEE_KEYWORDS หรือ PAYEE_ACCOUNTS อย่างใดอย่างหนึ่ง"""
-    hay = f"{info.get('receiver') or ''} {info.get('receiver_account') or ''} {info.get('bank') or ''}".lower()
-    if any(k in hay for k in PAYEE_KEYWORDS):
+    hay = _payee_hay(info)
+    if any(_norm_match_text(k) in hay for k in PAYEE_KEYWORDS):
         return True
     return _slip_account_label(info) is not None
 
