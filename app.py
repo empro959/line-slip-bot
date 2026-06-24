@@ -934,24 +934,33 @@ def _dining_after_slip(group_id: str, info: dict, slip_date: str = None):
             table_no = info.get("bill_table")
             source   = "รูปเดียว"
         else:
-            # จับคู่บิลค้างที่ 'เก่าสุด' (FIFO) ที่ยังไม่หมดอายุ — ล็อกกัน 2 สลิปจับใบเดียวกันพร้อมกัน
+            # จับคู่บิลค้าง — ล็อกกัน 2 สลิป (หลาย worker) จับใบเดียวกันพร้อมกัน
             with _dining_lock, _db() as conn:
+                # หมดอายุบิลค้างที่เกินกรอบเวลา (จ่ายสด/ไม่มีสลิป) ทิ้งก่อน กันไปจับคู่ผิด
+                for r in conn.execute(
+                        "SELECT id, recorded_at FROM dining_bills "
+                        "WHERE group_id=? AND bill_date=? AND matched=0", (group_id, today)).fetchall():
+                    g = _minutes_since(r["recorded_at"])
+                    if g is not None and g > DINING_MATCH_MIN:
+                        conn.execute("UPDATE dining_bills SET matched=2 WHERE id=?", (r["id"],))
+                # 1) จับ 'ยอดตรงเป๊ะ' ก่อน (เคสปกติ: สแกน QR บิลจ่ายเต็มจำนวน)
+                #    → กันจับคู่สลับลำดับเมื่อสลิปประมวลผลเสร็จไม่เรียงกัน (หลาย worker / Gemini เร็ว-ช้าไม่เท่า)
                 row = conn.execute(
-                    "SELECT id, table_no, amount, recorded_at FROM dining_bills "
-                    "WHERE group_id=? AND bill_date=? AND matched=0 ORDER BY id LIMIT 1",
-                    (group_id, today)).fetchone()
+                    "SELECT id, table_no, amount FROM dining_bills "
+                    "WHERE group_id=? AND bill_date=? AND matched=0 AND ABS(amount-?)<0.01 ORDER BY id LIMIT 1",
+                    (group_id, today, slip_amt)).fetchone()
+                if not row:
+                    # 2) ไม่มียอดตรง = ลูกค้าโอนเกิน/ขาดจริง → จับบิลค้างเก่าสุด (FIFO)
+                    row = conn.execute(
+                        "SELECT id, table_no, amount FROM dining_bills "
+                        "WHERE group_id=? AND bill_date=? AND matched=0 ORDER BY id LIMIT 1",
+                        (group_id, today)).fetchone()
                 if row:
-                    gap = _minutes_since(row["recorded_at"])
-                    if gap is not None and gap > DINING_MATCH_MIN:
-                        # บิลค้างนานเกินกรอบเวลา (น่าจะจ่ายสด/ไม่มีสลิป) → มาร์คหมดอายุ ไม่จับคู่กับสลิปนี้
-                        conn.execute("UPDATE dining_bills SET matched=2 WHERE id=?", (row["id"],))
-                        conn.commit()
-                    else:
-                        bill_amt = float(row["amount"])
-                        table_no = row["table_no"]
-                        source   = "จับคู่เวลา"
-                        conn.execute("UPDATE dining_bills SET matched=1 WHERE id=?", (row["id"],))
-                        conn.commit()
+                    bill_amt = float(row["amount"])
+                    table_no = row["table_no"]
+                    source   = "ยอดตรง" if abs(bill_amt - slip_amt) < 0.01 else "จับคู่เวลา"
+                    conn.execute("UPDATE dining_bills SET matched=1 WHERE id=?", (row["id"],))
+                conn.commit()
         if bill_amt is None:
             return None   # ไม่มีบิลให้เทียบ (เช่น หลังเที่ยงคืน/จ่ายสด) → บันทึกสลิปเฉยๆ
         diff = round(slip_amt - bill_amt, 2)
@@ -1081,6 +1090,9 @@ def _dining_reset(event, group_id: str):
         pend = conn.execute("SELECT COUNT(*) c FROM dining_bills WHERE group_id=? AND matched=0",
                             (group_id,)).fetchone()["c"]
         conn.execute("UPDATE dining_bills SET matched=1 WHERE group_id=? AND matched=0", (group_id,))
+        # ปิดยอดทั้งทริป = เก็บครบทุกโต๊ะแล้ว → เคลียร์รายการโอนขาดที่ยังค้างด้วย (สรุปจะสะอาด)
+        n_short = conn.execute("UPDATE dining_pairs SET collected=1 WHERE group_id=? AND collected=0",
+                               (group_id,)).rowcount
         conn.commit()
     _dining_set_balance(group_id, 0.0)
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
