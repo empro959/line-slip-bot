@@ -985,7 +985,7 @@ def build_dining_summary(group_id: str, report_date: str = None) -> str:
         for p in shorts:
             tbl = f"โต๊ะ {p['table_no']}" if p["table_no"] else "บิล"
             lines.append(f"• {tbl} ({p['recorded_at']}): บิล {p['bill_amount']:,.2f} / โอน {p['slip_amount']:,.2f} → ขาด {abs(p['diff']):,.2f}")
-    lines += ["─────────────────", "พิมพ์ 'เก็บครบแล้ว' เมื่อเก็บเงินครบ เพื่อรีเซ็ตยอดทริป"]
+    lines += ["─────────────────", "👇 เก็บเงินครบแล้ว กดปุ่มด้านล่าง (หรือพิมพ์ 'เก็บครบแล้ว')"]
     return "\n".join(lines)
 
 def _dining_report_lines(group_id: str, d: str):
@@ -1007,6 +1007,18 @@ def _dining_report_lines(group_id: str, d: str):
             tbl = f"โต๊ะ {p['table_no']}" if p["table_no"] else "บิล"
             out.append(f"   {tbl}: บิล {p['bill_amount']:,.2f}/โอน {p['slip_amount']:,.2f} ขาด {abs(p['diff']):,.2f}")
     return out
+
+def _dining_confirm_card() -> TemplateSendMessage:
+    """การ์ดปุ่มให้พนักงานกด 'ยืนยันเก็บเงินครบ' → รีเซ็ตยอดทริป (กดทีเดียว = ยืนยันเลย, กันกดซ้ำด้วย postback)"""
+    return TemplateSendMessage(
+        alt_text="ยืนยันเก็บเงินครบแล้ว เพื่อปิดยอดทริป",
+        template=ButtonsTemplate(
+            title="ปิดยอดทริป",
+            text="กดเมื่อเก็บเงินลูกค้าครบแล้ว → รีเซ็ตยอดสะสมเป็น 0",
+            actions=[PostbackAction(label="✅ เก็บครบแล้ว", data=f"dining_confirm:{uuid.uuid4().hex[:8]}")],
+        ),
+    )
+
 
 def _dining_reset(event, group_id: str):
     """พนักงานยืนยัน 'เก็บครบแล้ว' → ล้างบิลค้าง + รีเซ็ตยอดทริปเป็น 0 (เริ่มนับใหม่)"""
@@ -2440,7 +2452,7 @@ def _process_image_event(event):
             verdict  = build_verdict(info, promptpay, dup_type, prev_amount)
             save_slip(group_id, info, verdict["status"], message_id=msg_id)
 
-        # กระทบบิล-สลิป (เฉพาะ DINING_GROUPS): โอนเกิน→สะสมเงียบ, ขาด>เกณฑ์→คืนข้อความเตือน
+        # กระทบบิล-สลิป (เฉพาะ DINING_GROUPS): โอนเกิน→สะสมเงียบ, ขาด≥เกณฑ์→คืนข้อความเตือน
         dining_note = _dining_after_slip(group_id, info)
 
         # สลิปผ่าน (PASS) + ไม่โอนขาด → เงียบไว้ ไม่รกแชท (ยังบันทึกไว้ ดูรวมได้ที่ "สรุป")
@@ -2451,7 +2463,10 @@ def _process_image_event(event):
         if dining_note:
             reply_parts.append(dining_note)
         if reply_parts:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n\n".join(reply_parts)))
+            msgs = [TextSendMessage(text="\n\n".join(reply_parts))]
+            if dining_note:   # โอนขาด → เด้งปุ่ม 'เก็บครบแล้ว' มาพร้อมกันเลย (เก็บส่วนต่างเสร็จกดปิดยอดได้ทันที)
+                msgs.append(_dining_confirm_card())
+            line_bot_api.reply_message(event.reply_token, msgs)
         if verdict["admin_msg"] and ADMIN_USER_ID:
             line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
     except Exception as e:
@@ -2665,8 +2680,8 @@ def build_help(group_id: str) -> str:
             "• ส่งรูปบิลร้าน + สลิปโอน → บอทเทียบยอดให้",
             "  (รูปเดียวกัน=แม่นสุด / แยกรูปก็ได้ จับคู่ตามเวลา)",
             "• โอนเกิน = สะสมยอดทริป | โอนขาด = เตือนในกลุ่ม",
-            "• ยอดสะสม → ดูยอดทริป + รายการโอนขาด",
-            "• เก็บครบแล้ว → ยืนยันเก็บเงินครบ รีเซ็ตยอดทริป",
+            "• ยอดสะสม → ดูยอดทริป + รายการโอนขาด (มีปุ่มปิดยอด)",
+            "• เก็บครบแล้ว → ยืนยันเก็บเงินครบ รีเซ็ตยอดทริป (กดปุ่มก็ได้)",
             "",
         ]
     if (RESV_GROUPS and group_id in RESV_GROUPS) or BAR_GROUP_ID:
@@ -2823,7 +2838,11 @@ def handle_text(event):
                 _dining_reset(event, group_id)
                 return
             if text in ("ยอดสะสม", "ยอดทริป", "สรุปบิล", "ยอดบิล", "บิลสลิป", "กระทบยอด"):
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_dining_summary(group_id)))
+                # สรุปยอด + การ์ดปุ่ม 'เก็บครบแล้ว' (พนักงานดูยอดแล้วกดปิดได้เลย)
+                line_bot_api.reply_message(event.reply_token, [
+                    TextSendMessage(text=build_dining_summary(group_id)),
+                    _dining_confirm_card(),
+                ])
                 return
         if text.lower() in ("สรุป", "รายงาน", "report", "summary"):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
@@ -2968,6 +2987,15 @@ def handle_postback(event):
             do_reset_payable(event)
         except Exception as e:
             print(f"[reset] reset_payable error: {e}", flush=True)
+    elif action == "dining_confirm":
+        if not _postback_once(f"pb:{data}"):
+            _already(); return
+        try:
+            g = getattr(event.source, "group_id", event.source.user_id)
+            if _dining_enabled(g):
+                _dining_reset(event, g)   # ยืนยันเก็บเงินครบ → รีเซ็ตยอดทริป
+        except Exception as e:
+            print(f"[dining] confirm button error: {e}", flush=True)
 
 
 @app.route("/health", methods=["GET"])
