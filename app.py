@@ -87,7 +87,7 @@ SLIP_WARN_UNREAD   = os.environ.get("SLIP_WARN_UNREAD", "0") == "1"
 # เทียบ "ยอดบิลร้าน (ใบแจ้งรายการ)" กับ "ยอดสลิปที่ลูกค้าโอน": โอนขาด>เกณฑ์ → เตือน, โอนเกิน → สะสมเป็นยอดทริป
 # เว้นว่าง = ปิดฟีเจอร์ทั้งหมด (บิลถูกมองเป็น 'ไม่ใช่สลิป' ตามเดิม). ใส่ group id (คั่นคอมมา) เพื่อเปิด — ต้องเป็นกลุ่มใน SLIP_GROUPS ด้วย
 DINING_GROUPS      = [g.strip() for g in os.environ.get("DINING_GROUPS", "").split(",") if g.strip()]
-DINING_SHORT_BAHT  = float(os.environ.get("DINING_SHORT_BAHT", "1"))  # เตือนเมื่อโอน 'ขาด' มากกว่ากี่บาท (ดีฟอลต์ >1)
+DINING_SHORT_BAHT  = float(os.environ.get("DINING_SHORT_BAHT", "1"))  # เตือนเมื่อโอน 'ขาด' ตั้งแต่กี่บาทขึ้นไป (ดีฟอลต์ ≥1)
 DINING_MATCH_MIN   = int(os.environ.get("DINING_MATCH_MIN", "45"))    # บิลค้างรอจับคู่สลิปได้นานกี่นาที (เกินนี้=หมดอายุ ไม่จับคู่)
 # จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
 RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
@@ -953,7 +953,7 @@ def _dining_after_slip(group_id: str, info: dict, slip_date: str = None):
                 (group_id, today, table_no, bill_amt, slip_amt, diff,
                  datetime.now(TZ).strftime("%H:%M:%S"), source))
             conn.commit()
-        if diff < -DINING_SHORT_BAHT:
+        if diff <= -DINING_SHORT_BAHT:
             tbl = f"โต๊ะ {table_no}" if table_no else "บิลนี้"
             return (f"⚠️ โอนขาด! {tbl}\n─────────────────\n"
                     f"บิล {bill_amt:,.2f} / โอน {slip_amt:,.2f}\n"
@@ -974,7 +974,7 @@ def build_dining_summary(group_id: str, report_date: str = None) -> str:
         pending = conn.execute(
             "SELECT COUNT(*) c FROM dining_bills WHERE group_id=? AND matched=0",
             (group_id,)).fetchone()["c"]
-    shorts = [p for p in pairs if p["diff"] < -DINING_SHORT_BAHT]
+    shorts = [p for p in pairs if p["diff"] <= -DINING_SHORT_BAHT]
     lines = [f"🧾 กระทบบิล-สลิป {d}",
              "─────────────────",
              f"จับคู่ได้ {len(pairs)} คู่ | โอนขาด {len(shorts)} คู่",
@@ -998,7 +998,7 @@ def _dining_report_lines(group_id: str, d: str):
             (group_id, d)).fetchall()]
     if not pairs:
         return []
-    shorts = [p for p in pairs if p["diff"] < -DINING_SHORT_BAHT]
+    shorts = [p for p in pairs if p["diff"] <= -DINING_SHORT_BAHT]
     net    = sum(p["diff"] for p in pairs)
     out = ["", "─────────────────", f"🧾 บิล-สลิป: จับคู่ {len(pairs)} คู่ | สุทธิ {net:+,.2f} บาท"]
     if shorts:
