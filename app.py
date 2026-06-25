@@ -89,6 +89,9 @@ SLIP_WARN_UNREAD   = os.environ.get("SLIP_WARN_UNREAD", "0") == "1"
 DINING_GROUPS      = [g.strip() for g in os.environ.get("DINING_GROUPS", "").split(",") if g.strip()]
 DINING_SHORT_BAHT  = float(os.environ.get("DINING_SHORT_BAHT", "1"))  # เตือนเมื่อโอน 'ขาด' ตั้งแต่กี่บาทขึ้นไป (ดีฟอลต์ ≥1)
 DINING_MATCH_MIN   = int(os.environ.get("DINING_MATCH_MIN", "45"))    # บิลค้างรอจับคู่สลิปได้นานกี่นาที (เกินนี้=หมดอายุ ไม่จับคู่)
+# หน่วงเวลาก่อน 'จับคู่บิล-สลิป' (วินาที) — รอให้บิลที่ส่งไล่ๆ กันถูกอ่านเข้าคิวครบก่อน กันจับคู่สลับลำดับ
+# (ยอดสลิป/ตรวจปลอม ยังบันทึก+ตอบทันที ไม่หน่วง; หน่วงเฉพาะการเทียบบิล → เตือนโอนขาดแบบ push)
+DINING_MATCH_DELAY = int(os.environ.get("DINING_MATCH_DELAY", "90"))
 # จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
 RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
 # รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
@@ -999,6 +1002,23 @@ def _dining_after_slip(group_id: str, info: dict, slip_date: str = None):
     except Exception as e:
         print(f"[dining] match error group={group_id}: {e}", flush=True)
         return None
+
+def _dining_compare_and_push(group_id: str, info: dict):
+    """จับคู่บิล-สลิป (เรียกแบบหน่วงเวลาผ่าน Timer) — ถ้าโอนขาด push เตือน+ปุ่มเคลียร์เข้ากลุ่ม
+    หน่วงไว้เพื่อรอบิลที่ส่งไล่ๆ กันถูกอ่านเข้าคิวครบก่อนจับคู่ (กันจับคู่สลับลำดับ). best-effort"""
+    try:
+        res = _dining_after_slip(group_id, info)
+        if not res:
+            return
+        line_bot_api.push_message(group_id, [
+            TextSendMessage(text=res["note"]),
+            _dining_clear_card(res["pair_id"], res["table_no"], res["short"]),
+        ])
+    except Exception as e:
+        if _is_not_member_error(e):
+            _mark_group_left(group_id)
+        print(f"[dining] delayed compare/push error group={group_id}: {e}", flush=True)
+
 
 def build_dining_summary(group_id: str, report_date: str = None) -> str:
     d   = report_date or datetime.now(TZ).date().isoformat()
@@ -2541,23 +2561,17 @@ def _process_image_event(event):
             verdict  = build_verdict(info, promptpay, dup_type, prev_amount)
             save_slip(group_id, info, verdict["status"], message_id=msg_id)
 
-        # กระทบบิล-สลิป (เฉพาะ DINING_GROUPS): โอนเกิน→สะสมเงียบ, ขาด≥เกณฑ์→คืน dict เตือน+ปุ่มเคลียร์โต๊ะ
-        dining_res = _dining_after_slip(group_id, info)
-
-        # สลิปผ่าน (PASS) + ไม่โอนขาด → เงียบไว้ ไม่รกแชท (ยังบันทึกไว้ ดูรวมได้ที่ "สรุป")
-        # เตือนในกรุ๊ปเฉพาะที่มีปัญหา (WARN/FAIL) หรือโอนขาด
-        reply_parts = []
+        # สลิปผ่าน (PASS) → เงียบไว้ ไม่รกแชท (ยังบันทึกไว้ ดูรวมได้ที่ "สรุป")
+        # เตือนในกรุ๊ปเฉพาะที่มีปัญหา (WARN/FAIL) — ตอบทันทีด้วย reply
         if verdict["status"] != "PASS":
-            reply_parts.append(verdict["group_msg"])
-        if dining_res:
-            reply_parts.append(dining_res["note"])
-        if reply_parts:
-            msgs = [TextSendMessage(text="\n\n".join(reply_parts))]
-            if dining_res:   # โอนขาด → เด้งปุ่มเคลียร์ 'เฉพาะโต๊ะนั้น' มาพร้อมกันเลย
-                msgs.append(_dining_clear_card(dining_res["pair_id"], dining_res["table_no"], dining_res["short"]))
-            line_bot_api.reply_message(event.reply_token, msgs)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=verdict["group_msg"]))
         if verdict["admin_msg"] and ADMIN_USER_ID:
             line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
+
+        # กระทบบิล-สลิป (เฉพาะ DINING_GROUPS): หน่วง ~DINING_MATCH_DELAY วิ ก่อนจับคู่
+        # → รอบิลที่ส่งไล่ๆ กันถูกอ่านเข้าคิวครบ กันจับคู่สลับลำดับ; โอนขาด → push เตือน+ปุ่ม (reply token หมดอายุแล้ว)
+        if _dining:
+            threading.Timer(DINING_MATCH_DELAY, _dining_compare_and_push, args=(group_id, info)).start()
     except Exception as e:
         # ประมวลผล/บันทึกพลาด (หลังอ่านสลิปได้แล้ว) → เงียบในกลุ่ม เตือนเฉพาะแอดมิน (ไม่เด้งกวน)
         print(f"[error] handle_image group={group_id}: {e}", flush=True)
