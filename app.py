@@ -433,12 +433,15 @@ def extract_slip_info(image_bytes: bytes, retry: bool = False, dining: bool = Fa
         "(โอนผ่านธนาคาร/แอปธนาคาร หรือจ่ายผ่านเป๋าตัง/G-Wallet/รัฐช่วยจ่าย เช่น ไทยช่วยไทย คนละครึ่ง เราชนะ) "
         "แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
         '{"is_slip":true,"sender":null,"amount":0.00,"datetime":null,"bank":null,'
-        '"account":null,"receiver":null,"receiver_account":null,"ref_number":null,"cropped":false,"fraud_score":0,"fraud_reasons":[]'
+        '"account":null,"receiver":null,"receiver_account":null,"ref_number":null,"cropped":false,"fraud_score":0,"fraud_reasons":[],"is_card_settlement":false'
         + _bill_json + '}\n\n'
         "is_slip: true ถ้าเป็นหลักฐานการชำระเงิน/โอนเงิน/เติมเงินสำเร็จ "
         "(สลิปโอนทุกธนาคาร, เติมเงินพร้อมเพย์/วอลเล็ต, เป๋าตัง/รัฐช่วยจ่าย). "
         "ตีความกว้างไว้ก่อน: เห็นจำนวนเงิน + คำว่าสำเร็จ/วันเวลา/เลขอ้างอิง แม้ถ่ายจากจอ/เอียง/เบลอ → true. "
         "false เฉพาะรูปที่ไม่ใช่การเงินชัดๆ (คน/อาหาร/เมนู/วิว/สติกเกอร์)\n"
+        "💳 'ใบรูดบัตรเครดิต/เดบิต' จากเครื่อง EDC (มีคำว่า SETTLEMENT REPORT / SALES / CARD TOTALS / Card Name / "
+        "MASTERCARD / VISA / MERCHANT COPY / Settlement Successful / รหัส TID·MID·BATCH) = จ่ายด้วยบัตร ไม่ใช่สลิปโอนธนาคาร "
+        "→ ตั้ง is_card_settlement=true (อ่าน amount ตามปกติได้); สลิปโอน/จ่ายบิลผ่านแอปธนาคารทั่วไป (K+/Krungthai NEXT/ฯลฯ) ตั้ง is_card_settlement=false\n"
         "❌ สำคัญมาก: 'กระดาษ/โน้ตที่เขียนด้วยลายมือ-ปากกา' (เช่น จดสต๊อก/จดของ/จดรายการ/จดยอด เขียนมือ) "
         "ไม่ใช่สลิป/หลักฐานการโอน → is_slip=false และ amount=0 'เสมอ' แม้จะเห็นตัวเลขบนกระดาษ; "
         "สลิป/หลักฐานโอนจริงเป็น 'ภาพพิมพ์จากแอปธนาคาร/วอลเล็ต' (ฟอนต์พิมพ์ ปุ่ม โลโก้ เลขอ้างอิง คำว่าสำเร็จ) ไม่ใช่ลายมือบนกระดาษ\n"
@@ -2473,6 +2476,13 @@ def _process_image_event(event):
         print(f"[slip] อ่านไม่สำเร็จทั้ง flash+pro group={group_id}", flush=True)
         record_image_miss(group_id, "error")
         notify_admin_error(group_id, "extract_slip_info ล้มทั้ง flash+pro (อาจ rate-limit ช่วงพีค)")
+        return
+
+    # ใบรูดบัตรเครดิต/เดบิต (EDC settlement) = จ่ายด้วยบัตร ไม่ใช่สลิปโอน → ไม่นับยอดโอน (เข้า 'ข้ามไม่ใช่รายรับ' ดูที่ 'ดูที่ข้าม')
+    if info.get("is_card_settlement"):
+        _amt = f"{float(info.get('amount') or 0):,.2f}"
+        print(f"[skip] ใบรูดบัตรเครดิต (ไม่นับยอดโอน) group={group_id} amt={_amt}", flush=True)
+        record_image_miss(group_id, "notincome", detail=f"💳 บัตรเครดิต {_amt} (รูดบัตร EDC)")
         return
 
     # บิลร้านล้วน (ใบแจ้งรายการ) ในกลุ่ม dining → เก็บเข้าคิวรอจับคู่กับสลิป (ไม่ใช่สลิป ไม่นับตกหล่น)
