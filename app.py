@@ -1136,11 +1136,33 @@ def _dining_reset(event, group_id: str):
               f"เริ่มนับทริปใหม่จาก 0 บาท")))
 
 
+def _resv_when_label(r: dict) -> str:
+    """คำบอกวันเวลาที่คำนวณจาก resv_date เทียบ 'วันนี้' ปัจจุบัน (กันคำว่า 'พรุ่งนี้' ค้างจากวันที่จอง)
+    + เวลา HH:MM ที่ดึงจากสตริงเดิม. ถ้าไม่มี resv_date ชัด → คืนสตริงเดิม (resv_datetime/datetime)"""
+    raw = r.get("resv_datetime") or r.get("datetime") or ""
+    rd  = r.get("resv_date")
+    m   = re.search(r"(\d{1,2})[:.](\d{2})", raw)
+    tm  = f"{int(m.group(1)):02d}:{m.group(2)}" if m else None
+    if not _valid_ymd(rd):
+        return raw   # ไม่มีวันชัด → ใช้ของเดิม
+    try:
+        d = date.fromisoformat(rd)
+    except ValueError:
+        return raw
+    delta = (d - datetime.now(TZ).date()).days
+    if   delta == 0: day = "วันนี้"
+    elif delta == 1: day = "พรุ่งนี้"
+    elif delta == 2: day = "มะรืน"
+    else:            day = f"วัน{_TH_WD[d.weekday()]} {d.day} {_TH_MON[d.month - 1]}"
+    return f"{day} {tm}" if tm else day
+
+
 def _resv_line(r: dict) -> str:
     icon = "✅" if r.get("status") == "CONFIRMED" else "⏳"
     cust = r.get("customer") or "?"
     ppl  = f" {r['people']}" if r.get("people") else ""
-    when = f" | {r['resv_datetime']}" if r.get("resv_datetime") else ""
+    _wl  = _resv_when_label(r)
+    when = f" | {_wl}" if _wl else ""
     zone = f" | {r['table_no']}" if r.get("table_no") else ""
     by   = f" (โดย {r['confirmed_by']})" if r.get("status") == "CONFIRMED" and r.get("confirmed_by") else ""
     return f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}"
@@ -2092,6 +2114,7 @@ def get_display_name(source) -> str:
 
 
 _TH_WD = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
+_TH_MON = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
 
 def extract_reservation(text: str) -> dict:
     """ให้ Gemini ตัดสินว่าข้อความเป็นการจองโต๊ะหรือไม่ แล้วดึงรายละเอียด (รวมวันที่จริง resv_date)"""
@@ -2133,7 +2156,7 @@ def _resv_detail_lines(r: dict) -> str:
     # รองรับทั้ง dict จาก AI (datetime/table) และแถวจาก DB (resv_datetime/table_no)
     cust = r.get("customer")
     ppl  = r.get("people")
-    dt   = r.get("datetime") or r.get("resv_datetime")
+    dt   = _resv_when_label(r)   # คำนวณวันใหม่เทียบวันนี้ (กัน 'พรุ่งนี้' ค้าง)
     zone = r.get("table") or r.get("table_no")
     note = r.get("note")
     parts = []
