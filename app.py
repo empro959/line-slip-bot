@@ -1396,10 +1396,14 @@ def _payable_settle(group_id: str, pay_for_date: str, amount: float):
     with _db() as conn:
         # เลือกบรรทัดที่ 'ยังค้างจริง' (amount − paid > 0); ค้างยกมาก่อน
         if pay_for_date:   # มีวันที่บนสลิป → ตัดบิล/ค้างของวันนั้น
+            # เลือก 'บิลที่ยอดค้างตรงกับยอดจ่ายเป๊ะ' ก่อน (เช่น จ่าย 6,835 → ตัดบิล 6,835 ให้ครบ)
+            # แล้วค่อยค้างยกมาก่อน → FIFO (กันเอาไปตัดบิลก้อนใหญ่บางส่วนทั้งที่มีบิลตรงยอด)
             rows = conn.execute(
                 "SELECT id, doc_date, amount, COALESCE(paid,0) paid FROM payable_bills "
                 "WHERE group_id=? AND doc_date=? AND (amount - COALESCE(paid,0))>0.01 "
-                "ORDER BY CASE WHEN note=? THEN 0 ELSE 1 END, id", (group_id, pay_for_date, _PAYABLE_CARRY_NOTE)).fetchall()
+                "ORDER BY CASE WHEN ABS((amount - COALESCE(paid,0)) - ?)<0.01 THEN 0 ELSE 1 END, "
+                "CASE WHEN note=? THEN 0 ELSE 1 END, id",
+                (group_id, pay_for_date, float(amount), _PAYABLE_CARRY_NOTE)).fetchall()
         else:              # ไม่มีวันที่ → จับยอดค้างคงเหลือที่ตรงกับบรรทัดเดียว
             rows = conn.execute(
                 "SELECT id, doc_date, amount, COALESCE(paid,0) paid FROM payable_bills "
