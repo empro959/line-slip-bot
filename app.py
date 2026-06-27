@@ -1355,6 +1355,16 @@ def save_payable_bill(group_id: str, amount: float, note: str = None, doc_date: 
             "INSERT INTO payable_bills (group_id, doc_date, amount, note, recorded_at) VALUES (?,?,?,?,?)",
             (group_id, doc_date, float(amount), note, now))
         conn.execute("INSERT INTO groups (group_id) VALUES (?) ON CONFLICT DO NOTHING", (group_id,))
+        # บิล 'จริง' (ไม่ใช่ค้างยกมา) เข้ามา → ถ้ามี 'ยกมา' ยอด+วันเดียวกันที่ยังไม่ถูกจ่ายค้างอยู่
+        # ให้ลบทิ้ง 1 ใบ กันนับเบิ้ล (ยกมาเป็นตัวแทนชั่วคราว พอบิลจริงมาก็แทนที่)
+        if note != _PAYABLE_CARRY_NOTE:
+            dup = conn.execute(
+                "SELECT id FROM payable_bills WHERE group_id=? AND doc_date=? AND note=? "
+                "AND ABS(amount-?)<0.01 AND COALESCE(paid,0)<0.01 ORDER BY id LIMIT 1",
+                (group_id, doc_date, _PAYABLE_CARRY_NOTE, float(amount))).fetchone()
+            if dup:
+                conn.execute("DELETE FROM payable_bills WHERE id=?", (dup["id"],))
+                print(f"[payable] ลบ 'ยกมา' ซ้ำ {amount:,.2f} วันที่ {doc_date} (มีบิลจริงแล้ว) group={group_id}", flush=True)
         conn.commit()
     return rid
 
