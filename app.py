@@ -1168,11 +1168,13 @@ def _resv_line(r: dict) -> str:
     return f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}"
 
 
-def build_resv_summary(notify_group=None, title="📋 สรุปการจองวันนี้", upcoming=False, skip_if_empty=False) -> str:
+def build_resv_summary(notify_group=None, title="📋 สรุปการจองวันนี้", upcoming=False, skip_if_empty=False, match_origin=False) -> str:
     """สรุปการจอง
     upcoming=False (ดีฟอลต์): เฉพาะจอง 'ของวันนี้' (resv_date = วันนี้) — จองล่วงหน้าจะโผล่เฉพาะวันที่ถึง
     upcoming=True: จองที่กำลังจะถึง (resv_date >= วันนี้) แยกหัวข้อ วันนี/ล่วงหน้า — ใช้กับ digest ล่วงหน้า
     notify_group=None → ทุกการจอง / ระบุ group → เฉพาะการจองที่ส่งการ์ดเข้ากลุ่มนั้น
+    match_origin=True → นับจองที่ 'เกิดในกลุ่มนี้ (origin) หรือส่งเข้ากลุ่มนี้ (notify)' —
+       ใช้กับคำสั่ง 'สรุปจอง' ในกลุ่มต้นทาง เพราะจองล่วงหน้าถูกส่ง notify ไปกลุ่มบาร์ (จะได้เห็นล่วงหน้าด้วย)
     skip_if_empty=True → ถ้าไม่มีจองคืน None (ไว้ให้รายงานอัตโนมัติ 'ไม่ส่ง' วันที่ไม่มีจอง — ประหยัด push)"""
     today  = datetime.now(TZ).date().isoformat()
     if upcoming:
@@ -1185,8 +1187,12 @@ def build_resv_summary(notify_group=None, title="📋 สรุปการจ�
         params = [today, today]
     q = f"SELECT * FROM reservations WHERE {date_cond}"
     if notify_group:
-        q += " AND notify_group_id=?"
-        params.append(notify_group)
+        if match_origin:
+            q += " AND (notify_group_id=? OR origin_group_id=?)"
+            params += [notify_group, notify_group]
+        else:
+            q += " AND notify_group_id=?"
+            params.append(notify_group)
     q += " ORDER BY resv_date IS NULL, resv_date, created_at"
     with _db() as conn:
         rows = [dict(r) for r in conn.execute(q, params).fetchall()]
@@ -2951,7 +2957,8 @@ def handle_text(event):
         return
     # สรุปการจอง (วันนี้ + ล่วงหน้า) ของกลุ่มนี้ — ใช้ได้ทุกกลุ่ม
     if text.lower() in ("สรุปจอง", "สรุปการจอง", "รายการจอง", "จองวันนี้"):
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_resv_summary(group_id)))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=build_resv_summary(group_id, "📋 สรุปการจอง (วันนี้ + ล่วงหน้า)", upcoming=True, match_origin=True)))
         return
     # ล้างข้อมูลทั้งหมดของกลุ่มนี้ (สลิป+จอง ทุกวัน) — เตรียมเลิกใช้/รีเซ็ตกลุ่ม (มีปุ่มยืนยัน)
     if text.lower() in ("ล้างทั้งหมด", "ล้างกลุ่มนี้", "ล้างข้อมูลทั้งหมด", "รีเซ็ตทั้งหมด"):
