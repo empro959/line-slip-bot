@@ -1933,6 +1933,11 @@ def _is_not_member_error(e: Exception) -> bool:
     return isinstance(e, LineBotApiError) and getattr(e, "status_code", None) == 400
 
 
+def _report_off(gid: str) -> bool:
+    """กลุ่มนี้สั่ง 'ปิดรายงาน' ไว้ไหม — ยังเช็คสลิปปกติ แต่ไม่ส่งรายงานสรุปประจำวัน (00:30)"""
+    return _get_meta(f"noreport:{gid}") == "1"
+
+
 def _report_dest(group_id: str) -> str:
     """ปลายทางจริงของรายงานกลุ่มนี้ — ถ้าตั้ง REPORT_REDIRECT ไว้ ให้ส่งไปกลุ่มปลายทางแทนกลุ่มต้นทาง"""
     return REPORT_REDIRECT.get(group_id, group_id)
@@ -1953,10 +1958,11 @@ def maybe_send_daily_report():
         yesterday = (now.date() - timedelta(days=1)).isoformat()
         with _db() as conn:
             group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
-        # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) / สั่งเมิน (IGNORE_GROUPS) — กันค้าง retry/สแปม
+        # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) / สั่งเมิน (IGNORE_GROUPS) / สั่งปิดรายงาน/ปิดสลิป — กันค้าง retry/สแปม
         targets = [g for g in group_ids
                    if ((not SLIP_GROUPS) or g in SLIP_GROUPS) and not _group_left(g)
-                   and g not in IGNORE_GROUPS and g not in PAYABLE_GROUPS]
+                   and g not in IGNORE_GROUPS and g not in PAYABLE_GROUPS
+                   and not _report_off(g) and not _slip_off(g)]
         print(f"[report] trigger {today} → ส่งรายงานวันที่ {yesterday} ให้ {len(targets)} กลุ่ม", flush=True)
         failed = 0
         # idempotent รายกลุ่ม: กลุ่มที่ส่งสำเร็จแล้ววันนี้จะไม่ส่งซ้ำ แม้กลุ่มอื่นพลาดแล้วต้อง retry
@@ -2440,9 +2446,15 @@ threading.Thread(target=_reservation_reminder_loop, daemon=True).start()
 # LINE Webhook
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _slip_off(gid: str) -> bool:
+    """กลุ่มนี้สั่ง 'ปิดสลิป' ไว้ไหม — ไม่ยุ่งกับสลิปเลย (ไม่เช็ค/ไม่เตือน/ไม่รายงาน/ไม่รับคำสั่งสลิป)
+    ฟีเจอร์อื่น (จอง ฯลฯ) ยังทำงาน — ต่างจาก IGNORE_GROUPS ที่เมินทั้งกลุ่ม"""
+    return _get_meta(f"slipoff:{gid}") == "1"
+
+
 def _slip_enabled(group_id: str) -> bool:
-    """เช็คสลิป+เตือน+รายงาน เฉพาะกลุ่มใน SLIP_GROUPS (ถ้าไม่ตั้ง = ทุกกลุ่ม)"""
-    return (not SLIP_GROUPS) or (group_id in SLIP_GROUPS)
+    """เช็คสลิป+เตือน+รายงาน เฉพาะกลุ่มใน SLIP_GROUPS (ถ้าไม่ตั้ง = ทุกกลุ่ม) และไม่ได้สั่ง 'ปิดสลิป'"""
+    return ((not SLIP_GROUPS) or (group_id in SLIP_GROUPS)) and not _slip_off(group_id)
 
 
 @app.route("/callback", methods=["POST"])
@@ -2846,6 +2858,7 @@ def build_help(group_id: str) -> str:
         "🛠️ ทั่วไป",
         "• groupid → ดู Group ID ของกลุ่ม",
         "• คู่มือ → วิธีใช้แบบละเอียด",
+        "• ปิดสลิป / เปิดสลิป → ปิด/เปิดระบบสลิปทั้งกลุ่ม (ปิดรายงาน = หยุดแค่รายงานสรุป)",
         "• ล้างทั้งหมด → ล้างข้อมูลกลุ่มนี้ทั้งหมด (สลิป+จอง มีปุ่มยืนยัน)",
         "• help / คำสั่ง → เมนูนี้",
     ]
@@ -2978,6 +2991,20 @@ def handle_text(event):
     if text.lower() in ("ล้างทั้งหมด", "ล้างกลุ่มนี้", "ล้างข้อมูลทั้งหมด", "รีเซ็ตทั้งหมด"):
         send_reset_all_confirm(event, group_id)
         return
+    # เปิด/ปิด 'ระบบสลิปทั้งหมด' ของกลุ่มนี้ (ไม่เช็ค/ไม่เตือน/ไม่รายงาน) — วางนอกบล็อก _slip_enabled เพื่อให้ 'เปิดสลิป' ได้แม้ปิดอยู่
+    if text in ("ปิดสลิป", "ปิดเช็คสลิป", "ไม่เช็คสลิป", "ปิดระบบสลิป"):
+        _set_meta(f"slipoff:{group_id}", "1")
+        _del_meta(f"noreport:{group_id}")   # ปิดสลิปครอบคลุมรายงานอยู่แล้ว
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text="🛑 ปิดระบบสลิปของกลุ่มนี้แล้ว — บอทจะไม่เช็ค/ไม่เตือน/ไม่รายงานสลิปในกลุ่มนี้\n"
+                 "(ฟีเจอร์อื่น เช่น การจอง ยังใช้ได้ปกติ)\n"
+                 "• เปิดใหม่พิมพ์ 'เปิดสลิป'"))
+        return
+    if text in ("เปิดสลิป", "เปิดเช็คสลิป", "เปิดระบบสลิป"):
+        _del_meta(f"slipoff:{group_id}")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text="✅ เปิดระบบสลิปของกลุ่มนี้แล้ว — กลับมาเช็ค/เตือน/รายงานสลิปตามปกติ"))
+        return
     # คำสั่งเกี่ยวกับสลิป (สรุป/ลบ/ล้าง) → เฉพาะกลุ่มที่เปิดเช็คสลิปเท่านั้น
     if _slip_enabled(group_id):
         # กระทบบิล-สลิป (เฉพาะ DINING_GROUPS): ยืนยันเก็บครบ=รีเซ็ตยอด / ดูยอดสะสม
@@ -2994,6 +3021,20 @@ def handle_text(event):
                 return
         if text.lower() in ("สรุป", "รายงาน", "report", "summary"):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
+            return
+
+        # เปิด/ปิด 'รายงานสรุปประจำวัน' ของกลุ่มนี้ (ยังเช็คสลิป + ใช้คำสั่ง 'สรุป' ได้ปกติ)
+        if text in ("ปิดรายงาน", "ปิดรายงานสลิป", "งดรายงาน", "ไม่เอารายงาน", "ปิดสรุป"):
+            _set_meta(f"noreport:{group_id}", "1")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="🔕 ปิดรายงานสรุปประจำวัน (00:30) ของกลุ่มนี้แล้ว\n"
+                     "• ยังเช็คสลิป/เตือนปกติ + พิมพ์ 'สรุป' ดูเองได้\n"
+                     "• เปิดใหม่พิมพ์ 'เปิดรายงาน'"))
+            return
+        if text in ("เปิดรายงาน", "เปิดรายงานสลิป", "เอารายงาน", "เปิดสรุป"):
+            _del_meta(f"noreport:{group_id}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="🔔 เปิดรายงานสรุปประจำวัน (00:30) ของกลุ่มนี้แล้ว"))
             return
 
         # ดูใบที่ถูกข้าม 'ไม่ใช่รายรับ' (โชว์ยอด+ปลายทาง) — เช็กว่าโดนกรองทิ้งเป็นเงินร้านจริงไหม
