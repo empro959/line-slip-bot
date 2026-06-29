@@ -2014,9 +2014,9 @@ def maybe_send_daily_report():
             group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
         # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) / สั่งเมิน (IGNORE_GROUPS) / สั่งปิดรายงาน/ปิดสลิป — กันค้าง retry/สแปม
         targets = [g for g in group_ids
-                   if ((not SLIP_GROUPS) or g in SLIP_GROUPS) and not _group_left(g)
+                   if _slip_enabled(g) and not _group_left(g)
                    and g not in IGNORE_GROUPS and g not in PAYABLE_GROUPS
-                   and not _report_off(g) and not _slip_off(g)]
+                   and not _report_off(g)]
         print(f"[report] trigger {today} → ส่งรายงานวันที่ {yesterday} ให้ {len(targets)} กลุ่ม", flush=True)
         failed = 0
         # idempotent รายกลุ่ม: กลุ่มที่ส่งสำเร็จแล้ววันนี้จะไม่ส่งซ้ำ แม้กลุ่มอื่นพลาดแล้วต้อง retry
@@ -2496,9 +2496,19 @@ def _slip_off(gid: str) -> bool:
     return _get_meta(f"slipoff:{gid}") == "1"
 
 
+def _slip_allow():
+    """allowlist 'กลุ่มรับสลิป' ที่ตั้งผ่านแชท (meta) — ถ้ามี = ใช้แทน SLIP_GROUPS env (เซ็ตเองในแอปได้ ไม่ต้องแตะ env)
+    พิมพ์ 'กลุ่มนี้รับสลิป' ในกลุ่มจริง → กลุ่มนั้นเข้า allowlist, กลุ่มอื่นทั้งหมดเงียบสลิปทันที"""
+    raw = _get_meta("slip_allow") or ""
+    return [g for g in raw.split(",") if g]
+
+
 def _slip_enabled(group_id: str) -> bool:
-    """เช็คสลิป+เตือน+รายงาน เฉพาะกลุ่มใน SLIP_GROUPS (ถ้าไม่ตั้ง = ทุกกลุ่ม) และไม่ได้สั่ง 'ปิดสลิป'"""
-    return ((not SLIP_GROUPS) or (group_id in SLIP_GROUPS)) and not _slip_off(group_id)
+    """เช็คสลิป+เตือน+รายงาน เฉพาะกลุ่มรับสลิป และไม่ได้สั่ง 'ปิดสลิป'
+    ลำดับ: ถ้ามี allowlist ตั้งผ่านแชท → ใช้ตัวนั้น; ไม่งั้นใช้ env SLIP_GROUPS (ว่าง=ทุกกลุ่ม)"""
+    allow = _slip_allow()
+    in_scope = (group_id in allow) if allow else ((not SLIP_GROUPS) or (group_id in SLIP_GROUPS))
+    return in_scope and not _slip_off(group_id)
 
 
 @app.route("/callback", methods=["POST"])
@@ -2935,6 +2945,7 @@ def build_help(group_id: str) -> str:
         "• groupid → ดู Group ID ของกลุ่ม",
         "• คู่มือ → วิธีใช้แบบละเอียด",
         "• ปิดสลิป / เปิดสลิป → ปิด/เปิดระบบสลิปทั้งกลุ่ม (ปิดรายงาน = หยุดแค่รายงานสรุป)",
+        "• กลุ่มนี้รับสลิป → ตั้งให้เฉพาะกลุ่มนี้รับสลิป กลุ่มอื่นเงียบหมด (ล้างกลุ่มสลิป = ยกเลิก)",
         "• ล้างทั้งหมด → ล้างข้อมูลกลุ่มนี้ทั้งหมด (สลิป+จอง มีปุ่มยืนยัน)",
         "• help / คำสั่ง → เมนูนี้",
     ]
@@ -3080,6 +3091,24 @@ def handle_text(event):
         _del_meta(f"slipoff:{group_id}")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text="✅ เปิดระบบสลิปของกลุ่มนี้แล้ว — กลับมาเช็ค/เตือน/รายงานสลิปตามปกติ"))
+        return
+    # ตั้ง 'เฉพาะกลุ่มนี้' เป็นกลุ่มรับสลิป → กลุ่มอื่นทั้งหมดเงียบสลิปทันที (พิมพ์ครั้งเดียวในกลุ่มจริง)
+    if text in ("กลุ่มนี้รับสลิป", "ตั้งกลุ่มสลิป", "เปิดเฉพาะกลุ่มนี้", "เฉพาะกลุ่มนี้รับสลิป", "ตั้งกลุ่มนี้เป็นกลุ่มสลิป"):
+        allow = _slip_allow()
+        if group_id not in allow:
+            allow.append(group_id)
+        _set_meta("slip_allow", ",".join(allow))
+        _del_meta(f"slipoff:{group_id}")   # กลุ่มนี้ต้องเปิดสลิปแน่ๆ
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"✅ ตั้งกลุ่มนี้เป็น 'กลุ่มรับสลิป' แล้ว\n"
+                 f"กลุ่มรับสลิปตอนนี้: {len(allow)} กลุ่ม\n"
+                 "🔕 ทุกกลุ่มอื่นที่ไม่ได้ตั้ง = ไม่เช็ก/ไม่รายงานสลิปทั้งหมด (รวมกลุ่มใหม่ในอนาคต)\n"
+                 "• ถ้าตั้งผิด พิมพ์ 'ล้างกลุ่มสลิป' เพื่อกลับค่าเริ่มต้น"))
+        return
+    if text in ("ล้างกลุ่มสลิป", "รีเซ็ตกลุ่มสลิป", "ยกเลิกกลุ่มสลิป"):
+        _del_meta("slip_allow")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text="↩️ ล้างรายการ 'กลุ่มรับสลิป' แล้ว — กลับไปใช้ค่าตั้งต้น (ตาม env SLIP_GROUPS)"))
         return
     # คำสั่งเกี่ยวกับสลิป (สรุป/ลบ/ล้าง) → เฉพาะกลุ่มที่เปิดเช็คสลิปเท่านั้น
     if _slip_enabled(group_id):
