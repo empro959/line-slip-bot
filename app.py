@@ -1982,19 +1982,7 @@ def maybe_send_daily_report():
                 else:
                     failed += 1
                 print(f"[report] push FAILED {dest}: {e}", flush=True)
-        # สรุปจองล่วงหน้า → กลุ่มบาร์น้ำ (วันละครั้งพร้อมรายงานสลิป) — ไม่มีจองล่วงหน้า = ไม่ส่ง (ประหยัด)
-        _adv = build_advance_resv_report(skip_if_empty=True)
-        if _adv and BAR_GROUP_ID and not _group_left(BAR_GROUP_ID) and not _already_sent("advance_resv", today, BAR_GROUP_ID):
-            try:
-                line_bot_api.push_message(BAR_GROUP_ID, TextSendMessage(text=_adv))
-                _mark_sent("advance_resv", today, BAR_GROUP_ID)
-                print(f"[report] sent advance-resv → {BAR_GROUP_ID}", flush=True)
-            except Exception as e:
-                if _is_not_member_error(e):
-                    _mark_group_left(BAR_GROUP_ID)
-                else:
-                    failed += 1
-                print(f"[report] push FAILED advance-resv {BAR_GROUP_ID}: {e}", flush=True)
+        # หมายเหตุ: สรุป 'จองล่วงหน้า' ย้ายไปส่งรวมกับสรุปจองวันนี้ตอน 16:00 แล้ว (maybe_send_resv_summary)
         # มาร์คว่า 'ส่งครบแล้ว' เฉพาะเมื่อไม่มีอันไหนล้มเหลว — ถ้ามี fail ปล่อยไว้ให้ ping รอบหน้า retry
         if failed == 0:
             _set_meta("last_report_date", today)
@@ -2027,11 +2015,11 @@ def maybe_send_resv_summary():
         if not targets:
             _set_meta("last_resv_summary_date", today)
             return
-        # วันไหนไม่มีจอง = ไม่ส่งเลย (ประหยัด push) — ตามที่ขอ
-        text = build_resv_summary(None, "📋 สรุปการจองวันนี้ (16:00)", skip_if_empty=True)
+        # สรุปจอง 'วันนี้ + ล่วงหน้า' รวมในรอบเดียว 16:00 (จองล่วงหน้าย้ายมาจาก 00:30) — ไม่มีจองเลย = ไม่ส่ง (ประหยัด)
+        text = build_resv_summary(None, "📋 สรุปการจอง (วันนี้ + ล่วงหน้า) 16:00", upcoming=True, skip_if_empty=True)
         if text is None:
             _set_meta("last_resv_summary_date", today)
-            print("[resv-summary] วันนี้ไม่มีจอง — ไม่ส่ง (ประหยัด)", flush=True)
+            print("[resv-summary] วันนี้ไม่มีจอง/ล่วงหน้า — ไม่ส่ง (ประหยัด)", flush=True)
             return
         failed = 0
         # idempotent รายกลุ่ม: กลุ่มที่ส่งสำเร็จแล้ววันนี้จะไม่ส่งซ้ำ แม้กลุ่มอื่นพลาดแล้วต้อง retry
@@ -2917,7 +2905,7 @@ def build_manual(group_id: str) -> str:
             "• ยังไม่กดคอนเฟิร์ม บอทจะย้ำเตือนซ้ำจนกว่าจะกด\n"
             "คำสั่ง:\n"
             "• สรุปจอง → ดูรายการจอง (วันนี้ + ล่วงหน้า)\n"
-            "⏰ บอทส่งสรุปจองวันนี้ให้เองทุก 16:00"
+            "⏰ บอทส่งสรุปจอง (วันนี้ + ล่วงหน้า) ให้เองทุก 16:00"
         )
     blocks.append("\nℹ️ help → เมนูคำสั่ง | groupid → ดูข้อมูลกลุ่ม")
     return "\n".join(blocks)
