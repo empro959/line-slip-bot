@@ -1004,7 +1004,7 @@ def _dining_after_slip(group_id: str, info: dict, slip_date: str = None):
         return None
 
 def _dining_compare_and_push(group_id: str, info: dict):
-    """จับคู่บิล-สลิป (เรียกแบบหน่วงเวลาผ่าน Timer) — ถ้าโอนขาด push เตือน+ปุ่มเคลียร์เข้ากลุ่ม
+    """จับคู่บิล-สลิป (เรียกแบบหน่วงเวลา) — ถ้าโอนขาด push เตือน+ปุ่มเคลียร์เข้ากลุ่ม
     หน่วงไว้เพื่อรอบิลที่ส่งไล่ๆ กันถูกอ่านเข้าคิวครบก่อนจับคู่ (กันจับคู่สลับลำดับ). best-effort"""
     try:
         res = _dining_after_slip(group_id, info)
@@ -1018,6 +1018,32 @@ def _dining_compare_and_push(group_id: str, info: dict):
         if _is_not_member_error(e):
             _mark_group_left(group_id)
         print(f"[dining] delayed compare/push error group={group_id}: {e}", flush=True)
+
+
+# คิวหน่วงจับคู่บิล-สลิป — ใช้ thread เดียวเดินตรวจ แทน threading.Timer ต่อสลิป
+# (Timer ต่อใบ = สร้าง thread ต่อสลิป ตอนพีคสลิปรัวๆ → thread พุ่ง → memory เกิน/restart)
+_dining_q = []                       # [(due_epoch, group_id, info), ...]
+_dining_q_lock = threading.Lock()
+
+def _dining_schedule(group_id: str, info: dict):
+    """ตั้งคิวจับคู่บิล-สลิปแบบหน่วง DINING_MATCH_DELAY วิ (เก็บในลิสต์ ให้ scheduler เดียวดึงไปทำ)"""
+    with _dining_q_lock:
+        _dining_q.append((time.time() + DINING_MATCH_DELAY, group_id, info))
+
+def _dining_scheduler_loop():
+    """thread เดียวเดินตรวจคิวทุก ~5 วิ — ถึงเวลาแล้วค่อยจับคู่+เตือน (ประหยัด thread/memory กว่า Timer ต่อใบ)"""
+    while True:
+        try:
+            now = time.time()
+            with _dining_q_lock:
+                due = [x for x in _dining_q if x[0] <= now]
+                if due:
+                    _dining_q[:] = [x for x in _dining_q if x[0] > now]
+            for _due, gid, info in due:
+                _dining_compare_and_push(gid, info)
+        except Exception as e:
+            print(f"[dining-sched] loop error: {e}", flush=True)
+        time.sleep(5)
 
 
 def build_dining_summary(group_id: str, report_date: str = None) -> str:
@@ -2454,6 +2480,7 @@ def _reservation_reminder_loop():
 
 
 threading.Thread(target=_reservation_reminder_loop, daemon=True).start()
+threading.Thread(target=_dining_scheduler_loop, daemon=True).start()   # คิวจับคู่บิล-สลิป (1 thread แทน Timer ต่อใบ)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2638,7 +2665,7 @@ def _process_image_event(event):
         # กระทบบิล-สลิป (เฉพาะ DINING_GROUPS): หน่วง ~DINING_MATCH_DELAY วิ ก่อนจับคู่
         # → รอบิลที่ส่งไล่ๆ กันถูกอ่านเข้าคิวครบ กันจับคู่สลับลำดับ; โอนขาด → push เตือน+ปุ่ม (reply token หมดอายุแล้ว)
         if _dining:
-            threading.Timer(DINING_MATCH_DELAY, _dining_compare_and_push, args=(group_id, info)).start()
+            _dining_schedule(group_id, info)   # เข้าคิวให้ scheduler เดียวจับคู่ (ไม่สร้าง thread ต่อสลิป)
     except Exception as e:
         # ประมวลผล/บันทึกพลาด (หลังอ่านสลิปได้แล้ว) → เงียบในกลุ่ม เตือนเฉพาะแอดมิน (ไม่เด้งกวน)
         print(f"[error] handle_image group={group_id}: {e}", flush=True)
