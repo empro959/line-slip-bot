@@ -1572,6 +1572,26 @@ def _payable_cleanup_paid(acct: str):
         conn.commit()
 
 
+def _payable_reconcile(acct: str):
+    """จัดยอดใหม่: ล้างการตัดยอดทั้งหมด (paid/allocated=0) แล้วตัดยอดจ่ายใหม่ด้วยตรรกะปัจจุบัน
+    (ยอดตรงเป๊ะก่อน FIFO) เรียงตามวันจ่าย — แก้รายการเก่าที่เคยตัดผิดใบ
+    ⚠️ ปลอดภัยต่อยอดรวม: ค้างสะสม = opening + Σบิล − Σจ่าย (ไม่ขึ้นกับการตัดเข้าใบไหน) → ยอดไม่เปลี่ยน"""
+    with _db() as conn:
+        conn.execute("UPDATE payable_bills SET paid=0 WHERE group_id=?", (acct,))
+        conn.execute("UPDATE payable_payments SET allocated=0, settle_note=NULL WHERE group_id=?", (acct,))
+        conn.commit()
+        pays = [dict(p) for p in conn.execute(
+            "SELECT id, amount, doc_date FROM payable_payments WHERE group_id=? ORDER BY doc_date, id",
+            (acct,)).fetchall()]
+    for p in pays:
+        allocated, _settled, settle_note = _payable_settle(acct, p["doc_date"], float(p["amount"] or 0))
+        with _db() as conn:
+            conn.execute("UPDATE payable_payments SET allocated=?, settle_note=? WHERE id=?",
+                         (allocated, settle_note, p["id"]))
+            conn.commit()
+    _payable_cleanup_paid(acct)
+
+
 _PAYABLE_SRC = {"block": "บล็อกค้าง", "พิมพ์": "พิมพ์เอง", "รูป": "รูปบิล"}
 
 def build_payable_bill_list(acct: str, limit: int = 40) -> str:
@@ -1819,6 +1839,12 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         if errs:
             msg += "\n❌ ส่งไม่สำเร็จ:\n" + "\n".join(errs)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
+        return True
+
+    # จัดยอดใหม่ — ตัดยอดจ่ายเข้าบิลใหม่ทั้งหมด (ยอดตรงเป๊ะก่อน) แก้รายการเก่าที่ตัดผิดใบ; ยอดรวมไม่เปลี่ยน
+    if low in ("จัดยอดใหม่", "คำนวณยอดใหม่", "รีคอนยอด", "จัดยอด", "คำนวณยอด"):
+        _payable_reconcile(acct)
+        _payable_push_summary(event, group_id, acct)
         return True
 
     # ลบรายการล่าสุด (แก้บันทึกผิด)
@@ -2798,6 +2824,7 @@ def build_help(group_id: str) -> str:
             "• รายการบิล → ดูบิลทั้งหมด + ที่มา (เช็กว่ามาจากไหน)",
             "• ลบบิลล่าสุด / ลบจ่ายล่าสุด → แก้กรณีบันทึกผิด",
             "• ลบวันที่ 6/6 → ลบทุกบิล/จ่ายของวันนั้น",
+            "• จัดยอดใหม่ → ตัดยอดจ่ายเข้าบิลใหม่ให้ถูกใบ (ยอดรวมไม่เปลี่ยน)",
             "• ล้างบัญชีหนี้ → ล้างทั้งหมด เริ่มนับใหม่ (มีปุ่มยืนยัน)",
             "• ทดสอบรายงานหนี้ → ส่งสรุปหนี้เดี๋ยวนี้ (เช็คการส่ง/redirect)",
             "⏰ บอทเด้งสรุปหนี้ให้เองทุกครั้งที่มี 'การจ่าย' (บิลซื้อไม่เด้ง)",
