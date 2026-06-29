@@ -2533,11 +2533,9 @@ def _process_image_event(event):
         info = extract_slip_info(image_bytes, dining=_dining)
     except Exception as e:
         print(f"[slip] flash อ่านพลาด group={group_id}: {e}", flush=True)
-    # บิลร้านล้วน (ใบแจ้งรายการ ไม่มีสลิป) ในกลุ่ม dining → ไม่ต้องอ่านซ้ำด้วย pro (ประหยัดโควต้า)
-    _is_dining_bill = (_dining_enabled(group_id) and info is not None
-                       and info.get("is_bill") and not info.get("is_slip", False)
-                       and float(info.get("bill_total") or 0) > 0)
-    if not _is_dining_bill and (info is None or not info.get("is_slip", True) or float(info.get("amount") or 0) <= 0):
+    # อ่านซ้ำด้วย pro เมื่อรอบแรก 'พัง/ไม่ใช่สลิป/ยอด<=0' — รวมถึงกรณีกลุ่ม dining ที่ flash ตัดสินว่าเป็น 'บิล'
+    # (อาจเป็นรูป 'บิล+สลิปคู่กัน' ที่ flash เห็นแต่บิล อ่านสลิปบนจอไม่ออก) → ให้ pro ลองหาสลิปอีกรอบ กันยอดสลิปหาย
+    if info is None or not info.get("is_slip", True) or float(info.get("amount") or 0) <= 0:
         try:
             info_retry = extract_slip_info(image_bytes, retry=True, dining=_dining)
             if info is None or info_retry.get("is_slip") or float(info_retry.get("amount") or 0) > 0:
