@@ -92,6 +92,8 @@ DINING_MATCH_MIN   = int(os.environ.get("DINING_MATCH_MIN", "45"))    # บิ�
 # หน่วงเวลาก่อน 'จับคู่บิล-สลิป' (วินาที) — รอให้บิลที่ส่งไล่ๆ กันถูกอ่านเข้าคิวครบก่อน กันจับคู่สลับลำดับ
 # (ยอดสลิป/ตรวจปลอม ยังบันทึก+ตอบทันที ไม่หน่วง; หน่วงเฉพาะการเทียบบิล → เตือนโอนขาดแบบ push)
 DINING_MATCH_DELAY = int(os.environ.get("DINING_MATCH_DELAY", "90"))
+# เฝ้า memory: ถ้า RSS เกินค่านี้ (MB) บอทจะ DM เตือนแอดมิน (Render Starter ลิมิต 512MB) — กันก่อน OOM/restart
+MEM_WARN_MB = float(os.environ.get("MEM_WARN_MB", "430"))
 # จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
 RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
 # รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
@@ -2145,6 +2147,7 @@ def _report_backup_loop():
     while True:
         time.sleep(300)
         try:
+            _check_memory()           # เฝ้า memory ทุก ~5 นาที → เตือนแอดมินถ้าใกล้ลิมิต
             maybe_send_resv_summary()
             maybe_send_daily_report()
             maybe_send_payable_summary()
@@ -2510,6 +2513,39 @@ def callback():
 
 
 _last_admin_error_ts = 0.0
+_last_mem_warn_ts = 0.0
+
+def _mem_rss_mb():
+    """หน่วยความจำที่ใช้จริง (RSS) เป็น MB จาก /proc (Linux/Render) — อ่านไม่ได้คืน None"""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0   # kB → MB
+    except Exception:
+        return None
+    return None
+
+
+def _check_memory():
+    """เฝ้า memory — เกิน MEM_WARN_MB แล้ว DM เตือนแอดมิน (จำกัด 1 ครั้ง/30 นาที กันสแปม)
+    บอทเฝ้าตัวเอง: เตือนล่วงหน้าก่อน Render kill เพราะ OOM (จะได้อัปเกรด/ดูสาเหตุทัน)"""
+    global _last_mem_warn_ts
+    mb = _mem_rss_mb()
+    if mb is None or mb < MEM_WARN_MB:
+        return
+    if time.time() - _last_mem_warn_ts < 1800:
+        return
+    _last_mem_warn_ts = time.time()
+    print(f"[mem] ⚠️ RSS สูง {mb:.0f} MB (เกินเกณฑ์ {MEM_WARN_MB:.0f} MB)", flush=True)
+    if ADMIN_USER_ID:
+        try:
+            line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(
+                text=f"⚠️ [SYSTEM] หน่วยความจำบอทสูง: {mb:.0f} MB (ใกล้ลิมิต Render 512MB)\n"
+                     "ถ้าเตือนบ่อยช่วงพีค = ควรอัปเกรด RAM (Starter→Standard) กัน restart กลางคัน"))
+        except Exception:
+            pass
+
 
 def notify_admin_error(group_id, err):
     """แจ้ง Admin เวลาบอทอ่านสลิปพลาด แบบจำกัด 1 ครั้ง/30 นาที (กัน Admin โดนสแปม + ประหยัดโควต้า push)"""
@@ -3242,8 +3278,9 @@ def handle_postback(event):
 
 @app.route("/health", methods=["GET"])
 def health():
-    # ทุกครั้งที่ถูก ping (UptimeRobot ทุก 5 นาที) เช็คว่าถึงเวลาส่งรายงาน/สรุปจองไหม
+    # ทุกครั้งที่ถูก ping (UptimeRobot ทุก 5 นาที) เช็คว่าถึงเวลาส่งรายงาน/สรุปจองไหม + เฝ้า memory
     try:
+        _check_memory()
         maybe_send_resv_summary()
         maybe_send_daily_report()
         maybe_send_payable_summary()
@@ -3255,8 +3292,9 @@ def health():
                 "SELECT COUNT(*) c FROM slips WHERE slip_date=?", (datetime.now(TZ).date().isoformat(),)
             ).fetchone()["c"]
             group_count = conn.execute("SELECT COUNT(*) c FROM groups").fetchone()["c"]
+        _mb = _mem_rss_mb()
         return {"status": "ok", "slips_today": today_count, "active_groups": group_count,
-                "storage": STORAGE_DESC}
+                "storage": STORAGE_DESC, "memory_mb": round(_mb, 1) if _mb else None}
     except Exception as e:
         # DB ล่ม/เชื่อมไม่ได้ชั่วคราว — ตอบ 200 อยู่ (กัน UptimeRobot รีสตาร์ท) แต่บอกสถานะ
         return {"status": "db_error", "storage": f"{STORAGE_DESC} — {e}"}

@@ -75,7 +75,8 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 - ⚠️ **Render Postgres ฟรีถูกลบหลัง 90 วัน** → ต้อง upgrade เป็น paid หรือย้ายข้อมูลก่อนครบ
 - **อย่า deploy ตอนร้านเปิด** — ทุก deploy worker restart ~1 นาที สลิป/จองช่วงนั้นเสี่ยงหลุด
 - **pin เวอร์ชันใน requirements.txt** แล้ว — กัน auto-upgrade ทำพัง (อัปเดตเมื่อทดสอบแล้วเท่านั้น)
-- ดูสถานะ: `<render-url>/health` → `{status, slips_today, active_groups, storage}`
+- ดูสถานะ: `<render-url>/health` → `{status, slips_today, active_groups, storage, memory_mb}`
+- **เฝ้า memory:** `_check_memory()` (เรียกจาก /health ping + backup loop ทุก ~5 นาที) — RSS เกิน `MEM_WARN_MB`(430) → DM เตือนแอดมิน (จำกัด 1 ครั้ง/30 นาที) กันก่อน OOM/restart
 
 ## ข้อจำกัดที่รู้อยู่
 - AI อ่านสลิปจากรูป ~98% (1-2 ใบ/วันอาจพลาด) — 100% ต้องเปิด SlipOK API
