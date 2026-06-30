@@ -2741,16 +2741,17 @@ def delete_latest_slip(event, group_id):
              "─────────────────\n" + build_daily_report(group_id)))
 
 
-def delete_slip_by_index(event, group_id, n):
-    today = _today_iso()
+def delete_slip_by_index(event, group_id, n, slip_date: str = None):
+    d = slip_date or _today_iso()
+    when = "วันนี้" if d == _today_iso() else f"วันที่ {d}"
     with _db() as conn:
         rows = conn.execute(
             "SELECT id, sender, amount FROM slips WHERE group_id=? AND slip_date=? ORDER BY id",
-            (group_id, today)
+            (group_id, d)
         ).fetchall()
     if n < 1 or n > len(rows):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text=f"❌ ไม่มีรายการที่ {n} (วันนี้มี {len(rows)} รายการ)\nพิมพ์ 'สรุป' ดูเลขรายการก่อน"))
+            text=f"❌ ไม่มีรายการที่ {n} ({when}มี {len(rows)} รายการ)\nพิมพ์ 'สรุป {d}' ดูเลขรายการก่อน"))
         return
     row = rows[n - 1]
     with _db() as conn:
@@ -2758,8 +2759,8 @@ def delete_slip_by_index(event, group_id, n):
         conn.commit()
     amt = f"{float(row['amount'] or 0):,.2f}"
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
-        text=f"🗑️ ลบรายการที่ {n} แล้ว: {row['sender'] or '?'} | {amt} บาท\n"
-             "─────────────────\n" + build_daily_report(group_id)))
+        text=f"🗑️ ลบรายการที่ {n} ({when}) แล้ว: {row['sender'] or '?'} | {amt} บาท\n"
+             "─────────────────\n" + build_daily_report(group_id, d)))
 
 
 def add_manual_slip(event, group_id, amount: float, note: str = None, slip_date: str = None):
@@ -2915,6 +2916,7 @@ def build_help(group_id: str) -> str:
             "• เพิ่มสลิป 114 → กรอกยอดเองเมื่อบอทอ่านรูปไม่ออก",
             "  (ย้อนวัน: เพิ่มสลิปเมื่อวาน 114 / เพิ่มสลิป 6/6 114)",
             "• ลบล่าสุด / ลบ 3 → ลบสลิป (เลขดูจาก 'สรุป')",
+            "• ลบ 29/6 3 / ลบเมื่อวาน 3 → ลบสลิปย้อนวัน (เลขดูจาก 'สรุป 2026-06-29')",
             "• ล้างวันนี้ → ล้างสลิปวันนี้ทั้งหมด (มีปุ่มยืนยัน)",
             "",
         ]
@@ -2992,6 +2994,7 @@ def build_manual(group_id: str) -> str:
             "• เพิ่มสลิป 114 → กรอกยอดเอง (ใช้ตอนบอทอ่านรูปไม่ออก เช่น ถ่ายจอเบลอ/มืด) ใส่โน๊ตได้: เพิ่มสลิป 114 โต๊ะ5\n"
             "   ย้อนวัน (กรณีเคลียร์ยอดหลังเที่ยงคืน): เพิ่มสลิปเมื่อวาน 114 หรือ เพิ่มสลิป 6/6 114\n"
             "• ลบล่าสุด / ลบ 3 → ลบสลิป (เลขดูจาก 'สรุป')\n"
+            "• ลบ 29/6 3 / ลบเมื่อวาน 3 → ลบสลิปย้อนวัน\n"
             "• ล้างวันนี้ → ล้างสลิปวันนี้ทั้งหมด (มีปุ่มยืนยัน)\n"
             "⏰ บอทส่งสรุปสลิปเมื่อวานให้เองทุก 00:30"
         )
@@ -3218,6 +3221,22 @@ def handle_text(event):
             arg = text[2:].strip()
             if arg in ("ล่าสุด", "ใบล่าสุด"):
                 delete_latest_slip(event, group_id)
+                return
+            # ลบย้อนวัน: "ลบ 29/6 26" (วัน/เดือน เลขรายการ) | "ลบเมื่อวาน 26"
+            if arg.startswith("เมื่อวาน"):
+                rest = arg[len("เมื่อวาน"):].strip()
+                if rest.isdigit():
+                    y = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+                    delete_slip_by_index(event, group_id, int(rest), slip_date=y)
+                    return
+            dm = re.match(r"^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s+(\d+)$", arg)
+            if dm:
+                d = _parse_thai_date(dm.group(1))
+                if d is None:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                        text="❌ วันที่ไม่ถูก เช่น: ลบ 29/6 26 (วัน/เดือน เลขรายการ)"))
+                    return
+                delete_slip_by_index(event, group_id, int(dm.group(2)), slip_date=d)
                 return
             if arg.isdigit():
                 delete_slip_by_index(event, group_id, int(arg))
