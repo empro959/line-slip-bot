@@ -473,6 +473,9 @@ def extract_slip_info(image_bytes: bytes, retry: bool = False, dining: bool = Fa
         "(เช่น SAI YANG SOI 4) — ⚠️ ห้ามเอาชื่อคนฝั่ง 'จาก/ผู้จ่าย' (เช่น นาย...) มาเป็น receiver เด็ดขาด; "
         "receiver_account = 'รหัสร้านค้า' (เช่น KB000001944107) ถ้ามี\n"
         "receiver_account: เลขบัญชีปลายทาง/ผู้รับ (ตามที่เห็น แม้ถูกปิดบางส่วน เช่น xxx-x-x4818-x ก็ใส่)\n"
+        "ref_number: ใช้ 'รหัสอ้างอิง/เลขที่รายการ' ที่ 'ไม่ซ้ำต่อรายการ' (เลขยาวสุ่ม เช่น 202606235fy5l3i8dHouzVOLz หรือ C20260624617516105918)\n"
+        "  ⚠️ สลิป 'จ่ายบิล/ชำระร้านค้า' (Krungthai/KBank): 'ห้าม' ใช้ 'รหัสธุรกรรม/รหัสร้านค้า' (เช่น EMPKB000001944107005, KB000001944107) เป็น ref_number เด็ดขาด — "
+        "พวกนี้เป็นรหัสของ 'ร้าน' ซ้ำทุกใบทุกคน (ลูกค้าทุกคนได้เลขนี้เหมือนกัน) → ให้ใช้ 'รหัสอ้างอิง' ที่ไม่ซ้ำแทน; ถ้าหาเลขที่ไม่ซ้ำไม่เจอให้ null\n"
         "bank: ธนาคาร 'ปลายทาง/ผู้รับเงิน' (ฝั่ง 'ไปยัง') เท่านั้น — ⚠️ ห้ามใส่ธนาคารของผู้โอน/ต้นทาง\n"
         "cropped: true ถ้าสลิปถูกตัด/ครอป หรือมีบางส่วนถูกบัง/นิ้วบัง จนข้อมูลสำคัญ (ปลายทาง/ยอดเงิน/เลขอ้างอิง) มองไม่เห็นครบ\n\n"
         "datetime: ดึงวันเวลาจากสลิป แปลงเป็น ค.ศ. รูปแบบ ISO YYYY-MM-DDTHH:MM:SS เสมอ "
@@ -605,13 +608,19 @@ def find_duplicate(group_id: str, info: dict):
     with _db() as conn:
         if ref:
             row = conn.execute(
-                "SELECT amount FROM slips WHERE group_id=? AND ref_number=? ORDER BY id LIMIT 1",
+                "SELECT amount, sender FROM slips WHERE group_id=? AND ref_number=? ORDER BY id LIMIT 1",
                 (group_id, ref)).fetchone()
             if row:
                 prev = float(row["amount"] or 0)
-                if amount and prev and abs(prev - amount) > 0.01:
-                    return ("ref_mismatch", prev)
-                return ("ref", None)
+                # ref เดียวกันแต่ 'คนละผู้โอน' = มักเป็นรหัสร้านค้า/รหัสธุรกรรมที่ซ้ำทุกใบ
+                # (เช่น จ่ายบิล Krungthai/KBank รหัส EMPKB...ของร้าน) ลูกค้าหลายคนได้รหัสเดียวกัน
+                # → ไม่ใช่สลิปซ้ำ/ตัดต่อ ข้ามไป (กัน false positive ปฏิเสธเงินลูกค้าจริง)
+                cur_s, prev_s = (info.get("sender") or "").strip(), (row["sender"] or "").strip()
+                diff_sender = cur_s and prev_s and _norm_match_text(cur_s) != _norm_match_text(prev_s)
+                if not diff_sender:
+                    if amount and prev and abs(prev - amount) > 0.01:
+                        return ("ref_mismatch", prev)
+                    return ("ref", None)
         if amount and dt:
             if conn.execute(
                 "SELECT 1 FROM slips WHERE group_id=? AND amount=? AND slip_datetime=? LIMIT 1",
