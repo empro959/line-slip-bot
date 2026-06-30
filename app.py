@@ -2436,9 +2436,37 @@ def _touch_reminded(resv_id: int, when: str):
         conn.commit()
 
 
+def _resv_remind_due(r: dict, now, interval_min: int) -> bool:
+    """จองนี้ถึงเวลาย้ำเตือนไหม
+    ⏰ เตือนเฉพาะจองที่ 'ถึงวันงานแล้ว' (resv_date = วันนี้) — จองล่วงหน้าที่ยังไม่ถึงวัน/เลยวันไปแล้ว = ไม่เตือน (ทุกกลุ่ม)
+    - จองวันนี้ที่สร้างวันนี้: ตื๊อจำกัด RESV_NAG_MAX_HOURS จากตอนสร้าง (กันตื๊อไม่จบ)
+    - จองล่วงหน้าที่ 'เพิ่งถึงวัน' (สร้างวันก่อน): ตื๊อได้ตลอดวันงานจนคอนเฟิร์ม"""
+    notify = r.get("notify_group_id")
+    if not notify or notify in IGNORE_GROUPS or _group_left(notify):
+        return False
+    today = now.date().isoformat()
+    try:
+        last_dt    = datetime.strptime(r.get("reminded_at") or r.get("created_at"), "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+        created_dt = datetime.strptime(r.get("created_at"), "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+    except Exception:
+        return False
+    rd = r.get("resv_date")
+    if rd:
+        if rd != today:                       # อนาคต (ยังไม่ถึง) / อดีต (เลยวัน) → ไม่เตือน
+            return False
+    elif created_dt.date() != now.date():      # จองไม่ระบุวัน + ไม่ได้แจ้งวันนี้ = ค้างเก่า → ข้าม
+        return False
+    if created_dt.date() == now.date() and RESV_NAG_MAX_HOURS \
+            and (now - created_dt).total_seconds() > RESV_NAG_MAX_HOURS * 3600:
+        return False
+    if (now - last_dt).total_seconds() < interval_min * 60:
+        return False
+    return True
+
+
 def _reservation_reminder_loop():
-    """แจ้งเตือนการจองที่ยัง PENDING ซ้ำในกลุ่มที่ส่งการ์ดไว้
-    ทุก 5 นาทีช่วง 18:00–22:00 / ทุก 15 นาทีเวลาอื่น จนกว่าจะคอนเฟิร์ม (หรือเกิน RESV_NAG_MAX_HOURS)"""
+    """แจ้งเตือนการจองที่ยัง PENDING ซ้ำในกลุ่มที่ส่งการ์ดไว้ — เฉพาะจองที่ถึงวันงานแล้ว
+    ทุก 5 นาทีช่วง 18:00–22:00 / ทุก 15 นาทีเวลาอื่น จนกว่าจะคอนเฟิร์ม"""
     while True:
         time.sleep(60)
         try:
@@ -2451,23 +2479,9 @@ def _reservation_reminder_loop():
             except Exception:
                 continue   # storage ยังไม่พร้อม → ข้ามรอบนี้
             for r in rows:
+                if not _resv_remind_due(r, now, interval):
+                    continue
                 notify = r.get("notify_group_id")
-                if not notify:
-                    continue
-                if notify in IGNORE_GROUPS or _group_left(notify):
-                    continue   # กลุ่มที่สั่งเมิน/บอทถูกเตะออก → ไม่ย้ำเตือน
-                last = r.get("reminded_at") or r.get("created_at")
-                created = r.get("created_at")
-                try:
-                    last_dt    = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
-                    created_dt = datetime.strptime(created, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
-                except Exception:
-                    continue
-                # เกินเวลาตามตื๊อ → หยุดแจ้ง (กันแจ้งไม่รู้จบ)
-                if RESV_NAG_MAX_HOURS and (now - created_dt).total_seconds() > RESV_NAG_MAX_HOURS * 3600:
-                    continue
-                if (now - last_dt).total_seconds() < interval * 60:
-                    continue
                 try:
                     line_bot_api.push_message(notify, [
                         TextSendMessage(text=f"⏰ ย้ำเตือน: การจอง #{r['id']} ยังไม่มีใครคอนเฟิร์ม!\n"
