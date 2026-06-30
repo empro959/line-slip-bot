@@ -2438,9 +2438,9 @@ def _touch_reminded(resv_id: int, when: str):
 
 def _resv_remind_due(r: dict, now, interval_min: int) -> bool:
     """จองนี้ถึงเวลาย้ำเตือนไหม
-    ⏰ เตือนเฉพาะจองที่ 'ถึงวันงานแล้ว' (resv_date = วันนี้) — จองล่วงหน้าที่ยังไม่ถึงวัน/เลยวันไปแล้ว = ไม่เตือน (ทุกกลุ่ม)
-    - จองวันนี้ที่สร้างวันนี้: ตื๊อจำกัด RESV_NAG_MAX_HOURS จากตอนสร้าง (กันตื๊อไม่จบ)
-    - จองล่วงหน้าที่ 'เพิ่งถึงวัน' (สร้างวันก่อน): ตื๊อได้ตลอดวันงานจนคอนเฟิร์ม"""
+    ⏰ เตือนซ้ำเฉพาะ 'จองวันนี้' (จองสดวันนี้ = สร้างวันนี้ + เป็นของวันนี้) เท่านั้น
+    จองล่วงหน้า = ไม่เตือนซ้ำเลย (แม้ถึงวันงาน) — ดูในรายงานสรุปจอง 16:00 พอ
+    จองวันนี้ตื๊อจำกัด RESV_NAG_MAX_HOURS จากตอนสร้าง (กันตื๊อไม่จบ)"""
     notify = r.get("notify_group_id")
     if not notify or notify in IGNORE_GROUPS or _group_left(notify):
         return False
@@ -2450,14 +2450,12 @@ def _resv_remind_due(r: dict, now, interval_min: int) -> bool:
         created_dt = datetime.strptime(r.get("created_at"), "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
     except Exception:
         return False
+    if created_dt.date() != now.date():
+        return False                          # สร้างวันก่อน = จองล่วงหน้า → ไม่เตือนซ้ำ (ดูรายงานพอ)
     rd = r.get("resv_date")
-    if rd:
-        if rd != today:                       # อนาคต (ยังไม่ถึง) / อดีต (เลยวัน) → ไม่เตือน
-            return False
-    elif created_dt.date() != now.date():      # จองไม่ระบุวัน + ไม่ได้แจ้งวันนี้ = ค้างเก่า → ข้าม
-        return False
-    if created_dt.date() == now.date() and RESV_NAG_MAX_HOURS \
-            and (now - created_dt).total_seconds() > RESV_NAG_MAX_HOURS * 3600:
+    if rd and rd != today:
+        return False                          # สร้างวันนี้แต่เป็นจองล่วงหน้า (เพื่อวันอื่น) → ไม่เตือนซ้ำ
+    if RESV_NAG_MAX_HOURS and (now - created_dt).total_seconds() > RESV_NAG_MAX_HOURS * 3600:
         return False
     if (now - last_dt).total_seconds() < interval_min * 60:
         return False
