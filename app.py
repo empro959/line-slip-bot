@@ -2182,6 +2182,34 @@ def get_display_name(source) -> str:
         return "ไม่ทราบชื่อ"
 
 
+def _reply_with_mention(event, body: str):
+    """ตอบกลับพร้อม @mention 'คนที่พิมพ์' (กดได้/เด้งเตือน) ผ่าน LINE v3 (textV2 + mention)
+    ถ้าพลาด → fallback เป็นข้อความธรรมดา (ใส่ @ชื่อ นำหน้า) เพื่อให้ข้อความถึงเสมอ"""
+    uid = getattr(event.source, "user_id", None)
+    if uid:
+        try:
+            from linebot.v3.messaging import (Configuration, ApiClient, MessagingApi,
+                ReplyMessageRequest, TextMessageV2, MentionSubstitutionObject, UserMentionTarget)
+            with ApiClient(Configuration(access_token=LINE_TOKEN)) as _api:
+                MessagingApi(_api).reply_message(ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessageV2(
+                        text="{u} " + body,
+                        substitution={"u": MentionSubstitutionObject(
+                            type="mention",
+                            mentionee=UserMentionTarget(type="user", user_id=uid))})]))
+            return
+        except Exception as e:
+            print(f"[resv] v3 mention reply พลาด → fallback ข้อความธรรมดา: {e}", flush=True)
+    # fallback: ข้อความธรรมดา (อาจไม่ใช่ mention จริง แต่ใส่ชื่อให้เห็นว่าเรียกใคร)
+    try:
+        name = get_display_name(event.source)
+        prefix = f"@{name}\n" if name and name != "ไม่ทราบชื่อ" else ""
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=prefix + body))
+    except Exception as e:
+        print(f"[resv] fallback reply พลาด: {e}", flush=True)
+
+
 _TH_WD = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
 _TH_MON = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
 
@@ -2348,9 +2376,10 @@ def handle_reservation_text(event, text: str, group_id: str):
     if not info.get("table"):     missing.append("4. โซน")
     if missing:
         print(f"[resv] ข้อมูลไม่ครบ ขาด {missing} → ถามกลับ", flush=True)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text="📝 ขอข้อมูลจองเพิ่มครับ ยังขาด:\n" + "\n".join(missing) +
-                 "\n\nรบกวนแจ้งใหม่ให้ครบ: ชื่อ / จำนวนคน / วันเวลา / โซน"))
+        body = ("📝 ขอข้อมูลจองเพิ่มครับ ยังขาด:\n" + "\n".join(missing) +
+                "\n\nรบกวนแจ้งใหม่ให้ครบ: ชื่อ / จำนวนคน / วันเวลา / โซน"
+                "\n📖 กรุณาอ่านคู่มือและทำให้ถูกต้องด้วย")
+        _reply_with_mention(event, body)
         return True
 
     # ── เช็คเวลาจองอยู่ในเวลาเปิดร้าน (11:00–00:00) ไหม — นอกเวลาแค่ 'เตือน' ไม่บล็อก ──
