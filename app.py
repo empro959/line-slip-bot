@@ -327,14 +327,16 @@ def init_db():
                 collected   INTEGER DEFAULT 0
             )
         """)
-        # migration: collected ให้ตาราง dining_pairs ที่สร้างก่อนมีคอลัมน์นี้
-        if USE_PG:
-            conn.execute("ALTER TABLE dining_pairs ADD COLUMN IF NOT EXISTS collected INTEGER DEFAULT 0")
-        else:
-            try:
-                conn.execute("ALTER TABLE dining_pairs ADD COLUMN collected INTEGER DEFAULT 0")
-            except Exception:
-                pass
+        # migration: collected + slip_id ให้ตาราง dining_pairs ที่สร้างก่อนมีคอลัมน์นี้
+        # slip_id = id แถวใน slips ของสลิปคู่นี้ (ไว้ให้ปุ่ม 'บอทอ่านผิด' แก้ยอดในตาราง slips ได้)
+        for _dcol in ("collected INTEGER DEFAULT 0", "slip_id INTEGER"):
+            if USE_PG:
+                conn.execute(f"ALTER TABLE dining_pairs ADD COLUMN IF NOT EXISTS {_dcol}")
+            else:
+                try:
+                    conn.execute(f"ALTER TABLE dining_pairs ADD COLUMN {_dcol}")
+                except Exception:
+                    pass
         # นับรูปที่รับเข้ามาแต่ "ไม่ได้บันทึกเป็นสลิป" (อ่านไม่ออก/ไม่ใช่สลิป/error) ไว้กระทบยอดในรายงาน
         conn.execute(f"""
             CREATE TABLE IF NOT EXISTS image_misses (
@@ -754,7 +756,7 @@ def save_slip(group_id: str, info: dict, verdict_status: str, message_id: str = 
     today       = slip_date or datetime.now(TZ).date().isoformat()
     recorded_at = datetime.now(TZ).strftime("%H:%M:%S")
     with _db() as conn:
-        conn.execute(
+        rid = conn.insert_returning_id(
             "INSERT INTO slips (group_id, slip_date, sender, amount, bank, ref_number, slip_datetime, verdict, recorded_at, account_label, message_id) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (group_id, today, info.get("sender"), float(info.get("amount") or 0),
@@ -763,6 +765,7 @@ def save_slip(group_id: str, info: dict, verdict_status: str, message_id: str = 
         )
         conn.execute("INSERT INTO groups (group_id) VALUES (?) ON CONFLICT DO NOTHING", (group_id,))
         conn.commit()
+    return rid
 
 
 def _slip_message_seen(group_id: str, message_id: str) -> bool:
@@ -983,24 +986,32 @@ def _dining_after_slip(group_id: str, info: dict, slip_date: str = None):
         if bill_amt is None:
             return None   # ไม่มีบิลให้เทียบ (เช่น หลังเที่ยงคืน/จ่ายสด) → บันทึกสลิปเฉยๆ
         diff = round(slip_amt - bill_amt, 2)
-        bal  = round(_dining_balance(group_id) + diff, 2)
-        _dining_set_balance(group_id, bal)
         with _db() as conn:
             pair_id = conn.insert_returning_id(
-                "INSERT INTO dining_pairs (group_id, pair_date, table_no, bill_amount, slip_amount, diff, recorded_at, source, collected) "
-                "VALUES (?,?,?,?,?,?,?,?,0)",
+                "INSERT INTO dining_pairs (group_id, pair_date, table_no, bill_amount, slip_amount, diff, recorded_at, source, collected, slip_id) "
+                "VALUES (?,?,?,?,?,?,?,?,0,?)",
                 (group_id, today, table_no, bill_amt, slip_amt, diff,
-                 datetime.now(TZ).strftime("%H:%M:%S"), source))
+                 datetime.now(TZ).strftime("%H:%M:%S"), source, info.get("_slip_id")))
             conn.commit()
+        tbl = f"โต๊ะ {table_no}" if table_no else "บิลนี้"
         if diff <= -DINING_SHORT_BAHT:
-            tbl = f"โต๊ะ {table_no}" if table_no else "บิลนี้"
+            # โอนขาด → หักออกจากยอดสะสมทันที + ปุ่มเก็บส่วนต่าง
+            bal = round(_dining_balance(group_id) + diff, 2)
+            _dining_set_balance(group_id, bal)
             note = (f"⚠️ โอนขาด! {tbl}\n─────────────────\n"
                     f"บิล {bill_amt:,.2f} / โอน {slip_amt:,.2f}\n"
                     f"ขาด {abs(diff):,.2f} บาท\n"
                     f"ยอดสะสมทริป: {bal:+,.2f} บาท\n"
                     f"👇 เก็บส่วนต่างจากลูกค้าแล้ว กดปุ่มเคลียร์โต๊ะนี้")
-            return {"note": note, "pair_id": pair_id, "table_no": table_no, "short": abs(diff)}
-        return None   # โอนเกิน/พอดี → เงียบ (สะสมไว้แล้ว)
+            return {"kind": "under", "note": note, "pair_id": pair_id, "table_no": table_no, "short": abs(diff)}
+        if diff >= DINING_SHORT_BAHT:
+            # โอนเกิน → 'ยังไม่' เก็บเข้าทริป รอพนักงานยืนยันว่าเกินจริงหรือบอทอ่านผิด
+            note = (f"⚠️ โอนเกิน! {tbl}\n─────────────────\n"
+                    f"บิล {bill_amt:,.2f} / โอน {slip_amt:,.2f}\n"
+                    f"เกิน {diff:,.2f} บาท\n"
+                    f"👇 ลูกค้าโอนเกินจริง หรือ บอทอ่านผิด?")
+            return {"kind": "over", "note": note, "pair_id": pair_id, "table_no": table_no, "over": diff}
+        return None   # พอดี → เงียบ
     except Exception as e:
         print(f"[dining] match error group={group_id}: {e}", flush=True)
         return None
@@ -1012,10 +1023,11 @@ def _dining_compare_and_push(group_id: str, info: dict):
         res = _dining_after_slip(group_id, info)
         if not res:
             return
-        line_bot_api.push_message(group_id, [
-            TextSendMessage(text=res["note"]),
-            _dining_clear_card(res["pair_id"], res["table_no"], res["short"]),
-        ])
+        if res["kind"] == "over":
+            card = _dining_over_card(res["pair_id"], res["table_no"], res["over"])
+        else:
+            card = _dining_clear_card(res["pair_id"], res["table_no"], res["short"])
+        line_bot_api.push_message(group_id, [TextSendMessage(text=res["note"]), card])
     except Exception as e:
         if _is_not_member_error(e):
             _mark_group_left(group_id)
@@ -1131,6 +1143,73 @@ def _dining_clear_pair(event, group_id: str, pair_id: int):
         text=(f"✅ เคลียร์ {tbl} แล้ว (โดย {confirmer})\n"
               f"เก็บส่วนต่าง +{abs(diff):,.2f} บาท\n"
               f"ยอดสะสมคงเหลือ: {bal:+,.2f} บาท")))
+
+
+def _dining_over_card(pair_id, table_no, over) -> TemplateSendMessage:
+    """การ์ดยืนยัน 'โอนเกิน' — ให้พนักงานเลือก: เกินจริง(เก็บทริป) / บอทอ่านผิด(ใช้ยอดบิล)"""
+    tbl = f"โต๊ะ {table_no}" if table_no else "บิลนี้"
+    return TemplateSendMessage(
+        alt_text=f"ยืนยันโอนเกิน {tbl}",
+        template=ButtonsTemplate(
+            title=f"โอนเกิน {tbl}",
+            text=f"เกิน {over:,.2f} บาท — ลูกค้าโอนเกินจริง หรือบอทอ่านผิด?",
+            actions=[
+                PostbackAction(label="✅ โอนเกินจริง (เก็บทริป)", data=f"dining_over_keep:{pair_id}"),
+                PostbackAction(label="🔧 บอทอ่านผิด (ใช้ยอดบิล)", data=f"dining_over_fix:{pair_id}"),
+            ],
+        ),
+    )
+
+
+def _dining_over_keep(event, group_id: str, pair_id: int):
+    """พนักงานยืนยัน 'ลูกค้าโอนเกินจริง' → เก็บส่วนเกินเข้ายอดสะสมทริป"""
+    with _db() as conn:
+        row = conn.execute("SELECT table_no, diff, collected FROM dining_pairs WHERE id=? AND group_id=?",
+                           (pair_id, group_id)).fetchone()
+        if not row:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ ไม่พบรายการนี้แล้ว")); return
+        if row["collected"]:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ รายการนี้ยืนยันไปแล้ว ไม่ต้องกดซ้ำครับ")); return
+        conn.execute("UPDATE dining_pairs SET collected=1 WHERE id=?", (pair_id,))
+        conn.commit()
+    diff = float(row["diff"])   # บวก (เกิน)
+    bal  = round(_dining_balance(group_id) + diff, 2)
+    _dining_set_balance(group_id, bal)
+    confirmer = get_display_name(event.source)
+    tbl = f"โต๊ะ {row['table_no']}" if row["table_no"] else "บิลนี้"
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+        text=(f"✅ {tbl} โอนเกินจริง — เก็บเข้าทริป +{diff:,.2f} บาท (โดย {confirmer})\n"
+              f"ยอดสะสมทริป: {bal:+,.2f} บาท")))
+
+
+def _dining_over_fix(event, group_id: str, pair_id: int):
+    """พนักงานยืนยัน 'บอทอ่านผิด' → แก้ยอดสลิปในตาราง slips ให้เท่ายอดบิล (ยอดรับถูกต้อง)"""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT table_no, diff, bill_amount, slip_amount, slip_id, collected FROM dining_pairs WHERE id=? AND group_id=?",
+            (pair_id, group_id)).fetchone()
+        if not row:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ ไม่พบรายการนี้แล้ว")); return
+        if row["collected"]:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ รายการนี้แก้ไปแล้ว ไม่ต้องกดซ้ำครับ")); return
+        conn.execute("UPDATE dining_pairs SET collected=1, diff=0 WHERE id=?", (pair_id,))
+        fixed = False
+        if row["slip_id"]:
+            conn.execute("UPDATE slips SET amount=? WHERE id=? AND group_id=?",
+                         (float(row["bill_amount"]), row["slip_id"], group_id))
+            fixed = True
+        conn.commit()
+    confirmer = get_display_name(event.source)
+    tbl = f"โต๊ะ {row['table_no']}" if row["table_no"] else "บิลนี้"
+    diff = float(row["diff"] or 0)
+    if fixed:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=(f"🔧 แก้ยอด {tbl} เป็น {float(row['bill_amount']):,.2f} บาท (ตามบิล) แล้ว (โดย {confirmer})\n"
+                  f"ยอดรับลดลง {diff:,.2f} บาท จากที่บอทอ่านเกิน — ไม่เก็บเข้าทริป")))
+    else:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=(f"🔧 {tbl}: รับทราบว่าบอทอ่านผิด — แต่หาสลิปต้นทางไม่เจอ\n"
+                  f"รบกวนแก้ยอดเองด้วย: ลบใบนี้แล้ว 'เพิ่มสลิป {float(row['bill_amount']):,.0f}'")))
 
 
 def _dining_confirm_card() -> TemplateSendMessage:
@@ -2750,7 +2829,7 @@ def _process_image_event(event):
                 return
             dup_type, prev_amount = find_duplicate(group_id, info)
             verdict  = build_verdict(info, promptpay, dup_type, prev_amount)
-            save_slip(group_id, info, verdict["status"], message_id=msg_id)
+            info["_slip_id"] = save_slip(group_id, info, verdict["status"], message_id=msg_id)
 
         # สลิปผ่าน (PASS) → เงียบไว้ ไม่รกแชท (ยังบันทึกไว้ ดูรวมได้ที่ "สรุป")
         # เตือนในกรุ๊ปเฉพาะที่มีปัญหา (WARN/FAIL) — ตอบทันทีด้วย reply
@@ -2976,7 +3055,8 @@ def build_help(group_id: str) -> str:
             "🧾 กระทบบิล-สลิป (โอนขาด/เกิน)",
             "• ส่งรูปบิลร้าน + สลิปโอน → บอทเทียบยอดให้",
             "  (รูปเดียวกัน=แม่นสุด / แยกรูปก็ได้ จับคู่ตามเวลา)",
-            "• โอนเกิน = สะสมยอดทริป | โอนขาด = เตือน + ปุ่มเคลียร์โต๊ะนั้น",
+            "• โอนขาด = เตือน + ปุ่มเก็บส่วนต่าง | โอนเกิน = เตือน + ปุ่มยืนยัน",
+            "  (โอนเกิน เลือก: ✅ เกินจริง→เก็บทริป / 🔧 บอทอ่านผิด→ใช้ยอดบิล)",
             "• เก็บส่วนต่างครบ → กดปุ่ม ✅ เก็บครบแล้ว ใต้ข้อความเตือน (ตัดยอดโต๊ะนั้น)",
             "• ยอดสะสม → ดูยอด + โต๊ะที่ยังไม่เคลียร์ (มีปุ่มปิดยอดทริป)",
             "• เก็บครบแล้ว → ปิดยอดทั้งทริป รีเซ็ตเป็น 0 (ใช้ตอนสิ้นวัน)",
@@ -3364,6 +3444,22 @@ def handle_postback(event):
                 _dining_clear_pair(event, g, pair_id)   # เก็บส่วนต่างครบ → เคลียร์เฉพาะโต๊ะนั้น
         except Exception as e:
             print(f"[dining] clear button error: {e}", flush=True)
+    elif action in ("dining_over_keep", "dining_over_fix"):
+        try:
+            pair_id = int(parts[1])
+        except (IndexError, ValueError):
+            return
+        if not _postback_once(f"pb:{data}"):
+            _already("⚠️ รายการนี้ยืนยันไปแล้ว ไม่ต้องกดซ้ำครับ"); return
+        try:
+            g = getattr(event.source, "group_id", event.source.user_id)
+            if _dining_enabled(g):
+                if action == "dining_over_keep":
+                    _dining_over_keep(event, g, pair_id)   # โอนเกินจริง → เก็บเข้าทริป
+                else:
+                    _dining_over_fix(event, g, pair_id)    # บอทอ่านผิด → ใช้ยอดบิล
+        except Exception as e:
+            print(f"[dining] over button error: {e}", flush=True)
     elif action == "dining_confirm":
         if not _postback_once(f"pb:{data}"):
             _already(); return
