@@ -2157,11 +2157,12 @@ def maybe_send_resv_summary():
         if not targets:
             _set_meta("last_resv_summary_date", today)
             return
-        # สรุปจอง 'วันนี้ + ล่วงหน้า' รวมในรอบเดียว 16:00 (จองล่วงหน้าย้ายมาจาก 00:30) — ไม่มีจองเลย = ไม่ส่ง (ประหยัด)
-        text = build_resv_summary(None, "📋 สรุปการจอง (วันนี้ + ล่วงหน้า) 16:00", upcoming=True, skip_if_empty=True)
+        # สรุปจอง 'เฉพาะวันนี้' รอบ 16:00 — จองล่วงหน้าแจ้งเฉพาะวันงาน (จะโผล่เมื่อ resv_date = วันนี้)
+        # ดูจองล่วงหน้าเมื่อไหร่ก็ได้ด้วยคำสั่ง 'สรุปจอง' (upcoming) ; ไม่มีจองวันนี้ = ไม่ส่ง (ประหยัด)
+        text = build_resv_summary(None, "📋 สรุปการจองวันนี้ (16:00)", skip_if_empty=True)
         if text is None:
             _set_meta("last_resv_summary_date", today)
-            print("[resv-summary] วันนี้ไม่มีจอง/ล่วงหน้า — ไม่ส่ง (ประหยัด)", flush=True)
+            print("[resv-summary] วันนี้ไม่มีจอง — ไม่ส่ง (ประหยัด)", flush=True)
             return
         failed = 0
         # idempotent รายกลุ่ม: กลุ่มที่ส่งสำเร็จแล้ววันนี้จะไม่ส่งซ้ำ แม้กลุ่มอื่นพลาดแล้วต้อง retry
