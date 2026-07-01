@@ -15,7 +15,7 @@ from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (
     MessageEvent, ImageMessage, TextMessage, TextSendMessage,
     PostbackEvent, TemplateSendMessage, ButtonsTemplate, PostbackAction,
-    LeaveEvent, JoinEvent,
+    LeaveEvent, JoinEvent, UnsendEvent,
 )
 from google import genai
 from google.genai import types
@@ -3161,6 +3161,36 @@ def handle_leave(event):
     gid = getattr(event.source, "group_id", None) or getattr(event.source, "room_id", None)
     if gid:
         _mark_group_left(gid)
+
+
+@handler.add(UnsendEvent)
+def handle_unsend(event):
+    """มีคน 'ยกเลิกข้อความ (unsend)' รูปในกลุ่ม → ถอดสลิป/บิลที่บันทึกจากรูปนั้นออก
+    กันเงินผี: ผู้ส่งเรียกคืนสลิปหลังบอทนับไปแล้ว (รูปหายจากแชท แต่ยอดยังค้าง)"""
+    gid = getattr(event.source, "group_id", None) or getattr(event.source, "room_id", None)
+    mid = getattr(getattr(event, "unsend", None), "message_id", None)
+    if not gid or not mid:
+        return
+    removed_amt = None
+    try:
+        with _db() as conn:
+            srow = conn.execute("SELECT id, amount FROM slips WHERE group_id=? AND message_id=?",
+                                (gid, mid)).fetchone()
+            if srow:
+                conn.execute("DELETE FROM slips WHERE id=?", (srow["id"],))
+                removed_amt = float(srow["amount"] or 0)
+            conn.execute("DELETE FROM dining_bills WHERE group_id=? AND message_id=?", (gid, mid))
+            conn.commit()
+    except Exception as e:
+        print(f"[unsend] cleanup error group={gid} msg={mid}: {e}", flush=True)
+        return
+    if removed_amt is not None:
+        print(f"[unsend] ถอดสลิปที่ถูกยกเลิก {removed_amt:,.2f} group={gid}", flush=True)
+        try:
+            line_bot_api.push_message(gid, TextSendMessage(
+                text=f"↩️ มีการยกเลิกรูปสลิป — ถอดยอด {removed_amt:,.2f} บาท ออกจากรายรับแล้ว (กันนับเงินผี)"))
+        except Exception:
+            pass
 
 
 @handler.add(JoinEvent)
