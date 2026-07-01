@@ -108,6 +108,19 @@ TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler      = WebhookHandler(LINE_SECRET)
+# ── Failover หลาย LINE OA เพื่อประหยัดค่าโควต้า push ────────────────────────────
+# reply ฟรีไม่นับโควต้า (ผูก reply_token) — แต่ push/broadcast กินโควต้าฟรีเดือนละ ~300 ข้อความ/OA
+# แนวคิด: ใช้ OA1 (ตัวหลัก รับ event+reply) จนใกล้เต็มโควต้าเดือนนี้ แล้วสลับ push ไป OA2, OA3, ... อัตโนมัติ
+#   → ไม่ต้องบีบให้อยู่ใต้ 300 (เดี๋ยวข้อความตกหล่น) และไม่ต้องจ่ายแพ็กเกจเสียเงิน
+# OA สำรองต้อง: (1) เชิญเข้าทุกกลุ่มเหมือน OA1 (2) ปิด auto-reply + ปิด webhook (ตัวสำรอง push อย่างเดียว)
+# ตั้ง token สำรองใน env: LINE_CHANNEL_ACCESS_TOKEN_2, _3, _4, _5 — ใส่แค่ตัวไหนก็เปิดใช้ตัวนั้นทันที
+PUSH_FREE_LIMIT = int(os.environ.get("PUSH_FREE_LIMIT", "300"))  # โควต้า push ฟรี/เดือน/OA (ไทย ~300) ถึงเกณฑ์นี้แล้วสลับ OA ถัดไป
+_push_apis = [line_bot_api]        # index 0 = OA1 (ตัวหลัก)
+for _i in range(2, 6):             # รองรับ OA2..OA5
+    _tok2 = os.environ.get(f"LINE_CHANNEL_ACCESS_TOKEN_{_i}")
+    if _tok2:
+        _push_apis.append(LineBotApi(_tok2))
+_push_lock = threading.Lock()      # กัน race นับโควต้าจากหลาย thread (background jobs + handlers)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 # โมเดลสำหรับ 'อ่านซ้ำ' เมื่อรอบแรกอ่านไม่ออก — ใช้ตัวเก่งขึ้น (pro) เฉพาะใบยาก กู้สลิปที่ flash แพ้
 GEMINI_MODEL_RETRY = os.environ.get("GEMINI_MODEL_RETRY", "gemini-2.5-pro")
@@ -1036,7 +1049,7 @@ def _dining_compare_and_push(group_id: str, info: dict):
             card = _dining_over_card(res["pair_id"], res["table_no"], res["over"])
         else:
             card = _dining_clear_card(res["pair_id"], res["table_no"], res["short"])
-        line_bot_api.push_message(group_id, [TextSendMessage(text=res["note"]), card])
+        _push(group_id, [TextSendMessage(text=res["note"]), card])
     except Exception as e:
         if _is_not_member_error(e):
             _mark_group_left(group_id)
@@ -1375,7 +1388,7 @@ def _payable_send(event, source_group: str, dest_group: str, text: str):
         # reply token หมดอายุ/ใช้แล้ว (เช่นประมวลผลนาน) → fallback push เข้ากลุ่มที่ส่งเอง กันยืนยันหาย
         print(f"[payable] reply ไม่สำเร็จ src={source_group}: {e} — ลอง push สำรอง", flush=True)
         try:
-            line_bot_api.push_message(source_group, TextSendMessage(text=text))
+            _push(source_group, TextSendMessage(text=text))
         except Exception as e2:
             print(f"[payable] push สำรองไม่สำเร็จ src={source_group}: {e2}", flush=True)
 
@@ -1673,7 +1686,7 @@ def _payable_push_summary(event, source_group: str, acct: str):
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
                 replied = True
             else:
-                line_bot_api.push_message(grp, TextSendMessage(text=text))
+                _push(grp, TextSendMessage(text=text))
         except Exception as e:
             print(f"[payable] ส่งสรุปไม่สำเร็จ grp={grp}: {e}", flush=True)
 
@@ -1947,7 +1960,7 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         sent, errs = [], []
         for grp, with_total in _payable_report_recipients(acct):
             try:
-                line_bot_api.push_message(grp, TextSendMessage(text=build_payable_ledger(acct, with_total)))
+                _push(grp, TextSendMessage(text=build_payable_ledger(acct, with_total)))
                 sent.append(f"{grp} ({'มียอดรวม' if with_total else 'ไม่มียอดรวม'})")
             except Exception as e:
                 errs.append(f"{grp}: {e}")
@@ -2075,6 +2088,61 @@ def _is_not_member_error(e: Exception) -> bool:
     return isinstance(e, LineBotApiError) and getattr(e, "status_code", None) == 400
 
 
+def _is_quota_error(e: Exception) -> bool:
+    """push โดนปฏิเสธเพราะเต็มโควต้า push รายเดือน (429 / ข้อความมี monthly/limit/quota)
+    ใช้เป็น safety net: ถ้าตัวนับพลาดหรือ OA เต็มก่อนถึง PUSH_FREE_LIMIT → สลับ OA ถัดไปทันที ไม่ให้ตกหล่น"""
+    if not isinstance(e, LineBotApiError) or getattr(e, "status_code", None) != 429:
+        return False
+    msg = (str(getattr(e, "message", "")) + " " + str(getattr(e, "error", "")) + " " + str(e)).lower()
+    return ("monthly" in msg) or ("limit" in msg) or ("quota" in msg) or (msg.strip() == " ")  # 429 มักเป็นเต็มโควต้า
+
+
+def _push_month_key(idx: int) -> str:
+    """คีย์นับโควต้า push รายเดือนต่อ OA — reset เองเมื่อขึ้นเดือนใหม่ (คีย์เปลี่ยน)
+    OA1='push_count:YYYY-MM', OA2='push_count2:YYYY-MM', ..."""
+    mon = datetime.now(TZ).strftime("%Y-%m")
+    suffix = "" if idx == 0 else str(idx + 1)
+    return f"push_count{suffix}:{mon}"
+
+
+def _push_count(idx: int) -> int:
+    try:
+        return int(_get_meta(_push_month_key(idx)) or "0")
+    except (TypeError, ValueError):
+        return 0
+
+
+def _push(to, messages):
+    """ส่ง push แบบ failover หลาย OA — ใช้โควต้าฟรีของแต่ละ OA ให้ครบก่อนค่อยข้ามไปตัวถัดไป
+    - เลือก OA ตัวแรกที่เดือนนี้ยังไม่ถึง PUSH_FREE_LIMIT (นับแยกรายเดือนใน meta)
+    - ส่งสำเร็จ → นับ +จำนวนข้อความ (LINE นับเป็นราย bubble) ให้ OA ตัวนั้น
+    - ถ้า OA ที่เลือกเจอ quota error (429) → มาร์คเต็มแล้วลองตัวถัดไปทันที (กันตกหล่น)
+    - error อื่น (เช่น 400 not-member) → re-raise ให้ call site เดิมจัดการ (mark left / นับ fail) เหมือนเดิม
+    หมายเหตุ: reply_message ยังใช้ OA1 ตรงๆ (ฟรี ไม่ผ่านฟังก์ชันนี้)"""
+    cnt = len(messages) if isinstance(messages, (list, tuple)) else 1
+    n = len(_push_apis)
+    with _push_lock:
+        # เริ่มจาก OA ตัวแรกที่ยังมีโควต้าเหลือ; ถ้าเต็มหมดทุกตัว → ใช้ตัวสุดท้าย (ยอมเกินดีกว่าไม่ส่ง)
+        start = next((i for i in range(n) if _push_count(i) < PUSH_FREE_LIMIT), n - 1)
+        last_err = None
+        for idx in range(start, n):
+            try:
+                _push_apis[idx].push_message(to, messages)
+                _set_meta(_push_month_key(idx), str(_push_count(idx) + cnt))
+                if idx > 0:
+                    print(f"[push] ส่งผ่าน OA{idx+1} (OA ก่อนหน้าเต็มโควต้า) → {to}", flush=True)
+                return
+            except Exception as e:
+                last_err = e
+                if _is_quota_error(e) and idx < n - 1:
+                    _set_meta(_push_month_key(idx), str(PUSH_FREE_LIMIT))  # มาร์คเต็ม กันเลือกซ้ำรอบหน้า
+                    print(f"[push] OA{idx+1} เต็มโควต้า (429) → สลับไป OA{idx+2}", flush=True)
+                    continue
+                raise
+        if last_err:   # ตัวสุดท้ายก็ยังเจอ quota error → re-raise ให้ call site รู้ว่าส่งไม่ได้
+            raise last_err
+
+
 def _report_off(gid: str) -> bool:
     """กลุ่มนี้สั่ง 'ปิดรายงาน' ไว้ไหม — ยังเช็คสลิปปกติ แต่ไม่ส่งรายงานสรุปประจำวัน (00:30)"""
     return _get_meta(f"noreport:{gid}") == "1"
@@ -2115,7 +2183,7 @@ def maybe_send_daily_report():
             if _group_left(dest) or dest in IGNORE_GROUPS:
                 continue
             try:
-                line_bot_api.push_message(dest, TextSendMessage(text=build_daily_report(group_id, yesterday)))
+                _push(dest, TextSendMessage(text=build_daily_report(group_id, yesterday)))
                 _mark_sent("report", today, group_id)
                 print(f"[report] sent OK → {dest}" + (f" (redirect จาก {group_id})" if dest != group_id else ""), flush=True)
             except Exception as e:
@@ -2173,7 +2241,7 @@ def maybe_send_resv_summary():
             if _group_left(dest) or dest in IGNORE_GROUPS:
                 continue
             try:
-                line_bot_api.push_message(dest, TextSendMessage(text=text))
+                _push(dest, TextSendMessage(text=text))
                 _mark_sent("resv_summary", today, g)
                 print(f"[resv-summary] sent → {dest}" + (f" (redirect จาก {g})" if dest != g else ""), flush=True)
             except Exception as e:
@@ -2215,7 +2283,7 @@ def maybe_send_payable_summary():
                 if _already_sent("payable_summary", today, grp):   # idempotent รายกลุ่มผู้รับ
                     continue
                 try:
-                    line_bot_api.push_message(grp, TextSendMessage(text=build_payable_ledger(acct, with_total)))
+                    _push(grp, TextSendMessage(text=build_payable_ledger(acct, with_total)))
                     _mark_sent("payable_summary", today, grp)
                     print(f"[payable-summary] sent → {grp} (acct {acct}, total={with_total})", flush=True)
                 except Exception as e:
@@ -2500,7 +2568,7 @@ def handle_reservation_text(event, text: str, group_id: str):
     if dest == group_id:
         line_bot_api.reply_message(event.reply_token, [detail_msg, confirm_msg])
     else:
-        line_bot_api.push_message(dest, [detail_msg, confirm_msg])
+        _push(dest, [detail_msg, confirm_msg])
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"📤 ส่งจองล่วงหน้า #{resv_id} ไปกลุ่มบาร์น้ำแล้ว รอคอนเฟิร์ม\n─────────────────\n{detail}{time_warn}"))
     return True
@@ -2551,7 +2619,7 @@ def handle_reservation_confirm(event, resv_id: int):
     origin = resv.get("origin_group_id")
     if origin and origin != pressed_group:
         try:
-            line_bot_api.push_message(origin, TextSendMessage(
+            _push(origin, TextSendMessage(
                 text=f"✅ จองล่วงหน้า #{resv_id} ที่แจ้งไว้ บาร์น้ำคอนเฟิร์มแล้ว!\n"
                      f"โดย {confirmer}\n─────────────────\n{detail}"))
         except Exception as e:
@@ -2609,7 +2677,7 @@ def _reservation_reminder_loop():
                     continue
                 notify = r.get("notify_group_id")
                 try:
-                    line_bot_api.push_message(notify, [
+                    _push(notify, [
                         TextSendMessage(text=f"⏰ ย้ำเตือน: การจอง #{r['id']} ยังไม่มีใครคอนเฟิร์ม!\n"
                                              f"─────────────────\n{_resv_detail_lines(r)}"),
                         _resv_confirm_card(r["id"]),
@@ -2690,7 +2758,7 @@ def _check_memory():
     print(f"[mem] ⚠️ RSS สูง {mb:.0f} MB (เกินเกณฑ์ {MEM_WARN_MB:.0f} MB)", flush=True)
     if ADMIN_USER_ID:
         try:
-            line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(
+            _push(ADMIN_USER_ID, TextSendMessage(
                 text=f"⚠️ [SYSTEM] หน่วยความจำบอทสูง: {mb:.0f} MB (ใกล้ลิมิต Render 512MB)\n"
                      "ถ้าเตือนบ่อยช่วงพีค = ควรอัปเกรด RAM (Starter→Standard) กัน restart กลางคัน"))
         except Exception:
@@ -2706,7 +2774,7 @@ def notify_admin_error(group_id, err):
         return
     _last_admin_error_ts = time.time()
     try:
-        line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(
+        _push(ADMIN_USER_ID, TextSendMessage(
             text=f"🛠️ [SYSTEM] บอทอ่านสลิปไม่สำเร็จ (group={group_id})\n"
                  f"สาเหตุ: {str(err)[:250]}\n"
                  "ถ้าเป็นช่วงเย็น/สลิปเยอะ อาจเป็นเพราะโควต้า Gemini ฟรีหมดรายวัน "
@@ -2846,7 +2914,7 @@ def _process_image_event(event):
         if verdict["status"] != "PASS":
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=verdict["group_msg"]))
         if verdict["admin_msg"] and ADMIN_USER_ID:
-            line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
+            _push(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
 
         # กระทบบิล-สลิป (เฉพาะ DINING_GROUPS): หน่วง ~DINING_MATCH_DELAY วิ ก่อนจับคู่
         # → รอบิลที่ส่งไล่ๆ กันถูกอ่านเข้าคิวครบ กันจับคู่สลับลำดับ; โอนขาด → push เตือน+ปุ่ม (reply token หมดอายุแล้ว)
@@ -3188,7 +3256,7 @@ def handle_unsend(event):
     if removed_amt is not None:
         print(f"[unsend] ถอดสลิปที่ถูกยกเลิก {removed_amt:,.2f} group={gid}", flush=True)
         try:
-            line_bot_api.push_message(gid, TextSendMessage(
+            _push(gid, TextSendMessage(
                 text=f"↩️ มีการยกเลิกรูปสลิป — ถอดยอด {removed_amt:,.2f} บาท ออกจากรายรับแล้ว (กันนับเงินผี)"))
         except Exception:
             pass
@@ -3238,6 +3306,22 @@ def handle_text(event):
             roles.append("🪞 บัญชีหนี้แบบ mirror: กลุ่มนี้=กลุ่มดูสรุป (รับเฉพาะสรุปรายวันของบัญชีร่วม ไม่เด้งทุกบิล/สลิป)")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"🆔 Group ID:\n{group_id}\n─────────────────\n" + "\n".join(roles)))
+        return
+    # เช็คโควต้า push ที่ใช้ไปเดือนนี้ (แยกราย OA) — ไว้ดูว่าใกล้เต็ม/สลับ OA แล้วหรือยัง
+    if text.lower() in ("โควต้า", "quota", "โควตา", "push"):
+        mon = datetime.now(TZ).strftime("%Y-%m")
+        lines = [f"📈 โควต้า push เดือน {mon} (ลิมิต {PUSH_FREE_LIMIT}/OA)"]
+        total = 0
+        for i in range(len(_push_apis)):
+            used = _push_count(i)
+            total += used
+            bar = "🔴 เต็ม" if used >= PUSH_FREE_LIMIT else ("🟡" if used >= PUSH_FREE_LIMIT * 0.9 else "🟢")
+            lines.append(f"{bar} OA{i+1}: {used}/{PUSH_FREE_LIMIT}")
+        active = next((i for i in range(len(_push_apis)) if _push_count(i) < PUSH_FREE_LIMIT), len(_push_apis) - 1)
+        lines.append(f"─────────────────\nกำลังใช้: OA{active+1}  •  รวมทั้งหมด {total} ข้อความ")
+        if len(_push_apis) == 1:
+            lines.append("⚠️ ยังมี OA เดียว — ตั้ง env LINE_CHANNEL_ACCESS_TOKEN_2 เพื่อเปิดตัวสำรอง")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)))
         return
     # กลุ่มเจ้าหนี้การค้า → จัดการบัญชีหนี้ (บิล/จ่าย/สรุป) แล้วจบ ไม่ทำระบบสลิป/จองปกติ
     if group_id in PAYABLE_GROUPS:
@@ -3344,7 +3428,7 @@ def handle_text(event):
         if text.lower() in ("ทดสอบรายงาน", "รายงานเมื่อวาน", "force report", "test report"):
             yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
             try:
-                line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
+                _push(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(
                     text="✅ push รายงานเมื่อวานสำเร็จ — ระบบ push ใช้งานได้ปกติ"))
             except Exception as e:
