@@ -94,8 +94,13 @@ DINING_MATCH_MIN   = int(os.environ.get("DINING_MATCH_MIN", "45"))    # บิ�
 DINING_MATCH_DELAY = int(os.environ.get("DINING_MATCH_DELAY", "90"))
 # เฝ้า memory: ถ้า RSS เกินค่านี้ (MB) บอทจะ DM เตือนแอดมิน (Render Starter ลิมิต 512MB) — กันก่อน OOM/restart
 MEM_WARN_MB = float(os.environ.get("MEM_WARN_MB", "430"))
-# จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
-RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
+# จองที่ยังไม่คอนเฟิร์ม (ทั้งจองวันนี้และจองล่วงหน้า) จะแจ้งเตือนซ้ำทุก RESV_NAG_INTERVAL_MIN นาที (ทุกช่วงเวลาเท่ากัน)
+# ตื๊อได้ไม่เกิน RESV_NAG_MAX_HOURS ชั่วโมงนับจากตอนรับจอง (กันตื๊อไม่จบ) — จองล่วงหน้ายังโผล่ในสรุปรอบเช้าวันงานอีกครั้ง
+RESV_NAG_MAX_HOURS   = float(os.environ.get("RESV_NAG_MAX_HOURS", "3"))
+RESV_NAG_INTERVAL_MIN = int(os.environ.get("RESV_NAG_INTERVAL_MIN", "30"))
+# รายงานจองอัตโนมัติ 2 รอบ/วัน (ส่งครั้งเดียว/วันต่อรอบ ในกรอบ [ชม.นั้น, +3)) — ตั้งชั่วโมง 0-23
+RESV_ADVANCE_SUMMARY_HOUR = int(os.environ.get("RESV_ADVANCE_SUMMARY_HOUR", "11"))  # รายงาน 'จองล่วงหน้าที่ถึงวันงานวันนี้' รอบเช้า
+RESV_TODAY_SUMMARY_HOUR   = int(os.environ.get("RESV_TODAY_SUMMARY_HOUR", "16"))    # สรุป 'จองในวัน' (จองวันนี้เพื่อวันนี้) รอบบ่าย
 # รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
 RESV_REPORT_DAYS   = int(os.environ.get("RESV_REPORT_DAYS", "7"))
 # ลบข้อมูลเก่าอัตโนมัติ (วันละครั้ง) กัน DB บวม
@@ -108,6 +113,19 @@ TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler      = WebhookHandler(LINE_SECRET)
+# ── Failover หลาย LINE OA เพื่อประหยัดค่าโควต้า push ────────────────────────────
+# reply ฟรีไม่นับโควต้า (ผูก reply_token) — แต่ push/broadcast กินโควต้าฟรีเดือนละ ~300 ข้อความ/OA
+# แนวคิด: ใช้ OA1 (ตัวหลัก รับ event+reply) จนใกล้เต็มโควต้าเดือนนี้ แล้วสลับ push ไป OA2, OA3, ... อัตโนมัติ
+#   → ไม่ต้องบีบให้อยู่ใต้ 300 (เดี๋ยวข้อความตกหล่น) และไม่ต้องจ่ายแพ็กเกจเสียเงิน
+# OA สำรองต้อง: (1) เชิญเข้าทุกกลุ่มเหมือน OA1 (2) ปิด auto-reply + ปิด webhook (ตัวสำรอง push อย่างเดียว)
+# ตั้ง token สำรองใน env: LINE_CHANNEL_ACCESS_TOKEN_2, _3, _4, _5 — ใส่แค่ตัวไหนก็เปิดใช้ตัวนั้นทันที
+PUSH_FREE_LIMIT = int(os.environ.get("PUSH_FREE_LIMIT", "300"))  # โควต้า push ฟรี/เดือน/OA (ไทย ~300) ถึงเกณฑ์นี้แล้วสลับ OA ถัดไป
+_push_apis = [line_bot_api]        # index 0 = OA1 (ตัวหลัก)
+for _i in range(2, 6):             # รองรับ OA2..OA5
+    _tok2 = os.environ.get(f"LINE_CHANNEL_ACCESS_TOKEN_{_i}")
+    if _tok2:
+        _push_apis.append(LineBotApi(_tok2))
+_push_lock = threading.Lock()      # กัน race นับโควต้าจากหลาย thread (background jobs + handlers)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 # โมเดลสำหรับ 'อ่านซ้ำ' เมื่อรอบแรกอ่านไม่ออก — ใช้ตัวเก่งขึ้น (pro) เฉพาะใบยาก กู้สลิปที่ flash แพ้
 GEMINI_MODEL_RETRY = os.environ.get("GEMINI_MODEL_RETRY", "gemini-2.5-pro")
@@ -1036,7 +1054,7 @@ def _dining_compare_and_push(group_id: str, info: dict):
             card = _dining_over_card(res["pair_id"], res["table_no"], res["over"])
         else:
             card = _dining_clear_card(res["pair_id"], res["table_no"], res["short"])
-        line_bot_api.push_message(group_id, [TextSendMessage(text=res["note"]), card])
+        _push(group_id, [TextSendMessage(text=res["note"]), card])
     except Exception as e:
         if _is_not_member_error(e):
             _mark_group_left(group_id)
@@ -1284,16 +1302,27 @@ def _resv_line(r: dict) -> str:
     return f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}"
 
 
-def build_resv_summary(notify_group=None, title="📋 สรุปการจองวันนี้", upcoming=False, skip_if_empty=False, match_origin=False) -> str:
+def build_resv_summary(notify_group=None, title="📋 สรุปการจองวันนี้", upcoming=False, skip_if_empty=False, match_origin=False, date_mode=None) -> str:
     """สรุปการจอง
     upcoming=False (ดีฟอลต์): เฉพาะจอง 'ของวันนี้' (resv_date = วันนี้) — จองล่วงหน้าจะโผล่เฉพาะวันที่ถึง
     upcoming=True: จองที่กำลังจะถึง (resv_date >= วันนี้) แยกหัวข้อ วันนี/ล่วงหน้า — ใช้กับ digest ล่วงหน้า
+    date_mode='advance_arrived': จองล่วงหน้าที่ 'ถึงวันงานวันนี้' (resv_date=วันนี้ + จองมาตั้งแต่วันก่อน) — รายงาน 11:00
+       → โผล่เฉพาะวันงานของมัน ไม่โผล่ทุกวันก่อนถึง
+    date_mode='sameday': จอง 'ในวัน' (สร้างวันนี้ เพื่อวันนี้/ไม่ระบุวัน) — สรุป 16:00
     notify_group=None → ทุกการจอง / ระบุ group → เฉพาะการจองที่ส่งการ์ดเข้ากลุ่มนั้น
     match_origin=True → นับจองที่ 'เกิดในกลุ่มนี้ (origin) หรือส่งเข้ากลุ่มนี้ (notify)' —
        ใช้กับคำสั่ง 'สรุปจอง' ในกลุ่มต้นทาง เพราะจองล่วงหน้าถูกส่ง notify ไปกลุ่มบาร์ (จะได้เห็นล่วงหน้าด้วย)
     skip_if_empty=True → ถ้าไม่มีจองคืน None (ไว้ให้รายงานอัตโนมัติ 'ไม่ส่ง' วันที่ไม่มีจอง — ประหยัด push)"""
     today  = datetime.now(TZ).date().isoformat()
-    if upcoming:
+    if date_mode == "advance_arrived":
+        # จองล่วงหน้าที่วันงานคือวันนี้ (จองมาก่อนหน้า) — โผล่เฉพาะวันงาน ไม่โผล่ทุกวันตั้งแต่จอง
+        date_cond = "(resv_date = ? AND substr(created_at,1,10) < ?)"
+        params = [today, today]
+    elif date_mode == "sameday":
+        # จองในวัน: สร้างวันนี้ + เป็นของวันนี้ (หรือไม่ระบุวัน=ถือว่าวันนี้) — ไม่รวมจองล่วงหน้าเพื่อวันอื่น
+        date_cond = "(substr(created_at,1,10) = ? AND (resv_date = ? OR resv_date IS NULL))"
+        params = [today, today]
+    elif upcoming:
         # "วันงานจริง" ต้อง >= วันนี้ — ใช้ resv_date ถ้ามี ไม่งั้น fallback วันที่แจ้ง (กันจองที่เลยวันไปแล้วค้างในรายการล่วงหน้า)
         date_cond = "(COALESCE(resv_date, substr(created_at,1,10)) >= ?)"
         params = [today]
@@ -1375,7 +1404,7 @@ def _payable_send(event, source_group: str, dest_group: str, text: str):
         # reply token หมดอายุ/ใช้แล้ว (เช่นประมวลผลนาน) → fallback push เข้ากลุ่มที่ส่งเอง กันยืนยันหาย
         print(f"[payable] reply ไม่สำเร็จ src={source_group}: {e} — ลอง push สำรอง", flush=True)
         try:
-            line_bot_api.push_message(source_group, TextSendMessage(text=text))
+            _push(source_group, TextSendMessage(text=text))
         except Exception as e2:
             print(f"[payable] push สำรองไม่สำเร็จ src={source_group}: {e2}", flush=True)
 
@@ -1673,7 +1702,7 @@ def _payable_push_summary(event, source_group: str, acct: str):
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
                 replied = True
             else:
-                line_bot_api.push_message(grp, TextSendMessage(text=text))
+                _push(grp, TextSendMessage(text=text))
         except Exception as e:
             print(f"[payable] ส่งสรุปไม่สำเร็จ grp={grp}: {e}", flush=True)
 
@@ -1947,7 +1976,7 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         sent, errs = [], []
         for grp, with_total in _payable_report_recipients(acct):
             try:
-                line_bot_api.push_message(grp, TextSendMessage(text=build_payable_ledger(acct, with_total)))
+                _push(grp, TextSendMessage(text=build_payable_ledger(acct, with_total)))
                 sent.append(f"{grp} ({'มียอดรวม' if with_total else 'ไม่มียอดรวม'})")
             except Exception as e:
                 errs.append(f"{grp}: {e}")
@@ -2075,6 +2104,61 @@ def _is_not_member_error(e: Exception) -> bool:
     return isinstance(e, LineBotApiError) and getattr(e, "status_code", None) == 400
 
 
+def _is_quota_error(e: Exception) -> bool:
+    """push โดนปฏิเสธเพราะเต็มโควต้า push รายเดือน (429 / ข้อความมี monthly/limit/quota)
+    ใช้เป็น safety net: ถ้าตัวนับพลาดหรือ OA เต็มก่อนถึง PUSH_FREE_LIMIT → สลับ OA ถัดไปทันที ไม่ให้ตกหล่น"""
+    if not isinstance(e, LineBotApiError) or getattr(e, "status_code", None) != 429:
+        return False
+    msg = (str(getattr(e, "message", "")) + " " + str(getattr(e, "error", "")) + " " + str(e)).lower()
+    return ("monthly" in msg) or ("limit" in msg) or ("quota" in msg) or (msg.strip() == " ")  # 429 มักเป็นเต็มโควต้า
+
+
+def _push_month_key(idx: int) -> str:
+    """คีย์นับโควต้า push รายเดือนต่อ OA — reset เองเมื่อขึ้นเดือนใหม่ (คีย์เปลี่ยน)
+    OA1='push_count:YYYY-MM', OA2='push_count2:YYYY-MM', ..."""
+    mon = datetime.now(TZ).strftime("%Y-%m")
+    suffix = "" if idx == 0 else str(idx + 1)
+    return f"push_count{suffix}:{mon}"
+
+
+def _push_count(idx: int) -> int:
+    try:
+        return int(_get_meta(_push_month_key(idx)) or "0")
+    except (TypeError, ValueError):
+        return 0
+
+
+def _push(to, messages):
+    """ส่ง push แบบ failover หลาย OA — ใช้โควต้าฟรีของแต่ละ OA ให้ครบก่อนค่อยข้ามไปตัวถัดไป
+    - เลือก OA ตัวแรกที่เดือนนี้ยังไม่ถึง PUSH_FREE_LIMIT (นับแยกรายเดือนใน meta)
+    - ส่งสำเร็จ → นับ +จำนวนข้อความ (LINE นับเป็นราย bubble) ให้ OA ตัวนั้น
+    - ถ้า OA ที่เลือกเจอ quota error (429) → มาร์คเต็มแล้วลองตัวถัดไปทันที (กันตกหล่น)
+    - error อื่น (เช่น 400 not-member) → re-raise ให้ call site เดิมจัดการ (mark left / นับ fail) เหมือนเดิม
+    หมายเหตุ: reply_message ยังใช้ OA1 ตรงๆ (ฟรี ไม่ผ่านฟังก์ชันนี้)"""
+    cnt = len(messages) if isinstance(messages, (list, tuple)) else 1
+    n = len(_push_apis)
+    with _push_lock:
+        # เริ่มจาก OA ตัวแรกที่ยังมีโควต้าเหลือ; ถ้าเต็มหมดทุกตัว → ใช้ตัวสุดท้าย (ยอมเกินดีกว่าไม่ส่ง)
+        start = next((i for i in range(n) if _push_count(i) < PUSH_FREE_LIMIT), n - 1)
+        last_err = None
+        for idx in range(start, n):
+            try:
+                _push_apis[idx].push_message(to, messages)
+                _set_meta(_push_month_key(idx), str(_push_count(idx) + cnt))
+                if idx > 0:
+                    print(f"[push] ส่งผ่าน OA{idx+1} (OA ก่อนหน้าเต็มโควต้า) → {to}", flush=True)
+                return
+            except Exception as e:
+                last_err = e
+                if _is_quota_error(e) and idx < n - 1:
+                    _set_meta(_push_month_key(idx), str(PUSH_FREE_LIMIT))  # มาร์คเต็ม กันเลือกซ้ำรอบหน้า
+                    print(f"[push] OA{idx+1} เต็มโควต้า (429) → สลับไป OA{idx+2}", flush=True)
+                    continue
+                raise
+        if last_err:   # ตัวสุดท้ายก็ยังเจอ quota error → re-raise ให้ call site รู้ว่าส่งไม่ได้
+            raise last_err
+
+
 def _report_off(gid: str) -> bool:
     """กลุ่มนี้สั่ง 'ปิดรายงาน' ไว้ไหม — ยังเช็คสลิปปกติ แต่ไม่ส่งรายงานสรุปประจำวัน (00:30)"""
     return _get_meta(f"noreport:{gid}") == "1"
@@ -2115,7 +2199,7 @@ def maybe_send_daily_report():
             if _group_left(dest) or dest in IGNORE_GROUPS:
                 continue
             try:
-                line_bot_api.push_message(dest, TextSendMessage(text=build_daily_report(group_id, yesterday)))
+                _push(dest, TextSendMessage(text=build_daily_report(group_id, yesterday)))
                 _mark_sent("report", today, group_id)
                 print(f"[report] sent OK → {dest}" + (f" (redirect จาก {group_id})" if dest != group_id else ""), flush=True)
             except Exception as e:
@@ -2124,7 +2208,7 @@ def maybe_send_daily_report():
                 else:
                     failed += 1
                 print(f"[report] push FAILED {dest}: {e}", flush=True)
-        # หมายเหตุ: สรุป 'จองล่วงหน้า' ย้ายไปส่งรวมกับสรุปจองวันนี้ตอน 16:00 แล้ว (maybe_send_resv_summary)
+        # หมายเหตุ: สรุปจองแยกไปที่ maybe_send_resv_summary แล้ว (จองล่วงหน้าถึงวันงาน 11:00 / จองในวัน 16:00)
         # มาร์คว่า 'ส่งครบแล้ว' เฉพาะเมื่อไม่มีอันไหนล้มเหลว — ถ้ามี fail ปล่อยไว้ให้ ping รอบหน้า retry
         if failed == 0:
             _set_meta("last_report_date", today)
@@ -2135,58 +2219,72 @@ def maybe_send_daily_report():
 
 
 def maybe_send_resv_summary():
-    """ส่งสรุปการจองวันนี้ เข้ากลุ่มบาร์น้ำ + กลุ่มรับจอง ในกรอบ 16:00–18:59 วันละครั้ง (idempotent)
-    วันไหน 'ไม่มีจอง' = ไม่ส่งเลย (ประหยัด push); เลย 19:00 แล้วยังไม่ส่ง = ข้ามวันนี้ (กันส่งดึกไม่มีประโยชน์)"""
+    """ส่งรายงานจองอัตโนมัติ 2 รอบ/วัน (idempotent แยกรอบ):
+      • รอบเช้า RESV_ADVANCE_SUMMARY_HOUR (ดีฟอลต์ 11:00) → 'จองล่วงหน้าที่ถึงวันงานวันนี้'
+        (จองมาก่อนหน้า วันงานคือวันนี้ — โผล่เฉพาะวันงาน ไม่โผล่ทุกวันตั้งแต่จอง)
+      • รอบบ่าย RESV_TODAY_SUMMARY_HOUR   (ดีฟอลต์ 16:00) → 'จองในวัน' (จองวันนี้เพื่อวันนี้)
+    แต่ละรอบส่งครั้งเดียว/วันในกรอบ [ชม., +3); วันไหนไม่มีจอง = ไม่ส่ง (ประหยัด push)"""
     now = datetime.now(TZ)
+    _maybe_send_resv_slot(
+        now, RESV_ADVANCE_SUMMARY_HOUR, "resv_adv_summary",
+        lambda h: build_resv_summary(None, f"📅 จองล่วงหน้าวันนี้ ({h:02d}:00)", date_mode="advance_arrived", skip_if_empty=True))
+    _maybe_send_resv_slot(
+        now, RESV_TODAY_SUMMARY_HOUR, "resv_today_summary",
+        lambda h: build_resv_summary(None, f"📋 จองในวันวันนี้ ({h:02d}:00)", date_mode="sameday", skip_if_empty=True))
+
+
+def _maybe_send_resv_slot(now, start_hour, job, build_text):
+    """ส่งรายงานจองรอบหนึ่ง(idempotent/วัน) เข้ากลุ่มบาร์น้ำ + กลุ่มรับจอง ในกรอบ [start_hour, +3 ชม.)
+    build_text(start_hour) → ข้อความ (None = ไม่มีจอง ไม่ส่ง); เลยกรอบ = ข้ามวันนี้ (กันส่งผิดเวลา)"""
     hm  = (now.hour, now.minute)
-    if hm < (16, 0):
+    end_hour = min(start_hour + 3, 24)   # กรอบส่ง 3 ชม. (ไม่ข้ามเที่ยงคืน)
+    if hm < (start_hour, 0):
         return
     today = now.date().isoformat()
+    meta_key = f"last_{job}_date"
     with _report_lock:
-        if _get_meta("last_resv_summary_date") == today:
+        if _get_meta(meta_key) == today:
             return
-        if hm >= (19, 0):
-            # เลยกรอบเวลาส่งแล้ว (เช่น บอทเพิ่งตื่น/deploy ดึก) → มาร์คข้ามวันนี้ ไม่ส่งสรุปดึก
-            _set_meta("last_resv_summary_date", today)
-            print("[resv-summary] เลย 19:00 แล้ว ข้ามวันนี้ (พรุ่งนี้ส่ง 16:00)", flush=True)
+        if hm >= (end_hour, 0):
+            # เลยกรอบเวลาส่งแล้ว (เช่น บอทเพิ่งตื่น/deploy หลังกรอบ) → มาร์คข้ามวันนี้ ไม่ส่งผิดเวลา
+            _set_meta(meta_key, today)
+            print(f"[{job}] เลย {end_hour}:00 แล้ว ข้ามวันนี้ (พรุ่งนี้ส่ง {start_hour}:00)", flush=True)
             return
         # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) / สั่งเมิน (IGNORE_GROUPS) — กันค้าง retry/สแปม
         targets = list(dict.fromkeys(
             [t for t in ([BAR_GROUP_ID] + list(RESV_GROUPS))
              if t and not _group_left(t) and t not in IGNORE_GROUPS]))
         if not targets:
-            _set_meta("last_resv_summary_date", today)
+            _set_meta(meta_key, today)
             return
-        # สรุปจอง 'เฉพาะวันนี้' รอบ 16:00 — จองล่วงหน้าแจ้งเฉพาะวันงาน (จะโผล่เมื่อ resv_date = วันนี้)
-        # ดูจองล่วงหน้าเมื่อไหร่ก็ได้ด้วยคำสั่ง 'สรุปจอง' (upcoming) ; ไม่มีจองวันนี้ = ไม่ส่ง (ประหยัด)
-        text = build_resv_summary(None, "📋 สรุปการจองวันนี้ (16:00)", skip_if_empty=True)
+        text = build_text(start_hour)
         if text is None:
-            _set_meta("last_resv_summary_date", today)
-            print("[resv-summary] วันนี้ไม่มีจอง — ไม่ส่ง (ประหยัด)", flush=True)
+            _set_meta(meta_key, today)
+            print(f"[{job}] วันนี้ไม่มีจอง — ไม่ส่ง (ประหยัด)", flush=True)
             return
         failed = 0
         # idempotent รายกลุ่ม: กลุ่มที่ส่งสำเร็จแล้ววันนี้จะไม่ส่งซ้ำ แม้กลุ่มอื่นพลาดแล้วต้อง retry
         for g in targets:
-            if _already_sent("resv_summary", today, g):
+            if _already_sent(job, today, g):
                 continue
             dest = _report_dest(g)
             if _group_left(dest) or dest in IGNORE_GROUPS:
                 continue
             try:
-                line_bot_api.push_message(dest, TextSendMessage(text=text))
-                _mark_sent("resv_summary", today, g)
-                print(f"[resv-summary] sent → {dest}" + (f" (redirect จาก {g})" if dest != g else ""), flush=True)
+                _push(dest, TextSendMessage(text=text))
+                _mark_sent(job, today, g)
+                print(f"[{job}] sent → {dest}" + (f" (redirect จาก {g})" if dest != g else ""), flush=True)
             except Exception as e:
                 if _is_not_member_error(e):
                     _mark_group_left(dest)
                 else:
                     failed += 1
-                print(f"[resv-summary] FAILED {dest}: {e}", flush=True)
+                print(f"[{job}] FAILED {dest}: {e}", flush=True)
         if failed == 0:
-            _set_meta("last_resv_summary_date", today)
-            print(f"[resv-summary] done {today}", flush=True)
+            _set_meta(meta_key, today)
+            print(f"[{job}] done {today}", flush=True)
         else:
-            print(f"[resv-summary] {failed} กลุ่มส่งไม่สำเร็จ — retry รอบหน้า", flush=True)
+            print(f"[{job}] {failed} กลุ่มส่งไม่สำเร็จ — retry รอบหน้า", flush=True)
 
 
 def maybe_send_payable_summary():
@@ -2215,7 +2313,7 @@ def maybe_send_payable_summary():
                 if _already_sent("payable_summary", today, grp):   # idempotent รายกลุ่มผู้รับ
                     continue
                 try:
-                    line_bot_api.push_message(grp, TextSendMessage(text=build_payable_ledger(acct, with_total)))
+                    _push(grp, TextSendMessage(text=build_payable_ledger(acct, with_total)))
                     _mark_sent("payable_summary", today, grp)
                     print(f"[payable-summary] sent → {grp} (acct {acct}, total={with_total})", flush=True)
                 except Exception as e:
@@ -2500,7 +2598,7 @@ def handle_reservation_text(event, text: str, group_id: str):
     if dest == group_id:
         line_bot_api.reply_message(event.reply_token, [detail_msg, confirm_msg])
     else:
-        line_bot_api.push_message(dest, [detail_msg, confirm_msg])
+        _push(dest, [detail_msg, confirm_msg])
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"📤 ส่งจองล่วงหน้า #{resv_id} ไปกลุ่มบาร์น้ำแล้ว รอคอนเฟิร์ม\n─────────────────\n{detail}{time_warn}"))
     return True
@@ -2551,7 +2649,7 @@ def handle_reservation_confirm(event, resv_id: int):
     origin = resv.get("origin_group_id")
     if origin and origin != pressed_group:
         try:
-            line_bot_api.push_message(origin, TextSendMessage(
+            _push(origin, TextSendMessage(
                 text=f"✅ จองล่วงหน้า #{resv_id} ที่แจ้งไว้ บาร์น้ำคอนเฟิร์มแล้ว!\n"
                      f"โดย {confirmer}\n─────────────────\n{detail}"))
         except Exception as e:
@@ -2566,38 +2664,32 @@ def _touch_reminded(resv_id: int, when: str):
 
 def _resv_remind_due(r: dict, now, interval_min: int) -> bool:
     """จองนี้ถึงเวลาย้ำเตือนไหม
-    ⏰ เตือนซ้ำเฉพาะ 'จองวันนี้' (จองสดวันนี้ = สร้างวันนี้ + เป็นของวันนี้) เท่านั้น
-    จองล่วงหน้า = ไม่เตือนซ้ำเลย (แม้ถึงวันงาน) — ดูในรายงานสรุปจอง 16:00 พอ
-    จองวันนี้ตื๊อจำกัด RESV_NAG_MAX_HOURS จากตอนสร้าง (กันตื๊อไม่จบ)"""
+    ⏰ ตื๊อทุกจองที่ยัง PENDING (ทั้งจองวันนี้และจองล่วงหน้า) — ตื๊อ 'ตั้งแต่ตอนรับจอง'
+    ทุก interval_min นาที ภายใน RESV_NAG_MAX_HOURS ชม.แรกนับจากตอนสร้าง (กันตื๊อไม่จบ/ข้ามวัน)
+    → จองล่วงหน้าจึงถูกคอนเฟิร์มตั้งแต่รับจอง แล้วยังโผล่ในสรุปรอบเช้าวันงานอีกครั้ง"""
     notify = r.get("notify_group_id")
     if not notify or notify in IGNORE_GROUPS or _group_left(notify):
         return False
-    today = now.date().isoformat()
     try:
         last_dt    = datetime.strptime(r.get("reminded_at") or r.get("created_at"), "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
         created_dt = datetime.strptime(r.get("created_at"), "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
     except Exception:
         return False
-    if created_dt.date() != now.date():
-        return False                          # สร้างวันก่อน = จองล่วงหน้า → ไม่เตือนซ้ำ (ดูรายงานพอ)
-    rd = r.get("resv_date")
-    if rd and rd != today:
-        return False                          # สร้างวันนี้แต่เป็นจองล่วงหน้า (เพื่อวันอื่น) → ไม่เตือนซ้ำ
     if RESV_NAG_MAX_HOURS and (now - created_dt).total_seconds() > RESV_NAG_MAX_HOURS * 3600:
-        return False
+        return False                          # เกินกรอบตื๊อจากตอนสร้าง → หยุด (ครอบทั้งจองวันนี้/ล่วงหน้า)
     if (now - last_dt).total_seconds() < interval_min * 60:
         return False
     return True
 
 
 def _reservation_reminder_loop():
-    """แจ้งเตือนการจองที่ยัง PENDING ซ้ำในกลุ่มที่ส่งการ์ดไว้ — เฉพาะจองที่ถึงวันงานแล้ว
-    ทุก 5 นาทีช่วง 18:00–22:00 / ทุก 15 นาทีเวลาอื่น จนกว่าจะคอนเฟิร์ม"""
+    """แจ้งเตือนการจองที่ยัง PENDING ซ้ำในกลุ่มที่ส่งการ์ดไว้ — ทั้งจองวันนี้และจองล่วงหน้า
+    ทุก RESV_NAG_INTERVAL_MIN นาที (ทุกช่วงเวลาเท่ากัน) จนกว่าจะคอนเฟิร์ม/เกิน RESV_NAG_MAX_HOURS จากตอนรับจอง"""
     while True:
         time.sleep(60)
         try:
             now      = datetime.now(TZ)
-            interval = 5 if (18 <= now.hour < 22) else 15      # นาที
+            interval = RESV_NAG_INTERVAL_MIN      # นาที (เท่ากันทุกช่วงเวลา)
             try:
                 with _db() as conn:
                     rows = [dict(r) for r in conn.execute(
@@ -2609,7 +2701,7 @@ def _reservation_reminder_loop():
                     continue
                 notify = r.get("notify_group_id")
                 try:
-                    line_bot_api.push_message(notify, [
+                    _push(notify, [
                         TextSendMessage(text=f"⏰ ย้ำเตือน: การจอง #{r['id']} ยังไม่มีใครคอนเฟิร์ม!\n"
                                              f"─────────────────\n{_resv_detail_lines(r)}"),
                         _resv_confirm_card(r["id"]),
@@ -2690,7 +2782,7 @@ def _check_memory():
     print(f"[mem] ⚠️ RSS สูง {mb:.0f} MB (เกินเกณฑ์ {MEM_WARN_MB:.0f} MB)", flush=True)
     if ADMIN_USER_ID:
         try:
-            line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(
+            _push(ADMIN_USER_ID, TextSendMessage(
                 text=f"⚠️ [SYSTEM] หน่วยความจำบอทสูง: {mb:.0f} MB (ใกล้ลิมิต Render 512MB)\n"
                      "ถ้าเตือนบ่อยช่วงพีค = ควรอัปเกรด RAM (Starter→Standard) กัน restart กลางคัน"))
         except Exception:
@@ -2706,7 +2798,7 @@ def notify_admin_error(group_id, err):
         return
     _last_admin_error_ts = time.time()
     try:
-        line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(
+        _push(ADMIN_USER_ID, TextSendMessage(
             text=f"🛠️ [SYSTEM] บอทอ่านสลิปไม่สำเร็จ (group={group_id})\n"
                  f"สาเหตุ: {str(err)[:250]}\n"
                  "ถ้าเป็นช่วงเย็น/สลิปเยอะ อาจเป็นเพราะโควต้า Gemini ฟรีหมดรายวัน "
@@ -2846,7 +2938,7 @@ def _process_image_event(event):
         if verdict["status"] != "PASS":
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=verdict["group_msg"]))
         if verdict["admin_msg"] and ADMIN_USER_ID:
-            line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
+            _push(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
 
         # กระทบบิล-สลิป (เฉพาะ DINING_GROUPS): หน่วง ~DINING_MATCH_DELAY วิ ก่อนจับคู่
         # → รอบิลที่ส่งไล่ๆ กันถูกอ่านเข้าคิวครบ กันจับคู่สลับลำดับ; โอนขาด → push เตือน+ปุ่ม (reply token หมดอายุแล้ว)
@@ -3150,7 +3242,7 @@ def build_manual(group_id: str) -> str:
             "• ยังไม่กดคอนเฟิร์ม บอทจะย้ำเตือนซ้ำจนกว่าจะกด\n"
             "คำสั่ง:\n"
             "• สรุปจอง → ดูรายการจอง (วันนี้ + ล่วงหน้า)\n"
-            "⏰ บอทส่งสรุปจอง (วันนี้ + ล่วงหน้า) ให้เองทุก 16:00"
+            f"⏰ บอทส่งรายงานจองเอง 2 รอบ: จองล่วงหน้า {RESV_ADVANCE_SUMMARY_HOUR:02d}:00 | จองวันนี้ {RESV_TODAY_SUMMARY_HOUR:02d}:00"
         )
     blocks.append("\nℹ️ help → เมนูคำสั่ง | groupid → ดูข้อมูลกลุ่ม")
     return "\n".join(blocks)
@@ -3188,7 +3280,7 @@ def handle_unsend(event):
     if removed_amt is not None:
         print(f"[unsend] ถอดสลิปที่ถูกยกเลิก {removed_amt:,.2f} group={gid}", flush=True)
         try:
-            line_bot_api.push_message(gid, TextSendMessage(
+            _push(gid, TextSendMessage(
                 text=f"↩️ มีการยกเลิกรูปสลิป — ถอดยอด {removed_amt:,.2f} บาท ออกจากรายรับแล้ว (กันนับเงินผี)"))
         except Exception:
             pass
@@ -3238,6 +3330,22 @@ def handle_text(event):
             roles.append("🪞 บัญชีหนี้แบบ mirror: กลุ่มนี้=กลุ่มดูสรุป (รับเฉพาะสรุปรายวันของบัญชีร่วม ไม่เด้งทุกบิล/สลิป)")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"🆔 Group ID:\n{group_id}\n─────────────────\n" + "\n".join(roles)))
+        return
+    # เช็คโควต้า push ที่ใช้ไปเดือนนี้ (แยกราย OA) — ไว้ดูว่าใกล้เต็ม/สลับ OA แล้วหรือยัง
+    if text.lower() in ("โควต้า", "quota", "โควตา", "push"):
+        mon = datetime.now(TZ).strftime("%Y-%m")
+        lines = [f"📈 โควต้า push เดือน {mon} (ลิมิต {PUSH_FREE_LIMIT}/OA)"]
+        total = 0
+        for i in range(len(_push_apis)):
+            used = _push_count(i)
+            total += used
+            bar = "🔴 เต็ม" if used >= PUSH_FREE_LIMIT else ("🟡" if used >= PUSH_FREE_LIMIT * 0.9 else "🟢")
+            lines.append(f"{bar} OA{i+1}: {used}/{PUSH_FREE_LIMIT}")
+        active = next((i for i in range(len(_push_apis)) if _push_count(i) < PUSH_FREE_LIMIT), len(_push_apis) - 1)
+        lines.append(f"─────────────────\nกำลังใช้: OA{active+1}  •  รวมทั้งหมด {total} ข้อความ")
+        if len(_push_apis) == 1:
+            lines.append("⚠️ ยังมี OA เดียว — ตั้ง env LINE_CHANNEL_ACCESS_TOKEN_2 เพื่อเปิดตัวสำรอง")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)))
         return
     # กลุ่มเจ้าหนี้การค้า → จัดการบัญชีหนี้ (บิล/จ่าย/สรุป) แล้วจบ ไม่ทำระบบสลิป/จองปกติ
     if group_id in PAYABLE_GROUPS:
@@ -3344,7 +3452,7 @@ def handle_text(event):
         if text.lower() in ("ทดสอบรายงาน", "รายงานเมื่อวาน", "force report", "test report"):
             yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
             try:
-                line_bot_api.push_message(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
+                _push(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(
                     text="✅ push รายงานเมื่อวานสำเร็จ — ระบบ push ใช้งานได้ปกติ"))
             except Exception as e:
