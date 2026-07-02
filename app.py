@@ -94,8 +94,10 @@ DINING_MATCH_MIN   = int(os.environ.get("DINING_MATCH_MIN", "45"))    # บิ�
 DINING_MATCH_DELAY = int(os.environ.get("DINING_MATCH_DELAY", "90"))
 # เฝ้า memory: ถ้า RSS เกินค่านี้ (MB) บอทจะ DM เตือนแอดมิน (Render Starter ลิมิต 512MB) — กันก่อน OOM/restart
 MEM_WARN_MB = float(os.environ.get("MEM_WARN_MB", "430"))
-# จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
-RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
+# จองที่ยังไม่คอนเฟิร์ม (จองวันนี้) จะแจ้งเตือนซ้ำทุก RESV_NAG_INTERVAL_MIN นาที (ทุกช่วงเวลาเท่ากัน)
+# ตื๊อได้ไม่เกิน RESV_NAG_MAX_HOURS ชั่วโมงนับจากตอนแจ้ง (กันตื๊อไม่จบ) — จองล่วงหน้าไม่ตื๊อ ดูรายงานรอบเช้าพอ
+RESV_NAG_MAX_HOURS   = float(os.environ.get("RESV_NAG_MAX_HOURS", "3"))
+RESV_NAG_INTERVAL_MIN = int(os.environ.get("RESV_NAG_INTERVAL_MIN", "30"))
 # เวลาส่งสรุปการจอง 'ของวันนี้' อัตโนมัติ (ชั่วโมง 0-23) — ดีฟอลต์ 11 โมง; ส่งครั้งเดียว/วันในกรอบ [ชม.นี้, ชม.นี้+3)
 RESV_SUMMARY_HOUR  = int(os.environ.get("RESV_SUMMARY_HOUR", "11"))
 # รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
@@ -2664,13 +2666,13 @@ def _resv_remind_due(r: dict, now, interval_min: int) -> bool:
 
 
 def _reservation_reminder_loop():
-    """แจ้งเตือนการจองที่ยัง PENDING ซ้ำในกลุ่มที่ส่งการ์ดไว้ — เฉพาะจองที่ถึงวันงานแล้ว
-    ทุก 5 นาทีช่วง 18:00–22:00 / ทุก 15 นาทีเวลาอื่น จนกว่าจะคอนเฟิร์ม"""
+    """แจ้งเตือนการจองที่ยัง PENDING ซ้ำในกลุ่มที่ส่งการ์ดไว้ — เฉพาะจองสดของวันนี้
+    ทุก RESV_NAG_INTERVAL_MIN นาที (ทุกช่วงเวลาเท่ากัน) จนกว่าจะคอนเฟิร์ม/เกิน RESV_NAG_MAX_HOURS"""
     while True:
         time.sleep(60)
         try:
             now      = datetime.now(TZ)
-            interval = 5 if (18 <= now.hour < 22) else 15      # นาที
+            interval = RESV_NAG_INTERVAL_MIN      # นาที (เท่ากันทุกช่วงเวลา)
             try:
                 with _db() as conn:
                     rows = [dict(r) for r in conn.execute(
