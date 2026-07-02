@@ -96,6 +96,8 @@ DINING_MATCH_DELAY = int(os.environ.get("DINING_MATCH_DELAY", "90"))
 MEM_WARN_MB = float(os.environ.get("MEM_WARN_MB", "430"))
 # จองที่ยังไม่คอนเฟิร์ม จะแจ้งเตือนซ้ำ (ทุก 5 นาทีช่วง 18:00-22:00, ทุก 15 นาทีเวลาอื่น) จนกว่าจะเกินชั่วโมงนี้นับจากแจ้ง
 RESV_NAG_MAX_HOURS = float(os.environ.get("RESV_NAG_MAX_HOURS", "6"))
+# เวลาส่งสรุปการจอง 'ของวันนี้' อัตโนมัติ (ชั่วโมง 0-23) — ดีฟอลต์ 11 โมง; ส่งครั้งเดียว/วันในกรอบ [ชม.นี้, ชม.นี้+3)
+RESV_SUMMARY_HOUR  = int(os.environ.get("RESV_SUMMARY_HOUR", "11"))
 # รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
 RESV_REPORT_DAYS   = int(os.environ.get("RESV_REPORT_DAYS", "7"))
 # ลบข้อมูลเก่าอัตโนมัติ (วันละครั้ง) กัน DB บวม
@@ -2192,7 +2194,7 @@ def maybe_send_daily_report():
                 else:
                     failed += 1
                 print(f"[report] push FAILED {dest}: {e}", flush=True)
-        # หมายเหตุ: สรุป 'จองล่วงหน้า' ย้ายไปส่งรวมกับสรุปจองวันนี้ตอน 16:00 แล้ว (maybe_send_resv_summary)
+        # หมายเหตุ: สรุป 'จองล่วงหน้า' ย้ายไปส่งรวมกับสรุปจองวันนี้ (maybe_send_resv_summary, ดีฟอลต์ 11:00) แล้ว
         # มาร์คว่า 'ส่งครบแล้ว' เฉพาะเมื่อไม่มีอันไหนล้มเหลว — ถ้ามี fail ปล่อยไว้ให้ ping รอบหน้า retry
         if failed == 0:
             _set_meta("last_report_date", today)
@@ -2203,20 +2205,23 @@ def maybe_send_daily_report():
 
 
 def maybe_send_resv_summary():
-    """ส่งสรุปการจองวันนี้ เข้ากลุ่มบาร์น้ำ + กลุ่มรับจอง ในกรอบ 16:00–18:59 วันละครั้ง (idempotent)
-    วันไหน 'ไม่มีจอง' = ไม่ส่งเลย (ประหยัด push); เลย 19:00 แล้วยังไม่ส่ง = ข้ามวันนี้ (กันส่งดึกไม่มีประโยชน์)"""
+    """ส่งสรุปการจองวันนี้ เข้ากลุ่มบาร์น้ำ + กลุ่มรับจอง วันละครั้ง (idempotent)
+    ส่งในกรอบ [RESV_SUMMARY_HOUR:00, +3 ชม.) — ดีฟอลต์ 11:00–13:59 (ตั้งเวลาได้ด้วย env RESV_SUMMARY_HOUR)
+    วันไหน 'ไม่มีจอง' = ไม่ส่งเลย (ประหยัด push); เลยกรอบแล้วยังไม่ส่ง = ข้ามวันนี้ (กันส่งผิดเวลาไม่มีประโยชน์)"""
     now = datetime.now(TZ)
     hm  = (now.hour, now.minute)
-    if hm < (16, 0):
+    start_hour = RESV_SUMMARY_HOUR
+    end_hour   = min(RESV_SUMMARY_HOUR + 3, 24)   # กรอบส่ง 3 ชม. (ไม่ข้ามเที่ยงคืน)
+    if hm < (start_hour, 0):
         return
     today = now.date().isoformat()
     with _report_lock:
         if _get_meta("last_resv_summary_date") == today:
             return
-        if hm >= (19, 0):
-            # เลยกรอบเวลาส่งแล้ว (เช่น บอทเพิ่งตื่น/deploy ดึก) → มาร์คข้ามวันนี้ ไม่ส่งสรุปดึก
+        if hm >= (end_hour, 0):
+            # เลยกรอบเวลาส่งแล้ว (เช่น บอทเพิ่งตื่น/deploy หลังกรอบ) → มาร์คข้ามวันนี้ ไม่ส่งผิดเวลา
             _set_meta("last_resv_summary_date", today)
-            print("[resv-summary] เลย 19:00 แล้ว ข้ามวันนี้ (พรุ่งนี้ส่ง 16:00)", flush=True)
+            print(f"[resv-summary] เลย {end_hour}:00 แล้ว ข้ามวันนี้ (พรุ่งนี้ส่ง {start_hour}:00)", flush=True)
             return
         # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) / สั่งเมิน (IGNORE_GROUPS) — กันค้าง retry/สแปม
         targets = list(dict.fromkeys(
@@ -2225,9 +2230,9 @@ def maybe_send_resv_summary():
         if not targets:
             _set_meta("last_resv_summary_date", today)
             return
-        # สรุปจอง 'เฉพาะวันนี้' รอบ 16:00 — จองล่วงหน้าแจ้งเฉพาะวันงาน (จะโผล่เมื่อ resv_date = วันนี้)
+        # สรุปจอง 'เฉพาะวันนี้' — จองล่วงหน้าแจ้งเฉพาะวันงาน (จะโผล่เมื่อ resv_date = วันนี้)
         # ดูจองล่วงหน้าเมื่อไหร่ก็ได้ด้วยคำสั่ง 'สรุปจอง' (upcoming) ; ไม่มีจองวันนี้ = ไม่ส่ง (ประหยัด)
-        text = build_resv_summary(None, "📋 สรุปการจองวันนี้ (16:00)", skip_if_empty=True)
+        text = build_resv_summary(None, f"📋 สรุปการจองวันนี้ ({start_hour:02d}:00)", skip_if_empty=True)
         if text is None:
             _set_meta("last_resv_summary_date", today)
             print("[resv-summary] วันนี้ไม่มีจอง — ไม่ส่ง (ประหยัด)", flush=True)
@@ -2635,7 +2640,7 @@ def _touch_reminded(resv_id: int, when: str):
 def _resv_remind_due(r: dict, now, interval_min: int) -> bool:
     """จองนี้ถึงเวลาย้ำเตือนไหม
     ⏰ เตือนซ้ำเฉพาะ 'จองวันนี้' (จองสดวันนี้ = สร้างวันนี้ + เป็นของวันนี้) เท่านั้น
-    จองล่วงหน้า = ไม่เตือนซ้ำเลย (แม้ถึงวันงาน) — ดูในรายงานสรุปจอง 16:00 พอ
+    จองล่วงหน้า = ไม่เตือนซ้ำเลย (แม้ถึงวันงาน) — ดูในรายงานสรุปจองรอบเช้า (ดีฟอลต์ 11:00) พอ
     จองวันนี้ตื๊อจำกัด RESV_NAG_MAX_HOURS จากตอนสร้าง (กันตื๊อไม่จบ)"""
     notify = r.get("notify_group_id")
     if not notify or notify in IGNORE_GROUPS or _group_left(notify):
@@ -3218,7 +3223,7 @@ def build_manual(group_id: str) -> str:
             "• ยังไม่กดคอนเฟิร์ม บอทจะย้ำเตือนซ้ำจนกว่าจะกด\n"
             "คำสั่ง:\n"
             "• สรุปจอง → ดูรายการจอง (วันนี้ + ล่วงหน้า)\n"
-            "⏰ บอทส่งสรุปจอง (วันนี้ + ล่วงหน้า) ให้เองทุก 16:00"
+            f"⏰ บอทส่งสรุปจองของวันนี้ให้เองทุก {RESV_SUMMARY_HOUR:02d}:00"
         )
     blocks.append("\nℹ️ help → เมนูคำสั่ง | groupid → ดูข้อมูลกลุ่ม")
     return "\n".join(blocks)
