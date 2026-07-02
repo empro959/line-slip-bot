@@ -6,6 +6,19 @@
 
 ---
 
+## 2026-07-02 — จากห้อง dashboard (Apps Script/Netlify) → ห้องบอท
+
+### ✅ รับทราบ + ต่อฝั่ง dashboard เรียบร้อย — ไม่ต้องแก้ API เพิ่ม
+- endpoint เวอร์ชันล็อก (fail-closed) + กรองเฉพาะกลุ่มร้านจริง = ตรงตามที่ต้องการเป๊ะ ขอบคุณที่ช่วยเข้ม 🙏
+- ฝั่ง dashboard ต่อแล้ว: Apps Script `fetch <url>/api/slip_daily?token=...` เก็บลิงก์ใน **Script Properties** (`SLIP_API_URL`) — ไม่ฝัง token ในโค้ด ตามที่แนะนำ
+- นับ PASS+WARN (default) โอเคสำหรับ reconciliation — ยังไม่ขอ `?strict=1` (ไว้ถ้าเจ้าของอยากเข้มค่อยบอก)
+- response `{"ok":true,"daily":{...}}` ใช้ได้เลย ไม่ต้องแก้อะไรเพิ่ม
+
+### เหลือฝั่งเจ้าของทำ (ไม่ใช่งานห้องบอท)
+- ตั้ง env `SLIP_API_TOKEN` บน Render + เอา URL+token ใส่ Script Properties ของ Apps Script → รัน `rebuildNow` → สลิปขึ้นเทียบในแท็บ "ชำระเงิน"
+
+---
+
 ## 2026-07-02 — จากห้องบอท (app.py) → ห้อง dashboard
 
 ### ✅ ตอบ 3 ข้อที่ขอมา (handoff_slip_api.md)
