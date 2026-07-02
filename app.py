@@ -3646,20 +3646,30 @@ def health():
 @app.route("/api/slip_daily", methods=["GET"])
 def api_slip_daily():
     """อ่านอย่างเดียว: คืนยอดสลิปรวมรายวัน (ไว้ให้ dashboard เทียบกับเงินโอนจาก POS)
-    ความปลอดภัย: ถ้าตั้ง env SLIP_API_TOKEN ไว้ ต้องส่ง ?token=... ให้ตรง (ไม่ตั้ง = เปิดอ่านได้เลย)
+    ความปลอดภัย (fail-closed): ต้องตั้ง env รหัส (SLIP_API_TOKEN หรือ DASHBOARD_PASSWORD) และส่ง ?token=... ให้ตรง
+      — ไม่ตั้งรหัสเลย = ล็อก (403) กันยอดขายหลุดสาธารณะ (repo เป็น public)
+    ขอบเขต: นับเฉพาะกลุ่มที่บอทเปิดรับสลิปจริง (allowlist ผ่านแชท หรือ SLIP_GROUPS) — ไม่ปนกลุ่มทดสอบ
+    นับ verdict != 'FAIL' (PASS ผ่าน + WARN ผ่านแต่เตือน) ตัด FAIL (ปลอม/ซ้ำ) ออก
     คืน: {"ok":true,"daily":{"2026-07-01":{"amount":109000.0,"count":42}, ...}}
     """
-    need = os.environ.get("SLIP_API_TOKEN", "")
-    if need and request.args.get("token", "") != need:
+    need = os.environ.get("SLIP_API_TOKEN") or os.environ.get("DASHBOARD_PASSWORD") or ""
+    if not need:
+        return {"ok": False, "error": "locked: ตั้ง env SLIP_API_TOKEN หรือ DASHBOARD_PASSWORD ก่อน"}, 403
+    if request.args.get("token", "") != need:
         return {"ok": False, "error": "unauthorized"}, 401
     try:
+        allowed = _slip_allow() or SLIP_GROUPS   # กลุ่มที่บอทเช็คสลิปจริง (เว้นว่าง = ทุกกลุ่ม)
+        where, params = "slip_date IS NOT NULL", []
+        if allowed:
+            where += " AND group_id IN (%s)" % ",".join("?" * len(allowed))
+            params = list(allowed)
         with _db() as conn:
             rows = conn.execute(
                 "SELECT slip_date, "
                 "SUM(CASE WHEN verdict!='FAIL' THEN amount ELSE 0 END) amt, "
                 "COUNT(CASE WHEN verdict!='FAIL' THEN 1 END) cnt "
-                "FROM slips WHERE slip_date IS NOT NULL "
-                "GROUP BY slip_date ORDER BY slip_date DESC LIMIT 120"
+                f"FROM slips WHERE {where} "
+                "GROUP BY slip_date ORDER BY slip_date DESC LIMIT 120", params
             ).fetchall()
         daily = {r["slip_date"]: {"amount": round(float(r["amt"] or 0), 2), "count": int(r["cnt"] or 0)}
                  for r in rows}
