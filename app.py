@@ -3643,5 +3643,30 @@ def health():
         return {"status": "db_error", "storage": f"{STORAGE_DESC} — {e}"}
 
 
+@app.route("/api/slip_daily", methods=["GET"])
+def api_slip_daily():
+    """อ่านอย่างเดียว: คืนยอดสลิปรวมรายวัน (ไว้ให้ dashboard เทียบกับเงินโอนจาก POS)
+    ความปลอดภัย: ถ้าตั้ง env SLIP_API_TOKEN ไว้ ต้องส่ง ?token=... ให้ตรง (ไม่ตั้ง = เปิดอ่านได้เลย)
+    คืน: {"ok":true,"daily":{"2026-07-01":{"amount":109000.0,"count":42}, ...}}
+    """
+    need = os.environ.get("SLIP_API_TOKEN", "")
+    if need and request.args.get("token", "") != need:
+        return {"ok": False, "error": "unauthorized"}, 401
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT slip_date, "
+                "SUM(CASE WHEN verdict!='FAIL' THEN amount ELSE 0 END) amt, "
+                "COUNT(CASE WHEN verdict!='FAIL' THEN 1 END) cnt "
+                "FROM slips WHERE slip_date IS NOT NULL "
+                "GROUP BY slip_date ORDER BY slip_date DESC LIMIT 120"
+            ).fetchall()
+        daily = {r["slip_date"]: {"amount": round(float(r["amt"] or 0), 2), "count": int(r["cnt"] or 0)}
+                 for r in rows}
+        return {"ok": True, "daily": daily}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
