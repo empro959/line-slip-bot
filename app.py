@@ -99,8 +99,8 @@ MEM_WARN_MB = float(os.environ.get("MEM_WARN_MB", "430"))
 RESV_NAG_MAX_HOURS   = float(os.environ.get("RESV_NAG_MAX_HOURS", "3"))
 RESV_NAG_INTERVAL_MIN = int(os.environ.get("RESV_NAG_INTERVAL_MIN", "30"))
 # รายงานจองอัตโนมัติ 2 รอบ/วัน (ส่งครั้งเดียว/วันต่อรอบ ในกรอบ [ชม.นั้น, +3)) — ตั้งชั่วโมง 0-23
-RESV_ADVANCE_SUMMARY_HOUR = int(os.environ.get("RESV_ADVANCE_SUMMARY_HOUR", "11"))  # รายงาน 'จองล่วงหน้า' (วันข้างหน้า) รอบเช้า
-RESV_TODAY_SUMMARY_HOUR   = int(os.environ.get("RESV_TODAY_SUMMARY_HOUR", "16"))    # สรุป 'จองของวันนี้' รอบบ่าย
+RESV_ADVANCE_SUMMARY_HOUR = int(os.environ.get("RESV_ADVANCE_SUMMARY_HOUR", "11"))  # รายงาน 'จองล่วงหน้าที่ถึงวันงานวันนี้' รอบเช้า
+RESV_TODAY_SUMMARY_HOUR   = int(os.environ.get("RESV_TODAY_SUMMARY_HOUR", "16"))    # สรุป 'จองในวัน' (จองวันนี้เพื่อวันนี้) รอบบ่าย
 # รายงานสรุปจองล่วงหน้า (เข้ากลุ่มบาร์น้ำหลังเที่ยงคืน) — แสดงจองล่วงหน้าที่แจ้งมาภายในกี่วันล่าสุด (ใช้กับจองที่ไม่มีวันที่จริง)
 RESV_REPORT_DAYS   = int(os.environ.get("RESV_REPORT_DAYS", "7"))
 # ลบข้อมูลเก่าอัตโนมัติ (วันละครั้ง) กัน DB บวม
@@ -1302,20 +1302,26 @@ def _resv_line(r: dict) -> str:
     return f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}"
 
 
-def build_resv_summary(notify_group=None, title="📋 สรุปการจองวันนี้", upcoming=False, skip_if_empty=False, match_origin=False, advance_only=False) -> str:
+def build_resv_summary(notify_group=None, title="📋 สรุปการจองวันนี้", upcoming=False, skip_if_empty=False, match_origin=False, date_mode=None) -> str:
     """สรุปการจอง
     upcoming=False (ดีฟอลต์): เฉพาะจอง 'ของวันนี้' (resv_date = วันนี้) — จองล่วงหน้าจะโผล่เฉพาะวันที่ถึง
     upcoming=True: จองที่กำลังจะถึง (resv_date >= วันนี้) แยกหัวข้อ วันนี/ล่วงหน้า — ใช้กับ digest ล่วงหน้า
-    advance_only=True: เฉพาะจอง 'ล่วงหน้า' (resv_date > วันนี้) ไม่รวมของวันนี้ — ใช้กับรายงานล่วงหน้ารอบเช้า
+    date_mode='advance_arrived': จองล่วงหน้าที่ 'ถึงวันงานวันนี้' (resv_date=วันนี้ + จองมาตั้งแต่วันก่อน) — รายงาน 11:00
+       → โผล่เฉพาะวันงานของมัน ไม่โผล่ทุกวันก่อนถึง
+    date_mode='sameday': จอง 'ในวัน' (สร้างวันนี้ เพื่อวันนี้/ไม่ระบุวัน) — สรุป 16:00
     notify_group=None → ทุกการจอง / ระบุ group → เฉพาะการจองที่ส่งการ์ดเข้ากลุ่มนั้น
     match_origin=True → นับจองที่ 'เกิดในกลุ่มนี้ (origin) หรือส่งเข้ากลุ่มนี้ (notify)' —
        ใช้กับคำสั่ง 'สรุปจอง' ในกลุ่มต้นทาง เพราะจองล่วงหน้าถูกส่ง notify ไปกลุ่มบาร์ (จะได้เห็นล่วงหน้าด้วย)
     skip_if_empty=True → ถ้าไม่มีจองคืน None (ไว้ให้รายงานอัตโนมัติ 'ไม่ส่ง' วันที่ไม่มีจอง — ประหยัด push)"""
     today  = datetime.now(TZ).date().isoformat()
-    if advance_only:
-        # จองล่วงหน้าเท่านั้น: วันงานจริง > วันนี้ (ของวันนี้ไปอยู่รายงานรอบบ่าย)
-        date_cond = "(COALESCE(resv_date, substr(created_at,1,10)) > ?)"
-        params = [today]
+    if date_mode == "advance_arrived":
+        # จองล่วงหน้าที่วันงานคือวันนี้ (จองมาก่อนหน้า) — โผล่เฉพาะวันงาน ไม่โผล่ทุกวันตั้งแต่จอง
+        date_cond = "(resv_date = ? AND substr(created_at,1,10) < ?)"
+        params = [today, today]
+    elif date_mode == "sameday":
+        # จองในวัน: สร้างวันนี้ + เป็นของวันนี้ (หรือไม่ระบุวัน=ถือว่าวันนี้) — ไม่รวมจองล่วงหน้าเพื่อวันอื่น
+        date_cond = "(substr(created_at,1,10) = ? AND (resv_date = ? OR resv_date IS NULL))"
+        params = [today, today]
     elif upcoming:
         # "วันงานจริง" ต้อง >= วันนี้ — ใช้ resv_date ถ้ามี ไม่งั้น fallback วันที่แจ้ง (กันจองที่เลยวันไปแล้วค้างในรายการล่วงหน้า)
         date_cond = "(COALESCE(resv_date, substr(created_at,1,10)) >= ?)"
@@ -2202,7 +2208,7 @@ def maybe_send_daily_report():
                 else:
                     failed += 1
                 print(f"[report] push FAILED {dest}: {e}", flush=True)
-        # หมายเหตุ: สรุปจองแยกไปที่ maybe_send_resv_summary แล้ว (จองล่วงหน้า 11:00 / จองวันนี้ 16:00)
+        # หมายเหตุ: สรุปจองแยกไปที่ maybe_send_resv_summary แล้ว (จองล่วงหน้าถึงวันงาน 11:00 / จองในวัน 16:00)
         # มาร์คว่า 'ส่งครบแล้ว' เฉพาะเมื่อไม่มีอันไหนล้มเหลว — ถ้ามี fail ปล่อยไว้ให้ ping รอบหน้า retry
         if failed == 0:
             _set_meta("last_report_date", today)
@@ -2214,16 +2220,17 @@ def maybe_send_daily_report():
 
 def maybe_send_resv_summary():
     """ส่งรายงานจองอัตโนมัติ 2 รอบ/วัน (idempotent แยกรอบ):
-      • รอบเช้า RESV_ADVANCE_SUMMARY_HOUR (ดีฟอลต์ 11:00) → 'จองล่วงหน้า' (วันข้างหน้า)
-      • รอบบ่าย RESV_TODAY_SUMMARY_HOUR   (ดีฟอลต์ 16:00) → 'จองของวันนี้'
+      • รอบเช้า RESV_ADVANCE_SUMMARY_HOUR (ดีฟอลต์ 11:00) → 'จองล่วงหน้าที่ถึงวันงานวันนี้'
+        (จองมาก่อนหน้า วันงานคือวันนี้ — โผล่เฉพาะวันงาน ไม่โผล่ทุกวันตั้งแต่จอง)
+      • รอบบ่าย RESV_TODAY_SUMMARY_HOUR   (ดีฟอลต์ 16:00) → 'จองในวัน' (จองวันนี้เพื่อวันนี้)
     แต่ละรอบส่งครั้งเดียว/วันในกรอบ [ชม., +3); วันไหนไม่มีจอง = ไม่ส่ง (ประหยัด push)"""
     now = datetime.now(TZ)
     _maybe_send_resv_slot(
         now, RESV_ADVANCE_SUMMARY_HOUR, "resv_adv_summary",
-        lambda h: build_resv_summary(None, f"📅 สรุปจองล่วงหน้า ({h:02d}:00)", advance_only=True, skip_if_empty=True))
+        lambda h: build_resv_summary(None, f"📅 จองล่วงหน้าวันนี้ ({h:02d}:00)", date_mode="advance_arrived", skip_if_empty=True))
     _maybe_send_resv_slot(
         now, RESV_TODAY_SUMMARY_HOUR, "resv_today_summary",
-        lambda h: build_resv_summary(None, f"📋 สรุปการจองวันนี้ ({h:02d}:00)", skip_if_empty=True))
+        lambda h: build_resv_summary(None, f"📋 จองในวันวันนี้ ({h:02d}:00)", date_mode="sameday", skip_if_empty=True))
 
 
 def _maybe_send_resv_slot(now, start_hour, job, build_text):
