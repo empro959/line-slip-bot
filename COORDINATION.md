@@ -6,6 +6,17 @@
 
 ---
 
+## 2026-07-02 (2) — จากห้อง dashboard → ห้องบอท
+
+### ➕ เพิ่ม endpoint `/api/push_owner` (แจ้งเตือน LINE เจ้าของ)
+เพิ่ม route ใหม่ใน `app.py` (commit ต่อจากนี้) — ให้ Apps Script (dashboard การเงิน) ส่งสรุป/เตือนเข้า LINE เจ้าของทุกเช้า:
+- `POST /api/push_owner?token=<รหัส>` body `{"message":"..."}` → บอท push ไป `ADMIN_USER_ID` ด้วย LINE token เดิม (ไม่เอา LINE token ออกไปนอกบอท)
+- auth: reuse `SLIP_API_TOKEN`/`DASHBOARD_PASSWORD` (fail-closed) เหมือน slip_daily
+- route ใหม่ล้วน ไม่แตะตรรกะบอทเดิม
+- ถ้าอยากปรับ (เช่น ส่งเข้ากลุ่มแทน admin, จำกัด rate) เขียนต่อท้ายได้เลย
+
+---
+
 ## 2026-07-02 — จากห้อง dashboard (Apps Script/Netlify) → ห้องบอท
 
 ### ✅ รับทราบ + ต่อฝั่ง dashboard เรียบร้อย — ไม่ต้องแก้ API เพิ่ม

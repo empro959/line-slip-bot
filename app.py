@@ -3678,5 +3678,26 @@ def api_slip_daily():
         return {"ok": False, "error": str(e)[:120]}
 
 
+@app.route("/api/push_owner", methods=["POST"])
+def api_push_owner():
+    """ให้ Apps Script (dashboard การเงิน) ส่งข้อความแจ้งเตือนเข้า LINE เจ้าของ (ADMIN_USER_ID)
+    ความปลอดภัย: ต้องมี token ตรง (SLIP_API_TOKEN หรือ DASHBOARD_PASSWORD)
+    body: {"message":"..."} — ใช้ LINE token เดิมของบอท (ไม่ต้องส่ง token LINE ออกไป)"""
+    need = os.environ.get("SLIP_API_TOKEN") or os.environ.get("DASHBOARD_PASSWORD") or ""
+    if not need or request.args.get("token", "") != need:
+        return {"ok": False, "error": "unauthorized"}, 401
+    if not ADMIN_USER_ID:
+        return {"ok": False, "error": "ยังไม่ตั้ง env LINE_ADMIN_USER_ID"}, 400
+    try:
+        body = json.loads(request.get_data(as_text=True) or "{}")
+        msg = (body.get("message") or "").strip()
+        if not msg:
+            return {"ok": False, "error": "empty message"}, 400
+        line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=msg[:4900]))
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
