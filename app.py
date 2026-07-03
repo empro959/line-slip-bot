@@ -25,7 +25,9 @@ app = Flask(__name__)
 LINE_TOKEN        = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET       = os.environ.get("LINE_CHANNEL_SECRET")
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY")
-ADMIN_USER_ID     = os.environ.get("LINE_ADMIN_USER_ID", "")
+# เจ้าของ 1 คนหรือหลายคนก็ได้ — ใส่หลายรหัสคั่นด้วยคอมมา (เช่น "U111...,U222...")
+ADMIN_USER_IDS    = [u.strip() for u in os.environ.get("LINE_ADMIN_USER_ID", "").replace("\n", ",").split(",") if u.strip()]
+ADMIN_USER_ID     = ADMIN_USER_IDS[0] if ADMIN_USER_IDS else ""   # ตัวแรก = ใช้กับแจ้งเตือนระบบ (mem/error) พอ
 PROMPTPAY_API_KEY = os.environ.get("PROMPTPAY_API_KEY", "")
 # กลุ่มที่ให้ "เช็คสลิป + เตือน + ส่งรายงาน" เท่านั้น (คั่นด้วยคอมมา) — เว้นว่าง = ทุกกลุ่ม
 SLIP_GROUPS       = [g.strip() for g in os.environ.get("SLIP_GROUPS", "").split(",") if g.strip()]
@@ -3686,15 +3688,24 @@ def api_push_owner():
     need = os.environ.get("SLIP_API_TOKEN") or os.environ.get("DASHBOARD_PASSWORD") or ""
     if not need or request.args.get("token", "") != need:
         return {"ok": False, "error": "unauthorized"}, 401
-    if not ADMIN_USER_ID:
+    if not ADMIN_USER_IDS:
         return {"ok": False, "error": "ยังไม่ตั้ง env LINE_ADMIN_USER_ID"}, 400
     try:
         body = json.loads(request.get_data(as_text=True) or "{}")
         msg = (body.get("message") or "").strip()
         if not msg:
             return {"ok": False, "error": "empty message"}, 400
-        line_bot_api.push_message(ADMIN_USER_ID, TextSendMessage(text=msg[:4900]))
-        return {"ok": True}
+        # ส่งให้เจ้าของทุกคน — ถ้าบางรหัสพัง (เช่นยังไม่แอดบอท) คนอื่นยังได้อยู่
+        sent, errors = 0, []
+        for uid in ADMIN_USER_IDS:
+            try:
+                line_bot_api.push_message(uid, TextSendMessage(text=msg[:4900]))
+                sent += 1
+            except Exception as e:
+                errors.append(f"{uid[:8]}…: {str(e)[:80]}")
+        if sent == 0:
+            return {"ok": False, "error": "; ".join(errors)[:180]}
+        return {"ok": True, "sent": sent, "total": len(ADMIN_USER_IDS), "errors": errors}
     except Exception as e:
         return {"ok": False, "error": str(e)[:120]}
 
