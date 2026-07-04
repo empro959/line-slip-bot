@@ -2838,6 +2838,9 @@ _slip_pool = ThreadPoolExecutor(max_workers=int(os.environ.get("SLIP_WORKERS", "
 # โหลดรูปเบา (แค่ดึง bytes) จึงมีหลาย worker ได้ ไม่กิน memory เท่าอ่าน AI ที่ยังจำกัดที่ _slip_pool
 _dl_pool   = ThreadPoolExecutor(max_workers=int(os.environ.get("SLIP_DL_WORKERS", "6")),
                                 thread_name_prefix="dl")
+# จำกัด 'รูปที่ค้างใน RAM พร้อมกัน' (โหลดแล้วรออ่าน) ไม่ให้เกิน N ใบ — กัน burst ทำ memory พุ่งจน OOM/restart
+# (โหลดรูปทันทีกัน 410 แลกกับต้อง buffer bytes; semaphore นี้เป็นเบรกกันบวมเกิน) ลดค่าถ้า RAM ตึง
+_slip_inflight = threading.BoundedSemaphore(int(os.environ.get("SLIP_MAX_INFLIGHT", "6")))
 
 
 @handler.add(MessageEvent, message=ImageMessage)
@@ -2854,16 +2857,28 @@ def _download_image_event(event):
     if group_id in IGNORE_GROUPS or group_id in PAYABLE_GROUPS or not _slip_enabled(group_id):
         _slip_pool.submit(_process_image_event, event)
         return
+    # จองสิทธิ์ 'รูปค้าง RAM' ก่อนโหลด — เต็มโควตาจะบล็อกที่นี่ (backpressure กัน memory บวมช่วง burst)
+    # worker อ่านสลิป (_process_image_event) จะคืนสิทธิ์ให้เมื่อทำเสร็จ (holds_sem=True)
+    _slip_inflight.acquire()
     try:
         content     = line_bot_api.get_message_content(event.message.id)
         image_bytes = b"".join(chunk for chunk in content.iter_content())
-        _slip_pool.submit(_process_image_event, event, image_bytes, None)
+        _slip_pool.submit(_process_image_event, event, image_bytes, None, True)
     except Exception as e:
         print(f"[error] โหลดรูปไม่สำเร็จ (webhook) group={group_id}: {e}", flush=True)
-        _slip_pool.submit(_process_image_event, event, None, e)
+        _slip_pool.submit(_process_image_event, event, None, e, True)
 
 
-def _process_image_event(event, image_bytes=None, download_err=None):
+def _process_image_event(event, image_bytes=None, download_err=None, holds_sem=False):
+    """ห่อ _process_slip_image ด้วย try/finally — คืนสิทธิ์ semaphore เสมอเมื่อทำเสร็จ (ทุก path/return/error)"""
+    try:
+        _process_slip_image(event, image_bytes, download_err)
+    finally:
+        if holds_sem:
+            _slip_inflight.release()
+
+
+def _process_slip_image(event, image_bytes=None, download_err=None):
     group_id = getattr(event.source, "group_id", event.source.user_id)
     if group_id in IGNORE_GROUPS:
         return   # กลุ่มที่สั่งให้เมินทั้งหมด → ไม่ทำอะไรเลย
