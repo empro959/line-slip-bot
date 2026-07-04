@@ -2124,6 +2124,14 @@ def _looks_like_gemini_issue(e) -> bool:
                                 "rate limit", "429", "503", "overload", "gemini"))
 
 
+def _is_gemini_credits_error(e) -> bool:
+    """429 เพราะ 'เครดิต Gemini (prepay) หมด' — ต้องเติมเงิน ไม่ใช่รอ (ต่างจาก rate-limit ชั่วคราว)
+    → ใช้ trigger circuit breaker: หยุดยิง Gemini ชั่วคราว + เตือนเติมด่วน (แทน re-queue ไล่ยิงจนเปลือง)"""
+    s = str(e).lower()
+    return ("resource_exhausted" in s or "429" in s) and any(
+        k in s for k in ("credit", "depleted", "prepay", "billing", "balance", "insufficient"))
+
+
 def _is_quota_error(e: Exception) -> bool:
     """push โดนปฏิเสธเพราะเต็มโควต้า push รายเดือน (429 / ข้อความมี monthly/limit/quota)
     ใช้เป็น safety net: ถ้าตัวนับพลาดหรือ OA เต็มก่อนถึง PUSH_FREE_LIMIT → สลับ OA ถัดไปทันที ไม่ให้ตกหล่น"""
@@ -2821,6 +2829,10 @@ def notify_admin_error(group_id, err):
     if _is_content_gone(err):
         tip = ("📎 รูปถูกยกเลิก/หมดอายุก่อนบอทโหลดทัน (LINE 410 'content is gone') — "
                "ไม่เกี่ยวกับ Gemini; ให้ส่งรูปสลิปใหม่ หรือใช้ 'เพิ่มสลิป <ยอด>' ลงมือ")
+    elif _is_gemini_credits_error(err):
+        tip = ("💳 เครดิต Gemini (prepay) หมด! เติมด่วนที่ https://ai.studio/projects — "
+               "บอทหยุดอ่านสลิปชั่วคราวกันยิงเปล่า, จะกลับมาอ่านเองใน ~1 นาทีหลังเติม; "
+               "แนะนำเปลี่ยนเป็นจ่ายอัตโนมัติกันหมดกลางคัน")
     elif _looks_like_gemini_issue(err):
         tip = ("🤖 น่าจะเป็นโควต้า Gemini ฟรีหมดรายวัน/rate-limit ช่วงพีค → "
                "พิจารณาเปิดบิลลิ่ง Gemini (ถูกมาก) เพื่อไม่ให้ขาดช่วง")
@@ -2851,6 +2863,13 @@ SLIP_RETRY_MAX   = int(os.environ.get("SLIP_RETRY_MAX", "2"))     # ลองใ
 SLIP_RETRY_DELAY = int(os.environ.get("SLIP_RETRY_DELAY", "45"))  # หน่วงกี่วินาทีก่อนลองใหม่ (รอ burst ซา)
 # กันคิว re-queue บวม RAM ตอน Gemini ล่มยาว (ทุกใบล้ม+ลองใหม่พร้อมกัน) — เกินนี้ = ยอมแพ้เลย ไม่เข้าคิว
 _slip_requeue_sem = threading.BoundedSemaphore(int(os.environ.get("SLIP_RETRY_QUEUE_MAX", "8")))
+# Circuit breaker 'เครดิต Gemini หมด' — เจอ 429 credits depleted → หยุดยิง Gemini ชั่วคราว (กันยิงเปล่าเปลือง/สแปม)
+# ระหว่างหยุด: ข้ามการอ่าน (นับตกหล่น) แต่ปล่อย 'probe' 1 ใบทุก GEMINI_PROBE_INTERVAL วิ เช็คว่าเครดิตกลับมายัง
+GEMINI_OUT_COOLDOWN   = int(os.environ.get("GEMINI_OUT_COOLDOWN", "600"))   # หยุดยิงกี่วินาทีหลังเจอเครดิตหมด
+GEMINI_PROBE_INTERVAL = int(os.environ.get("GEMINI_PROBE_INTERVAL", "60"))  # ระหว่างหยุด ทดสอบทุกกี่วินาที
+_gemini_out_lock  = threading.Lock()
+_gemini_out_until = 0.0   # epoch; > now = อยู่ในช่วง 'เครดิตหมด' (หยุดยิง Gemini)
+_gemini_last_probe = 0.0  # เวลาที่ปล่อย probe ล่าสุด
 
 
 @handler.add(MessageEvent, message=ImageMessage)
@@ -2922,6 +2941,21 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
             notify_admin_error(group_id, e)
             return
 
+    # Circuit breaker 'เครดิต Gemini หมด' — ระหว่างหยุด: ข้ามการอ่าน (กันยิงเปล่า/สแปม) ยกเว้นปล่อย probe ทดสอบเป็นระยะ
+    global _gemini_out_until, _gemini_last_probe
+    _now = time.time()
+    _probe = False
+    with _gemini_out_lock:
+        _in_outage = _gemini_out_until > _now
+        if _in_outage and (_now - _gemini_last_probe >= GEMINI_PROBE_INTERVAL):
+            _gemini_last_probe = _now
+            _probe = True   # ปล่อยใบนี้ทดสอบว่าเครดิตกลับมายัง
+    if _in_outage and not _probe:
+        print(f"[slip] ข้าม Gemini: ช่วงเครดิตหมด (หยุดยิงชั่วคราว) group={group_id}", flush=True)
+        record_image_miss(group_id, "error")
+        notify_admin_error(group_id, "429 RESOURCE_EXHAUSTED credits depleted (บอทหยุดอ่านชั่วคราว รอเติมเครดิต)")
+        return
+
     # อ่านสลิป: รอบแรก flash; ถ้า 'พัง/ไม่ใช่สลิป/ยอด<=0' ลองซ้ำด้วย pro (กู้ทั้งใบอ่านยาก + กรณี Gemini ล้มชั่วคราว)
     # dining=True เฉพาะกลุ่ม DINING_GROUPS → ใส่คำสั่งอ่านบิลใน prompt เฉพาะกลุ่มนั้น (กลุ่มอื่นได้ prompt เดิมเป๊ะ)
     _dining = _dining_enabled(group_id)
@@ -2947,6 +2981,15 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
     # อ่านไม่สำเร็จทั้ง flash+pro (มักเพราะ Gemini ล้มชั่วคราวช่วงพีค) → ลองใหม่ (re-queue) แทนดรอปทันที
     if info is None:
         print(f"[slip] อ่านไม่สำเร็จทั้ง flash+pro group={group_id} (รอบ {attempt}): {last_err}", flush=True)
+        # เครดิต Gemini หมด → เปิด breaker (หยุดยิงชั่วคราว) + เตือนเติมด่วน; ไม่ re-queue (ยิงไปก็ 429 เปล่า)
+        if _is_gemini_credits_error(last_err):
+            with _gemini_out_lock:
+                _gemini_out_until  = time.time() + GEMINI_OUT_COOLDOWN
+                _gemini_last_probe = time.time()   # เริ่มนับ probe ใหม่ตอน arm (กันยิงซ้ำทันที รอ 1 รอบก่อนทดสอบ)
+            print(f"[slip] 💳 เครดิต Gemini หมด → หยุดยิง {GEMINI_OUT_COOLDOWN}s group={group_id}", flush=True)
+            record_image_miss(group_id, "error")
+            notify_admin_error(group_id, last_err)
+            return
         # ยังไม่หมดโควตาลองใหม่ + มีรูป + คิว re-queue ไม่เต็ม → เข้าคิวลองใหม่หลังหน่วง (รอ burst/Gemini ซา)
         if attempt <= SLIP_RETRY_MAX and image_bytes is not None and _slip_requeue_sem.acquire(blocking=False):
             print(f"[slip] เข้าคิวลองใหม่ครั้งที่ {attempt+1}/{SLIP_RETRY_MAX+1} ใน {SLIP_RETRY_DELAY}s group={group_id}", flush=True)
@@ -2958,6 +3001,12 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
         record_image_miss(group_id, "error")
         notify_admin_error(group_id, last_err or f"extract_slip_info ล้มทั้ง flash+pro ({attempt} รอบ)")
         return
+
+    # อ่านสำเร็จ — ถ้าใบนี้เป็น probe ช่วงเครดิตหมด แปลว่าเครดิตกลับมาแล้ว → ปลด breaker กลับมาอ่านปกติ
+    if _probe:
+        with _gemini_out_lock:
+            _gemini_out_until = 0.0
+        print(f"[slip] ✅ เครดิต Gemini กลับมา — เปิดอ่านต่อ group={group_id}", flush=True)
 
     # ใบรูดบัตรเครดิต/เดบิต (EDC settlement) = จ่ายด้วยบัตร ไม่ใช่สลิปโอน → ไม่นับยอดโอน (เข้า 'ข้ามไม่ใช่รายรับ' ดูที่ 'ดูที่ข้าม')
     if info.get("is_card_settlement"):
