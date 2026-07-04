@@ -128,9 +128,14 @@ for _i in range(2, 6):             # รองรับ OA2..OA5
     if _tok2:
         _push_apis.append(LineBotApi(_tok2))
 _push_lock = threading.Lock()      # กัน race นับโควต้าจากหลาย thread (background jobs + handlers)
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-# โมเดลสำหรับ 'อ่านซ้ำ' เมื่อรอบแรกอ่านไม่ออก — ใช้ตัวเก่งขึ้น (pro) เฉพาะใบยาก กู้สลิปที่ flash แพ้
-GEMINI_MODEL_RETRY = os.environ.get("GEMINI_MODEL_RETRY", "gemini-2.5-pro")
+# รับชื่อย่อ (flash/pro/flash-lite) → เติมเป็นชื่อโมเดลเต็มให้อัตโนมัติ กันพลาดตอนตั้ง env ผิด (เช่นใส่แค่ 'flash')
+_GEMINI_ALIASES = {"flash": "gemini-2.5-flash", "pro": "gemini-2.5-pro", "flash-lite": "gemini-2.5-flash-lite"}
+def _norm_gemini_model(m: str) -> str:
+    m = (m or "").strip()
+    return _GEMINI_ALIASES.get(m.lower(), m)
+GEMINI_MODEL = _norm_gemini_model(os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
+# โมเดลสำหรับ 'อ่านซ้ำ' เมื่อรอบแรกอ่านไม่ออก — เดิม pro (เก่งกู้ใบยาก แต่ลิมิต RPM ต่ำ); ตั้ง flash เพื่อหนีคอขวด pro ช่วงพีค
+GEMINI_MODEL_RETRY = _norm_gemini_model(os.environ.get("GEMINI_MODEL_RETRY", "gemini-2.5-pro"))
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 def _gemini_generate(contents, attempts=4, model=None, json_mode=False):
