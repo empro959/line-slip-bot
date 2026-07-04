@@ -2846,6 +2846,11 @@ _dl_pool   = ThreadPoolExecutor(max_workers=int(os.environ.get("SLIP_DL_WORKERS"
 # จำกัด 'รูปที่ค้างใน RAM พร้อมกัน' (โหลดแล้วรออ่าน) ไม่ให้เกิน N ใบ — กัน burst ทำ memory พุ่งจน OOM/restart
 # (โหลดรูปทันทีกัน 410 แลกกับต้อง buffer bytes; semaphore นี้เป็นเบรกกันบวมเกิน) ลดค่าถ้า RAM ตึง
 _slip_inflight = threading.BoundedSemaphore(int(os.environ.get("SLIP_MAX_INFLIGHT", "6")))
+# re-queue: สลิปที่ Gemini อ่านล้มทั้ง flash+pro (มัก 503/rate-limit ชั่วคราวช่วงพีค) → ลองใหม่แทนดรอปทันที
+SLIP_RETRY_MAX   = int(os.environ.get("SLIP_RETRY_MAX", "2"))     # ลองใหม่กี่รอบ (นอกจากรอบแรก)
+SLIP_RETRY_DELAY = int(os.environ.get("SLIP_RETRY_DELAY", "45"))  # หน่วงกี่วินาทีก่อนลองใหม่ (รอ burst ซา)
+# กันคิว re-queue บวม RAM ตอน Gemini ล่มยาว (ทุกใบล้ม+ลองใหม่พร้อมกัน) — เกินนี้ = ยอมแพ้เลย ไม่เข้าคิว
+_slip_requeue_sem = threading.BoundedSemaphore(int(os.environ.get("SLIP_RETRY_QUEUE_MAX", "8")))
 
 
 @handler.add(MessageEvent, message=ImageMessage)
@@ -2874,16 +2879,19 @@ def _download_image_event(event):
         _slip_pool.submit(_process_image_event, event, None, e, True)
 
 
-def _process_image_event(event, image_bytes=None, download_err=None, holds_sem=False):
-    """ห่อ _process_slip_image ด้วย try/finally — คืนสิทธิ์ semaphore เสมอเมื่อทำเสร็จ (ทุก path/return/error)"""
+def _process_image_event(event, image_bytes=None, download_err=None, holds_sem=False, attempt=1, requeue_held=False):
+    """ห่อ _process_slip_image ด้วย try/finally — คืนสิทธิ์ semaphore เสมอเมื่อทำเสร็จ (ทุก path/return/error)
+    holds_sem = ถือสิทธิ์ 'รูปค้าง RAM' (_slip_inflight) / requeue_held = ถือสิทธิ์คิว re-queue (_slip_requeue_sem)"""
     try:
-        _process_slip_image(event, image_bytes, download_err)
+        _process_slip_image(event, image_bytes, download_err, attempt)
     finally:
         if holds_sem:
             _slip_inflight.release()
+        if requeue_held:
+            _slip_requeue_sem.release()
 
 
-def _process_slip_image(event, image_bytes=None, download_err=None):
+def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
     group_id = getattr(event.source, "group_id", event.source.user_id)
     if group_id in IGNORE_GROUPS:
         return   # กลุ่มที่สั่งให้เมินทั้งหมด → ไม่ทำอะไรเลย
@@ -2918,9 +2926,11 @@ def _process_slip_image(event, image_bytes=None, download_err=None):
     # dining=True เฉพาะกลุ่ม DINING_GROUPS → ใส่คำสั่งอ่านบิลใน prompt เฉพาะกลุ่มนั้น (กลุ่มอื่นได้ prompt เดิมเป๊ะ)
     _dining = _dining_enabled(group_id)
     info = None
+    last_err = None   # เก็บ error จริงจาก Gemini (ไว้เตือนแอดมินตอนยอมแพ้ ให้รู้เหตุจริง 503/429/timeout)
     try:
         info = extract_slip_info(image_bytes, dining=_dining)
     except Exception as e:
+        last_err = e
         print(f"[slip] flash อ่านพลาด group={group_id}: {e}", flush=True)
     # อ่านซ้ำด้วย pro เมื่อรอบแรก 'พัง/ไม่ใช่สลิป/ยอด<=0' — รวมถึงกรณีกลุ่ม dining ที่ flash ตัดสินว่าเป็น 'บิล'
     # (อาจเป็นรูป 'บิล+สลิปคู่กัน' ที่ flash เห็นแต่บิล อ่านสลิปบนจอไม่ออก) → ให้ pro ลองหาสลิปอีกรอบ กันยอดสลิปหาย
@@ -2931,13 +2941,22 @@ def _process_slip_image(event, image_bytes=None, download_err=None):
                 info = info_retry
                 print(f"[slip] retry กู้สลิปได้ group={group_id}", flush=True)
         except Exception as e:
+            last_err = e
             print(f"[slip] retry อ่านซ้ำพลาด group={group_id}: {e}", flush=True)
 
-    # อ่านไม่สำเร็จทั้ง flash+pro (มักเพราะ Gemini ล้มชั่วคราวช่วงพีค) → ข้ามเงียบ ไม่เด้งกวนกลุ่ม + เตือนเฉพาะแอดมิน
+    # อ่านไม่สำเร็จทั้ง flash+pro (มักเพราะ Gemini ล้มชั่วคราวช่วงพีค) → ลองใหม่ (re-queue) แทนดรอปทันที
     if info is None:
-        print(f"[slip] อ่านไม่สำเร็จทั้ง flash+pro group={group_id}", flush=True)
+        print(f"[slip] อ่านไม่สำเร็จทั้ง flash+pro group={group_id} (รอบ {attempt}): {last_err}", flush=True)
+        # ยังไม่หมดโควตาลองใหม่ + มีรูป + คิว re-queue ไม่เต็ม → เข้าคิวลองใหม่หลังหน่วง (รอ burst/Gemini ซา)
+        if attempt <= SLIP_RETRY_MAX and image_bytes is not None and _slip_requeue_sem.acquire(blocking=False):
+            print(f"[slip] เข้าคิวลองใหม่ครั้งที่ {attempt+1}/{SLIP_RETRY_MAX+1} ใน {SLIP_RETRY_DELAY}s group={group_id}", flush=True)
+            threading.Timer(SLIP_RETRY_DELAY, _slip_pool.submit,
+                            args=(_process_image_event, event, image_bytes, None, False, attempt + 1, True)).start()
+            return
+        # หมดโควตาลองใหม่ (หรือคิวเต็ม) → ยอมแพ้: นับตกหล่น + เตือนแอดมินพร้อม error 'จริง' จาก Gemini
+        print(f"[slip] ยอมแพ้หลังลอง {attempt} รอบ group={group_id}", flush=True)
         record_image_miss(group_id, "error")
-        notify_admin_error(group_id, "extract_slip_info ล้มทั้ง flash+pro (อาจ rate-limit ช่วงพีค)")
+        notify_admin_error(group_id, last_err or f"extract_slip_info ล้มทั้ง flash+pro ({attempt} รอบ)")
         return
 
     # ใบรูดบัตรเครดิต/เดบิต (EDC settlement) = จ่ายด้วยบัตร ไม่ใช่สลิปโอน → ไม่นับยอดโอน (เข้า 'ข้ามไม่ใช่รายรับ' ดูที่ 'ดูที่ข้าม')
