@@ -2106,6 +2106,19 @@ def _is_not_member_error(e: Exception) -> bool:
     return isinstance(e, LineBotApiError) and getattr(e, "status_code", None) == 400
 
 
+def _is_content_gone(e: Exception) -> bool:
+    """โหลดรูปจาก LINE ไม่ได้เพราะ 'รูปหาย' — 410 'content is gone' (ยกเลิกข้อความ/หมดอายุ) หรือ 404
+    คนละเรื่องกับ Gemini quota โดยสิ้นเชิง (พังตั้งแต่ขั้นดาวน์โหลด ยังไม่ถึง Gemini)"""
+    return isinstance(e, LineBotApiError) and getattr(e, "status_code", None) in (404, 410)
+
+
+def _looks_like_gemini_issue(e) -> bool:
+    """error นี้น่าจะมาจาก Gemini (rate-limit/quota/overload) — ใช้เลือกข้อความเตือนแอดมินให้ตรงเหตุ"""
+    s = str(e).lower()
+    return any(k in s for k in ("resource_exhausted", "quota", "rate-limit", "rate_limit",
+                                "rate limit", "429", "503", "overload", "gemini"))
+
+
 def _is_quota_error(e: Exception) -> bool:
     """push โดนปฏิเสธเพราะเต็มโควต้า push รายเดือน (429 / ข้อความมี monthly/limit/quota)
     ใช้เป็น safety net: ถ้าตัวนับพลาดหรือ OA เต็มก่อนถึง PUSH_FREE_LIMIT → สลับ OA ถัดไปทันที ไม่ให้ตกหล่น"""
@@ -2799,12 +2812,20 @@ def notify_admin_error(group_id, err):
     if time.time() - _last_admin_error_ts < 1800:
         return
     _last_admin_error_ts = time.time()
+    # เลือกข้อความตามเหตุจริง — กันโทษ Gemini ผิด (เช่น 410 รูปหาย ไม่เกี่ยวกับ Gemini)
+    if _is_content_gone(err):
+        tip = ("📎 รูปถูกยกเลิก/หมดอายุก่อนบอทโหลดทัน (LINE 410 'content is gone') — "
+               "ไม่เกี่ยวกับ Gemini; ให้ส่งรูปสลิปใหม่ หรือใช้ 'เพิ่มสลิป <ยอด>' ลงมือ")
+    elif _looks_like_gemini_issue(err):
+        tip = ("🤖 น่าจะเป็นโควต้า Gemini ฟรีหมดรายวัน/rate-limit ช่วงพีค → "
+               "พิจารณาเปิดบิลลิ่ง Gemini (ถูกมาก) เพื่อไม่ให้ขาดช่วง")
+    else:
+        tip = ("อ่านสลิปไม่สำเร็จชั่วคราว — ถ้าเกิดถี่ช่วงสลิปเยอะ อาจเป็นโควต้า Gemini "
+               "→ พิจารณาเปิดบิลลิ่ง Gemini")
     try:
         _push(ADMIN_USER_ID, TextSendMessage(
             text=f"🛠️ [SYSTEM] บอทอ่านสลิปไม่สำเร็จ (group={group_id})\n"
-                 f"สาเหตุ: {str(err)[:250]}\n"
-                 "ถ้าเป็นช่วงเย็น/สลิปเยอะ อาจเป็นเพราะโควต้า Gemini ฟรีหมดรายวัน "
-                 "→ พิจารณาเปิดบิลลิ่ง Gemini (ถูกมาก) เพื่อให้ไม่ขาดช่วง"))
+                 f"สาเหตุ: {str(err)[:250]}\n{tip}"))
     except Exception:
         pass
 
@@ -2813,15 +2834,36 @@ def notify_admin_error(group_id, err):
 # (worker ล่ม = storage รีเซ็ต = จอง/สลิปช่วงนั้นพลาด) — ค่าน้อยปลอดภัยกว่าเพราะ Render Starter แรมจำกัด
 _slip_pool = ThreadPoolExecutor(max_workers=int(os.environ.get("SLIP_WORKERS", "2")),
                                 thread_name_prefix="slip")
+# pool 'โหลดรูป' แยกจากอ่าน Gemini — workers เยอะกว่า เพื่อคว้าไฟล์จาก LINE ตอนยังสด (กัน 410 ช่วงพีค)
+# โหลดรูปเบา (แค่ดึง bytes) จึงมีหลาย worker ได้ ไม่กิน memory เท่าอ่าน AI ที่ยังจำกัดที่ _slip_pool
+_dl_pool   = ThreadPoolExecutor(max_workers=int(os.environ.get("SLIP_DL_WORKERS", "6")),
+                                thread_name_prefix="dl")
 
 
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
-    # ส่งเข้า pool (จำกัดจำนวนพร้อมกัน) → ตอบ LINE ทันที, รูปที่เกินจะเข้าคิวไม่ถล่ม memory
-    _slip_pool.submit(_process_image_event, event)
+    # ส่งเข้า 'pool โหลดรูป' (workers เยอะ) → คว้าไฟล์จาก LINE ตอนยังสด กัน 410 'content is gone' ช่วงสลิปเยอะ
+    # แล้วค่อยส่งงานหนัก (อ่าน Gemini) เข้า _slip_pool ที่จำกัด concurrency กัน memory พุ่ง
+    _dl_pool.submit(_download_image_event, event)
 
 
-def _process_image_event(event):
+def _download_image_event(event):
+    """ขั้น 'โหลดรูป' ทำทันที (concurrency สูง) — สลิปโหลดที่นี่แล้วส่ง bytes เข้าคิวอ่าน
+    กลุ่มเจ้าหนี้/เมิน/ไม่เปิดสลิป → ส่งต่อให้ worker เดิมจัดการ (payable โหลดเองในนั้น)"""
+    group_id = getattr(event.source, "group_id", event.source.user_id)
+    if group_id in IGNORE_GROUPS or group_id in PAYABLE_GROUPS or not _slip_enabled(group_id):
+        _slip_pool.submit(_process_image_event, event)
+        return
+    try:
+        content     = line_bot_api.get_message_content(event.message.id)
+        image_bytes = b"".join(chunk for chunk in content.iter_content())
+        _slip_pool.submit(_process_image_event, event, image_bytes, None)
+    except Exception as e:
+        print(f"[error] โหลดรูปไม่สำเร็จ (webhook) group={group_id}: {e}", flush=True)
+        _slip_pool.submit(_process_image_event, event, None, e)
+
+
+def _process_image_event(event, image_bytes=None, download_err=None):
     group_id = getattr(event.source, "group_id", event.source.user_id)
     if group_id in IGNORE_GROUPS:
         return   # กลุ่มที่สั่งให้เมินทั้งหมด → ไม่ทำอะไรเลย
@@ -2836,15 +2878,21 @@ def _process_image_event(event):
     if _slip_message_seen(group_id, msg_id):
         print(f"[skip] รูปนี้ประมวลผลแล้ว (message_id ซ้ำ) group={group_id} msg={msg_id}", flush=True)
         return
-    # ดาวน์โหลดรูป — ถ้าโหลดไม่ได้ (เน็ต/LINE สะดุด) เงียบในกลุ่ม เตือนเฉพาะแอดมิน
-    try:
-        content     = line_bot_api.get_message_content(event.message.id)
-        image_bytes = b"".join(chunk for chunk in content.iter_content())
-    except Exception as e:
-        print(f"[error] โหลดรูปไม่สำเร็จ group={group_id}: {e}", flush=True)
+    # ใช้รูปที่โหลดมาแล้วจากขั้น webhook (สด กัน 410) — โหลดพลาดตั้งแต่ตอนนั้น = เงียบในกลุ่ม เตือนเฉพาะแอดมิน
+    if download_err is not None:
         record_image_miss(group_id, "error")
-        notify_admin_error(group_id, e)
+        notify_admin_error(group_id, download_err)
         return
+    if image_bytes is None:
+        # fallback: ยังไม่มี bytes (เช่นถูกเรียกตรง ๆ ไม่ผ่านขั้นโหลด) → โหลดเองที่นี่
+        try:
+            content     = line_bot_api.get_message_content(event.message.id)
+            image_bytes = b"".join(chunk for chunk in content.iter_content())
+        except Exception as e:
+            print(f"[error] โหลดรูปไม่สำเร็จ group={group_id}: {e}", flush=True)
+            record_image_miss(group_id, "error")
+            notify_admin_error(group_id, e)
+            return
 
     # อ่านสลิป: รอบแรก flash; ถ้า 'พัง/ไม่ใช่สลิป/ยอด<=0' ลองซ้ำด้วย pro (กู้ทั้งใบอ่านยาก + กรณี Gemini ล้มชั่วคราว)
     # dining=True เฉพาะกลุ่ม DINING_GROUPS → ใส่คำสั่งอ่านบิลใน prompt เฉพาะกลุ่มนั้น (กลุ่มอื่นได้ prompt เดิมเป๊ะ)
