@@ -11,9 +11,9 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 ## Stack
 - **Web:** Flask + gunicorn (`gunicorn.conf.py`: 1 worker / 8 threads / timeout 120) — Render รัน `gunicorn app:app` (ต้องมี `gunicorn.conf.py` เพราะไม่อ่าน Procfile)
 - **AI:** Gemini ผ่าน `google-genai` SDK (model `gemini-2.5-flash`) — แบบ paid billing
-- **DB:** PostgreSQL (managed บน Render) — ตั้งผ่าน env `DATABASE_URL`; ถ้าไม่ตั้ง fallback เป็น SQLite (local)
+- **DB:** PostgreSQL บน **Neon** (serverless, free plan) — ตั้งผ่าน env `DATABASE_URL` (host `...neon.tech`); ถ้าไม่ตั้ง fallback เป็น SQLite (local). region = **AWS US-East (Virginia)** ตรงกับ Render (Virginia) → บอท↔DB เร็ว. ⚠️ Neon free มีลิมิต compute ~191 CU-hrs/เดือน → ดู 'ประหยัด Neon compute' ใน ops
 - **LINE:** line-bot-sdk v3 (ใช้ API v2 compat: `linebot`, `linebot.models`)
-- **Host:** Render Starter (ไม่หลับ), ping `/health` ทุก 5 นาทีด้วย UptimeRobot
+- **Host:** Render Starter (Virginia/US-East, ไม่หลับ), ping `/health` ทุก 5 นาทีด้วย UptimeRobot
 
 ## Storage layer (สำคัญ — เคยเป็นจุดเจ็บ)
 - `_db()` = **connect ตรงทุกครั้ง** (Postgres เชื่อมเร็ว), สร้างตารางครั้งเดียวด้วย `_ensure_init()` (idempotent)
@@ -58,7 +58,7 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 ## ENV vars (ตั้งที่ Render — repo เป็น public ห้าม hardcode)
 - `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET`, `LINE_ADMIN_USER_ID`
 - `GEMINI_API_KEY`, `GEMINI_MODEL` (ดีฟอลต์ gemini-2.5-flash)
-- `DATABASE_URL` (Postgres — ต้อง region เดียวกับ web service)
+- `DATABASE_URL` (Neon Postgres — host `...neon.tech`; ควร region เดียวกับ Render เพื่อ latency ต่ำ)
 - `SLIP_GROUPS`, `RESV_GROUPS`, `RESV_EXCLUDE_GROUPS`, `BAR_GROUP_ID`, `PAYEE_KEYWORDS`
 - `IGNORE_GROUPS` — กลุ่มที่ "บอทเมินทั้งหมด" (ไม่เช็คสลิป/ไม่จอง/ไม่ตอบคำสั่ง/ไม่ส่งรายงาน-เตือน) ใช้กับกลุ่มที่เลิกใช้
 - `PAYABLE_GROUPS` — กลุ่มบัญชีเจ้าหนี้ (เช่น กลุ่มดวงใจ); `PAYABLE_VENDOR` (ดีฟอลต์ "ดวงใจการสุรา"); `PAYABLE_SUMMARY_HOUR` (ดีฟอลต์ 1 = ตี1)
@@ -66,14 +66,14 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 - `PAYABLE_MIRROR` — บัญชีหนี้แบบ "บัญชีเดียว 2 กลุ่ม"; รูปแบบ `primary:mirror`. primary=กลุ่มทำงาน (ส่งบิล/สลิป + บอท**ตอบยืนยันรายตัวด้วย reply ฟรี**ที่นี่) + เก็บข้อมูลจริง, mirror(กลุ่ม 2)=รับ **เฉพาะสรุปรายวัน** (ตี1) ไม่เด้งทุกบิล/สลิป (ประหยัดโควต้า push). ใช้ข้อมูลชุดเดียวกัน. ทั้ง 2 กลุ่มต้องอยู่ใน `PAYABLE_GROUPS` ด้วย
 - `DINING_GROUPS` — กลุ่มที่เปิดระบบ D (กระทบบิล-สลิป โอนขาด/เกิน); เว้นว่าง=ปิด (บิลร้านนับเป็น notslip ตามเดิม). ต้องอยู่ใน SLIP_GROUPS ด้วย
 - `DINING_SHORT_BAHT`(1) — เตือนเมื่อโอน 'ขาด' ตั้งแต่กี่บาทขึ้นไป (≥); `DINING_MATCH_MIN`(45) — บิลค้างรอจับคู่สลิปได้นานกี่นาที (เกิน=หมดอายุ); `DINING_MATCH_DELAY`(90) — หน่วงวินาทีก่อนจับคู่บิล-สลิป (รอบิลที่ส่งไล่ๆ กันถูกอ่านเข้าคิวครบ กันจับคู่สลับลำดับ; โอนขาดเตือนแบบ push)
-- `RESV_NAG_MAX_HOURS`(3), `RESV_NAG_INTERVAL_MIN`(30 = ตื๊อคอนเฟิร์มทุกกี่นาที), `RESV_ADVANCE_SUMMARY_HOUR`(11 = รายงานจองล่วงหน้า), `RESV_TODAY_SUMMARY_HOUR`(16 = สรุปจองวันนี้), `RESV_REPORT_DAYS`(7), `RESV_KEEP_DAYS`(15), `MISS_KEEP_DAYS`(14), `SLIP_KEEP_DAYS`(60), `SLIP_WORKERS`(2 = อ่าน Gemini พร้อมกันกี่ใบ), `SLIP_DL_WORKERS`(6 = โหลดรูปพร้อมกันกี่ใบ), `SLIP_MAX_INFLIGHT`(6 = รูปค้าง RAM พร้อมกันสูงสุด — ลดถ้า RAM ตึง), `SLIP_RETRY_MAX`(2 = re-queue กี่รอบเมื่อ Gemini ล้ม), `SLIP_RETRY_DELAY`(45s), `SLIP_RETRY_QUEUE_MAX`(8), `GEMINI_OUT_COOLDOWN`(600s = หยุดยิงเมื่อเครดิตหมด), `GEMINI_PROBE_INTERVAL`(60s = probe เช็คเครดิตกลับ), `MEM_WARN_MB`(430)
+- `RESV_NAG_MAX_HOURS`(3), `RESV_NAG_INTERVAL_MIN`(30 = ตื๊อคอนเฟิร์มทุกกี่นาที), `RESV_ADVANCE_SUMMARY_HOUR`(11 = รายงานจองล่วงหน้า), `RESV_TODAY_SUMMARY_HOUR`(16 = สรุปจองวันนี้), `RESV_REPORT_DAYS`(7), `RESV_KEEP_DAYS`(15), `MISS_KEEP_DAYS`(14), `SLIP_KEEP_DAYS`(60), `SLIP_WORKERS`(2 = อ่าน Gemini พร้อมกันกี่ใบ), `SLIP_DL_WORKERS`(6 = โหลดรูปพร้อมกันกี่ใบ), `SLIP_MAX_INFLIGHT`(6 = รูปค้าง RAM พร้อมกันสูงสุด — ลดถ้า RAM ตึง), `SLIP_RETRY_MAX`(2 = re-queue กี่รอบเมื่อ Gemini ล้ม), `SLIP_RETRY_DELAY`(45s), `SLIP_RETRY_QUEUE_MAX`(8), `GEMINI_OUT_COOLDOWN`(600s = หยุดยิงเมื่อเครดิตหมด), `GEMINI_PROBE_INTERVAL`(60s = probe เช็คเครดิตกลับ), `MEM_WARN_MB`(430), `QUIET_START_HOUR`(3)/`QUIET_END_HOUR`(10 = ช่วงเงียบลึก หยุด query ปล่อย Neon หลับ), `RESV_LOOP_SEC`(120 = รอบเช็คจอง PENDING นอกช่วงเงียบ)
 - `SLIP_WARN_UNREAD`(1) — เตือนในกลุ่มเมื่อบอท "อ่านออกแต่ไม่ใช่สลิป" (notslip); ตั้ง 0 เพื่อปิดถ้ารก. หมายเหตุ: ระบบ "อ่านซ้ำอัตโนมัติด้วย pro" 1 รอบเมื่อรอบแรกอ่านไม่ออก/ไม่ใช่สลิป/ยอด≤0 **หรือ flash โยน error** (กู้ใบยาก/ถ่ายจอ + กัน Gemini ล้มชั่วคราวช่วงพีค)
 - **เคส error (อ่านไม่สำเร็จจริง):** ดาวน์โหลดรูป/อ่านพังทั้ง flash+pro/บันทึกพลาด → **เงียบในกลุ่ม + เตือนเฉพาะแอดมิน** (ไม่เด้ง "ส่งสลิปใหม่" กวนกลุ่มอีก — รูปที่พลาดยังนับใน "ตกหล่น" เห็นได้ที่ `สรุป`)
 - `PROMPTPAY_API_KEY` (SlipOK — ยังไม่เปิด; เปิดได้เพื่อตรวจกับธนาคารจริง 100%)
 - **Failover หลาย OA (ประหยัดค่า push):** `LINE_CHANNEL_ACCESS_TOKEN_2` (`_3`.._5 ได้) + `PUSH_FREE_LIMIT`(300). reply ฟรีไม่นับ; push กินโควต้าฟรี ~300/เดือน/OA. `_push()` ใช้ OA1 จนนับถึง `PUSH_FREE_LIMIT` เดือนนี้แล้วสลับ OA2/3.. อัตโนมัติ (นับแยกรายเดือนใน meta `push_count[N]:YYYY-MM` reset เองขึ้นเดือนใหม่); เจอ 429 (เต็มจริง) ก็สลับตัวถัดไปทันทีกันตกหล่น; 400 not-member ยัง re-raise ให้ call site มาร์ค left เหมือนเดิม. OA สำรองต้องเชิญเข้า**ทุกกลุ่ม**เหมือน OA1 + ปิด auto-reply/webhook (push อย่างเดียว). ดูยอดที่ใช้: พิมพ์ `โควต้า` ในแชท
 
 ## ข้อควรรู้ในการดูแล (ops)
-- ⚠️ **Render Postgres ฟรีถูกลบหลัง 90 วัน** → ต้อง upgrade เป็น paid หรือย้ายข้อมูลก่อนครบ
+- **ประหยัด Neon compute (กันชนลิมิต free ~191 CU-hrs/เดือน):** ช่วง 'เงียบลึก' `QUIET_START_HOUR`(3)–`QUIET_END_HOUR`(10) background loops (`_reservation_reminder_loop`, `_report_backup_loop`) + `/health` จะ **หยุด query DB** (นอนยาว / ตอบ `{status:ok,quiet:true}`) → ปล่อยให้ Neon serverless หลับ ~7 ชม./วัน (~ลด 29%). นอกช่วงนี้เช็คปกติ (reminder ทุก `RESV_LOOP_SEC`=120s). วัดจริงที่ Neon console → ถ้ายังใกล้ลิมิต ขยายหน้าต่างเงียบ/ลดความถี่เพิ่ม
 - **อย่า deploy ตอนร้านเปิด** — ทุก deploy worker restart ~1 นาที สลิป/จองช่วงนั้นเสี่ยงหลุด
 - **pin เวอร์ชันใน requirements.txt** แล้ว — กัน auto-upgrade ทำพัง (อัปเดตเมื่อทดสอบแล้วเท่านั้น)
 - ดูสถานะ: `<render-url>/health` → `{status, slips_today, active_groups, storage, memory_mb}`

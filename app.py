@@ -111,7 +111,20 @@ MISS_KEEP_DAYS     = int(os.environ.get("MISS_KEEP_DAYS", "14"))  # ตัวน
 SLIP_KEEP_DAYS     = int(os.environ.get("SLIP_KEEP_DAYS", "60"))  # สลิป เก็บ 60 วัน
 # เวลาเปิดร้าน (ชั่วโมง) สำหรับตรวจเวลาจอง — เปิด 11:00 ถึง 00:00 (เที่ยงคืน)
 OPEN_HOUR, CLOSE_HOUR = 11, 24
+# ช่วง 'เงียบลึก' (ร้านปิดดึก–เช้า ไม่มีงานตามเวลา: nag ดึกจบแล้ว, หลังรายงาน 00:30, ก่อนรายงานจอง 11:00)
+# ในช่วงนี้ background loops + /health จะ 'หยุด query DB' → ปล่อยให้ Neon (serverless) หลับ ประหยัด compute (กันชนลิมิต free)
+QUIET_START_HOUR = int(os.environ.get("QUIET_START_HOUR", "3"))
+QUIET_END_HOUR   = int(os.environ.get("QUIET_END_HOUR", "10"))
+RESV_LOOP_SEC    = int(os.environ.get("RESV_LOOP_SEC", "120"))  # รอบเช็คจอง PENDING (nag ทุก 30 นาทีอยู่แล้ว 120s พอ)
 TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
+
+
+def _in_deep_quiet() -> bool:
+    """อยู่ช่วง 'เงียบลึก' ไหม — ใช้หยุด poll DB ปล่อย Neon หลับ (ประหยัด compute) เมื่อไม่มีงานตามเวลา"""
+    h = datetime.now(TZ).hour
+    if QUIET_START_HOUR <= QUIET_END_HOUR:
+        return QUIET_START_HOUR <= h < QUIET_END_HOUR
+    return h >= QUIET_START_HOUR or h < QUIET_END_HOUR   # เผื่อ window ข้ามเที่ยงคืน
 
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler      = WebhookHandler(LINE_SECRET)
@@ -2360,6 +2373,9 @@ def maybe_send_payable_summary():
 def _report_backup_loop():
     """thread สำรอง — เผื่อ UptimeRobot ไม่ ping; เช็คทุก ~5 นาที"""
     while True:
+        if _in_deep_quiet():
+            time.sleep(1800)   # เงียบลึก → ไม่มีรายงานตามเวลา หยุดเช็ค ปล่อย Neon หลับ
+            continue
         time.sleep(300)
         try:
             _check_memory()           # เฝ้า memory ทุก ~5 นาที → เตือนแอดมินถ้าใกล้ลิมิต
@@ -2714,7 +2730,10 @@ def _reservation_reminder_loop():
     """แจ้งเตือนการจองที่ยัง PENDING ซ้ำในกลุ่มที่ส่งการ์ดไว้ — ทั้งจองวันนี้และจองล่วงหน้า
     ทุก RESV_NAG_INTERVAL_MIN นาที (ทุกช่วงเวลาเท่ากัน) จนกว่าจะคอนเฟิร์ม/เกิน RESV_NAG_MAX_HOURS จากตอนรับจอง"""
     while True:
-        time.sleep(60)
+        if _in_deep_quiet():
+            time.sleep(1800)   # เงียบลึก (ดึก–เช้า) → นอนยาว ไม่ query จอง ปล่อย Neon หลับ; ตื่นมาเช็คนาฬิกาใหม่
+            continue
+        time.sleep(RESV_LOOP_SEC)
         try:
             now      = datetime.now(TZ)
             interval = RESV_NAG_INTERVAL_MIN      # นาที (เท่ากันทุกช่วงเวลา)
@@ -3759,6 +3778,9 @@ def handle_postback(event):
 
 @app.route("/health", methods=["GET"])
 def health():
+    # ช่วงเงียบลึก (ดึก–เช้า) → ตอบเบาๆ ไม่แตะ DB/รายงาน เพื่อปล่อยให้ Neon หลับ ประหยัด compute
+    if _in_deep_quiet():
+        return {"status": "ok", "quiet": True}
     # ทุกครั้งที่ถูก ping (UptimeRobot ทุก 5 นาที) เช็คว่าถึงเวลาส่งรายงาน/สรุปจองไหม + เฝ้า memory
     try:
         _check_memory()
