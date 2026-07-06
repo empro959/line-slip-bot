@@ -2346,8 +2346,13 @@ def _push(to, messages):
     # ไม่งั้น → โหมดเดิม: เริ่ม OA ตัวแรกที่ยังมีโควต้าเหลือ แล้ว failover cascade ถัดไป (เต็มหมด→ตัวสุดท้าย ยอมเกินดีกว่าไม่ส่ง)
     route_idx = _oa_route.get(to) if isinstance(to, str) else None
     if route_idx is not None and route_idx < n:
-        candidates = [route_idx]
+        candidates = [route_idx]                 # กลุ่มนี้ผูก OA ตัวนี้ (สมาชิกเดียว) → ส่งตัวเดียว
+    elif _oa_route:
+        # แผน B เปิดอยู่ แต่ปลายทางนี้ไม่ได้แมป (เช่น DM แอดมิน) → ส่งผ่าน OA1 (เอด ตัวหลัก/friended) ตัวเดียว
+        # ห้าม cascade ไป OA2/3/4 เพราะมันไม่ได้อยู่ในปลายทางนี้ (จะ push ไม่ได้ = not member)
+        candidates = [0]
     else:
+        # โหมดเดิม (ไม่ตั้ง OA_ROUTE): OA ทุกตัวอยู่กลุ่มเดียวกัน → failover cascade ตามโควต้า
         start = next((i for i in range(n) if _push_count(i) < PUSH_FREE_LIMIT), n - 1)
         candidates = list(range(start, n))
     last = candidates[-1]
