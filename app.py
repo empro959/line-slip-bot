@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import hmac
+import hashlib
 import base64
 import uuid
 import requests
@@ -3000,15 +3002,59 @@ def _slip_enabled(group_id: str) -> bool:
     return in_scope and not _slip_off(group_id)
 
 
+def _channel_secret_for(idx: int):
+    """channel secret ของ OA ตัวที่ idx (0=หลัก/เอด, 1=OA2, ...) — ใช้ตรวจ signature ของ webhook ช่องนั้น"""
+    return LINE_SECRET if idx == 0 else os.environ.get(f"LINE_CHANNEL_SECRET_{idx+1}")
+
+
+def _sig_ok(secret: str, body: str, signature: str) -> bool:
+    """ตรวจ X-Line-Signature = base64(HMAC-SHA256(channel_secret, body)) แบบ constant-time"""
+    if not secret:
+        return False
+    mac = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).digest()
+    return hmac.compare_digest(base64.b64encode(mac).decode("utf-8"), signature or "")
+
+
+def _handle_secondary_callback(body: str, signature: str) -> bool:
+    """webhook ของ OA สำรอง (OA2..) — รองรับเฉพาะคำสั่ง 'groupid' เพื่อใช้ตอนตั้งค่า OA_ROUTE
+    OA สำรองปกติเป็น push-only; เปิด webhook มาที่ /callback ชั่วคราว แล้วพิมพ์ 'groupid' ในกลุ่ม
+    → OA นั้นตอบ 'group id ของตัวเอง' (ได้ไอดีที่ตรงกับ OA นั้นแม้คนละ provider). คืน True ถ้า signature ตรงช่องใดช่องหนึ่ง"""
+    for idx in range(1, len(_push_apis)):
+        if not _sig_ok(_channel_secret_for(idx), body, signature):
+            continue
+        try:
+            events = json.loads(body).get("events", [])
+        except Exception:
+            return True
+        for ev in events:
+            if ev.get("type") != "message" or (ev.get("message") or {}).get("type") != "text":
+                continue
+            if (ev["message"].get("text") or "").strip().lower().replace(" ", "") != "groupid":
+                continue
+            src = ev.get("source") or {}
+            gid = src.get("groupId") or src.get("roomId")
+            token = ev.get("replyToken")
+            if gid and token:
+                try:
+                    _push_apis[idx].reply_message(token, TextSendMessage(text=f"🆔 group id (OA{idx+1}):\n{gid}"))
+                except Exception as e:
+                    print(f"[onboard] OA{idx+1} ตอบ groupid ล้มเหลว: {e}", flush=True)
+        return True
+    return False
+
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
     body = request.get_data(as_text=True)
     try:
         handler.handle(body, signature)
+        return "OK"
     except InvalidSignatureError:
+        # ไม่ใช่ช่องหลัก (เอด) → ลองช่องสำรอง (OA2..) เพื่อบริการ 'groupid' ตอนตั้งค่า
+        if _handle_secondary_callback(body, signature):
+            return "OK"
         abort(400)
-    return "OK"
 
 
 _last_admin_error_ts = 0.0
