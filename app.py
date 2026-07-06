@@ -134,10 +134,10 @@ handler      = WebhookHandler(LINE_SECRET)
 #   → ไม่ต้องบีบให้อยู่ใต้ 300 (เดี๋ยวข้อความตกหล่น) และไม่ต้องจ่ายแพ็กเกจเสียเงิน
 # OA สำรองต้อง: (1) เชิญเข้าทุกกลุ่มเหมือน OA1 (2) ปิด auto-reply + ปิด webhook (ตัวสำรอง push อย่างเดียว)
 # ตั้ง token สำรองใน env: LINE_CHANNEL_ACCESS_TOKEN_2, _3, _4, _5 — ใส่แค่ตัวไหนก็เปิดใช้ตัวนั้นทันที
-# โควต้า push ฟรี/เดือน/OA — แผน Communication (ฟรี) = 500/เดือน, Light = 10,000, ฯลฯ
+# โควต้า push ฟรี/เดือน/OA — แผนฟรีของไทย = 300/เดือน (แพ็กเสียเงินสูงกว่านี้ เช่น 15,000)
 # ตั้ง env ให้ตรงแพ็กเกจจริงของ OA ที่ใช้อยู่ (เช่นตอนเอดมีแพ็ก 15,000 → PUSH_FREE_LIMIT=15000)
 # ⚠️ LINE นับ 'push เข้ากลุ่ม' = จำนวนสมาชิกกลุ่ม (ไม่ใช่ 1) — ดู _recipient_count
-PUSH_FREE_LIMIT = int(os.environ.get("PUSH_FREE_LIMIT", "500"))
+PUSH_FREE_LIMIT = int(os.environ.get("PUSH_FREE_LIMIT", "300"))
 # เตือนเจ้าของครั้งเดียว/เดือน เมื่อ 'OA ตัวสุดท้าย' (ไม่มีตัวสำรองต่อ) push ใกล้เต็ม — ใช้เป็นสัญญาณว่า
 # 'push ไม่พอแล้ว' ถึงเวลาพิจารณาแยกกลุ่มไปอีก OA (แผน B) หรือลด push ก่อนข้อความตกหล่น
 PUSH_WARN_RATIO = float(os.environ.get("PUSH_WARN_RATIO", "0.8"))
