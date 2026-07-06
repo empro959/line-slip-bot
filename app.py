@@ -135,6 +135,10 @@ handler      = WebhookHandler(LINE_SECRET)
 # OA สำรองต้อง: (1) เชิญเข้าทุกกลุ่มเหมือน OA1 (2) ปิด auto-reply + ปิด webhook (ตัวสำรอง push อย่างเดียว)
 # ตั้ง token สำรองใน env: LINE_CHANNEL_ACCESS_TOKEN_2, _3, _4, _5 — ใส่แค่ตัวไหนก็เปิดใช้ตัวนั้นทันที
 PUSH_FREE_LIMIT = int(os.environ.get("PUSH_FREE_LIMIT", "300"))  # โควต้า push ฟรี/เดือน/OA (ไทย ~300) ถึงเกณฑ์นี้แล้วสลับ OA ถัดไป
+# เตือนเจ้าของครั้งเดียว/เดือน เมื่อ 'OA ตัวสุดท้าย' (ไม่มีตัวสำรองต่อ) push ใกล้เต็ม — ใช้เป็นสัญญาณว่า
+# 'push ไม่พอแล้ว' ถึงเวลาพิจารณาแยกกลุ่มไปอีก OA (แผน B) หรือลด push ก่อนข้อความตกหล่น
+PUSH_WARN_RATIO = float(os.environ.get("PUSH_WARN_RATIO", "0.8"))
+PUSH_WARN_AT    = max(1, int(PUSH_FREE_LIMIT * PUSH_WARN_RATIO))
 _push_apis = [line_bot_api]        # index 0 = OA1 (ตัวหลัก)
 for _i in range(2, 6):             # รองรับ OA2..OA5
     _tok2 = os.environ.get(f"LINE_CHANNEL_ACCESS_TOKEN_{_i}")
@@ -2259,26 +2263,55 @@ def _push_count(idx: int) -> int:
         return 0
 
 
+def _push_warn_key() -> str:
+    """คีย์ 'เตือนใกล้เต็มแล้วเดือนนี้' — reset เองขึ้นเดือนใหม่ (คีย์เปลี่ยน) → เตือนได้ใหม่รอบละเดือน"""
+    return f"push_warned:{datetime.now(TZ).strftime('%Y-%m')}"
+
+
+def _notify_push_near_limit(cnt: int):
+    """เตือนเจ้าของครั้งเดียว/เดือน เมื่อ OA ตัวสุดท้าย/ตัวเดียว push ใกล้เต็มโควต้าฟรี
+    สัญญาณ 'push ไม่พอแล้ว' → ถึงเวลาลด push หรือแยกกลุ่มไปอีก OA (แผน B) ก่อนข้อความตกหล่น"""
+    if not ADMIN_USER_ID:
+        return
+    try:
+        _push(ADMIN_USER_ID, TextSendMessage(
+            text=(f"⚠️ push เดือนนี้ใช้ไป {cnt}/{PUSH_FREE_LIMIT} ข้อความ (ใกล้เต็มโควต้าฟรี)\n"
+                  "OA ใกล้ตันแล้ว — ถ้าเต็ม ข้อความที่บอทเด้งเอง (รายงาน/ตื๊อจอง) จะเริ่มตกหล่น\n"
+                  "แก้: ลด push ที่ไม่จำเป็น หรือแยกกลุ่มไปอีก OA (แผน B)\n"
+                  "พิมพ์ 'โควต้า' ในกลุ่มเพื่อดูรายละเอียด")))
+    except Exception as e:
+        print(f"[push-warn] เตือนเจ้าของไม่สำเร็จ: {e}", flush=True)
+
+
 def _push(to, messages):
     """ส่ง push แบบ failover หลาย OA — ใช้โควต้าฟรีของแต่ละ OA ให้ครบก่อนค่อยข้ามไปตัวถัดไป
     - เลือก OA ตัวแรกที่เดือนนี้ยังไม่ถึง PUSH_FREE_LIMIT (นับแยกรายเดือนใน meta)
     - ส่งสำเร็จ → นับ +จำนวนข้อความ (LINE นับเป็นราย bubble) ให้ OA ตัวนั้น
     - ถ้า OA ที่เลือกเจอ quota error (429) → มาร์คเต็มแล้วลองตัวถัดไปทันที (กันตกหล่น)
     - error อื่น (เช่น 400 not-member) → re-raise ให้ call site เดิมจัดการ (mark left / นับ fail) เหมือนเดิม
+    - OA 'ตัวสุดท้าย' (ไม่มีตัวสำรองต่อ) แตะเกณฑ์เตือน → เตือนเจ้าของครั้งเดียว/เดือน (นอก lock กัน deadlock)
     หมายเหตุ: reply_message ยังใช้ OA1 ตรงๆ (ฟรี ไม่ผ่านฟังก์ชันนี้)"""
     cnt = len(messages) if isinstance(messages, (list, tuple)) else 1
     n = len(_push_apis)
+    warn_at = None
     with _push_lock:
         # เริ่มจาก OA ตัวแรกที่ยังมีโควต้าเหลือ; ถ้าเต็มหมดทุกตัว → ใช้ตัวสุดท้าย (ยอมเกินดีกว่าไม่ส่ง)
         start = next((i for i in range(n) if _push_count(i) < PUSH_FREE_LIMIT), n - 1)
         last_err = None
+        sent = False
         for idx in range(start, n):
             try:
                 _push_apis[idx].push_message(to, messages)
-                _set_meta(_push_month_key(idx), str(_push_count(idx) + cnt))
+                new_cnt = _push_count(idx) + cnt
+                _set_meta(_push_month_key(idx), str(new_cnt))
                 if idx > 0:
                     print(f"[push] ส่งผ่าน OA{idx+1} (OA ก่อนหน้าเต็มโควต้า) → {to}", flush=True)
-                return
+                # เตือนเมื่อ 'ตัวสุดท้าย' (ไม่มี OA สำรองต่อ) ใกล้เต็ม — มาร์คใน lock กันส่งซ้ำ, ส่งจริงนอก lock
+                if idx == n - 1 and new_cnt >= PUSH_WARN_AT and _get_meta(_push_warn_key()) != "1":
+                    _set_meta(_push_warn_key(), "1")
+                    warn_at = new_cnt
+                sent = True
+                break
             except Exception as e:
                 last_err = e
                 if _is_quota_error(e) and idx < n - 1:
@@ -2286,8 +2319,10 @@ def _push(to, messages):
                     print(f"[push] OA{idx+1} เต็มโควต้า (429) → สลับไป OA{idx+2}", flush=True)
                     continue
                 raise
-        if last_err:   # ตัวสุดท้ายก็ยังเจอ quota error → re-raise ให้ call site รู้ว่าส่งไม่ได้
+        if not sent and last_err:   # ตัวสุดท้ายก็ยังเจอ quota error → re-raise ให้ call site รู้ว่าส่งไม่ได้
             raise last_err
+    if warn_at is not None:   # ส่งเตือนนอก _push_lock (เพราะ _notify → _push วนกลับมา acquire lock อีก)
+        _notify_push_near_limit(warn_at)
 
 
 def _report_off(gid: str) -> bool:
