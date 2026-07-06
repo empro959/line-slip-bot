@@ -35,6 +35,9 @@ SLIP_GROUPS       = [g.strip() for g in os.environ.get("SLIP_GROUPS", "").split(
 RESV_GROUPS       = [g.strip() for g in os.environ.get("RESV_GROUPS", "").split(",") if g.strip()]
 # กลุ่มที่ "ปิดการจองโต๊ะ" — ไม่ยุ่งกับการจองเลย (ทั้งจองวันนี้และล่วงหน้า) เช่นกลุ่ม the riches
 RESV_EXCLUDE_GROUPS = [g.strip() for g in os.environ.get("RESV_EXCLUDE_GROUPS", "").split(",") if g.strip()]
+# แผน B: กลุ่มที่ "เด้งข้อมูลจอง (ไม่มีปุ่ม) ให้รับรู้" เช่น บาร์น้ำ, sound — คอนเฟิร์มยังทำที่กลุ่มรับจอง (นับสลิป) ที่เดียว
+# ตั้งไว้ = เปิดโหมดแผน B: จองทุกใบคอนเฟิร์มที่กลุ่มเดิม + เด้งสำเนาข้อมูลไปกลุ่มพวกนี้ (push ผ่าน OA ของกลุ่มนั้น)
+RESV_INFO_GROUPS  = [g.strip() for g in os.environ.get("RESV_INFO_GROUPS", "").split(",") if g.strip()]
 # กลุ่มที่ "ให้บอทเมินทั้งหมด" — ไม่ทำอะไรเลย (ไม่เช็คสลิป/ไม่จอง/ไม่ตอบคำสั่ง/ไม่ส่งรายงาน-เตือน) เช่นกลุ่มที่เลิกใช้แล้ว
 IGNORE_GROUPS     = [g.strip() for g in os.environ.get("IGNORE_GROUPS", "").split(",") if g.strip()]
 # กลุ่ม "บัญชีเจ้าหนี้การค้า" (เช่น ดวงใจการสุรา) — ในกลุ่มนี้ บอทไม่ทำระบบสลิป/จองปกติ แต่ทำบัญชีหนี้แทน
@@ -147,6 +150,19 @@ for _i in range(2, 6):             # รองรับ OA2..OA5
     _tok2 = os.environ.get(f"LINE_CHANNEL_ACCESS_TOKEN_{_i}")
     if _tok2:
         _push_apis.append(LineBotApi(_tok2))
+# แผน B (แยกกลุ่มคนละ OA): แมป 'กลุ่ม → OA ตัวไหน' — LINE ให้ OA อยู่ได้กลุ่มละตัว จึง push กลุ่มนั้นด้วย token ตัวนั้น
+# รูปแบบ env OA_ROUTE="Cxxxx:2,Cyyyy:3,Czzzz:4" (groupid:เลข OA แบบ 1-based). ไม่ตั้ง = โหมดเดิม (OA1 + failover cascade)
+_oa_route = {}
+for _pair in os.environ.get("OA_ROUTE", "").split(","):
+    _pair = _pair.strip()
+    if ":" in _pair:
+        _gid, _num = _pair.rsplit(":", 1)
+        try:
+            _ix = int(_num) - 1
+        except ValueError:
+            continue
+        if _gid.strip() and _ix >= 0:
+            _oa_route[_gid.strip()] = _ix
 _push_lock = threading.Lock()      # กัน race นับโควต้าจากหลาย thread (background jobs + handlers)
 # รับชื่อย่อ (flash/pro/flash-lite) → เติมเป็นชื่อโมเดลเต็มให้อัตโนมัติ กันพลาดตอนตั้ง env ผิด (เช่นใส่แค่ 'flash')
 _GEMINI_ALIASES = {"flash": "gemini-2.5-flash", "pro": "gemini-2.5-pro", "flash-lite": "gemini-2.5-flash-lite"}
@@ -2294,21 +2310,22 @@ def _recipient_count(to) -> int:
     return cnt
 
 
-def _push_warn_key() -> str:
-    """คีย์ 'เตือนใกล้เต็มแล้วเดือนนี้' — reset เองขึ้นเดือนใหม่ (คีย์เปลี่ยน) → เตือนได้ใหม่รอบละเดือน"""
-    return f"push_warned:{datetime.now(TZ).strftime('%Y-%m')}"
+def _push_warn_key(idx: int = 0) -> str:
+    """คีย์ 'OA นี้เตือนใกล้เต็มแล้วเดือนนี้' (แยกราย OA) — reset เองขึ้นเดือนใหม่ (คีย์เปลี่ยน)"""
+    suffix = "" if idx == 0 else str(idx + 1)
+    return f"push_warned{suffix}:{datetime.now(TZ).strftime('%Y-%m')}"
 
 
-def _notify_push_near_limit(cnt: int):
-    """เตือนเจ้าของครั้งเดียว/เดือน เมื่อ OA ตัวสุดท้าย/ตัวเดียว push ใกล้เต็มโควต้าฟรี
-    สัญญาณ 'push ไม่พอแล้ว' → ถึงเวลาลด push หรือแยกกลุ่มไปอีก OA (แผน B) ก่อนข้อความตกหล่น"""
+def _notify_push_near_limit(idx: int, cnt: int):
+    """เตือนเจ้าของครั้งเดียว/เดือน เมื่อ OA (ที่ไม่มีตัวสำรองต่อ) push ใกล้เต็มโควต้าฟรี
+    สัญญาณ 'push ไม่พอแล้ว' → ถึงเวลาลด push หรือแยกกลุ่มไปอีก OA ก่อนข้อความตกหล่น"""
     if not ADMIN_USER_ID:
         return
     try:
         _push(ADMIN_USER_ID, TextSendMessage(
-            text=(f"⚠️ push เดือนนี้ใช้ไป {cnt}/{PUSH_FREE_LIMIT} ข้อความ (ใกล้เต็มโควต้าฟรี)\n"
-                  "OA ใกล้ตันแล้ว — ถ้าเต็ม ข้อความที่บอทเด้งเอง (รายงาน/ตื๊อจอง) จะเริ่มตกหล่น\n"
-                  "แก้: ลด push ที่ไม่จำเป็น หรือแยกกลุ่มไปอีก OA (แผน B)\n"
+            text=(f"⚠️ push OA{idx+1} เดือนนี้ใช้ไป {cnt}/{PUSH_FREE_LIMIT} ข้อความ (ใกล้เต็มโควต้าฟรี)\n"
+                  "OA นี้ใกล้ตันแล้ว — ถ้าเต็ม ข้อความที่บอทเด้งเอง (รายงาน/ตื๊อจอง) ของกลุ่มที่ผูกกับ OA นี้จะตกหล่น\n"
+                  "แก้: ลด push ที่ไม่จำเป็น หรือย้าย/แยกกลุ่มไปอีก OA\n"
                   "พิมพ์ 'โควต้า' ในกลุ่มเพื่อดูรายละเอียด")))
     except Exception as e:
         print(f"[push-warn] เตือนเจ้าของไม่สำเร็จ: {e}", flush=True)
@@ -2325,36 +2342,43 @@ def _push(to, messages):
     # LINE นับ push เข้ากลุ่ม = จำนวนสมาชิก (ไม่ใช่จำนวน bubble) — คิดผู้รับจริงไว้ก่อน (นอก lock กัน API ช้าบล็อก push อื่น)
     inc = _recipient_count(to)
     n = len(_push_apis)
-    warn_at = None
-    with _push_lock:
-        # เริ่มจาก OA ตัวแรกที่ยังมีโควต้าเหลือ; ถ้าเต็มหมดทุกตัว → ใช้ตัวสุดท้าย (ยอมเกินดีกว่าไม่ส่ง)
+    # แผน B: ถ้ากลุ่มนี้ผูกกับ OA ตัวใดตัวหนึ่ง (OA_ROUTE) → ส่งผ่านตัวนั้นตัวเดียว (OA อื่นไม่ได้อยู่ในกลุ่ม ส่งไม่ได้อยู่แล้ว)
+    # ไม่งั้น → โหมดเดิม: เริ่ม OA ตัวแรกที่ยังมีโควต้าเหลือ แล้ว failover cascade ถัดไป (เต็มหมด→ตัวสุดท้าย ยอมเกินดีกว่าไม่ส่ง)
+    route_idx = _oa_route.get(to) if isinstance(to, str) else None
+    if route_idx is not None and route_idx < n:
+        candidates = [route_idx]
+    else:
         start = next((i for i in range(n) if _push_count(i) < PUSH_FREE_LIMIT), n - 1)
+        candidates = list(range(start, n))
+    last = candidates[-1]
+    warn_idx = warn_at = None
+    with _push_lock:
         last_err = None
         sent = False
-        for idx in range(start, n):
+        for idx in candidates:
             try:
                 _push_apis[idx].push_message(to, messages)
                 new_cnt = _push_count(idx) + inc
                 _set_meta(_push_month_key(idx), str(new_cnt))
-                if idx > 0:
+                if idx != candidates[0]:
                     print(f"[push] ส่งผ่าน OA{idx+1} (OA ก่อนหน้าเต็มโควต้า) → {to}", flush=True)
-                # เตือนเมื่อ 'ตัวสุดท้าย' (ไม่มี OA สำรองต่อ) ใกล้เต็ม — มาร์คใน lock กันส่งซ้ำ, ส่งจริงนอก lock
-                if idx == n - 1 and new_cnt >= PUSH_WARN_AT and _get_meta(_push_warn_key()) != "1":
-                    _set_meta(_push_warn_key(), "1")
-                    warn_at = new_cnt
+                # เตือนเมื่อ OA 'ตัวท้ายสุดที่ยังลองได้' ใกล้เต็ม (ไม่มีตัวสำรองต่อ) — มาร์คใน lock กันส่งซ้ำ, ส่งจริงนอก lock
+                if idx == last and new_cnt >= PUSH_WARN_AT and _get_meta(_push_warn_key(idx)) != "1":
+                    _set_meta(_push_warn_key(idx), "1")
+                    warn_idx, warn_at = idx, new_cnt
                 sent = True
                 break
             except Exception as e:
                 last_err = e
-                if _is_quota_error(e) and idx < n - 1:
+                if _is_quota_error(e) and idx != last:
                     _set_meta(_push_month_key(idx), str(PUSH_FREE_LIMIT))  # มาร์คเต็ม กันเลือกซ้ำรอบหน้า
-                    print(f"[push] OA{idx+1} เต็มโควต้า (429) → สลับไป OA{idx+2}", flush=True)
+                    print(f"[push] OA{idx+1} เต็มโควต้า (429) → สลับ OA ถัดไป", flush=True)
                     continue
                 raise
-        if not sent and last_err:   # ตัวสุดท้ายก็ยังเจอ quota error → re-raise ให้ call site รู้ว่าส่งไม่ได้
+        if not sent and last_err:   # ตัวท้ายสุดก็ยังเจอ quota error → re-raise ให้ call site รู้ว่าส่งไม่ได้
             raise last_err
     if warn_at is not None:   # ส่งเตือนนอก _push_lock (เพราะ _notify → _push วนกลับมา acquire lock อีก)
-        _notify_push_near_limit(warn_at)
+        _notify_push_near_limit(warn_idx, warn_at)
 
 
 def _report_off(gid: str) -> bool:
@@ -2785,8 +2809,12 @@ def handle_reservation_text(event, text: str, group_id: str):
     time_warn = "" if _within_open_hours(tmin) else \
         f"\n⚠️ เวลา {info.get('time_hhmm')} อยู่นอกเวลาเปิดร้าน (11:00–00:00) โปรดตรวจสอบ"
 
-    # ปลายทาง: จองล่วงหน้า → กลุ่มบาร์น้ำ / จองวันนี้ → กลุ่มเดิม
-    dest = BAR_GROUP_ID if (is_advance and BAR_GROUP_ID) else group_id
+    # ปลายทางการ์ด+ปุ่มคอนเฟิร์ม:
+    #  - แผน B (ตั้ง RESV_INFO_GROUPS): คอนเฟิร์มที่ 'กลุ่มเดิม' (นับสลิป) เสมอ ทั้งจองวันนี้/ล่วงหน้า
+    #    แล้วเด้ง 'สำเนาข้อมูล (ไม่มีปุ่ม)' ไปบาร์น้ำ/sound ให้รับรู้
+    #  - โหมดเดิม: จองล่วงหน้า → กลุ่มบาร์น้ำ (คอนเฟิร์มที่นั่น) / จองวันนี้ → กลุ่มเดิม
+    plan_b = bool(RESV_INFO_GROUPS)
+    dest = group_id if plan_b else (BAR_GROUP_ID if (is_advance and BAR_GROUP_ID) else group_id)
     resv_id = save_reservation(group_id, requested_by, info, text, dest)
     detail = _resv_detail_lines(info)
     head = "📅 จองล่วงหน้า" if is_advance else "🔔 จองโต๊ะ"
@@ -2795,14 +2823,31 @@ def handle_reservation_text(event, text: str, group_id: str):
         text=f"{head}ใหม่ #{resv_id}\nจากคุณ {requested_by}\n─────────────────\n{detail}{time_warn}")
     confirm_msg = _resv_confirm_card(resv_id, head)
 
-    print(f"[resv] จอง #{resv_id} advance={is_advance} → ส่งไป {dest}", flush=True)
+    print(f"[resv] จอง #{resv_id} advance={is_advance} plan_b={plan_b} → การ์ดที่ {dest}", flush=True)
     if dest == group_id:
         line_bot_api.reply_message(event.reply_token, [detail_msg, confirm_msg])
     else:
         _push(dest, [detail_msg, confirm_msg])
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"📤 ส่งจองล่วงหน้า #{resv_id} ไปกลุ่มบาร์น้ำแล้ว รอคอนเฟิร์ม\n─────────────────\n{detail}{time_warn}"))
+    # แผน B: เด้งสำเนา 'ข้อมูลจอง' (ไม่มีปุ่ม) ให้บาร์น้ำ/sound รับรู้ (คอนเฟิร์มยังทำที่กลุ่มเดิม)
+    _resv_broadcast_info(resv_id, head, f"จากคุณ {requested_by}\n{detail}{time_warn}", skip_group=dest)
     return True
+
+
+def _resv_broadcast_info(resv_id: int, head: str, detail: str, skip_group: str = None):
+    """แผน B: เด้ง 'ข้อมูลจอง (ไม่มีปุ่มคอนเฟิร์ม)' ให้กลุ่มใน RESV_INFO_GROUPS (บาร์น้ำ/sound) รับรู้
+    push ผ่าน OA ของกลุ่มนั้น (ตาม OA_ROUTE); คอนเฟิร์มยังทำที่กลุ่มรับจองที่เดียว — กลุ่มพวกนี้แค่ดู"""
+    if not RESV_INFO_GROUPS:
+        return
+    msg = TextSendMessage(text=f"{head} #{resv_id}\n─────────────────\n{detail}")
+    for g in RESV_INFO_GROUPS:
+        if g == skip_group or _group_left(g) or g in IGNORE_GROUPS:
+            continue
+        try:
+            _push(g, msg)
+        except Exception as e:
+            print(f"[resv] เด้งข้อมูลจอง → {g} ล้มเหลว: {e}", flush=True)
 
 
 def _resv_confirm_card(resv_id: int, head: str = "🔔 จองโต๊ะ") -> TemplateSendMessage:
@@ -2855,6 +2900,9 @@ def handle_reservation_confirm(event, resv_id: int):
                      f"โดย {confirmer}\n─────────────────\n{detail}"))
         except Exception as e:
             print(f"[resv] notify origin failed: {e}", flush=True)
+
+    # แผน B: อัปเดตสถานะ 'คอนเฟิร์มแล้ว' ให้บาร์น้ำ/sound ที่เคยเด้งข้อมูลจองนี้ไว้ (ข้ามกลุ่มที่กด)
+    _resv_broadcast_info(resv_id, "✅ คอนเฟิร์มจองแล้ว", f"{detail}\nโดย {confirmer}", skip_group=pressed_group)
 
 
 def _touch_reminded(resv_id: int, when: str):
