@@ -1738,23 +1738,101 @@ def _payable_cleanup_paid(acct: str):
 
 
 def _payable_reconcile(acct: str):
-    """จัดยอดใหม่: ล้างการตัดยอดทั้งหมด (paid/allocated=0) แล้วตัดยอดจ่ายใหม่ด้วยตรรกะปัจจุบัน
-    (ยอดตรงเป๊ะก่อน FIFO) เรียงตามวันจ่าย — แก้รายการเก่าที่เคยตัดผิดใบ
-    ⚠️ ปลอดภัยต่อยอดรวม: ค้างสะสม = opening + Σบิล − Σจ่าย (ไม่ขึ้นกับการตัดเข้าใบไหน) → ยอดไม่เปลี่ยน"""
+    """จัดยอดใหม่: จับคู่ 'จ่าย'↔'บิล' ใหม่ (แก้ตัดผิดใบ) โดย 'คงยอดค้างสะสมเดิมเป๊ะ'
+
+    สูตรยอดค้าง = opening + Σ(บิล.amount − บิล.paid) − Σ(จ่าย.amount − จ่าย.allocated)
+                = opening + Σบิล − Σจ่าย + orphan   [orphan = Σจ่าย.allocated − Σบิล.paid]
+
+    บั๊กเดิม (เคสจริง 128,206 → −194,437): บิลที่ 'จ่ายครบ' ถูก cleanup ลบทิ้ง แต่ 'จ่าย'
+    ที่เคยตัดบิลนั้นยังมี allocated>0 (นี่แหละ orphan). ของเดิม reset allocated=0 ทั้งหมด →
+    orphan หาย → จ่ายก้อนนั้นลอย ไม่มีบิลรองรับ → ยอดค้างถูกหักซ้ำจนติดลบ.
+
+    วิธีแก้ (atomic + self-verify — 'ยอมยกเลิก ดีกว่าทำเพี้ยน'):
+      1) โหลดข้อมูล + คำนวณ FIFO ใหม่ 'ในหน่วยความจำ' ทั้งหมดก่อน (ยังไม่แตะ DB)
+      2) 'ฉีด orphan กลับ' เข้า allocated (ส่วนที่จ่ายบิลเก่าที่ถูกลบไปแล้ว) เพื่อคงยอด
+      3) ตรวจ total_before == total_after; ไม่ตรง/ผิดปกติ → raise (ไม่เขียน DB เลย)
+      4) ผ่านแล้วค่อยเขียนกลับใน transaction เดียว
+    คืน (total_before, total_after)"""
+    def _short(d):
+        try:
+            return datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m")
+        except (ValueError, TypeError):
+            return d or "-"
+
     with _db() as conn:
-        conn.execute("UPDATE payable_bills SET paid=0 WHERE group_id=?", (acct,))
-        conn.execute("UPDATE payable_payments SET allocated=0, settle_note=NULL WHERE group_id=?", (acct,))
-        conn.commit()
-        pays = [dict(p) for p in conn.execute(
-            "SELECT id, amount, doc_date FROM payable_payments WHERE group_id=? ORDER BY doc_date, id",
-            (acct,)).fetchall()]
+        bills = [dict(r) for r in conn.execute(
+            "SELECT id, doc_date, amount, COALESCE(paid,0) paid, note FROM payable_bills "
+            "WHERE group_id=? ORDER BY doc_date, id", (acct,)).fetchall()]
+        pays = [dict(r) for r in conn.execute(
+            "SELECT id, doc_date, amount, COALESCE(allocated,0) allocated FROM payable_payments "
+            "WHERE group_id=? ORDER BY doc_date, id", (acct,)).fetchall()]
+    opening = _payable_opening(acct)
+
+    sum_bill  = sum(float(b["amount"] or 0) for b in bills)
+    sum_pay   = sum(float(p["amount"] or 0) for p in pays)
+    sum_paid  = sum(float(b["paid"] or 0) for b in bills)
+    sum_alloc = sum(float(p["allocated"] or 0) for p in pays)
+    orphan    = sum_alloc - sum_paid   # จ่ายที่เคยตัดบิลที่ถูกลบไปแล้ว — ต้องคงไว้ ห้ามทิ้ง
+    total_before = opening + sum_bill - sum_pay + orphan
+    if orphan < -0.01:
+        raise ValueError(f"orphan ผิดปกติ ({orphan:,.2f}) — ข้อมูลไม่สอดคล้อง")
+
+    # (1) FIFO ใหม่ในหน่วยความจำ — มิเรอร์ _payable_settle: ตัดบิล 'วันเดียวกับจ่าย', ยอดตรงก่อน แล้วยกมา แล้ว id
+    for b in bills:
+        b["new_paid"] = 0.0
     for p in pays:
-        allocated, _settled, settle_note = _payable_settle(acct, p["doc_date"], float(p["amount"] or 0))
-        with _db() as conn:
+        p["new_alloc"] = 0.0
+        p["dates"] = []
+        remaining = float(p["amount"] or 0)
+        cands = [b for b in bills
+                 if b["doc_date"] == p["doc_date"] and (float(b["amount"] or 0) - b["new_paid"]) > 0.01]
+        cands.sort(key=lambda b: (
+            0 if abs((float(b["amount"] or 0) - b["new_paid"]) - float(p["amount"] or 0)) < 0.01 else 1,
+            0 if b["note"] == _PAYABLE_CARRY_NOTE else 1,
+            b["id"]))
+        for b in cands:
+            if remaining <= 0.01:
+                break
+            take = min(remaining, float(b["amount"] or 0) - b["new_paid"])
+            b["new_paid"]  += take
+            p["new_alloc"] += take
+            remaining      -= take
+            p["dates"].append(_short(b["doc_date"]))
+
+    # (2) ฉีด orphan กลับเข้า allocated ของจ่าย (เรียงตามวัน) เท่าที่ยังมีช่องว่าง (amount − new_alloc)
+    if orphan > 0.01:
+        remaining = orphan
+        for p in pays:
+            if remaining <= 0.01:
+                break
+            spare = float(p["amount"] or 0) - p["new_alloc"]
+            if spare <= 0.01:
+                continue
+            add = min(spare, remaining)
+            p["new_alloc"] += add
+            remaining      -= add
+            if "บิลเก่า" not in p["dates"]:
+                p["dates"].append("บิลเก่า")
+        if remaining > 0.01:
+            raise ValueError(f"ฉีดยอดจ่ายบิลเก่ากลับไม่ครบ (เหลือ {remaining:,.2f})")
+
+    # (3) ตรวจยอดคงเดิมก่อนแตะ DB
+    total_after = (opening
+                   + sum(float(b["amount"] or 0) - b["new_paid"] for b in bills)
+                   - sum(float(p["amount"] or 0) - p["new_alloc"] for p in pays))
+    if abs(total_after - total_before) > 0.01:
+        raise ValueError(f"ยอดจะเพี้ยน {total_before:,.2f} → {total_after:,.2f}")
+
+    # (4) ผ่านการตรวจ → เขียนกลับใน transaction เดียว (พลาดกลางคัน = rollback อัตโนมัติ)
+    with _db() as conn:
+        for b in bills:
+            conn.execute("UPDATE payable_bills SET paid=? WHERE id=?", (b["new_paid"], b["id"]))
+        for p in pays:
             conn.execute("UPDATE payable_payments SET allocated=?, settle_note=? WHERE id=?",
-                         (allocated, settle_note, p["id"]))
-            conn.commit()
+                         (p["new_alloc"], (",".join(p["dates"]) or None), p["id"]))
+        conn.commit()
     _payable_cleanup_paid(acct)
+    return total_before, total_after
 
 
 _PAYABLE_SRC = {"block": "บล็อกค้าง", "พิมพ์": "พิมพ์เอง", "รูป": "รูปบิล"}
@@ -2006,14 +2084,22 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
         return True
 
-    # จัดยอดใหม่ — 🛑 ปิดใช้งาน: _payable_reconcile มีบั๊กร้ายแรง
-    # มัน reset allocation ของ 'จ่าย' ทั้งหมด แต่บิลเก่าที่จ่ายครบถูก cleanup (ลบ) ไปแล้ว → จ่ายเก่า 'ลอย'
-    # ไม่มีบิลให้ตัด → นับลดหนี้ซ้ำ + cleanup ลบบิลปัจจุบันทิ้ง → ยอดเพี้ยนหนัก (เคสจริง 128,206 → −194,437)
-    # ยอดค้างที่แสดงอยู่ 'ถูกต้องด้วยตัวเองแล้ว' (opening + Σบิล − Σจ่าย) ไม่ต้องจัดใหม่ → กันไม่ให้กดโดนบั๊ก
+    # จัดยอดใหม่ — จับคู่ 'จ่าย'↔'บิล' ใหม่ (แก้ตัดผิดใบ) แบบ 'คงยอดค้างเดิมเป๊ะ' + ตรวจยอดก่อนเขียน
+    # ถ้าคำนวณแล้วยอดจะเพี้ยน/ผิดปกติ → ยกเลิกทั้งหมด ไม่แตะข้อมูลเดิม (กันบั๊กเก่าที่เคยทำ 128,206 → −194,437)
     if low in ("จัดยอดใหม่", "คำนวณยอดใหม่", "รีคอนยอด", "จัดยอด", "คำนวณยอด"):
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text="🛑 คำสั่ง 'จัดยอดใหม่' ปิดใช้งานชั่วคราว — พบบั๊กที่ทำยอดค้างเพี้ยน\n"
-                 "ยอดค้างสะสมที่แสดงอยู่ตอนนี้ 'ถูกต้องแล้ว' ไม่ต้องจัดใหม่ครับ"))
+        try:
+            before, after = _payable_reconcile(acct)
+        except Exception as e:
+            print(f"[payable] จัดยอดใหม่ ยกเลิก group={group_id}: {e}", flush=True)
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"🛑 จัดยอดใหม่ไม่สำเร็จ — ยกเลิกแล้ว ไม่แตะข้อมูลเดิมสักรายการ\n"
+                     f"เหตุผล: {e}\n(ยอดค้างที่แสดงอยู่ตอนนี้ยังถูกต้องเหมือนเดิม)"))
+            return True
+        _payable_send(event, group_id, out,
+            f"🔄 จัดยอดใหม่เรียบร้อย — จับคู่จ่าย↔บิลใหม่ ยอดค้างคงเดิม\n"
+            f"💰 ค้างจ่าย {PAYABLE_VENDOR} สะสม: {after:,.2f} บาท\n"
+            "─────────────────\n"
+            + build_payable_ledger(acct, with_total=True))
         return True
 
     # ลบรายการล่าสุด (แก้บันทึกผิด)
@@ -3289,6 +3375,7 @@ def build_help(group_id: str) -> str:
             "• สรุปหนี้ → ดูยอดค้างวันนี้",
             "• สรุปหนี้ 2026-06-09 → ดูย้อนหลัง (ตามวันที่)",
             "• รายการบิล → ดูบิลทั้งหมด + ที่มา (เช็กว่ามาจากไหน)",
+            "• จัดยอดใหม่ → จับคู่จ่าย↔บิลใหม่ (ยอดค้างคงเดิม, เพี้ยนเมื่อไหร่ยกเลิกเอง)",
             "• ลบบิลล่าสุด / ลบจ่ายล่าสุด → แก้กรณีบันทึกผิด",
             "• ลบวันที่ 6/6 → ลบทุกบิล/จ่ายของวันนั้น",
             "• ล้างบัญชีหนี้ → ล้างทั้งหมด เริ่มนับใหม่ (มีปุ่มยืนยัน)",
