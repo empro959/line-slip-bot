@@ -2488,13 +2488,15 @@ def _maybe_send_resv_slot(now, start_hour, job, build_text):
         for g in targets:
             if _already_sent(job, today, g):
                 continue
-            dest = _report_dest(g)
+            # สรุปจอง 'ไม่ใช้ REPORT_REDIRECT' — ส่งไปกลุ่มของมันเอง (สลิป/บาร์น้ำ) ให้จองสรุปอยู่กลุ่มเดิม
+            # (ต่างจากรายงานสลิป 00:30 ที่ redirect เข้า management ได้)
+            dest = g
             if _group_left(dest) or dest in IGNORE_GROUPS:
                 continue
             try:
                 _push(dest, TextSendMessage(text=text))
                 _mark_sent(job, today, g)
-                print(f"[{job}] sent → {dest}" + (f" (redirect จาก {g})" if dest != g else ""), flush=True)
+                print(f"[{job}] sent → {dest}", flush=True)
             except Exception as e:
                 if _is_not_member_error(e):
                     _mark_group_left(dest)
