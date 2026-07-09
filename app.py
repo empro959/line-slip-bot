@@ -3011,9 +3011,13 @@ def _handle_secondary_callback(body: str, signature: str) -> bool:
     """webhook ของ OA สำรอง (OA2..) — รองรับเฉพาะคำสั่ง 'groupid' เพื่อใช้ตอนตั้งค่า OA_ROUTE
     OA สำรองปกติเป็น push-only; เปิด webhook มาที่ /callback ชั่วคราว แล้วพิมพ์ 'groupid' ในกลุ่ม
     → OA นั้นตอบ 'group id ของตัวเอง' (ได้ไอดีที่ตรงกับ OA นั้นแม้คนละ provider). คืน True ถ้า signature ตรงช่องใดช่องหนึ่ง"""
+    tried = []
     for idx in range(1, len(_push_apis)):
-        if not _sig_ok(_channel_secret_for(idx), body, signature):
+        secret = _channel_secret_for(idx)
+        tried.append(f"OA{idx+1}({'มี secret' if secret else 'ไม่ตั้ง secret'})")
+        if not _sig_ok(secret, body, signature):
             continue
+        print(f"[onboard] webhook signature ตรงกับ OA{idx+1}", flush=True)
         try:
             events = json.loads(body).get("events", [])
         except Exception:
@@ -3029,9 +3033,14 @@ def _handle_secondary_callback(body: str, signature: str) -> bool:
             if gid and token:
                 try:
                     _push_apis[idx].reply_message(token, TextSendMessage(text=f"🆔 group id (OA{idx+1}):\n{gid}"))
+                    print(f"[onboard] ตอบ groupid OA{idx+1} = {gid}", flush=True)
                 except Exception as e:
                     print(f"[onboard] OA{idx+1} ตอบ groupid ล้มเหลว: {e}", flush=True)
         return True
+    # ไม่ตรงช่องไหนเลย — บอกให้ชัดว่าเพราะไม่มีช่องสำรอง หรือ secret ไม่ตรง (ไว้ debug ตอนตั้งค่า)
+    print(f"[onboard] ⚠️ webhook signature ไม่ตรงช่องหลัก(เอด)และช่องสำรองใดเลย → ตอบ 400. "
+          f"ช่องสำรองที่มี token: {tried or 'ไม่มีเลย (ยังไม่ตั้ง LINE_CHANNEL_ACCESS_TOKEN_2?)'} "
+          f"— ถ้ามีช่องแต่ยังไม่ตรง = LINE_CHANNEL_SECRET_N ไม่ตรง secret จริงของ channel นั้น", flush=True)
     return False
 
 
