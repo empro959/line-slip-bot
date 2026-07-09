@@ -2334,29 +2334,21 @@ def _notify_push_near_limit(idx: int, cnt: int):
 
 
 def _push(to, messages):
-    """ส่ง push แบบ failover หลาย OA — ใช้โควต้าฟรีของแต่ละ OA ให้ครบก่อนค่อยข้ามไปตัวถัดไป
-    - เลือก OA ตัวแรกที่เดือนนี้ยังไม่ถึง PUSH_FREE_LIMIT (นับแยกรายเดือนใน meta)
+    """ส่ง push โดยเลือก OA ตาม 'กลุ่ม→OA' (OA_ROUTE) — LINE ให้ OA อยู่กลุ่มละตัว จึงไม่มี failover สลับในกลุ่มเดียว
+    - ปลายทางที่แมปใน OA_ROUTE → OA ตัวนั้น; ปลายทางอื่น → OA1 (เอด) เสมอ
     - ส่งสำเร็จ → นับ +จำนวนผู้รับจริง (push เข้ากลุ่ม = จำนวนสมาชิก ตามที่ LINE คิดโควต้า) ให้ OA ตัวนั้น
-    - ถ้า OA ที่เลือกเจอ quota error (429) → มาร์คเต็มแล้วลองตัวถัดไปทันที (กันตกหล่น)
-    - error อื่น (เช่น 400 not-member) → re-raise ให้ call site เดิมจัดการ (mark left / นับ fail) เหมือนเดิม
-    - OA 'ตัวสุดท้าย' (ไม่มีตัวสำรองต่อ) แตะเกณฑ์เตือน → เตือนเจ้าของครั้งเดียว/เดือน (นอก lock กัน deadlock)
+    - error (เช่น 400 not-member / 429) → re-raise ให้ call site เดิมจัดการ (mark left / นับ fail) เหมือนเดิม
+    - OA แตะเกณฑ์เตือน → เตือนเจ้าของครั้งเดียว/เดือน/OA (นอก lock กัน deadlock)
     หมายเหตุ: reply_message ยังใช้ OA1 ตรงๆ (ฟรี ไม่ผ่านฟังก์ชันนี้)"""
     # LINE นับ push เข้ากลุ่ม = จำนวนสมาชิก (ไม่ใช่จำนวน bubble) — คิดผู้รับจริงไว้ก่อน (นอก lock กัน API ช้าบล็อก push อื่น)
     inc = _recipient_count(to)
     n = len(_push_apis)
-    # แผน B: ถ้ากลุ่มนี้ผูกกับ OA ตัวใดตัวหนึ่ง (OA_ROUTE) → ส่งผ่านตัวนั้นตัวเดียว (OA อื่นไม่ได้อยู่ในกลุ่ม ส่งไม่ได้อยู่แล้ว)
-    # ไม่งั้น → โหมดเดิม: เริ่ม OA ตัวแรกที่ยังมีโควต้าเหลือ แล้ว failover cascade ถัดไป (เต็มหมด→ตัวสุดท้าย ยอมเกินดีกว่าไม่ส่ง)
+    # LINE ให้ OA อยู่กลุ่มละตัว → OA2/3/4 ไม่เคยอยู่ร่วมกลุ่มกับเอด → "failover สลับ OA ในกลุ่มเดียว" ทำไม่ได้เลย
+    #   - ปลายทางที่แมปใน OA_ROUTE → ส่งผ่าน OA ตัวนั้นตัวเดียว
+    #   - ปลายทางอื่นทั้งหมด (DM แอดมิน / กลุ่มที่มีแต่เอด เช่นกลุ่มหนี้) → OA1 (เอด) เสมอ ไม่ cascade
+    #     ⚠️ เดิม cascade ไป OA ถัดไปเมื่อเอดครบโควต้า — พอเพิ่ม token OA2 แต่มันไม่ได้อยู่ในกลุ่มนั้น → push ล้ม 'not member'
     route_idx = _oa_route.get(to) if isinstance(to, str) else None
-    if route_idx is not None and route_idx < n:
-        candidates = [route_idx]                 # กลุ่มนี้ผูก OA ตัวนี้ (สมาชิกเดียว) → ส่งตัวเดียว
-    elif _oa_route:
-        # แผน B เปิดอยู่ แต่ปลายทางนี้ไม่ได้แมป (เช่น DM แอดมิน) → ส่งผ่าน OA1 (เอด ตัวหลัก/friended) ตัวเดียว
-        # ห้าม cascade ไป OA2/3/4 เพราะมันไม่ได้อยู่ในปลายทางนี้ (จะ push ไม่ได้ = not member)
-        candidates = [0]
-    else:
-        # โหมดเดิม (ไม่ตั้ง OA_ROUTE): OA ทุกตัวอยู่กลุ่มเดียวกัน → failover cascade ตามโควต้า
-        start = next((i for i in range(n) if _push_count(i) < PUSH_FREE_LIMIT), n - 1)
-        candidates = list(range(start, n))
+    candidates = [route_idx] if (route_idx is not None and route_idx < n) else [0]
     last = candidates[-1]
     warn_idx = warn_at = None
     with _push_lock:
