@@ -3757,8 +3757,15 @@ def handle_text(event):
             total += used
             bar = "🔴 เต็ม" if used >= PUSH_FREE_LIMIT else ("🟡" if used >= PUSH_FREE_LIMIT * 0.9 else "🟢")
             lines.append(f"{bar} OA{i+1}: {used}/{PUSH_FREE_LIMIT}")
-        active = next((i for i in range(len(_push_apis)) if _push_count(i) < PUSH_FREE_LIMIT), len(_push_apis) - 1)
-        lines.append(f"─────────────────\nกำลังใช้: OA{active+1}  •  รวมทั้งหมด {total} ข้อความ")
+        lines.append(f"─────────────────\nรวมทั้งหมด {total} ข้อความ")
+        if _oa_route:
+            # แผน B: แต่ละกลุ่มผูก OA ของตัวเอง (ไม่มี 'OA ที่ใช้อยู่' ตัวเดียวแบบ failover เก่า)
+            here = _oa_route.get(group_id)
+            lines.append(f"📍 กลุ่มนี้ push ผ่าน OA{(here + 1) if here is not None else 1}")
+            lines.append("โหมด: แยกกลุ่มคนละ OA (แผน B) — แต่ละกลุ่มใช้ OA ของตัวเอง ไม่สลับกัน")
+        else:
+            active = next((i for i in range(len(_push_apis)) if _push_count(i) < PUSH_FREE_LIMIT), len(_push_apis) - 1)
+            lines.append(f"กำลังใช้: OA{active+1}")
         lines.append("ℹ️ นับแบบ LINE: push เข้ากลุ่ม = จำนวนสมาชิก (reply ฟรี ไม่นับ) — เทียบเลขจริงที่ LINE OA Manager")
         if len(_push_apis) == 1:
             lines.append("⚠️ ยังมี OA เดียว — ตั้ง env LINE_CHANNEL_ACCESS_TOKEN_2 เพื่อเปิดตัวสำรอง")
