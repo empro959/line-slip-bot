@@ -133,6 +133,11 @@ def _in_deep_quiet() -> bool:
 
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler      = WebhookHandler(LINE_SECRET)
+
+# แจ้งเตือนเจ้าของ/กลุ่ม management: ส่งผ่าน OA แยกได้ (ตั้ง env LINE_ADMIN_PUSH_TOKEN = access token ของ OA อื่น เช่น OA2)
+# ไม่ตั้ง = ใช้ OA เดิม (บอทเช็กสลิป) เหมือนเดิม
+_ADMIN_PUSH_TOKEN = os.environ.get("LINE_ADMIN_PUSH_TOKEN", "").strip()
+admin_push_api = LineBotApi(_ADMIN_PUSH_TOKEN) if _ADMIN_PUSH_TOKEN else line_bot_api
 # ── Failover หลาย LINE OA เพื่อประหยัดค่าโควต้า push ────────────────────────────
 # reply ฟรีไม่นับโควต้า (ผูก reply_token) — แต่ push/broadcast กินโควต้าฟรีเดือนละ ~300 ข้อความ/OA
 # แนวคิด: ใช้ OA1 (ตัวหลัก รับ event+reply) จนใกล้เต็มโควต้าเดือนนี้ แล้วสลับ push ไป OA2, OA3, ... อัตโนมัติ
@@ -4124,7 +4129,7 @@ def api_push_owner():
         sent, errors = 0, []
         for uid in ADMIN_USER_IDS:
             try:
-                line_bot_api.push_message(uid, TextSendMessage(text=msg[:4900]))
+                admin_push_api.push_message(uid, TextSendMessage(text=msg[:4900]))
                 sent += 1
             except Exception as e:
                 errors.append(f"{uid[:8]}…: {str(e)[:80]}")
