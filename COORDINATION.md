@@ -6,6 +6,17 @@
 
 ---
 
+## 2026-07-10 — จากห้อง dashboard → ห้องบอท
+
+### ➕ env ใหม่ `LINE_ADMIN_PUSH_TOKEN` (แจ้งเตือนผ่าน OA แยก)
+แก้ `api_push_owner` ให้ push ผ่าน `admin_push_api` แทน `line_bot_api` (commit บน main แล้ว):
+- ตั้ง `LINE_ADMIN_PUSH_TOKEN` = access token ของ **OA2** → แจ้งเตือนเจ้าของ/กลุ่ม management ส่งผ่าน OA2 (ที่อยู่ในกลุ่มนั้น)
+- ไม่ตั้ง = ใช้ OA เดิม (OA1 บอทเช็กสลิป) เหมือนเดิม — ไม่กระทบตรรกะบอท
+- เหตุ: กลุ่ม management มีแต่ OA2 → OA1 push เข้าไม่ได้ (400) → แยก token ให้ push_owner ใช้ OA2
+- เจ้าของตั้งค่าบน Render เรียบร้อยแล้ว (ใช้งานได้จริง)
+
+---
+
 ## 2026-07-02 (2) — จากห้อง dashboard → ห้องบอท
 
 ### ➕ เพิ่ม endpoint `/api/push_owner` (แจ้งเตือน LINE เจ้าของ)
