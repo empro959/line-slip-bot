@@ -2364,6 +2364,8 @@ def _push(to, messages):
                 _push_apis[idx].push_message(to, messages)
                 new_cnt = _push_count(idx) + inc
                 _set_meta(_push_month_key(idx), str(new_cnt))
+                if isinstance(to, str) and to[:1] in ("C", "R"):
+                    _clear_group_left(to)   # push สำเร็จ = ยังอยู่ในกลุ่ม → ปลดมาร์ค left ถ้าเคยถูกมาร์คพลาด (self-heal)
                 if idx != candidates[0]:
                     print(f"[push] ส่งผ่าน OA{idx+1} (OA ก่อนหน้าเต็มโควต้า) → {to}", flush=True)
                 # เตือนเมื่อ OA 'ตัวท้ายสุดที่ยังลองได้' ใกล้เต็ม (ไม่มีตัวสำรองต่อ) — มาร์คใน lock กันส่งซ้ำ, ส่งจริงนอก lock
@@ -3776,9 +3778,15 @@ def handle_text(event):
             lines.append("⚠️ ยังมี OA เดียว — ตั้ง env LINE_CHANNEL_ACCESS_TOKEN_2 เพื่อเปิดตัวสำรอง")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)))
         return
-    # ทดสอบส่งรายงานสลิปเดี๋ยวนี้ (ไม่ต้องรอ 00:30) — ยิงไปปลายทางจริง (ตาม REPORT_REDIRECT + OA_ROUTE) เช็คว่า push ถึงไหม
-    if text.lower() in ("ทดสอบรายงาน", "ทดสอบรายงานสลิป", "force report"):
+    # ทดสอบ/ส่งซ้ำรายงานสลิปเดี๋ยวนี้ (ไม่ต้องรอ 00:30) — ยิงไปปลายทางจริง (REPORT_REDIRECT + OA_ROUTE)
+    #   'ทดสอบรายงาน' = วันนี้; 'ทดสอบรายงาน 2026-07-10' = ส่งซ้ำของวันที่ระบุ (กู้รายงานที่หายรอบ 00:30)
+    if text.lower().startswith(("ทดสอบรายงาน", "force report")):
         d = datetime.now(TZ).date().isoformat()
+        for p in text.split()[1:]:
+            try:
+                datetime.strptime(p, "%Y-%m-%d"); d = p; break
+            except ValueError:
+                continue
         dest = _report_dest(group_id)
         try:
             _push(dest, TextSendMessage(text=build_daily_report(group_id, d)))
