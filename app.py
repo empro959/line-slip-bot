@@ -3776,6 +3776,19 @@ def handle_text(event):
             lines.append("⚠️ ยังมี OA เดียว — ตั้ง env LINE_CHANNEL_ACCESS_TOKEN_2 เพื่อเปิดตัวสำรอง")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text="\n".join(lines)))
         return
+    # ทดสอบส่งรายงานสลิปเดี๋ยวนี้ (ไม่ต้องรอ 00:30) — ยิงไปปลายทางจริง (ตาม REPORT_REDIRECT + OA_ROUTE) เช็คว่า push ถึงไหม
+    if text.lower() in ("ทดสอบรายงาน", "ทดสอบรายงานสลิป", "force report"):
+        d = datetime.now(TZ).date().isoformat()
+        dest = _report_dest(group_id)
+        try:
+            _push(dest, TextSendMessage(text=build_daily_report(group_id, d)))
+            note = f" (redirect จากกลุ่มนี้ไป {dest})" if dest != group_id else ""
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"✅ ยิงรายงานสลิปวันนี้ ({d}) เข้าปลายทางแล้ว{note}\nไปเช็คว่าเข้ากลุ่มปลายทางไหม"))
+        except Exception as e:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"❌ ส่งรายงานไม่สำเร็จ: {e}\n(ปลายทาง {dest} — เช็คว่า OA ของกลุ่มนั้นอยู่ในกลุ่ม + token ถูก)"))
+        return
     # กลุ่มเจ้าหนี้การค้า → จัดการบัญชีหนี้ (บิล/จ่าย/สรุป) แล้วจบ ไม่ทำระบบสลิป/จองปกติ
     if group_id in PAYABLE_GROUPS:
         handle_payable_text(event, text, group_id)
