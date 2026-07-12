@@ -2226,6 +2226,11 @@ def _mark_sent(job: str, date: str, target: str):
 
 # ── กลุ่มที่บอทถูกเตะออก/ส่งไม่ได้ (กันสแปม+กันค้าง retry) — มาร์คเมื่อ LeaveEvent หรือ push เจอ 400 ──
 def _group_left(gid: str) -> bool:
+    # กลุ่มแผน B (ผูก OA เฉพาะใน OA_ROUTE) = จงใจให้มี OA อยู่ → ไม่ให้มาร์ค 'left' มา suppress การส่งถาวร
+    # (กัน trap: เผลอมาร์ค left ตอน setup ยังไม่พร้อม แล้วรายงานเงียบตลอดไป เพราะ push-only ไม่มี event มา self-heal)
+    # ถ้าส่งไม่ได้จริงจะ error ทุกครั้ง (เห็นใน log) แต่พอส่งได้ push สำเร็จจะ _clear_group_left ให้เอง
+    if gid in _oa_route:
+        return False
     return _get_meta(f"left:{gid}") == "1"
 
 def _mark_group_left(gid: str):
@@ -2294,10 +2299,11 @@ def _push_count(idx: int) -> int:
 _member_count_cache = {}     # id -> (count, expires_epoch); กันยิง API ถี่ทุก push
 MEMBER_COUNT_TTL = int(os.environ.get("MEMBER_COUNT_TTL", "3600"))
 
-def _recipient_count(to) -> int:
+def _recipient_count(to, api=None) -> int:
     """จำนวน 'ผู้รับจริง' ของปลายทาง push = ที่ LINE ใช้คิดโควต้า
     - user (Uxxx) = 1
     - group (Cxxx) / room (Rxxx) = จำนวนสมาชิก (แคช MEMBER_COUNT_TTL วิ กันยิง API ถี่)
+    ⚠️ ต้องนับด้วย OA ที่ 'จะส่งจริง' (api) — OA อื่นไม่ได้อยู่ในกลุ่มนั้น get_members_count จะ error → นับเป็น 1 ผิด
     LINE: push เข้ากลุ่ม 1 ครั้ง (กี่ bubble ก็ตาม) นับ = จำนวนสมาชิก | reply ฟรี ไม่นับเลย"""
     if not isinstance(to, str) or not to or to[0] not in ("C", "R"):
         return 1
@@ -2305,9 +2311,10 @@ def _recipient_count(to) -> int:
     hit = _member_count_cache.get(to)
     if hit and hit[1] > now:
         return hit[0]
+    api = api or line_bot_api
     try:
-        cnt = int(line_bot_api.get_group_members_count(to) if to[0] == "C"
-                  else line_bot_api.get_room_members_count(to))
+        cnt = int(api.get_group_members_count(to) if to[0] == "C"
+                  else api.get_room_members_count(to))
         cnt = max(1, cnt)
     except Exception as e:
         # นับไม่ได้ (เน็ต/บอทออกจากกลุ่ม) → ใช้ค่าที่แคชไว้ ไม่งั้น 1 (อย่างน้อยไม่พัง/ไม่บล็อกการส่ง)
@@ -2345,8 +2352,6 @@ def _push(to, messages):
     - error (เช่น 400 not-member / 429) → re-raise ให้ call site เดิมจัดการ (mark left / นับ fail) เหมือนเดิม
     - OA แตะเกณฑ์เตือน → เตือนเจ้าของครั้งเดียว/เดือน/OA (นอก lock กัน deadlock)
     หมายเหตุ: reply_message ยังใช้ OA1 ตรงๆ (ฟรี ไม่ผ่านฟังก์ชันนี้)"""
-    # LINE นับ push เข้ากลุ่ม = จำนวนสมาชิก (ไม่ใช่จำนวน bubble) — คิดผู้รับจริงไว้ก่อน (นอก lock กัน API ช้าบล็อก push อื่น)
-    inc = _recipient_count(to)
     n = len(_push_apis)
     # LINE ให้ OA อยู่กลุ่มละตัว → OA2/3/4 ไม่เคยอยู่ร่วมกลุ่มกับเอด → "failover สลับ OA ในกลุ่มเดียว" ทำไม่ได้เลย
     #   - ปลายทางที่แมปใน OA_ROUTE → ส่งผ่าน OA ตัวนั้นตัวเดียว
@@ -2354,6 +2359,8 @@ def _push(to, messages):
     #     ⚠️ เดิม cascade ไป OA ถัดไปเมื่อเอดครบโควต้า — พอเพิ่ม token OA2 แต่มันไม่ได้อยู่ในกลุ่มนั้น → push ล้ม 'not member'
     route_idx = _oa_route.get(to) if isinstance(to, str) else None
     candidates = [route_idx] if (route_idx is not None and route_idx < n) else [0]
+    # LINE นับ push เข้ากลุ่ม = จำนวนสมาชิก — นับด้วย OA ที่จะส่งจริง (candidates[0]) ไม่งั้น OA อื่นนับกลุ่มไม่ได้ = นับผิดเป็น 1
+    inc = _recipient_count(to, _push_apis[candidates[0]])
     last = candidates[-1]
     warn_idx = warn_at = None
     with _push_lock:
@@ -3780,7 +3787,11 @@ def handle_text(event):
         return
     # ทดสอบ/ส่งซ้ำรายงานสลิปเดี๋ยวนี้ (ไม่ต้องรอ 00:30) — ยิงไปปลายทางจริง (REPORT_REDIRECT + OA_ROUTE)
     #   'ทดสอบรายงาน' = วันนี้; 'ทดสอบรายงาน 2026-07-10' = ส่งซ้ำของวันที่ระบุ (กู้รายงานที่หายรอบ 00:30)
-    if text.lower().startswith(("ทดสอบรายงาน", "force report")):
+    # ⚠️ ต้อง match แบบเป๊ะ + เว้นกลุ่มหนี้ — ไม่งั้น 'ทดสอบรายงานหนี้' (คำสั่งบัญชีหนี้) จะโดนดักผิด
+    _low_tr = text.lower().strip()
+    if (group_id not in PAYABLE_GROUPS
+            and (_low_tr in ("ทดสอบรายงาน", "ทดสอบรายงานสลิป", "force report")
+                 or _low_tr.startswith("ทดสอบรายงาน "))):
         d = datetime.now(TZ).date().isoformat()
         for p in text.split()[1:]:
             try:
@@ -3792,7 +3803,7 @@ def handle_text(event):
             _push(dest, TextSendMessage(text=build_daily_report(group_id, d)))
             note = f" (redirect จากกลุ่มนี้ไป {dest})" if dest != group_id else ""
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                text=f"✅ ยิงรายงานสลิปวันนี้ ({d}) เข้าปลายทางแล้ว{note}\nไปเช็คว่าเข้ากลุ่มปลายทางไหม"))
+                text=f"✅ ยิงรายงานสลิป ({d}) เข้าปลายทางแล้ว{note}\nไปเช็คว่าเข้ากลุ่มปลายทางไหม"))
         except Exception as e:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
                 text=f"❌ ส่งรายงานไม่สำเร็จ: {e}\n(ปลายทาง {dest} — เช็คว่า OA ของกลุ่มนั้นอยู่ในกลุ่ม + token ถูก)"))
@@ -3897,9 +3908,9 @@ def handle_text(event):
             except ValueError:
                 pass
 
-        # ทดสอบ/กู้รายงานอัตโนมัติ — push 'รายงานเมื่อวาน' เข้ากลุ่มนี้เดี๋ยวนี้
-        # ใช้เช็คว่าระบบ push ใช้งานได้ไหม (ถ้าพลาดจะโชว์สาเหตุใน LINE เลย) + กู้รายงานที่ 00:30 พลาดไป
-        if text.lower() in ("ทดสอบรายงาน", "รายงานเมื่อวาน", "force report", "test report"):
+        # push 'รายงานเมื่อวาน' เข้า 'กลุ่มนี้' เดี๋ยวนี้ (ต่างจาก 'ทดสอบรายงาน' ที่ยิงไปปลายทาง redirect)
+        # ใช้เช็คว่า push เข้ากลุ่มนี้ได้ไหม + ดูรายงานเมื่อวานซ้ำ
+        if text.lower() in ("รายงานเมื่อวาน", "test report"):
             yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
             try:
                 _push(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
