@@ -2845,14 +2845,22 @@ def handle_reservation_text(event, text: str, group_id: str):
         _push(dest, [detail_msg, confirm_msg])
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"📤 ส่งจองล่วงหน้า #{resv_id} ไปกลุ่มบาร์น้ำแล้ว รอคอนเฟิร์ม\n─────────────────\n{detail}{time_warn}"))
-    # แผน B: เด้งสำเนา 'ข้อมูลจอง' (ไม่มีปุ่ม) ให้บาร์น้ำ/sound รับรู้ (คอนเฟิร์มยังทำที่กลุ่มเดิม)
-    _resv_broadcast_info(resv_id, head, f"จากคุณ {requested_by}\n{detail}{time_warn}", skip_group=dest)
+    # แผน B: เด้งสำเนา 'ข้อมูลจอง' (ไม่มีปุ่ม) ให้บาร์น้ำ/sound — 'เฉพาะจองล่วงหน้า' (จองวันนี้ไม่ต้องเด้ง)
+    if is_advance:
+        _resv_broadcast_info(resv_id, head, f"จากคุณ {requested_by}\n{detail}{time_warn}", skip_group=dest)
     return True
+
+
+def _resv_is_advance(resv: dict) -> bool:
+    """จองล่วงหน้า = วันงาน (resv_date) เป็นวันหลังวันที่แจ้งจอง (created_at); ไม่มี resv_date/วันเดียวกัน = จองวันนี้"""
+    rd = resv.get("resv_date")
+    return bool(rd) and rd > (resv.get("created_at") or "")[:10]
 
 
 def _resv_broadcast_info(resv_id: int, head: str, detail: str, skip_group: str = None):
     """แผน B: เด้ง 'ข้อมูลจอง (ไม่มีปุ่มคอนเฟิร์ม)' ให้กลุ่มใน RESV_INFO_GROUPS (บาร์น้ำ/sound) รับรู้
-    push ผ่าน OA ของกลุ่มนั้น (ตาม OA_ROUTE); คอนเฟิร์มยังทำที่กลุ่มรับจองที่เดียว — กลุ่มพวกนี้แค่ดู"""
+    push ผ่าน OA ของกลุ่มนั้น (ตาม OA_ROUTE); คอนเฟิร์มยังทำที่กลุ่มรับจองที่เดียว — กลุ่มพวกนี้แค่ดู
+    หมายเหตุ: เรียกเฉพาะ 'จองล่วงหน้า' เท่านั้น (จองวันนี้ไม่ broadcast) — เช็คที่ call site"""
     if not RESV_INFO_GROUPS:
         return
     msg = TextSendMessage(text=f"{head} #{resv_id}\n─────────────────\n{detail}")
@@ -2914,8 +2922,9 @@ def handle_reservation_confirm(event, resv_id: int):
         except Exception as e:
             print(f"[resv] notify origin failed: {e}", flush=True)
 
-    # แผน B: อัปเดตสถานะ 'คอนเฟิร์มแล้ว' ให้บาร์น้ำ/sound ที่เคยเด้งข้อมูลจองนี้ไว้ (ข้ามกลุ่มที่กด)
-    _resv_broadcast_info(resv_id, "✅ คอนเฟิร์มจองแล้ว", f"{detail}\nโดย {confirmer}", skip_group=pressed_group)
+    # แผน B: อัปเดตสถานะ 'คอนเฟิร์มแล้ว' ให้บาร์น้ำ/sound — เฉพาะจองล่วงหน้า (ที่เคยเด้งข้อมูลไว้เท่านั้น)
+    if _resv_is_advance(resv):
+        _resv_broadcast_info(resv_id, "✅ คอนเฟิร์มจองแล้ว", f"{detail}\nโดย {confirmer}", skip_group=pressed_group)
 
 
 def _touch_reminded(resv_id: int, when: str):
