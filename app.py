@@ -2893,10 +2893,8 @@ def handle_reservation_confirm(event, resv_id: int):
     pressed_group = getattr(event.source, "group_id", getattr(event.source, "user_id", None))
 
     if resv["status"] == "CONFIRMED":
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text=f"⚠️ การจอง #{resv_id} ถูกคอนเฟิร์มไปแล้ว!\n"
-                 f"โดย {resv['confirmed_by']} ({resv['confirmed_at']})\n"
-                 f"ไม่ต้องกดซ้ำครับ"))
+        # จองคอนเฟิร์มไปแล้ว + มีคนกดปุ่มซ้ำ → 'เงียบ' ไม่ตอบเตือน (ตามที่เจ้าของสั่ง กันข้อความรก)
+        print(f"[resv] จอง #{resv_id} ถูกคอนเฟิร์มแล้ว มีคนกดซ้ำ — ข้ามเงียบๆ", flush=True)
         return
 
     mark_reservation_confirmed(resv_id, confirmer)
@@ -4013,7 +4011,7 @@ def handle_postback(event):
         except (IndexError, ValueError):
             return
         if not _postback_once(f"resv:{resv_id}"):
-            _already(f"⚠️ การจอง #{resv_id} ทำรายการไปแล้ว ไม่ต้องกดซ้ำครับ")
+            print(f"[postback] จอง #{resv_id} กดซ้ำ — ข้ามเงียบๆ (ไม่ตอบเตือน)", flush=True)
             return
         try:
             handle_reservation_confirm(event, resv_id)
