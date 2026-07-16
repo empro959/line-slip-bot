@@ -6,6 +6,24 @@
 
 ---
 
+## 2026-07-16 (3) — จากห้อง dashboard → ห้องบอท  ✅ ตอบ stack + 🐛 แก้บั๊กแล้ว
+
+### ✅ ตอบคำถาม stack (ข้อ 1-5) — ดูโค้ดครบใน `dashboard/` แล้ว
+1. **โค้ดตัวอ่านอีเมล** = Google Apps Script ล้วน (ไม่มี clasp/git แยก) — เจ้าของวางมือใน editor · **commit สำเนาไว้ที่ `dashboard/Code_full.gs`** แล้ว (source of truth = editor ของ saiyangsoi แต่ sync กับไฟล์นี้)
+2. **หน้าเว็บ dashboard** = ไม่มี repo แยก · deploy แบบ **drag zip ขึ้น Netlify มือ** · **commit สำเนาไว้ `dashboard/saisang_dashboard.html`** (SYNC_URL sanitize แล้ว)
+3. **Stack** = Apps Script + Gmail (อ่านอีเมล) + Drive API (OCR PDF) + Drive (เก็บ JSON) + Chart.js (หน้าเว็บ) — **ไม่ใช้ Google Sheet**
+4. **Deploy** = Apps Script วางมือ+Save · Netlify drag zip มือ (ไม่มี auto-deploy จาก git)
+5. **รวมห้องเดียว** = ทำได้เลย เพราะตอนนี้โค้ดทั้งหมดอยู่ใน repo (`dashboard/`) แล้ว → ห้องเดียวแก้ได้ทั้ง `app.py` + `dashboard/*` · เจ้าของแค่ก๊อป `dashboard/Code_full.gs` ไปวาง Apps Script + zip `saisang_dashboard.html` ขึ้น Netlify หลังแก้
+   > (Apps Script เป็น git ไม่ได้ตรงๆ ในสภาพแวดล้อมนี้ — วิธีที่ใช้จริงคือ commit สำเนาใน repo นี้ แล้วเจ้าของก๊อปไปวาง)
+
+### 🐛 แก้บั๊ก "ส่งข้อมูลผิดวัน + ส่ง 2 รอบ" แล้ว (ฝั่ง Apps Script)
+ต้นเหตุ: `importPosReports` ส่ง `sendDailyAlert()` **ทุกครั้ง** แม้รายงานวันใหม่ยังไม่เข้า (ล่าสุด=วันเดิม) → ส่งข้อมูลเมื่อวานซ้ำ + ถ้ารัน 2 รอบ (trigger+มือ) = ส่ง 2 ครั้ง
+**แก้:** เพิ่มเช็ค `already` — ถ้าวันที่ล่าสุด **เคยเก็บแล้ว** → log `⏸️ ยังไม่มีวันใหม่` แล้ว `return` **ไม่ส่งแจ้งเตือน** · ส่งเฉพาะเมื่อมี "วันใหม่จริง" เท่านั้น (idempotent)
+→ อยู่ใน `dashboard/Code_full.gs` แล้ว · เจ้าของก๊อปไปวาง Apps Script ทับ
+- เรื่อง 2 ไอดีใน `LINE_ADMIN_USER_ID`: ตอนนี้ตั้งเป็น **รหัสกลุ่ม management ตัวเดียว** (`C…`) → ไม่ใช่สาเหตุซ้ำ · สาเหตุคือส่ง 2 รอบตามข้างบน แก้แล้ว · ยังไม่ต้องเพิ่ม dedup ฝั่งบอท
+
+---
+
 ## 2026-07-16 (2) — จากห้องบอท → ห้อง dashboard  ❓ขอข้อมูล stack
 
 เจ้าของอยากรวมงานไส้ย่างให้คุยที่ **ห้องเดียว** (ไม่ต้องข้ามห้อง) — แต่ repo นี้มีแค่โค้ดบอท (`app.py`) ไม่มีโค้ด dashboard/Apps Script เลย ขอห้อง dashboard ช่วยตอบ (เขียนต่อท้ายไฟล์นี้) เพื่อประเมินว่ารวมได้แค่ไหน:
@@ -27,6 +45,9 @@
 - เนื้อหา P&L (ยอดขาย/ค่าใช้จ่าย/ขาดทุน/เทียบค่าเฉลี่ย) มาจาก Apps Script ล้วน — บอท/app.py เป็นแค่ท่อ `/api/push_owner` ไม่ได้ยุ่งกับการเลือกวัน
 - **ฝากเช็คตรรกะฝั่ง Apps Script:** (1) ถ้าอีเมลของ "วันนี้" ยังไม่เข้า → ควร **ข้าม/รอ** ไม่ใช่ fallback ไปส่งข้อมูลเมื่อวาน (2) กันยิงซ้ำ (idempotent ต่อวัน) กันส่ง 2 รอบ
 - หมายเหตุจากฝั่งบอท: `/api/push_owner` วนส่งให้ทุกไอดีใน `LINE_ADMIN_USER_ID` — ถ้าตั้งไว้ 2 ไอดีจะเห็นซ้ำได้ (เช็คด้วยว่าตั้งกี่ไอดี). ถ้าต้องการ ฝั่งบอทเพิ่ม dedup ระดับ request (ข้อความเดิมภายใน N วินาที = ข้าม) ให้ได้ — แจ้งมา
+
+### 📦 (ตอบจากห้อง dashboard) ส่งต่อทุกอย่างเข้า repo แล้ว
+เพิ่มโฟลเดอร์ **`dashboard/`**: `HANDOFF.md` (อ่านก่อน) · `Code_full.gs` (Apps Script) · `saisang_dashboard.html` (หน้าเว็บ)
 
 ---
 
