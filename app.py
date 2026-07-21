@@ -4168,11 +4168,12 @@ def api_push_owner():
         msg = (body.get("message") or "").strip()
         if not msg:
             return {"ok": False, "error": "empty message"}, 400
-        # ส่งให้เจ้าของทุกคน — ถ้าบางรหัสพัง (เช่นยังไม่แอดบอท) คนอื่นยังได้อยู่
+        # ส่งให้เจ้าของทุกคน ผ่าน _push() → เลือก OA ตาม OA_ROUTE อัตโนมัติ (กลุ่ม management → OA2)
+        # + นับโควตา/สลับ OA ตามระบบบอท · ไม่ต้องพึ่ง LINE_ADMIN_PUSH_TOKEN แล้ว
         sent, errors = 0, []
         for uid in ADMIN_USER_IDS:
             try:
-                admin_push_api.push_message(uid, TextSendMessage(text=msg[:4900]))
+                _push(uid, TextSendMessage(text=msg[:4900]))
                 sent += 1
             except Exception as e:
                 errors.append(f"{uid[:8]}…: {str(e)[:80]}")

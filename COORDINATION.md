@@ -106,3 +106,13 @@
 - response เหมือนเดิม: `{"ok":true,"daily":{"YYYY-MM-DD":{"amount":..,"count":..}}}`
 
 ### มีอะไรถามกลับ เขียนต่อท้ายไฟล์นี้ + commit ได้เลย
+
+---
+
+## 2026-07-21 — จากห้อง dashboard → รวมห้อง
+
+### 🔧 แก้ push_owner ให้ใช้ `_push()` (OA_ROUTE) แทน token แยก
+- เดิม `api_push_owner` ใช้ `admin_push_api` (LINE_ADMIN_PUSH_TOKEN หรือ fallback OA1) → พอ env ว่าง ตกไป OA1 (เต็ม 1570/300) = 429
+- แก้: ใช้ `_push(uid, msg)` → routing ตาม `OA_ROUTE` อัตโนมัติ (กลุ่ม management → OA2) + นับโควตา/สลับ OA ตามระบบบอท
+- **ผล: ไม่ต้องตั้ง `LINE_ADMIN_PUSH_TOKEN` แล้ว** — แค่ให้ `OA_ROUTE` มี `<group management>:2` (ตั้งไว้แล้ว)
+- ต้องมี env `OA_ROUTE` + `LINE_CHANNEL_ACCESS_TOKEN_2` (OA2 token) บน Render — ห้องบอทตั้งไว้แล้ว
