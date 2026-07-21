@@ -404,16 +404,18 @@ function importPosReports(){
   var balText=b?pdfToText_(b.blob):'';
   var pay=balText?parseBalance_(balText):{}, zones=balText?parseBalanceZones_(balText):{};
   var c=findLatestPdf_('SalesSummaryReportByCustomer'); var bills=0; try{ if(c) bills=parseBills_(pdfToText_(c.blob)); }catch(e){}
-  var already=loadDaily_().some(function(x){return x.date===dd.key;});  // วันนี้เคยเก็บแล้วไหม (กันส่งซ้ำ/ส่งข้อมูลเมื่อวานซ้ำ)
   var day={date:dd.key,period:dd.period,sales:parseSale_(st).cats,expenses:parsePayout_(pt).records,payments:pay,menu:parseSaleItems_(st),zones:zones,voids:parseVoids_(st),bills:bills};
   var daily=loadDaily_().filter(function(x){return x.date!==dd.key;}); // กันซ้ำ
   daily.push(day); saveDaily_(daily);
   writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));
   var dayS=day.sales.reduce(function(a,c){return a+c.amount;},0);
   Logger.log('✅ เก็บวันที่ '+dd.key+' ('+dd.period+') ยอดขายวันนั้น '+dayS.toLocaleString()+' | สะสม '+daily.length+' วัน');
-  // ส่งแจ้งเตือน "เฉพาะเมื่อมีวันใหม่จริง" — ถ้ารายงานวันใหม่ยังไม่เข้า (ล่าสุด=วันเดิม) → ข้าม ไม่ส่งข้อมูลเมื่อวานซ้ำ
-  if(already){ Logger.log('⏸️ รายงานล่าสุด ('+dd.key+') เก็บไปแล้ว — ยังไม่มีวันใหม่ ไม่ส่งแจ้งเตือนซ้ำ'); return; }
-  sendDailyAlert();  // ส่งสรุป+เตือนเข้า LINE เจ้าของ
+  // ส่งแจ้งเตือนเฉพาะถ้า "วันนี้ยังไม่เคยแจ้ง" — จำวันที่แจ้งล่าสุดใน Script Properties
+  // (ใช้ค่านี้ ไม่ใช่ "มีใน pos_daily" เพราะ backfill ก็เก็บวันโดยไม่แจ้ง → จะพลาดการส่ง)
+  var props=PropertiesService.getScriptProperties();
+  if(props.getProperty('LAST_ALERT_DATE')===dd.key){ Logger.log('⏸️ แจ้งเตือน '+dd.key+' ส่งไปแล้ว — ไม่ส่งซ้ำ'); return; }
+  sendDailyAlert();                                   // ส่งสรุป+เตือนเข้า LINE เจ้าของ
+  props.setProperty('LAST_ALERT_DATE', dd.key);       // จำว่าแจ้งวันนี้แล้ว
 }
 
 // เก็บย้อนหลัง (รันครั้งเดียวตอนติดตั้ง เพื่อสะสมเดือนปัจจุบัน) — จับคู่ Sale/Payout จากเลขท้ายชื่อไฟล์
