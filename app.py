@@ -153,23 +153,27 @@ PUSH_FREE_LIMIT = int(os.environ.get("PUSH_FREE_LIMIT", "300"))
 PUSH_WARN_RATIO = float(os.environ.get("PUSH_WARN_RATIO", "0.8"))
 PUSH_WARN_AT    = max(1, int(PUSH_FREE_LIMIT * PUSH_WARN_RATIO))
 _push_apis = [line_bot_api]        # index 0 = OA1 (ตัวหลัก)
-for _i in range(2, 6):             # รองรับ OA2..OA5
+for _i in range(2, 10):            # รองรับ OA2..OA9 (เพิ่ม OA ได้แค่ตั้ง env LINE_CHANNEL_ACCESS_TOKEN_6/_7/... )
     _tok2 = os.environ.get(f"LINE_CHANNEL_ACCESS_TOKEN_{_i}")
     if _tok2:
         _push_apis.append(LineBotApi(_tok2))
 # แผน B (แยกกลุ่มคนละ OA): แมป 'กลุ่ม → OA ตัวไหน' — LINE ให้ OA อยู่ได้กลุ่มละตัว จึง push กลุ่มนั้นด้วย token ตัวนั้น
 # รูปแบบ env OA_ROUTE="Cxxxx:2,Cyyyy:3,Czzzz:4" (groupid:เลข OA แบบ 1-based). ไม่ตั้ง = โหมดเดิม (OA1 + failover cascade)
-_oa_route = {}
+_oa_route = {}     # gid -> [ลำดับ OA (0-based)]; หลายตัว = สลับอัตโนมัติเมื่อเต็ม เช่น "Cxxxx:3/4/2"
 for _pair in os.environ.get("OA_ROUTE", "").split(","):
     _pair = _pair.strip()
     if ":" in _pair:
-        _gid, _num = _pair.rsplit(":", 1)
-        try:
-            _ix = int(_num) - 1
-        except ValueError:
-            continue
-        if _gid.strip() and _ix >= 0:
-            _oa_route[_gid.strip()] = _ix
+        _gid, _nums = _pair.rsplit(":", 1)
+        _ixs = []
+        for _n in _nums.replace("|", "/").split("/"):   # รองรับหลาย OA คั่นด้วย / (หรือ |)
+            try:
+                _k = int(_n.strip()) - 1
+            except ValueError:
+                continue
+            if _k >= 0 and _k not in _ixs:
+                _ixs.append(_k)
+        if _gid.strip() and _ixs:
+            _oa_route[_gid.strip()] = _ixs
 _push_lock = threading.Lock()      # กัน race นับโควต้าจากหลาย thread (background jobs + handlers)
 # รับชื่อย่อ (flash/pro/flash-lite) → เติมเป็นชื่อโมเดลเต็มให้อัตโนมัติ กันพลาดตอนตั้ง env ผิด (เช่นใส่แค่ 'flash')
 _GEMINI_ALIASES = {"flash": "gemini-2.5-flash", "pro": "gemini-2.5-pro", "flash-lite": "gemini-2.5-flash-lite"}
@@ -2293,6 +2297,20 @@ def _push_count(idx: int) -> int:
     except (TypeError, ValueError):
         return 0
 
+_real_usage_cache = {}   # idx -> (usage, expires_epoch) กันยิง API ถี่
+def _line_real_usage(idx: int):
+    """ยอด push จริงเดือนนี้จาก LINE (ตรงกับ OA Manager) — บอทนับเองมักต่ำกว่า เพราะ LINE รวมบรอดแคสต์/ข้อความอื่นด้วย"""
+    now = time.time()
+    hit = _real_usage_cache.get(idx)
+    if hit and hit[1] > now:
+        return hit[0]
+    try:
+        val = int(_push_apis[idx].get_message_quota_consumption().total_usage)
+    except Exception:
+        val = None
+    _real_usage_cache[idx] = (val, now + 300)   # cache 5 นาที
+    return val
+
 
 # แคชจำนวนสมาชิกกลุ่ม/ห้อง — LINE นับ 'push เข้ากลุ่ม 1 ครั้ง' = จำนวนสมาชิก (ไม่ใช่ 1)
 # จึงต้องรู้จำนวนสมาชิกเพื่อให้ตัวนับโควต้าตรงกับที่ LINE คิดจริง (เดิมนับเป็น 'จำนวน bubble' → ต่ำกว่าจริงมาก)
@@ -2357,8 +2375,10 @@ def _push(to, messages):
     #   - ปลายทางที่แมปใน OA_ROUTE → ส่งผ่าน OA ตัวนั้นตัวเดียว
     #   - ปลายทางอื่นทั้งหมด (DM แอดมิน / กลุ่มที่มีแต่เอด เช่นกลุ่มหนี้) → OA1 (เอด) เสมอ ไม่ cascade
     #     ⚠️ เดิม cascade ไป OA ถัดไปเมื่อเอดครบโควต้า — พอเพิ่ม token OA2 แต่มันไม่ได้อยู่ในกลุ่มนั้น → push ล้ม 'not member'
-    route_idx = _oa_route.get(to) if isinstance(to, str) else None
-    candidates = [route_idx] if (route_idx is not None and route_idx < n) else [0]
+    route = _oa_route.get(to) if isinstance(to, str) else None
+    candidates = [i for i in route if i < n] if route else [0]   # ลิสต์ OA (หลายตัว = สลับอัตโนมัติเมื่อเต็ม)
+    if not candidates:
+        candidates = [0]
     # LINE นับ push เข้ากลุ่ม = จำนวนสมาชิก — นับด้วย OA ที่จะส่งจริง (candidates[0]) ไม่งั้น OA อื่นนับกลุ่มไม่ได้ = นับผิดเป็น 1
     inc = _recipient_count(to, _push_apis[candidates[0]])
     last = candidates[-1]
@@ -2383,9 +2403,11 @@ def _push(to, messages):
                 break
             except Exception as e:
                 last_err = e
-                if _is_quota_error(e) and idx != last:
-                    _set_meta(_push_month_key(idx), str(PUSH_FREE_LIMIT))  # มาร์คเต็ม กันเลือกซ้ำรอบหน้า
-                    print(f"[push] OA{idx+1} เต็มโควต้า (429) → สลับ OA ถัดไป", flush=True)
+                # สลับ OA ถัดไปเมื่อ: เต็มโควต้า (429) หรือส่งไม่ได้ (400 เช่น OA ไม่ได้อยู่ในกลุ่ม) — ถ้ายังมีตัวสำรอง
+                if idx != last and isinstance(e, LineBotApiError) and getattr(e, "status_code", None) in (400, 429):
+                    if _is_quota_error(e):
+                        _set_meta(_push_month_key(idx), str(PUSH_FREE_LIMIT))  # มาร์คเต็ม กันเลือกซ้ำเดือนนี้
+                    print(f"[push] OA{idx+1} ส่งไม่ได้ ({getattr(e,'status_code','?')}) → ลอง OA ถัดไป", flush=True)
                     continue
                 raise
         if not sent and last_err:   # ตัวท้ายสุดก็ยังเจอ quota error → re-raise ให้ call site รู้ว่าส่งไม่ได้
@@ -3778,16 +3800,25 @@ def handle_text(event):
         lines = [f"📈 โควต้า push เดือน {mon} (ลิมิต {PUSH_FREE_LIMIT}/OA)"]
         total = 0
         for i in range(len(_push_apis)):
-            used = _push_count(i)
-            total += used
-            bar = "🔴 เต็ม" if used >= PUSH_FREE_LIMIT else ("🟡" if used >= PUSH_FREE_LIMIT * 0.9 else "🟢")
-            lines.append(f"{bar} OA{i+1}: {used}/{PUSH_FREE_LIMIT}")
-        lines.append(f"─────────────────\nรวมทั้งหมด {total} ข้อความ")
+            used = _push_count(i)                 # บอทนับ (เฉพาะที่บอท push)
+            real = _line_real_usage(i)            # LINE นับจริง (รวมบรอดแคสต์/ข้อความอื่น)
+            shown = real if real is not None else used
+            total += shown
+            bar = "🔴 เต็ม" if shown >= PUSH_FREE_LIMIT else ("🟡" if shown >= PUSH_FREE_LIMIT * 0.9 else "🟢")
+            if real is not None and real != used:
+                lines.append(f"{bar} OA{i+1}: {real}/{PUSH_FREE_LIMIT}  (LINE จริง · บอทนับ {used})")
+            else:
+                lines.append(f"{bar} OA{i+1}: {shown}/{PUSH_FREE_LIMIT}")
+        lines.append(f"─────────────────\nรวมทั้งหมด {total} ข้อความ (ยอดจริงจาก LINE)")
         if _oa_route:
             # แผน B: แต่ละกลุ่มผูก OA ของตัวเอง (ไม่มี 'OA ที่ใช้อยู่' ตัวเดียวแบบ failover เก่า)
             here = _oa_route.get(group_id)
-            lines.append(f"📍 กลุ่มนี้ push ผ่าน OA{(here + 1) if here is not None else 1}")
-            lines.append("โหมด: แยกกลุ่มคนละ OA (แผน B) — แต่ละกลุ่มใช้ OA ของตัวเอง ไม่สลับกัน")
+            if here:
+                _seq = "→".join("OA" + str(i + 1) for i in here)
+                lines.append(f"📍 กลุ่มนี้ push ผ่าน {_seq}" + (" (สลับอัตโนมัติเมื่อเต็ม)" if len(here) > 1 else ""))
+            else:
+                lines.append("📍 กลุ่มนี้ push ผ่าน OA1")
+            lines.append("โหมด: แยกกลุ่มคนละ OA (แผน B)" + (" + สลับ OA อัตโนมัติเมื่อเต็ม" if here and len(here) > 1 else ""))
         else:
             active = next((i for i in range(len(_push_apis)) if _push_count(i) < PUSH_FREE_LIMIT), len(_push_apis) - 1)
             lines.append(f"กำลังใช้: OA{active+1}")

@@ -116,3 +116,20 @@
 - แก้: ใช้ `_push(uid, msg)` → routing ตาม `OA_ROUTE` อัตโนมัติ (กลุ่ม management → OA2) + นับโควตา/สลับ OA ตามระบบบอท
 - **ผล: ไม่ต้องตั้ง `LINE_ADMIN_PUSH_TOKEN` แล้ว** — แค่ให้ `OA_ROUTE` มี `<group management>:2` (ตั้งไว้แล้ว)
 - ต้องมี env `OA_ROUTE` + `LINE_CHANNEL_ACCESS_TOKEN_2` (OA2 token) บน Render — ห้องบอทตั้งไว้แล้ว
+
+---
+
+## 2026-07-21 (2) — จากห้อง dashboard → รวมห้อง  🔄 auto-failover OA + นับจริง
+
+### ✨ `_push` สลับ OA อัตโนมัติ + รองรับหลาย OA ต่อกลุ่ม
+- `OA_ROUTE` รองรับหลาย OA ต่อกลุ่ม: `Cxxxx:3/4/2` = ลอง OA3→OA4→OA2 (คั่นด้วย `/`)
+- `_push` cascade เมื่อเจอ **429 (เต็ม) หรือ 400 (ไม่ใช่สมาชิก)** → ลอง OA ถัดไปเอง (ใช้ error จริงจาก LINE ไม่ใช่ตัวนับภายใน → แม่นแม้ตัวนับเพี้ยน)
+- `_oa_route[gid]` เปลี่ยนจาก int เป็น **list** — อัปเดตจุดที่ใช้ครบ (2232 key-check, display, _push)
+- รองรับ OA2..OA9 แล้ว (เดิม OA2..OA5) — เพิ่ม OA แค่ตั้ง `LINE_CHANNEL_ACCESS_TOKEN_6/_7/...`
+
+### 📊 รายงานโควตาโชว์ "เลขจริงจาก LINE"
+- เพิ่ม `_line_real_usage(idx)` = `get_message_quota_consumption().total_usage` (cache 5 นาที)
+- แก้ที่เจ้าของบอกว่า "ตัวนับบอท ≠ LINE" — เพราะบอทนับเฉพาะที่บอท push · LINE รวมบรอดแคสต์/ข้อความอื่นด้วย → ตอนนี้โชว์เลข LINE จริง + บอทนับในวงเล็บ
+
+### เจ้าของต้องตั้ง (Render)
+- เชิญ OA3+OA4 เข้ากลุ่ม management → ตั้ง `OA_ROUTE` = `<C…management>:3/4/2`
