@@ -782,8 +782,27 @@ function buildWeeklyMsg_(){
   return lines.join('\n');
 }
 
-function sendDailyAlert(){ var m=buildDailyMsg_(); if(m) pushOwner_(m); }
-function sendWeeklyAlert(){ var m=buildWeeklyMsg_(); if(m) pushOwner_(m); }
+// ส่งอีเมลสรุปให้เจ้าของ (ฟรี ไม่กินโควตา LINE) — ตั้งอีเมลด้วย setOwnerEmails()
+function emailOwners_(subject, body){
+  var to=PropertiesService.getScriptProperties().getProperty('OWNER_EMAILS');
+  if(!to){ try{ to=Session.getEffectiveUser().getEmail(); }catch(e){} }   // ไม่ตั้ง = เมลเจ้าของ Apps Script
+  if(!to){ Logger.log('ยังไม่ตั้ง OWNER_EMAILS'); return; }
+  try{ MailApp.sendEmail(to, subject, body); Logger.log('✉️ อีเมลสรุปส่งแล้ว → '+to); }
+  catch(e){ Logger.log('อีเมลพลาด: '+e); }
+}
+// ตั้งอีเมลผู้รับ (คั่นด้วยคอมมา) — แก้แล้วรันครั้งเดียว
+function setOwnerEmails(){
+  PropertiesService.getScriptProperties().setProperty('OWNER_EMAILS','ใส่อีเมล1@gmail.com,อีเมล2@gmail.com'); // <<< แก้ตรงนี้
+  Logger.log('✅ ตั้งอีเมลเจ้าของแล้ว: '+PropertiesService.getScriptProperties().getProperty('OWNER_EMAILS'));
+}
+function sendDailyAlert(){ var m=buildDailyMsg_(); if(!m) return;
+  try{ pushOwner_(m); }catch(e){}                       // LINE (best-effort — ถ้าโควตาเต็มก็ข้าม)
+  emailOwners_('📊 สรุปยอดขายเมื่อวาน — ไส้ย่างซอย๔', m); // อีเมล (ฟรี ชัวร์)
+}
+function sendWeeklyAlert(){ var m=buildWeeklyMsg_(); if(!m) return;
+  try{ pushOwner_(m); }catch(e){}
+  emailOwners_('📅 สรุปรายสัปดาห์ — ไส้ย่างซอย๔', m);
+}
 // ทดสอบส่งเข้า LINE เจ้าของ (รันดูว่าข้อความเข้าไหม)
 function testPushOwner(){ Logger.log(buildDailyMsg_()); sendDailyAlert(); }
 
