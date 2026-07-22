@@ -776,20 +776,22 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None, 
         if api_amt and slip_amt and abs(float(api_amt) - float(slip_amt)) > 0.01:
             issues.append(f"🔴 ยอดเงินไม่ตรง: สลิปแสดง {slip_amt} แต่ API พบ {api_amt} บาท")
 
+    # บรรทัด "ซ้ำกับใบไหน" — โชว์ผู้โอน/เวลา/เลขอ้างอิงของสลิปใบก่อนที่ตรง ให้ตรวจสอบง่าย
+    def _dup_ref_line(p):
+        if not p:
+            return ""
+        ptime = p.get("slip_datetime") or p.get("recorded_at") or "-"
+        return f"\n   ↳ ซ้ำกับใบก่อน: {p.get('sender') or '-'} · เวลา {ptime} · อ้างอิง {p.get('ref_number') or '-'}"
+
     if dup_type == "ref_mismatch":
         cur_amt  = f"{float(info.get('amount') or 0):,.2f}"
         prev_amt = f"{float(prev_amount or 0):,.2f}"
         issues.append(f"🔴 เลขอ้างอิงเดียวกับสลิปใบก่อน แต่ยอดเงินไม่ตรง! "
-                      f"(ใบก่อน {prev_amt} / ใบนี้ {cur_amt} บาท) → สลิปถูกตัดต่อ!")
+                      f"(ใบก่อน {prev_amt} / ใบนี้ {cur_amt} บาท) → สลิปถูกตัดต่อ!{_dup_ref_line(prev)}")
     elif dup_type == "ref":
-        issues.append(f"🔴 เลขอ้างอิง {info.get('ref_number')} เคยถูกส่งมาแล้ว! (สลิปซ้ำ)")
+        issues.append(f"🔴 เลขอ้างอิง {info.get('ref_number')} เคยถูกส่งมาแล้ว! (สลิปซ้ำ){_dup_ref_line(prev)}")
     elif dup_type == "amount_time":
-        who = ""
-        if prev:
-            ptime = prev.get("slip_datetime") or prev.get("recorded_at") or "-"
-            pref  = prev.get("ref_number") or "-"
-            who   = f"\n   ↳ ซ้ำกับใบก่อน: {prev.get('sender') or '-'} · เวลา {ptime} · อ้างอิง {pref}"
-        issues.append(f"🔴 ยอด {info.get('amount')} บาท + วันเวลา + ผู้โอนเดียวกับสลิปใบก่อนหน้า → น่าจะเป็นสลิปซ้ำ (โปรดตรวจสอบ){who}")
+        issues.append(f"🔴 ยอด {info.get('amount')} บาท + วันเวลา + ผู้โอนเดียวกับสลิปใบก่อนหน้า → น่าจะเป็นสลิปซ้ำ (โปรดตรวจสอบ){_dup_ref_line(prev)}")
 
     # ข้อมูลไม่ครบ / ถูกตัด-บัง (เคสซ่อนปลายทาง ฯลฯ)
     receiver_missing = not (info.get("receiver") or info.get("receiver_account"))
