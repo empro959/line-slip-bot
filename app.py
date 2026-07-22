@@ -63,6 +63,9 @@ for _pair in os.environ.get("PAYABLE_MIRROR", "").split(","):
             _PAYABLE_PRIMARY_OF[_m] = _p
 # กลุ่ม "บาร์น้ำ+จองโต๊ะล่วงหน้า" — จองล่วงหน้าจากกลุ่มไหนก็ตามจะส่งการ์ด+ปุ่มมาที่นี่ (ดู id ด้วยคำสั่ง groupid)
 BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
+# กลุ่ม "staff" — จองวันนี้จากกลุ่มไหนก็ตามส่งการ์ด+ปุ่มมาที่นี่ให้ staff คอนเฟิร์ม + เป็นปลายทางสรุปจองรายวัน
+# ดีฟอลต์ = กลุ่มส่งสลิป (SLIP_GROUPS[0]) เพราะเจ้าของยืนยันว่า staff = กลุ่มเดียวกับกลุ่มส่งสลิป
+STAFF_GROUP_ID    = os.environ.get("STAFF_GROUP_ID", "") or (SLIP_GROUPS[0] if SLIP_GROUPS else "")
 # redirect รายงาน: ส่งรายงานของ "กลุ่มต้นทาง" ไปเข้า "กลุ่มปลายทาง" แทน (เนื้อห้ารายงานยังเป็นของต้นทาง)
 # รูปแบบ "ต้นทาง:ปลายทาง,ต้นทาง2:ปลายทาง2" — ครอบทุกรายงาน (สลิป/จอง/หนี้). ตั้งบน Render กัน repo public เห็น group id
 REPORT_REDIRECT   = {}
@@ -2491,7 +2494,7 @@ def maybe_send_resv_summary():
 
 
 def _maybe_send_resv_slot(now, start_hour, job, build_text):
-    """ส่งรายงานจองรอบหนึ่ง(idempotent/วัน) เข้ากลุ่มบาร์น้ำ + กลุ่มรับจอง ในกรอบ [start_hour, +3 ชม.)
+    """ส่งรายงานจองรอบหนึ่ง(idempotent/วัน) เข้ากลุ่ม staff กลุ่มเดียว ในกรอบ [start_hour, +3 ชม.)
     build_text(start_hour) → ข้อความ (None = ไม่มีจอง ไม่ส่ง); เลยกรอบ = ข้ามวันนี้ (กันส่งผิดเวลา)"""
     hm  = (now.hour, now.minute)
     end_hour = min(start_hour + 3, 24)   # กรอบส่ง 3 ชม. (ไม่ข้ามเที่ยงคืน)
@@ -2507,9 +2510,10 @@ def _maybe_send_resv_slot(now, start_hour, job, build_text):
             _set_meta(meta_key, today)
             print(f"[{job}] เลย {end_hour}:00 แล้ว ข้ามวันนี้ (พรุ่งนี้ส่ง {start_hour}:00)", flush=True)
             return
-        # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) / สั่งเมิน (IGNORE_GROUPS) — กันค้าง retry/สแปม
+        # สรุปจอง (ทั้งรอบล่วงหน้า-ถึงวันงาน + รอบจองในวัน) ส่งเข้ากลุ่ม staff กลุ่มเดียว
+        # ข้ามถ้าบอทถูกเตะออก (_group_left) / สั่งเมิน (IGNORE_GROUPS) — กันค้าง retry/สแปม
         targets = list(dict.fromkeys(
-            [t for t in ([BAR_GROUP_ID] + list(RESV_GROUPS))
+            [t for t in [STAFF_GROUP_ID]
              if t and not _group_left(t) and t not in IGNORE_GROUPS]))
         if not targets:
             _set_meta(meta_key, today)
@@ -2794,8 +2798,9 @@ def mark_reservation_confirmed(resv_id: int, confirmed_by: str):
 
 
 def handle_reservation_text(event, text: str, group_id: str):
-    """จองวันนี้ → การ์ด+ปุ่มในกลุ่มเดิม (เฉพาะกลุ่มใน RESV_GROUPS)
-    จองล่วงหน้า → ส่งการ์ด+ปุ่มไปกลุ่มบาร์น้ำ (BAR_GROUP_ID) จากกลุ่มไหนก็ได้
+    """จองวันนี้ → การ์ด+ปุ่มไปกลุ่ม staff (STAFF_GROUP_ID) คอนเฟิร์ม (รับจากกลุ่มใน RESV_GROUPS)
+    จองล่วงหน้า → ส่งการ์ด+ปุ่มไปกลุ่มบาร์น้ำ (BAR_GROUP_ID) คอนเฟิร์ม จากกลุ่มไหนก็ได้
+    กลุ่มต้นทางได้ 'ข้อมูลจอง (ไม่มีปุ่ม)' + เด้งผลคอนเฟิร์มกลับ
     ยกเว้นกลุ่มใน RESV_EXCLUDE_GROUPS → ไม่ยุ่งกับการจองเลย"""
     if group_id in RESV_EXCLUDE_GROUPS:
         return False
@@ -2850,12 +2855,12 @@ def handle_reservation_text(event, text: str, group_id: str):
     time_warn = "" if _within_open_hours(tmin) else \
         f"\n⚠️ เวลา {info.get('time_hhmm')} อยู่นอกเวลาเปิดร้าน (11:00–00:00) โปรดตรวจสอบ"
 
-    # ปลายทางการ์ด+ปุ่มคอนเฟิร์ม:
-    #  - แผน B (ตั้ง RESV_INFO_GROUPS): คอนเฟิร์มที่ 'กลุ่มเดิม' (นับสลิป) เสมอ ทั้งจองวันนี้/ล่วงหน้า
-    #    แล้วเด้ง 'สำเนาข้อมูล (ไม่มีปุ่ม)' ไปบาร์น้ำ/sound ให้รับรู้
-    #  - โหมดเดิม: จองล่วงหน้า → กลุ่มบาร์น้ำ (คอนเฟิร์มที่นั่น) / จองวันนี้ → กลุ่มเดิม
-    plan_b = bool(RESV_INFO_GROUPS)
-    dest = group_id if plan_b else (BAR_GROUP_ID if (is_advance and BAR_GROUP_ID) else group_id)
+    # ปลายทางการ์ด+ปุ่มคอนเฟิร์ม (ใครเป็นคนกดยืนยันจอง):
+    #  - จองวันนี้     → กลุ่ม staff (= กลุ่มส่งสลิป) เป็นคนคอนเฟิร์ม
+    #  - จองล่วงหน้า   → กลุ่มบาร์น้ำ เป็นคนคอนเฟิร์ม
+    # ถ้ากลุ่มต้นทาง = กลุ่มที่ต้องคอนเฟิร์มอยู่แล้ว → การ์ดขึ้นในกลุ่มเดิม (reply)
+    # ถ้าไม่ใช่ → กลุ่มต้นทางได้ 'ข้อมูลจอง (ไม่มีปุ่ม)' + การ์ด+ปุ่มไปกลุ่มที่คอนเฟิร์ม แล้วเด้งผลยืนยันกลับ
+    dest = (BAR_GROUP_ID if is_advance else STAFF_GROUP_ID) or group_id
     resv_id = save_reservation(group_id, requested_by, info, text, dest)
     detail = _resv_detail_lines(info)
     head = "📅 จองล่วงหน้า" if is_advance else "🔔 จองโต๊ะ"
@@ -2864,13 +2869,14 @@ def handle_reservation_text(event, text: str, group_id: str):
         text=f"{head}ใหม่ #{resv_id}\nจากคุณ {requested_by}\n─────────────────\n{detail}{time_warn}")
     confirm_msg = _resv_confirm_card(resv_id, head)
 
-    print(f"[resv] จอง #{resv_id} advance={is_advance} plan_b={plan_b} → การ์ดที่ {dest}", flush=True)
+    dest_name = "กลุ่มบาร์น้ำ" if is_advance else "กลุ่ม staff"
+    print(f"[resv] จอง #{resv_id} advance={is_advance} → การ์ดที่ {dest} ({dest_name})", flush=True)
     if dest == group_id:
         line_bot_api.reply_message(event.reply_token, [detail_msg, confirm_msg])
     else:
         _push(dest, [detail_msg, confirm_msg])
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text=f"📤 ส่งจองล่วงหน้า #{resv_id} ไปกลุ่มบาร์น้ำแล้ว รอคอนเฟิร์ม\n─────────────────\n{detail}{time_warn}"))
+            text=f"📤 ส่งจอง #{resv_id} ให้{dest_name}คอนเฟิร์มแล้ว รอยืนยัน\n─────────────────\n{detail}{time_warn}"))
     # แผน B: เด้งสำเนา 'ข้อมูลจอง' (ไม่มีปุ่ม) ให้บาร์น้ำ/sound — 'เฉพาะจองล่วงหน้า' (จองวันนี้ไม่ต้องเด้ง)
     if is_advance:
         _resv_broadcast_info(resv_id, head, f"จากคุณ {requested_by}\n{detail}{time_warn}", skip_group=dest)
@@ -2937,13 +2943,17 @@ def handle_reservation_confirm(event, resv_id: int):
         text=f"✅ การจอง #{resv_id} คอนเฟิร์มแล้ว!\nโดย {confirmer}\n─────────────────\n"
              f"ผู้แจ้งจอง: {resv.get('requested_by','-')}\n{detail}"))
 
-    # แจ้งกลับกลุ่มต้นทาง ถ้าต่างจากกลุ่มที่กด (เคสล่วงหน้า: บาร์น้ำกด → แจ้งกลับกลุ่มที่แจ้ง)
+    # แจ้งกลับกลุ่มต้นทาง ถ้าต่างจากกลุ่มที่กด
+    #  - จองล่วงหน้า: บาร์น้ำกด → แจ้งกลับกลุ่มที่แจ้ง
+    #  - จองวันนี้: staff กด → แจ้งกลับกลุ่มที่แจ้ง
     # ถ้าต้นทาง = กลุ่มที่กด (จองในกลุ่มเดียวกัน) → ไม่ต้องแจ้งซ้ำ
     origin = resv.get("origin_group_id")
     if origin and origin != pressed_group:
+        by_name = "บาร์น้ำ" if _resv_is_advance(resv) else "staff"
+        kind = "จองล่วงหน้า" if _resv_is_advance(resv) else "จอง"
         try:
             _push(origin, TextSendMessage(
-                text=f"✅ จองล่วงหน้า #{resv_id} ที่แจ้งไว้ บาร์น้ำคอนเฟิร์มแล้ว!\n"
+                text=f"✅ {kind} #{resv_id} ที่แจ้งไว้ {by_name}คอนเฟิร์มแล้ว!\n"
                      f"โดย {confirmer}\n─────────────────\n{detail}"))
         except Exception as e:
             print(f"[resv] notify origin failed: {e}", flush=True)
