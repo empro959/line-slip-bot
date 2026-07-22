@@ -673,35 +673,45 @@ def _postback_once(token: str) -> bool:
         return True
 
 def find_duplicate(group_id: str, info: dict):
-    """หาความซ้ำ/ความผิดปกติเทียบกับใบก่อนหน้าในกรุ๊ป — คืน (type, prev_amount)
+    """หาความซ้ำ/ความผิดปกติเทียบกับใบก่อนหน้าในกรุ๊ป — คืน (type, prev_amount, prev)
+    prev = dict ข้อมูลสลิปใบก่อนที่ตรง (sender/slip_datetime/ref_number/recorded_at) ไว้โชว์ว่าซ้ำกับใบไหน
     - ref_mismatch: เลขอ้างอิงเดียวกันแต่ยอดเงินไม่ตรง = ถูกตัดต่อ! (ฟันธง)
     - ref: เลขอ้างอิงตรง + ยอดตรง = สลิปซ้ำจริง
-    - amount_time: ยอดเงิน + วันเวลาบนสลิปตรงกัน (กันกรณี ref อ่านเพี้ยน)"""
+    - amount_time: ยอดเงิน + วันเวลาบนสลิปตรงกัน 'และผู้โอนคนเดียวกัน' (กันกรณี ref อ่านเพี้ยน)
+      *ถ้าผู้โอนคนละคน = ลูกค้าคนละโต๊ะบังเอิญจ่ายยอดเท่ากัน ไม่ใช่สลิปซ้ำ → ไม่เตือน (กัน false positive)"""
     ref    = info.get("ref_number")
     amount = float(info.get("amount") or 0)
     dt     = info.get("datetime")
+    cur_s  = _norm_match_text((info.get("sender") or "").strip())
     with _db() as conn:
         if ref:
             row = conn.execute(
-                "SELECT amount, sender FROM slips WHERE group_id=? AND ref_number=? ORDER BY id LIMIT 1",
+                "SELECT amount, sender, ref_number, slip_datetime, recorded_at FROM slips WHERE group_id=? AND ref_number=? ORDER BY id LIMIT 1",
                 (group_id, ref)).fetchone()
             if row:
                 prev = float(row["amount"] or 0)
                 # ref เดียวกันแต่ 'คนละผู้โอน' = มักเป็นรหัสร้านค้า/รหัสธุรกรรมที่ซ้ำทุกใบ
                 # (เช่น จ่ายบิล Krungthai/KBank รหัส EMPKB...ของร้าน) ลูกค้าหลายคนได้รหัสเดียวกัน
                 # → ไม่ใช่สลิปซ้ำ/ตัดต่อ ข้ามไป (กัน false positive ปฏิเสธเงินลูกค้าจริง)
-                cur_s, prev_s = (info.get("sender") or "").strip(), (row["sender"] or "").strip()
-                diff_sender = cur_s and prev_s and _norm_match_text(cur_s) != _norm_match_text(prev_s)
+                prev_s = _norm_match_text((row["sender"] or "").strip())
+                diff_sender = cur_s and prev_s and cur_s != prev_s
                 if not diff_sender:
                     if amount and prev and abs(prev - amount) > 0.01:
-                        return ("ref_mismatch", prev)
-                    return ("ref", None)
+                        return ("ref_mismatch", prev, dict(row))
+                    return ("ref", None, dict(row))
         if amount and dt:
-            if conn.execute(
-                "SELECT 1 FROM slips WHERE group_id=? AND amount=? AND slip_datetime=? LIMIT 1",
-                (group_id, amount, dt)).fetchone():
-                return ("amount_time", None)
-    return (None, None)
+            row = conn.execute(
+                "SELECT amount, sender, ref_number, slip_datetime, recorded_at FROM slips "
+                "WHERE group_id=? AND amount=? AND slip_datetime=? ORDER BY id DESC LIMIT 1",
+                (group_id, amount, dt)).fetchone()
+            if row:
+                prev_s = _norm_match_text((row["sender"] or "").strip())
+                # ยอด+เวลาตรง แต่ 'คนละผู้โอน' → บังเอิญคนละบิลจ่ายยอดเท่ากัน ไม่ใช่สลิปซ้ำ
+                # (อ่านชื่อไม่ได้สักฝั่ง = เตือนไว้ก่อนแบบ conservative)
+                if cur_s and prev_s and cur_s != prev_s:
+                    return (None, None, None)
+                return ("amount_time", None, dict(row))
+    return (None, None, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -746,7 +756,7 @@ def _is_income(info: dict) -> bool:
     return _slip_account_label(info) is not None
 
 
-def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None) -> dict:
+def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None, prev=None) -> dict:
     issues = []
     fraud_score = info.get("fraud_score", 0)
 
@@ -774,7 +784,12 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None) 
     elif dup_type == "ref":
         issues.append(f"🔴 เลขอ้างอิง {info.get('ref_number')} เคยถูกส่งมาแล้ว! (สลิปซ้ำ)")
     elif dup_type == "amount_time":
-        issues.append(f"🔴 ยอด {info.get('amount')} บาท + วันเวลาเดียวกับสลิปใบก่อนหน้า → น่าจะเป็นสลิปซ้ำ (โปรดตรวจสอบ)")
+        who = ""
+        if prev:
+            ptime = prev.get("slip_datetime") or prev.get("recorded_at") or "-"
+            pref  = prev.get("ref_number") or "-"
+            who   = f"\n   ↳ ซ้ำกับใบก่อน: {prev.get('sender') or '-'} · เวลา {ptime} · อ้างอิง {pref}"
+        issues.append(f"🔴 ยอด {info.get('amount')} บาท + วันเวลา + ผู้โอนเดียวกับสลิปใบก่อนหน้า → น่าจะเป็นสลิปซ้ำ (โปรดตรวจสอบ){who}")
 
     # ข้อมูลไม่ครบ / ถูกตัด-บัง (เคสซ่อนปลายทาง ฯลฯ)
     receiver_missing = not (info.get("receiver") or info.get("receiver_account"))
@@ -3402,8 +3417,8 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
             if _slip_message_seen(group_id, msg_id):
                 print(f"[skip] รูปนี้ประมวลผลแล้ว (message_id ซ้ำ, in-lock) group={group_id} msg={msg_id}", flush=True)
                 return
-            dup_type, prev_amount = find_duplicate(group_id, info)
-            verdict  = build_verdict(info, promptpay, dup_type, prev_amount)
+            dup_type, prev_amount, prev = find_duplicate(group_id, info)
+            verdict  = build_verdict(info, promptpay, dup_type, prev_amount, prev)
             info["_slip_id"] = save_slip(group_id, info, verdict["status"], message_id=msg_id)
 
         # สลิปผ่าน (PASS) → เงียบไว้ ไม่รกแชท (ยังบันทึกไว้ ดูรวมได้ที่ "สรุป")
