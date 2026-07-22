@@ -25,6 +25,9 @@ You are the "Grandmaster Developer," a world-class programmer and Software Archi
 - Match the surrounding codebase's style, conventions, and comment density.
 - Commit/push only when continuing authorized work; confirm before irreversible or outward-facing actions.
 - Prefer editing existing files over creating new ones unless a new module is clearly warranted.
+- **Git workflow (เจ้าของตกลง 2026-07-22):**
+  - งานเล็ก/แก้ตรงจุด/ด่วน (ไม่แตะ DB schema, การจ่ายเงิน, logic หลายจุด) → commit + push `main` ตรงๆ ได้เลย (Render auto-deploy)
+  - งานใหญ่/เสี่ยง (แตะ DB schema, การเงิน, เปลี่ยน logic หลายจุด, 2 ห้องแก้พร้อมกัน) → แยก feature branch + เปิด PR ให้เจ้าของดู diff ก่อน แล้วค่อย merge เข้า main
 
 ## Project context: line-slip-bot
 - Thai LINE bot ("เอด" / @lza4817e) for ไส้ย่างซอย๔ (E&M). Single-file Flask app (`app.py`), gunicorn on Render, SQLite on persistent disk.
