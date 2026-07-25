@@ -4285,6 +4285,57 @@ def api_db_import():
         return {"ok": False, "error": str(e)[:300]}, 500
 
 
+@app.route("/api/db_migrate", methods=["GET", "POST"])
+def api_db_migrate():
+    """คัดลอกข้อมูลจาก DB เก่า → DB ปัจจุบัน ในคำสั่งเดียว (ไม่ต้องดาวน์โหลด JSON)
+    วิธีใช้: ตั้ง DATABASE_URL = DB ใหม่ (Supabase) + MIGRATE_SOURCE_URL = DB เก่า (Neon) บน Render แล้ว redeploy
+    จากนั้นเรียก GET /api/db_migrate?token=...&confirm=yes → บอทเชื่อม DB เก่า อ่านทุกตาราง แล้วเขียนเข้า DB ใหม่
+    ปลอดภัย: token + confirm=yes · mode=merge (ไม่ทับ) ค่าเริ่มต้น / mode=replace = ล้างก่อน · รันซ้ำได้ (idempotent)"""
+    if not _migrate_auth():
+        return {"ok": False, "error": "unauthorized"}, 401
+    if request.args.get("confirm") != "yes":
+        return {"ok": False, "error": "ต้องส่ง ?confirm=yes เพื่อยืนยัน"}, 400
+    src_url = os.environ.get("MIGRATE_SOURCE_URL", "")
+    if not src_url:
+        return {"ok": False, "error": "ยังไม่ตั้ง env MIGRATE_SOURCE_URL (= DATABASE_URL ของ DB เก่า)"}, 400
+    if not USE_PG:
+        return {"ok": False, "error": "DB ปลายทางต้องเป็น Postgres (ตั้ง DATABASE_URL ให้เป็น DB ใหม่ก่อน)"}, 400
+    mode = request.args.get("mode", "merge")
+    try:
+        src = psycopg2.connect(src_url, connect_timeout=15)
+        data = {}
+        with src.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as scur:
+            for t in _MIGRATE_TABLES:
+                scur.execute(f"SELECT * FROM {t}")
+                data[t] = [dict(r) for r in scur.fetchall()]
+        src.close()
+        _ensure_init()
+        copied = {}
+        with _db() as conn:
+            for t in _MIGRATE_TABLES:
+                rows = data.get(t) or []
+                if mode == "replace":
+                    conn.execute(f"DELETE FROM {t}")
+                n = 0
+                for row in rows:
+                    cols = list(row.keys())
+                    if not cols:
+                        continue
+                    ph = ",".join(["?"] * len(cols))
+                    conn.execute(f"INSERT INTO {t} ({','.join(cols)}) VALUES ({ph}) ON CONFLICT DO NOTHING",
+                                 [row[c] for c in cols])
+                    n += 1
+                copied[t] = n
+            for t in _MIGRATE_SEQ_TABLES:
+                conn.execute(
+                    f"SELECT setval(pg_get_serial_sequence('{t}','id'), "
+                    f"GREATEST((SELECT COALESCE(MAX(id),1) FROM {t}),1))")
+            conn.commit()
+        return {"ok": True, "mode": mode, "copied": copied}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:300]}, 500
+
+
 @app.route("/api/push_owner", methods=["POST"])
 def api_push_owner():
     """ให้ Apps Script (dashboard การเงิน) ส่งข้อความแจ้งเตือนเข้า LINE เจ้าของ (ADMIN_USER_ID)
