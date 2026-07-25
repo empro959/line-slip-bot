@@ -4211,6 +4211,80 @@ def api_slip_daily():
         return {"ok": False, "error": str(e)[:120]}
 
 
+# ── ย้าย DB (Neon → Supabase ฯลฯ): dump/load ทุกตารางผ่าน endpoint ตัวบอทเอง ──
+# ไม่ต้องใช้ psql/pg_dump: 1) ยังชี้ DB เดิม → GET /api/db_export เซฟ JSON  2) เปลี่ยน DATABASE_URL เป็น DB ใหม่ (redeploy)
+# 3) POST /api/db_import?confirm=yes แนบ JSON → ข้อมูลเข้าครบ (สคีมาสร้างอัตโนมัติตอน init)
+_MIGRATE_TABLES = ["meta", "groups", "slips", "reservations",
+                   "payable_bills", "payable_payments",
+                   "dining_bills", "dining_pairs", "image_misses"]
+# ตารางที่มีคอลัมน์ id (SERIAL) → ต้องรีเซ็ต sequence หลัง import กัน insert ใหม่ชน id เดิม
+_MIGRATE_SEQ_TABLES = ["slips", "reservations", "payable_bills", "payable_payments",
+                       "dining_bills", "dining_pairs", "image_misses"]
+
+def _migrate_auth() -> bool:
+    need = os.environ.get("SLIP_API_TOKEN") or os.environ.get("DASHBOARD_PASSWORD") or ""
+    return bool(need) and request.args.get("token", "") == need
+
+
+@app.route("/api/db_export", methods=["GET"])
+def api_db_export():
+    """ดัมพ์ข้อมูลทุกตารางเป็น JSON (อ่านอย่างเดียว, ต้องมี ?token=) — ใช้ตอนยังชี้ DB เดิมเพื่อเซฟไว้ย้าย"""
+    if not _migrate_auth():
+        return {"ok": False, "error": "unauthorized"}, 401
+    try:
+        dump, counts = {}, {}
+        with _db() as conn:
+            for t in _MIGRATE_TABLES:
+                rows = conn.execute(f"SELECT * FROM {t}").fetchall()
+                dump[t] = [dict(r) for r in rows]
+                counts[t] = len(rows)
+        body = json.dumps({"ok": True, "ts": datetime.now(TZ).isoformat(),
+                           "counts": counts, "tables": dump}, ensure_ascii=False, default=str)
+        return app.response_class(body, mimetype="application/json")
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}, 500
+
+
+@app.route("/api/db_import", methods=["POST"])
+def api_db_import():
+    """โหลด JSON จาก /api/db_export เข้า DB ปัจจุบัน (ต้องมี ?token= + ?confirm=yes)
+    ค่าเริ่มต้น mode=merge (ON CONFLICT DO NOTHING ไม่ทับของเดิม) · ?mode=replace = ล้างตารางก่อนโหลด (ระวัง!)"""
+    if not _migrate_auth():
+        return {"ok": False, "error": "unauthorized"}, 401
+    if request.args.get("confirm") != "yes":
+        return {"ok": False, "error": "ต้องส่ง ?confirm=yes เพื่อยืนยัน"}, 400
+    mode = request.args.get("mode", "merge")
+    try:
+        body = json.loads(request.get_data(as_text=True) or "{}")
+        tables = body.get("tables") or {}
+        _ensure_init()   # สร้างสคีมา/คอลัมน์ให้ครบก่อน (เผื่อ DB ใหม่ยังว่าง)
+        loaded = {}
+        with _db() as conn:
+            for t in _MIGRATE_TABLES:
+                rows = tables.get(t) or []
+                if mode == "replace":
+                    conn.execute(f"DELETE FROM {t}")
+                n = 0
+                for row in rows:
+                    cols = list(row.keys())
+                    if not cols:
+                        continue
+                    ph = ",".join(["?"] * len(cols))
+                    sql = f"INSERT INTO {t} ({','.join(cols)}) VALUES ({ph}) ON CONFLICT DO NOTHING"
+                    conn.execute(sql, [row[c] for c in cols])
+                    n += 1
+                loaded[t] = n
+            if USE_PG:   # เดิน sequence ของ id ต่อจาก max(id) กัน insert ใหม่ชน
+                for t in _MIGRATE_SEQ_TABLES:
+                    conn.execute(
+                        f"SELECT setval(pg_get_serial_sequence('{t}','id'), "
+                        f"GREATEST((SELECT COALESCE(MAX(id),1) FROM {t}),1))")
+            conn.commit()
+        return {"ok": True, "mode": mode, "loaded": loaded}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:300]}, 500
+
+
 @app.route("/api/push_owner", methods=["POST"])
 def api_push_owner():
     """ให้ Apps Script (dashboard การเงิน) ส่งข้อความแจ้งเตือนเข้า LINE เจ้าของ (ADMIN_USER_ID)
