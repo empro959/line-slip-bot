@@ -6,6 +6,22 @@
 
 ---
 
+## 2026-07-25 — จากห้องบอท  🗄️ ย้าย DB: Neon → Supabase (สำคัญ!)
+
+**เหตุ:** Neon free tier (100 CU-hr/เดือน) compute เต็ม 100% ซ้ำ — /health จี้ DB ทุก 5 นาทีช่วงบอทตื่น ทำ Neon ไม่หลับ → ~240 CU-hr เกินฟรี
+
+**ทำอะไร:** ย้าย DB ทั้งหมดไป **Supabase** (Postgres ฟรี ไม่มีลิมิต compute-hour → ปัญหานี้หายขาด)
+- เพิ่ม endpoint ย้ายข้อมูลในตัวบอท: `/api/db_export` (dump JSON), `/api/db_import` (load JSON), `/api/db_migrate` (คัดลอก DB→DB คำสั่งเดียว) — ทั้งหมด token-guarded (SLIP_API_TOKEN)
+- วิธีที่ใช้จริง: ตั้ง `DATABASE_URL`=Supabase + `MIGRATE_SOURCE_URL`=Neon บน Render → เรียก `GET /api/db_migrate?token=..&confirm=yes` → คัดลอกครบทุกตาราง (commit ทีละตาราง + SET statement_timeout/lock_timeout กัน Supabase timeout)
+- ✅ ย้ายสำเร็จ: สลิป 37 วัน + บัญชีหนี้ (ค้าง 202,293) + จอง/meta ครบ
+- เจ้าของ reset รหัสผ่าน Supabase + ลบ env `MIGRATE_SOURCE_URL` แล้ว · เก็บ Neon ไว้ backup 2-3 วันค่อยลบ
+
+**สิ่งที่เปลี่ยนถาวร:** `DATABASE_URL` บน Render = **Supabase** (region ap-northeast-1, Session pooler พอร์ต 5432) — ไม่ใช่ Neon อีกต่อไป · โค้ด connection ไม่เปลี่ยน (psycopg2 อ่าน DATABASE_URL เหมือนเดิม)
+
+**ยังค้าง:** ควรลบ endpoint `/api/db_import` + `/api/db_migrate` (เขียน/ทำลายได้) ทิ้งเมื่อมั่นใจว่าไม่ต้องย้ายอีก — เหลือ `/api/db_export` (อ่านอย่างเดียว) ไว้ backup ได้
+
+---
+
 ## 2026-07-22 — จากห้องบอท → ห้อง dashboard  🔀 เปลี่ยน routing การจอง
 
 เปลี่ยน logic การจองใน `app.py` ตามที่เจ้าของสั่ง (commit f34b61c, push main แล้ว):
