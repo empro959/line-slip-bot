@@ -4311,9 +4311,13 @@ def api_db_migrate():
         src.close()
         _ensure_init()
         copied = {}
-        with _db() as conn:
-            for t in _MIGRATE_TABLES:
-                rows = data.get(t) or []
+        # เขียน 'ทีละตาราง' (คนละ transaction) — กัน lock ค้างยาว + ถ้าตารางใหญ่ timeout ตารางอื่นยังผ่าน
+        # ตั้ง statement/lock timeout เอง (Supabase default อาจสั้น) · ON CONFLICT DO NOTHING = รันซ้ำได้
+        for t in _MIGRATE_TABLES:
+            rows = data.get(t) or []
+            with _db() as conn:
+                conn.execute("SET statement_timeout = '600s'")
+                conn.execute("SET lock_timeout = '25s'")
                 if mode == "replace":
                     conn.execute(f"DELETE FROM {t}")
                 n = 0
@@ -4325,12 +4329,12 @@ def api_db_migrate():
                     conn.execute(f"INSERT INTO {t} ({','.join(cols)}) VALUES ({ph}) ON CONFLICT DO NOTHING",
                                  [row[c] for c in cols])
                     n += 1
-                copied[t] = n
-            for t in _MIGRATE_SEQ_TABLES:
-                conn.execute(
-                    f"SELECT setval(pg_get_serial_sequence('{t}','id'), "
-                    f"GREATEST((SELECT COALESCE(MAX(id),1) FROM {t}),1))")
-            conn.commit()
+                if t in _MIGRATE_SEQ_TABLES:
+                    conn.execute(
+                        f"SELECT setval(pg_get_serial_sequence('{t}','id'), "
+                        f"GREATEST((SELECT COALESCE(MAX(id),1) FROM {t}),1))")
+                conn.commit()
+            copied[t] = n
         return {"ok": True, "mode": mode, "copied": copied}
     except Exception as e:
         return {"ok": False, "error": str(e)[:300]}, 500
