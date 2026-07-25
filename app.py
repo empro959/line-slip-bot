@@ -4211,15 +4211,11 @@ def api_slip_daily():
         return {"ok": False, "error": str(e)[:120]}
 
 
-# ── ย้าย DB (Neon → Supabase ฯลฯ): dump/load ทุกตารางผ่าน endpoint ตัวบอทเอง ──
-# ไม่ต้องใช้ psql/pg_dump: 1) ยังชี้ DB เดิม → GET /api/db_export เซฟ JSON  2) เปลี่ยน DATABASE_URL เป็น DB ใหม่ (redeploy)
-# 3) POST /api/db_import?confirm=yes แนบ JSON → ข้อมูลเข้าครบ (สคีมาสร้างอัตโนมัติตอน init)
+# ── /api/db_export: dump ทุกตารางเป็น JSON (อ่านอย่างเดียว, token-guarded) ไว้ backup ──
+# (เคยมี db_import/db_migrate ไว้ย้าย Neon→Supabase — ลบทิ้งแล้วหลังย้ายเสร็จ 2026-07-25 กันเขียน/ลบข้อมูลหลุด)
 _MIGRATE_TABLES = ["meta", "groups", "slips", "reservations",
                    "payable_bills", "payable_payments",
                    "dining_bills", "dining_pairs", "image_misses"]
-# ตารางที่มีคอลัมน์ id (SERIAL) → ต้องรีเซ็ต sequence หลัง import กัน insert ใหม่ชน id เดิม
-_MIGRATE_SEQ_TABLES = ["slips", "reservations", "payable_bills", "payable_payments",
-                       "dining_bills", "dining_pairs", "image_misses"]
 
 def _migrate_auth() -> bool:
     need = os.environ.get("SLIP_API_TOKEN") or os.environ.get("DASHBOARD_PASSWORD") or ""
@@ -4243,101 +4239,6 @@ def api_db_export():
         return app.response_class(body, mimetype="application/json")
     except Exception as e:
         return {"ok": False, "error": str(e)[:200]}, 500
-
-
-@app.route("/api/db_import", methods=["POST"])
-def api_db_import():
-    """โหลด JSON จาก /api/db_export เข้า DB ปัจจุบัน (ต้องมี ?token= + ?confirm=yes)
-    ค่าเริ่มต้น mode=merge (ON CONFLICT DO NOTHING ไม่ทับของเดิม) · ?mode=replace = ล้างตารางก่อนโหลด (ระวัง!)"""
-    if not _migrate_auth():
-        return {"ok": False, "error": "unauthorized"}, 401
-    if request.args.get("confirm") != "yes":
-        return {"ok": False, "error": "ต้องส่ง ?confirm=yes เพื่อยืนยัน"}, 400
-    mode = request.args.get("mode", "merge")
-    try:
-        body = json.loads(request.get_data(as_text=True) or "{}")
-        tables = body.get("tables") or {}
-        _ensure_init()   # สร้างสคีมา/คอลัมน์ให้ครบก่อน (เผื่อ DB ใหม่ยังว่าง)
-        loaded = {}
-        with _db() as conn:
-            for t in _MIGRATE_TABLES:
-                rows = tables.get(t) or []
-                if mode == "replace":
-                    conn.execute(f"DELETE FROM {t}")
-                n = 0
-                for row in rows:
-                    cols = list(row.keys())
-                    if not cols:
-                        continue
-                    ph = ",".join(["?"] * len(cols))
-                    sql = f"INSERT INTO {t} ({','.join(cols)}) VALUES ({ph}) ON CONFLICT DO NOTHING"
-                    conn.execute(sql, [row[c] for c in cols])
-                    n += 1
-                loaded[t] = n
-            if USE_PG:   # เดิน sequence ของ id ต่อจาก max(id) กัน insert ใหม่ชน
-                for t in _MIGRATE_SEQ_TABLES:
-                    conn.execute(
-                        f"SELECT setval(pg_get_serial_sequence('{t}','id'), "
-                        f"GREATEST((SELECT COALESCE(MAX(id),1) FROM {t}),1))")
-            conn.commit()
-        return {"ok": True, "mode": mode, "loaded": loaded}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:300]}, 500
-
-
-@app.route("/api/db_migrate", methods=["GET", "POST"])
-def api_db_migrate():
-    """คัดลอกข้อมูลจาก DB เก่า → DB ปัจจุบัน ในคำสั่งเดียว (ไม่ต้องดาวน์โหลด JSON)
-    วิธีใช้: ตั้ง DATABASE_URL = DB ใหม่ (Supabase) + MIGRATE_SOURCE_URL = DB เก่า (Neon) บน Render แล้ว redeploy
-    จากนั้นเรียก GET /api/db_migrate?token=...&confirm=yes → บอทเชื่อม DB เก่า อ่านทุกตาราง แล้วเขียนเข้า DB ใหม่
-    ปลอดภัย: token + confirm=yes · mode=merge (ไม่ทับ) ค่าเริ่มต้น / mode=replace = ล้างก่อน · รันซ้ำได้ (idempotent)"""
-    if not _migrate_auth():
-        return {"ok": False, "error": "unauthorized"}, 401
-    if request.args.get("confirm") != "yes":
-        return {"ok": False, "error": "ต้องส่ง ?confirm=yes เพื่อยืนยัน"}, 400
-    src_url = os.environ.get("MIGRATE_SOURCE_URL", "")
-    if not src_url:
-        return {"ok": False, "error": "ยังไม่ตั้ง env MIGRATE_SOURCE_URL (= DATABASE_URL ของ DB เก่า)"}, 400
-    if not USE_PG:
-        return {"ok": False, "error": "DB ปลายทางต้องเป็น Postgres (ตั้ง DATABASE_URL ให้เป็น DB ใหม่ก่อน)"}, 400
-    mode = request.args.get("mode", "merge")
-    try:
-        src = psycopg2.connect(src_url, connect_timeout=15)
-        data = {}
-        with src.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as scur:
-            for t in _MIGRATE_TABLES:
-                scur.execute(f"SELECT * FROM {t}")
-                data[t] = [dict(r) for r in scur.fetchall()]
-        src.close()
-        _ensure_init()
-        copied = {}
-        # เขียน 'ทีละตาราง' (คนละ transaction) — กัน lock ค้างยาว + ถ้าตารางใหญ่ timeout ตารางอื่นยังผ่าน
-        # ตั้ง statement/lock timeout เอง (Supabase default อาจสั้น) · ON CONFLICT DO NOTHING = รันซ้ำได้
-        for t in _MIGRATE_TABLES:
-            rows = data.get(t) or []
-            with _db() as conn:
-                conn.execute("SET statement_timeout = '600s'")
-                conn.execute("SET lock_timeout = '25s'")
-                if mode == "replace":
-                    conn.execute(f"DELETE FROM {t}")
-                n = 0
-                for row in rows:
-                    cols = list(row.keys())
-                    if not cols:
-                        continue
-                    ph = ",".join(["?"] * len(cols))
-                    conn.execute(f"INSERT INTO {t} ({','.join(cols)}) VALUES ({ph}) ON CONFLICT DO NOTHING",
-                                 [row[c] for c in cols])
-                    n += 1
-                if t in _MIGRATE_SEQ_TABLES:
-                    conn.execute(
-                        f"SELECT setval(pg_get_serial_sequence('{t}','id'), "
-                        f"GREATEST((SELECT COALESCE(MAX(id),1) FROM {t}),1))")
-                conn.commit()
-            copied[t] = n
-        return {"ok": True, "mode": mode, "copied": copied}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:300]}, 500
 
 
 @app.route("/api/push_owner", methods=["POST"])
