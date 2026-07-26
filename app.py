@@ -3222,6 +3222,7 @@ GEMINI_PROBE_INTERVAL = int(os.environ.get("GEMINI_PROBE_INTERVAL", "60"))  # �
 _gemini_out_lock  = threading.Lock()
 _gemini_out_until = 0.0   # epoch; > now = อยู่ในช่วง 'เครดิตหมด' (หยุดยิง Gemini)
 _gemini_last_probe = 0.0  # เวลาที่ปล่อย probe ล่าสุด
+_gemini_out_alerted = False  # เตือนเจ้าของ 'เครดิตหมด' ไปแล้วรอบนี้ยัง (เตือนครั้งเดียว/รอบ กันสแปมทุกสลิป)
 
 
 @handler.add(MessageEvent, message=ImageMessage)
@@ -3294,7 +3295,7 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
             return
 
     # Circuit breaker 'เครดิต Gemini หมด' — ระหว่างหยุด: ข้ามการอ่าน (กันยิงเปล่า/สแปม) ยกเว้นปล่อย probe ทดสอบเป็นระยะ
-    global _gemini_out_until, _gemini_last_probe
+    global _gemini_out_until, _gemini_last_probe, _gemini_out_alerted
     _now = time.time()
     _probe = False
     with _gemini_out_lock:
@@ -3303,9 +3304,9 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
             _gemini_last_probe = _now
             _probe = True   # ปล่อยใบนี้ทดสอบว่าเครดิตกลับมายัง
     if _in_outage and not _probe:
+        # ช่วงเครดิตหมด: ข้ามเงียบๆ (นับตกหล่น) — 'ไม่' เตือนซ้ำทุกใบ (เตือนไปแล้วตอนเปิด breaker ครั้งเดียว)
         print(f"[slip] ข้าม Gemini: ช่วงเครดิตหมด (หยุดยิงชั่วคราว) group={group_id}", flush=True)
         record_image_miss(group_id, "error")
-        notify_admin_error(group_id, "429 RESOURCE_EXHAUSTED credits depleted (บอทหยุดอ่านชั่วคราว รอเติมเครดิต)")
         return
 
     # อ่านสลิป: รอบแรก flash; ถ้า 'พัง/ไม่ใช่สลิป/ยอด<=0' ลองซ้ำด้วย pro (กู้ทั้งใบอ่านยาก + กรณี Gemini ล้มชั่วคราว)
@@ -3338,9 +3339,12 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
             with _gemini_out_lock:
                 _gemini_out_until  = time.time() + GEMINI_OUT_COOLDOWN
                 _gemini_last_probe = time.time()   # เริ่มนับ probe ใหม่ตอน arm (กันยิงซ้ำทันที รอ 1 รอบก่อนทดสอบ)
+                _alert_now = not _gemini_out_alerted   # เตือนเจ้าของครั้งเดียว/รอบ (กันสแปม)
+                _gemini_out_alerted = True
             print(f"[slip] 💳 เครดิต Gemini หมด → หยุดยิง {GEMINI_OUT_COOLDOWN}s group={group_id}", flush=True)
             record_image_miss(group_id, "error")
-            notify_admin_error(group_id, last_err)
+            if _alert_now:
+                notify_admin_error(group_id, last_err)
             return
         # ยังไม่หมดโควตาลองใหม่ + มีรูป + คิว re-queue ไม่เต็ม → เข้าคิวลองใหม่หลังหน่วง (รอ burst/Gemini ซา)
         if attempt <= SLIP_RETRY_MAX and image_bytes is not None and _slip_requeue_sem.acquire(blocking=False):
@@ -3358,6 +3362,7 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
     if _probe:
         with _gemini_out_lock:
             _gemini_out_until = 0.0
+            _gemini_out_alerted = False   # เครดิตกลับมาแล้ว → รอบหน้าถ้าหมดอีกให้เตือนได้ใหม่
         print(f"[slip] ✅ เครดิต Gemini กลับมา — เปิดอ่านต่อ group={group_id}", flush=True)
 
     # ใบรูดบัตรเครดิต/เดบิต (EDC settlement) = จ่ายด้วยบัตร ไม่ใช่สลิปโอน → ไม่นับยอดโอน (เข้า 'ข้ามไม่ใช่รายรับ' ดูที่ 'ดูที่ข้าม')
