@@ -46,6 +46,10 @@ IGNORE_GROUPS     = [g.strip() for g in os.environ.get("IGNORE_GROUPS", "").spli
 # รูปบิล=เพิ่มหนี้, สลิปโอน=ลดหนี้, สรุปยอดค้างอัตโนมัติ; ตั้ง id กลุ่มด้วยคำสั่ง groupid
 PAYABLE_GROUPS    = [g.strip() for g in os.environ.get("PAYABLE_GROUPS", "").split(",") if g.strip()]
 PAYABLE_VENDOR    = os.environ.get("PAYABLE_VENDOR", "ดวงใจการสุรา")   # ชื่อเจ้าหนี้ (โชว์ในรายงาน)
+# คีย์เวิร์ดบัญชีผู้รับของเจ้าหนี้ (ชื่อ/พร้อมเพย์/เลขบัญชีดวงใจ) — คั่นด้วยคอมมา
+# ตั้งไว้ = สลิปจ่ายจะถูก 'นับลดหนี้เฉพาะเมื่อปลายทางตรงกับดวงใจ' (กันสลิปจ่ายเจ้าอื่นหลุดนับผิด)
+# เว้นว่าง = ไม่เช็ค (นับทุกสลิปเหมือนเดิม)
+PAYABLE_PAYEE_KEYWORDS = [k.strip() for k in os.environ.get("PAYABLE_PAYEE_KEYWORDS", "").split(",") if k.strip()]
 PAYABLE_SUMMARY_HOUR = int(os.environ.get("PAYABLE_SUMMARY_HOUR", "1"))  # ส่งสรุปหนี้รายวันหลังกี่โมง (ดีฟอลต์ ตี1)
 # รับวันที่ที่ AI อ่านจากบิล/สลิป(รูป) เฉพาะที่ไม่เก่าเกินกี่วัน (กันอ่านปีเพี้ยน/มั่ว) — ยอดค้างจริงเก่าได้ จึงตั้งกว้าง; เกินช่วงนี้หรืออนาคต→ใช้วันที่ส่ง
 PAYABLE_DATE_MAX_DAYS = int(os.environ.get("PAYABLE_DATE_MAX_DAYS", "90"))
@@ -598,7 +602,7 @@ def extract_payable_doc(image_bytes: bytes, retry: bool = False) -> dict:
     prompt = (
         f"รูปนี้อยู่ในกลุ่มซื้อ-ขายระหว่างร้านอาหารกับร้านขายเครื่องดื่ม/สุรา ({PAYABLE_VENDOR}) "
         "ช่วยดูว่าเป็นเอกสารแบบไหน แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
-        '{"doc_type":"bill","amount":0.00,"ref_number":null,"sender":null,"doc_date":null,"pay_for_date":null}\n\n'
+        '{"doc_type":"bill","amount":0.00,"ref_number":null,"sender":null,"receiver":null,"doc_date":null,"pay_for_date":null}\n\n'
         "doc_type:\n"
         "  - 'payment' = สลิปโอนเงินผ่านแอปธนาคาร (มี 'โอนเงินสำเร็จ'/ผู้โอน→ผู้รับ/เลขที่รายการ/จำนวนเงิน) "
         "⚠️ ถือเป็น payment 'เสมอ' แม้มีโน้ต/ข้อความเขียนกำกับ เช่น '(6/6) ค้าง 14,153' (โน้ตพวกนี้ไม่ทำให้เป็นบิล)\n"
@@ -614,6 +618,8 @@ def extract_payable_doc(image_bytes: bytes, retry: bool = False) -> dict:
         "  • ถ้าเป็น 'payment': ใช้ยอดเงินที่โอนจริง\n"
         "ref_number: เลขอ้างอิงรายการ (เฉพาะสลิปโอน ถ้าไม่มีใส่ null)\n"
         "sender: ชื่อผู้โอน/ชื่อบิล ถ้าอ่านได้ (ไม่มีใส่ null)\n"
+        "receiver (เฉพาะ payment): 'ชื่อบัญชี/พร้อมเพย์/เลขบัญชีของผู้รับเงิน' บนสลิป (บรรทัด 'ไปยัง/ผู้รับ/โอนเข้า') "
+        "อ่านให้ครบเท่าที่เห็น (ชื่อ + เลขบัญชี/พร้อมเพย์ ถ้ามี); ถ้าไม่ใช่ payment หรืออ่านไม่ได้ใส่ null\n"
         "doc_date: 'วันที่ล่าสุด/วันที่ออกเอกสารใบนี้' (บิล=วันที่ออกบิล, สลิป=วันที่โอน) แปลงเป็น ค.ศ. YYYY-MM-DD "
         "(พ.ศ. เช่น 2569 = ค.ศ. 2026 ให้ลบ 543). "
         "⚠️ ถ้าบนบิลมีหลายวันที่ (เช่นมีรายการ 'ยอดยกมา/ค้างเก่า' ที่เป็นวันก่อนๆ) ให้เลือก 'วันที่ใหม่สุด' เท่านั้น "
@@ -1910,6 +1916,19 @@ def build_payable_bill_list(acct: str, limit: int = 40) -> str:
     return "\n".join(lines)
 
 
+def _payable_payee_ok(info: dict) -> bool:
+    """สลิปจ่ายนี้ 'โอนเข้าบัญชีเจ้าหนี้ (ดวงใจ)' จริงไหม — เทียบ receiver บนสลิปกับ PAYABLE_PAYEE_KEYWORDS
+    - ไม่ตั้ง keyword = ไม่เช็ค (คืน True เหมือนเดิม)
+    - อ่าน receiver ไม่ได้ (ว่าง) = ปล่อยผ่าน (True) กันบล็อกสลิปจริงที่ OCR อ่านปลายทางไม่ออก
+    - อ่าน receiver ได้ แต่ไม่ตรง keyword เลย = False (จ่ายเจ้าอื่น ไม่นับลดหนี้ดวงใจ)"""
+    if not PAYABLE_PAYEE_KEYWORDS:
+        return True
+    rcv = _norm_match_text((info.get("receiver") or "").strip())
+    if not rcv:
+        return True
+    return any(_norm_match_text(k) in rcv for k in PAYABLE_PAYEE_KEYWORDS)
+
+
 def _process_payable_image(event, group_id: str):
     """รูปในกลุ่มเจ้าหนี้ → AI แยกบิล(เพิ่มหนี้)/สลิปจ่าย(ลดหนี้) แล้วบันทึก + ตอบยอดค้างสะสม
     บัญชีเดียว 2 กลุ่ม (mirror): เก็บข้อมูลที่ acct (primary), เด้งผลที่ out (mirror) — กลุ่ม primary เงียบ"""
@@ -1962,6 +1981,12 @@ def _process_payable_image(event, group_id: str):
         if amount <= 0:
             record_image_miss(acct, "payable_unread")
             notify("🟡 อ่านยอดเงินบนสลิปไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่")
+            return
+        # เช็คปลายทาง: ต้องโอนเข้าบัญชีดวงใจจริงถึงจะนับลดหนี้ (กันสลิปจ่ายเจ้าอื่นหลุดนับผิด)
+        if not _payable_payee_ok(info):
+            record_image_miss(acct, "payable_other_payee")
+            notify(f"⛔ สลิปนี้จ่ายเข้า '{info.get('receiver') or '?'}' ไม่ใช่ {PAYABLE_VENDOR} → ไม่นับลดหนี้\n"
+                   "(ถ้าจ่ายดวงใจจริงแต่บอทอ่านปลายทางเพี้ยน พิมพ์ยอดเอง/แจ้งแอดมินได้)")
             return
         ref = info.get("ref_number")
         if _payment_ref_exists(acct, ref):
