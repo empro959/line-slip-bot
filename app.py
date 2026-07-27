@@ -1932,6 +1932,10 @@ def _payable_payee_ok(info: dict) -> bool:
 def _process_payable_image(event, group_id: str):
     """รูปในกลุ่มเจ้าหนี้ → AI แยกบิล(เพิ่มหนี้)/สลิปจ่าย(ลดหนี้) แล้วบันทึก + ตอบยอดค้างสะสม
     บัญชีเดียว 2 กลุ่ม (mirror): เก็บข้อมูลที่ acct (primary), เด้งผลที่ out (mirror) — กลุ่ม primary เงียบ"""
+    # กลุ่ม mirror = 'ดูสรุปอย่างเดียว' ไม่บันทึกรูปเป็นบิล/หนี้ (คนในกลุ่มส่งสลิปเจ้าอื่น เช่น Shopee/ค่าเช่า → ไม่นับ)
+    if group_id in _PAYABLE_PRIMARY_OF:
+        print(f"[payable] กลุ่ม mirror (ดูสรุป) ข้ามการบันทึกรูป group={group_id}", flush=True)
+        return
     acct = _payable_account_key(group_id)   # ที่เก็บข้อมูลจริง (บัญชีเดียวกันสำหรับ primary/mirror)
     out  = _payable_output_group(group_id)  # ที่เด้งผล (primary→mirror, ไม่งั้นกลุ่มเดิม)
     silent = group_id in PAYABLE_MIRROR     # กลุ่ม 1 (mirror primary): ไม่แจ้งเตือนรายตัว — เห็นผลที่ 'สรุปรายวัน' พอ
