@@ -3205,16 +3205,16 @@ _slip_pool = ThreadPoolExecutor(max_workers=int(os.environ.get("SLIP_WORKERS", "
                                 thread_name_prefix="slip")
 # pool 'โหลดรูป' แยกจากอ่าน Gemini — workers เยอะกว่า เพื่อคว้าไฟล์จาก LINE ตอนยังสด (กัน 410 ช่วงพีค)
 # โหลดรูปเบา (แค่ดึง bytes) จึงมีหลาย worker ได้ ไม่กิน memory เท่าอ่าน AI ที่ยังจำกัดที่ _slip_pool
-_dl_pool   = ThreadPoolExecutor(max_workers=int(os.environ.get("SLIP_DL_WORKERS", "6")),
+_dl_pool   = ThreadPoolExecutor(max_workers=int(os.environ.get("SLIP_DL_WORKERS", "3")),
                                 thread_name_prefix="dl")
 # จำกัด 'รูปที่ค้างใน RAM พร้อมกัน' (โหลดแล้วรออ่าน) ไม่ให้เกิน N ใบ — กัน burst ทำ memory พุ่งจน OOM/restart
 # (โหลดรูปทันทีกัน 410 แลกกับต้อง buffer bytes; semaphore นี้เป็นเบรกกันบวมเกิน) ลดค่าถ้า RAM ตึง
-_slip_inflight = threading.BoundedSemaphore(int(os.environ.get("SLIP_MAX_INFLIGHT", "6")))
+_slip_inflight = threading.BoundedSemaphore(int(os.environ.get("SLIP_MAX_INFLIGHT", "3")))
 # re-queue: สลิปที่ Gemini อ่านล้มทั้ง flash+pro (มัก 503/rate-limit ชั่วคราวช่วงพีค) → ลองใหม่แทนดรอปทันที
 SLIP_RETRY_MAX   = int(os.environ.get("SLIP_RETRY_MAX", "2"))     # ลองใหม่กี่รอบ (นอกจากรอบแรก)
 SLIP_RETRY_DELAY = int(os.environ.get("SLIP_RETRY_DELAY", "45"))  # หน่วงกี่วินาทีก่อนลองใหม่ (รอ burst ซา)
 # กันคิว re-queue บวม RAM ตอน Gemini ล่มยาว (ทุกใบล้ม+ลองใหม่พร้อมกัน) — เกินนี้ = ยอมแพ้เลย ไม่เข้าคิว
-_slip_requeue_sem = threading.BoundedSemaphore(int(os.environ.get("SLIP_RETRY_QUEUE_MAX", "8")))
+_slip_requeue_sem = threading.BoundedSemaphore(int(os.environ.get("SLIP_RETRY_QUEUE_MAX", "4")))
 # Circuit breaker 'เครดิต Gemini หมด' — เจอ 429 credits depleted → หยุดยิง Gemini ชั่วคราว (กันยิงเปล่าเปลือง/สแปม)
 # ระหว่างหยุด: ข้ามการอ่าน (นับตกหล่น) แต่ปล่อย 'probe' 1 ใบทุก GEMINI_PROBE_INTERVAL วิ เช็คว่าเครดิตกลับมายัง
 GEMINI_OUT_COOLDOWN   = int(os.environ.get("GEMINI_OUT_COOLDOWN", "600"))   # หยุดยิงกี่วินาทีหลังเจอเครดิตหมด

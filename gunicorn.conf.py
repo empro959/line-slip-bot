@@ -4,7 +4,7 @@
 import os
 
 workers          = int(os.environ.get("WEB_CONCURRENCY", "1"))  # 1 process (state/thread แชร์กันได้)
-threads          = int(os.environ.get("GUNICORN_THREADS", "8"))  # รับหลาย webhook พร้อมกัน (สลิป/จองรัวๆ)
+threads          = int(os.environ.get("GUNICORN_THREADS", "4"))  # รับหลาย webhook พร้อมกัน (สลิป/จองรัวๆ) · ลด 8→4 ลด peak RAM
 timeout          = 120          # ต้อง >> เวลารอ storage ใน _db() (15s) กัน worker ถูกฆ่า
 graceful_timeout = 30
 
