@@ -2920,9 +2920,17 @@ def handle_reservation_text(event, text: str, group_id: str):
     if dest == group_id:
         line_bot_api.reply_message(event.reply_token, [detail_msg, confirm_msg])
     else:
-        _push(dest, [detail_msg, confirm_msg])
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text=f"📤 ส่งจอง #{resv_id} ให้{dest_name}คอนเฟิร์มแล้ว รอยืนยัน\n─────────────────\n{detail}{time_warn}"))
+        # push การ์ดไปกลุ่มที่คอนเฟิร์ม — ถ้าล้ม (เช่น เอดไม่อยู่ในกลุ่มนั้น) 'ห้ามเงียบ':
+        # ยังบันทึกจองแล้ว → ตอบกลุ่มต้นทางพร้อมการ์ดให้กดยืนยัน 'ที่นี่' แทน (กันจองหาย)
+        try:
+            _push(dest, [detail_msg, confirm_msg])
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"📤 ส่งจอง #{resv_id} ให้{dest_name}คอนเฟิร์มแล้ว รอยืนยัน\n─────────────────\n{detail}{time_warn}"))
+        except Exception as e:
+            print(f"[resv] push การ์ดไป {dest} ({dest_name}) ล้ม: {e} — ตอบการ์ดที่กลุ่มต้นทางแทน", flush=True)
+            line_bot_api.reply_message(event.reply_token, [
+                TextSendMessage(text=f"⚠️ ส่งการ์ดไป{dest_name}ไม่ได้ (เอดอาจยังไม่อยู่ในกลุ่มนั้น) — จอง #{resv_id} บันทึกแล้ว กดยืนยันที่นี่ได้เลย\n─────────────────\n{detail}{time_warn}"),
+                confirm_msg])
     # แผน B: เด้งสำเนา 'ข้อมูลจอง' (ไม่มีปุ่ม) ให้บาร์น้ำ/sound — 'เฉพาะจองล่วงหน้า' (จองวันนี้ไม่ต้องเด้ง)
     if is_advance:
         _resv_broadcast_info(resv_id, head, f"จากคุณ {requested_by}\n{detail}{time_warn}", skip_group=dest)
