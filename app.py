@@ -2931,9 +2931,8 @@ def handle_reservation_text(event, text: str, group_id: str):
             line_bot_api.reply_message(event.reply_token, [
                 TextSendMessage(text=f"⚠️ ส่งการ์ดไป{dest_name}ไม่ได้ (เอดอาจยังไม่อยู่ในกลุ่มนั้น) — จอง #{resv_id} บันทึกแล้ว กดยืนยันที่นี่ได้เลย\n─────────────────\n{detail}{time_warn}"),
                 confirm_msg])
-    # แผน B: เด้งสำเนา 'ข้อมูลจอง' (ไม่มีปุ่ม) ให้บาร์น้ำ/sound — 'เฉพาะจองล่วงหน้า' (จองวันนี้ไม่ต้องเด้ง)
-    if is_advance:
-        _resv_broadcast_info(resv_id, head, f"จากคุณ {requested_by}\n{detail}{time_warn}", skip_group=dest)
+    # เด้งแจ้งเตือน/ยืนยัน 'เฉพาะกลุ่มต้นทาง + กลุ่มที่คอนเฟิร์ม (staff/บาร์น้ำ)' เท่านั้น
+    # ไม่เด้งสำเนาไปกลุ่มอื่น (เช่น Sound) — จองจากกลุ่มไหนแจ้งกลุ่มนั้น (ตามที่เจ้าของสั่ง 2026-07-28)
     return True
 
 
@@ -3012,9 +3011,6 @@ def handle_reservation_confirm(event, resv_id: int):
         except Exception as e:
             print(f"[resv] notify origin failed: {e}", flush=True)
 
-    # แผน B: อัปเดตสถานะ 'คอนเฟิร์มแล้ว' ให้บาร์น้ำ/sound — เฉพาะจองล่วงหน้า (ที่เคยเด้งข้อมูลไว้เท่านั้น)
-    if _resv_is_advance(resv):
-        _resv_broadcast_info(resv_id, "✅ คอนเฟิร์มจองแล้ว", f"{detail}\nโดย {confirmer}", skip_group=pressed_group)
 
 
 def _touch_reminded(resv_id: int, when: str):
