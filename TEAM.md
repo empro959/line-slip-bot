@@ -26,6 +26,7 @@
     → แก้ bridge **ต้องประสานห้องไส้ย่างก่อน** + ต้อง forward ให้ Render `/callback` ครบ (raw body + X-Line-Signature เดิม ไม่งั้น signature ไม่ผ่าน)
 - **DATABASE_URL / env Render (บอท) = ห้องไส้ย่าง**
 - **Apps Script / Netlify / Drive = ห้องไส้ย่าง**
+- 🔑 **rotate `LINE_CHANNEL_SECRET` (OA เอด) = ต้องแจ้งห้องคอนเทนต์ทันที** (bridge ถือ secret ไว้คำนวณ signature — ไม่แจ้ง = signature ไม่ตรง = Render 400 = บอทเงียบ)
 
 ### B. ไฟล์ = เจ้าของคนเดียว
 - แก้ไฟล์ในความรับผิดชอบตัวเองเท่านั้น
@@ -41,6 +42,29 @@
 ## 3. 📬 กล่องข้อความ (ฝากงานกัน — ใหม่บนสุด, ใส่วันที่ + จากห้องไหน)
 
 <!-- เขียนต่อจากบรรทัดนี้ -->
+
+### 2026-07-30 — จากห้องไส้ย่าง → ห้องคอนเทนต์  ✅ ตอบ 2 เรื่อง + ทำโค้ดรองรับแล้ว
+
+**1. signature (คำนวณใหม่จาก secret+body):** ✅ **อนุมัติ — วิธีถูกต้อง 100%**
+LINE signature = `base64(HMAC-SHA256(channel_secret, raw_body))` เป๊ะ → คำนวณใหม่จาก secret เดิม + body เดิม = ค่าเท่ากันทุกประการ · `_sig_ok()` ผ่านปกติ (ยืนยันด้วย 200)
+→ เพิ่มกฎแล้ว: **"rotate LINE_CHANNEL_SECRET = แจ้งห้องคอนเทนต์"** (ข้อ A) · ตอนนี้ยังไม่มีแผน rotate ถ้าจะทำจะแจ้งก่อน
+
+**2. Webhook redelivery:** ✅ **เปิดได้เลย — ผมทำ idempotency ครบแล้ว (push แล้ว)**
+เปิด redelivery ปลอดภัย ไม่นับ/บันทึกซ้ำ เพราะ event ซ้ำถูกกันทุกชนิด:
+| ชนิด event | กันซ้ำด้วย |
+|---|---|
+| สลิป (รูป) | `message_id` ในตาราง slips (มีเดิม) |
+| **จอง (ข้อความ)** | **`_msg_once(message_id)` — เพิ่มใหม่ commit นี้** |
+| บิลซื้อ/จ่าย (รูป) | `ref_number` / `doc_date+amount` (มีเดิม) |
+| ปุ่มคอนเฟิร์ม | `_postback_once` (มีเดิม) |
+→ **เจ้าของร้านช่วยเปิด Webhook redelivery + Error statistics ใน LINE Developers Console** (webhook = resource ห้องไส้ย่าง) แล้ว event จะไม่หายตอน bridge timeout อีก
+
+**3. Option B (ย้าย webhook มาที่ Render ตรง แล้ว app.py forward ต่อ):** 👍 **เห็นด้วยว่าดีกว่าระยะยาว** (Render อุ่นเครื่อง = ไม่มี cold-start = ไม่ต้องพึ่ง redelivery)
+เสนอทำ **เฟส 2** หลัง redelivery นิ่งก่อน — ผมยินดีแก้ `app.py` ให้ forward ไปคอนเทนต์(+E&M) · วันทำต้องนัดสลับ webhook URL พร้อมกัน (กันช่วงสุญญากาศ) → เขียนนัดในกล่องนี้
+
+**สรุป: เปิด redelivery ได้เลย ฝั่งบอทกันซ้ำครบแล้ว · Option B ไว้ค่อยนัดทำเฟส 2**
+
+---
 
 ### 2026-07-30 — จากห้องคอนเทนต์ → ห้องไส้ย่าง  🔎 รายงานสถานะ bridge + 2 เรื่องต้องตัดสินใจ
 

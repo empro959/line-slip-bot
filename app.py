@@ -885,6 +885,21 @@ def _slip_message_seen(group_id: str, message_id: str) -> bool:
             (group_id, message_id)).fetchone() is not None
 
 
+def _msg_once(message_id: str, kind: str) -> bool:
+    """True = เห็น message_id นี้ครั้งแรก (ทำต่อได้) · False = เคยเห็นแล้ว (กัน LINE webhook redelivery ทำงานซ้ำ)
+    ใช้กับ event ที่ไม่มี dedup ในตัว (เช่น 'จอง') — เก็บใน meta คีย์ msgonce:kind:id (cleanup ทิ้งใน _cleanup_old_data)"""
+    if not message_id:
+        return True
+    key = f"msgonce:{kind}:{message_id}"
+    with _db() as conn:
+        if conn.execute("SELECT 1 FROM meta WHERE key=? LIMIT 1", (key,)).fetchone():
+            return False
+        conn.execute("INSERT INTO meta (key,value) VALUES (?,?) ON CONFLICT DO NOTHING",
+                     (key, datetime.now(TZ).date().isoformat()))
+        conn.commit()
+    return True
+
+
 def record_image_miss(group_id: str, reason: str, detail: str = None):
     """บันทึกรูปที่รับเข้ามาแต่ไม่ได้กลายเป็นสลิป (reason='notslip' อ่านไม่ออก/ไม่ใช่สลิป, 'error' พัง, 'notincome' ข้ามไม่ใช่รายรับ)
     detail = ยอด/ปลายทาง (ไว้ดูใบที่ถูกข้าม) — ห้าม throw ซ้อน (best-effort)"""
@@ -2238,6 +2253,9 @@ def _cleanup_old_data():
             # ตัวกันกดปุ่มยืนยันซ้ำ (pb_done:*) เก่าเกิน 30 วัน → ลบทิ้ง (ปุ่มหมดอายุไปนานแล้ว)
             conn.execute("DELETE FROM meta WHERE key LIKE 'pb_done:%' AND value < ?",
                          ((today - timedelta(days=30)).isoformat(),))
+            # ตัวกัน webhook redelivery ซ้ำ (msgonce:*) เก่าเกิน 7 วัน → ลบทิ้ง (redelivery เกิดในไม่กี่ชม. พอ)
+            conn.execute("DELETE FROM meta WHERE key LIKE 'msgonce:%' AND value < ?",
+                         ((today - timedelta(days=7)).isoformat(),))
             conn.commit()
         if n_resv or n_miss or n_slip:
             print(f"[cleanup] ลบจองเก่า {n_resv} + ตัวนับรูปเก่า {n_miss} + สลิปเก่า {n_slip}", flush=True)
@@ -2906,6 +2924,11 @@ def handle_reservation_text(event, text: str, group_id: str):
     #  - จองล่วงหน้า   → กลุ่มบาร์น้ำ เป็นคนคอนเฟิร์ม
     # ถ้ากลุ่มต้นทาง = กลุ่มที่ต้องคอนเฟิร์มอยู่แล้ว → การ์ดขึ้นในกลุ่มเดิม (reply)
     # ถ้าไม่ใช่ → กลุ่มต้นทางได้ 'ข้อมูลจอง (ไม่มีปุ่ม)' + การ์ด+ปุ่มไปกลุ่มที่คอนเฟิร์ม แล้วเด้งผลยืนยันกลับ
+    # กัน 'จองซ้ำ' จาก webhook redelivery (LINE ส่ง event เดิมซ้ำเมื่อ bridge timeout) — ข้อความเดียวกัน = บันทึกครั้งเดียว
+    _mid = getattr(getattr(event, "message", None), "id", None)
+    if not _msg_once(_mid, "resv"):
+        print(f"[resv] ข้ามจองซ้ำ (webhook redelivery) msg={_mid}", flush=True)
+        return True
     dest = (BAR_GROUP_ID if is_advance else STAFF_GROUP_ID) or group_id
     resv_id = save_reservation(group_id, requested_by, info, text, dest)
     detail = _resv_detail_lines(info)
