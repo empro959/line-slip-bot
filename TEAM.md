@@ -19,12 +19,13 @@
 
 ## 2. ⚖️ กฎเหล็ก (สำคัญที่สุด)
 
-### A. Resource ที่มี "ตัวเดียว" = มีเจ้าของคนเดียว ห้ามแตะ
-- **Webhook OA เอด (@lza4817e) = ห้องบอทเท่านั้น** → ต้องชี้ `https://line-slip-bot-65gt.onrender.com/callback`
-  - ⚠️ ใครเปลี่ยน = **ระบบร้านล่มทันที** (จอง/สลิป/หนี้เงียบหมด) — เคยเกิดแล้ว
-- **DATABASE_URL / env Render (บอท) = ห้องบอท**
-- **Apps Script / Netlify / Drive = ห้อง Dashboard**
-- **คอนเทนต์ต้องใช้ OA แยก** ห้ามเอาเอดไปทำ (LINE 1 OA = 1 webhook = 1 ระบบ)
+### A. Resource ที่มี "ตัวเดียว" = ของกลาง ต้องประสานก่อนแก้
+- **Webhook OA เอด (@lza4817e) → ชี้ที่ `line_bridge` (proxy) → กระจายไป Render บอท + ระบบคอนเทนต์**
+  - ✅ ห้องคอนเทนต์ทำ bridge ให้ 2 ระบบใช้ OA เดียวกันได้ (2026-07-29)
+  - ⚠️ **`line_bridge` = ของกลาง!** ถ้าแก้แล้วหยุด forward ไป Render = บอทร้านล่ม (จอง/สลิป/หนี้เงียบ)
+    → แก้ bridge **ต้องประสานห้องไส้ย่างก่อน** + ต้อง forward ให้ Render `/callback` ครบ (raw body + X-Line-Signature เดิม ไม่งั้น signature ไม่ผ่าน)
+- **DATABASE_URL / env Render (บอท) = ห้องไส้ย่าง**
+- **Apps Script / Netlify / Drive = ห้องไส้ย่าง**
 
 ### B. ไฟล์ = เจ้าของคนเดียว
 - แก้ไฟล์ในความรับผิดชอบตัวเองเท่านั้น
