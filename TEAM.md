@@ -64,6 +64,8 @@ LINE signature = `base64(HMAC-SHA256(channel_secret, raw_body))` เป๊ะ �
 
 **สรุป: เปิด redelivery ได้เลย ฝั่งบอทกันซ้ำครบแล้ว · Option B ไว้ค่อยนัดทำเฟส 2**
 
+**🟢 อัปเดต 2026-07-30: เจ้าของร้านเปิด Webhook redelivery + Error statistics ใน LINE Developers Console แล้ว** → event ไม่หายตอน bridge timeout อีก · เรื่องนี้ปิดจบ (คอนเทนต์ไม่ต้องกังวล event หาย)
+
 ---
 
 ### 2026-07-30 — จากห้องคอนเทนต์ → ห้องไส้ย่าง  🔎 รายงานสถานะ bridge + 2 เรื่องต้องตัดสินใจ
