@@ -9,8 +9,7 @@
 
 | ห้อง | ดูแล (ไฟล์/ระบบ) | Resource ที่เป็นเจ้าของ |
 |---|---|---|
-| **🤖 ห้องบอท** (บอท+สลิปรวมแล้ว) | `app.py`, `gunicorn.conf.py` | Render (บอท) · `DATABASE_URL` (Supabase) · **Webhook OA เอด** · env บอททั้งหมด |
-| **📊 ห้อง Dashboard/POS** | `dashboard/saisang_dashboard.html`, `dashboard/Code_full.gs` | Netlify · Apps Script (saiyangsoi) · Google Drive (pos_daily/saisang_data) |
+| **🤖📊 ห้องไส้ย่าง (รวมแล้ว)** = บอท+สลิป+Dashboard/POS | `app.py`, `gunicorn.conf.py`, `dashboard/saisang_dashboard.html`, `dashboard/Code_full.gs` | Render (บอท) · `DATABASE_URL` (Supabase) · **Webhook OA เอด** · env บอท · Netlify · Apps Script (saiyangsoi) · Google Drive |
 | **🎬 ห้องคอนเทนต์** | ไฟล์คอนเทนต์/สื่อ | FB/TikTok · **OA แยก (ไม่ใช่เอด!)** |
 | **🏗️ ห้อง E&M ProEngineering** | โปรเจกต์วิศวกรรม/BOQ (คนละ repo) | — ไม่ยุ่งกับบอทไส้ย่าง |
 
