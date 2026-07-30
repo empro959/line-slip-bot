@@ -11,7 +11,7 @@
 |---|---|---|
 | **🤖📊 ห้องไส้ย่าง (รวมแล้ว)** = บอท+สลิป+Dashboard/POS | `app.py`, `gunicorn.conf.py`, `dashboard/saisang_dashboard.html`, `dashboard/Code_full.gs` | Render (บอท) · `DATABASE_URL` (Supabase) · **Webhook OA เอด** · env บอท · Netlify · Apps Script (saiyangsoi) · Google Drive |
 | **🎬 ห้องคอนเทนต์** | ไฟล์คอนเทนต์/สื่อ | FB/TikTok · **OA แยก (ไม่ใช่เอด!)** |
-| **🏗️ ห้อง E&M ProEngineering** | โปรเจกต์วิศวกรรม/BOQ (คนละ repo) | — ไม่ยุ่งกับบอทไส้ย่าง |
+| **🏗️ ห้อง E&M ProEngineering** | โปรเจกต์วิศวกรรม/BOQ — repo `empro959/em-proengineering` (คนละ repo) | OA ของ E&M เอง (ไม่ใช่ @lza4817e) · Render `em-proengineering` (auto-deploy จาก main) · DB Neon (แยกจาก Supabase บอท) · Google Drive บัญชี E&M — **ไม่ยุ่งกับบอทไส้ย่าง/line_bridge** |
 
 > ห้องใหม่ (ที่จะเปิด) → เพิ่มแถวที่นี่ก่อนเริ่มงาน + ระบุว่าดูแลอะไร
 
@@ -41,6 +41,11 @@
 ## 3. 📬 กล่องข้อความ (ฝากงานกัน — ใหม่บนสุด, ใส่วันที่ + จากห้องไหน)
 
 <!-- เขียนต่อจากบรรทัดนี้ -->
+
+### 2026-07-30 — จากห้อง E&M ProEngineering → ทุกห้อง
+- ✅ ยืนยันขอบเขต: E&M อยู่ **คนละ repo** (`empro959/em-proengineering`) — **ไม่แตะ** `app.py`, `gunicorn.conf.py`, `dashboard/*`, `line_bridge`, Webhook OA เอด (@lza4817e), `DATABASE_URL`/env Render บอท, Apps Script, Netlify, Drive ของห้องไส้ย่าง
+- ทรัพยากร E&M **แยกครบ ไม่ทับใคร:** OA ของ E&M เอง · Render service `em-proengineering` (auto-deploy จาก main) · DB Neon · Google Drive บัญชี E&M
+- ถ้าห้องใดอยากใช้ทรัพยากร E&M ร่วม (OA/DB/Render/Drive) → เขียนบอกในกล่องนี้ก่อน จะได้ไม่ชนกัน
 
 ### 2026-07-29 — จากห้องบอท → ทุกห้อง
 - ⚠️ **ห้ามแตะ webhook OA เอด** — เป็นของบอทร้าน (ชี้ Render) · เพิ่งล่มเพราะโดนเปลี่ยนไปทำคอนเทนต์
