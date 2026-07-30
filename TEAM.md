@@ -11,7 +11,7 @@
 |---|---|---|
 | **🤖📊 ห้องไส้ย่าง (รวมแล้ว)** = บอท+สลิป+Dashboard/POS | `app.py`, `gunicorn.conf.py`, `dashboard/saisang_dashboard.html`, `dashboard/Code_full.gs` | Render (บอท) · `DATABASE_URL` (Supabase) · **Webhook OA เอด** · env บอท · Netlify · Apps Script (saiyangsoi) · Google Drive |
 | **🎬 ห้องคอนเทนต์** | ไฟล์คอนเทนต์/สื่อ | FB/TikTok · **OA แยก (ไม่ใช่เอด!)** |
-| **🏗️ ห้อง E&M ProEngineering** | โปรเจกต์วิศวกรรม/BOQ — repo `empro959/em-proengineering` (คนละ repo) | OA ของ E&M เอง (ไม่ใช่ @lza4817e) · Render `em-proengineering` (auto-deploy จาก main) · DB Neon (แยกจาก Supabase บอท) · Google Drive บัญชี E&M — **ไม่ยุ่งกับบอทไส้ย่าง/line_bridge** |
+| **🏗️ ห้อง E&M ProEngineering** | โปรเจกต์วิศวกรรม/BOQ — repo `empro959/em-proengineering` (คนละ repo) | **OA `Bot E&M1` @129znmoo** (คนละตัวกับ @lza4817e ของบอท · ฟรี Push 300/เดือน) · Render `em-proengineering` (auto-deploy จาก main) · DB Neon (แยกจาก Supabase บอท) · Google Drive บัญชี E&M — **ไม่ยุ่งกับบอทไส้ย่าง/line_bridge** |
 
 > ห้องใหม่ (ที่จะเปิด) → เพิ่มแถวที่นี่ก่อนเริ่มงาน + ระบุว่าดูแลอะไร
 
@@ -46,7 +46,8 @@
 - ✅ ยืนยันขอบเขต: E&M อยู่ **คนละ repo** (`empro959/em-proengineering`) — **ไม่แตะ** `app.py`, `gunicorn.conf.py`, `dashboard/*`, `line_bridge`, Webhook OA เอด (@lza4817e), `DATABASE_URL`/env Render บอท, Apps Script, Netlify, Drive ของห้องไส้ย่าง
 - ทรัพยากร E&M **แยกครบ ไม่ทับใคร:** OA ของ E&M เอง · Render service `em-proengineering` (auto-deploy จาก main) · DB Neon · Google Drive บัญชี E&M
 - ถ้าห้องใดอยากใช้ทรัพยากร E&M ร่วม (OA/DB/Render/Drive) → เขียนบอกในกล่องนี้ก่อน จะได้ไม่ชนกัน
-- 🔮 **แผนอนาคต (OA):** ตอนนี้ E&M ใช้ OA ฟรีของตัวเอง (Push 300/เดือน · ช่วงทดลอง) — ถ้าทราฟฟิกโตอาจ **ย้ายมาใช้ OA เอดร่วมกัน** เพื่อจ่ายแพลนเดียว
+- ✅ OA ของ E&M = **`Bot E&M1` @129znmoo** (ยืนยันคนละตัวกับ @lza4817e ของบอท — ไม่มี webhook ชนกัน)
+- 🔮 **แผนอนาคต (OA):** ตอนนี้ E&M ใช้ OA @129znmoo ฟรี (Push 0/300 · ช่วงทดลอง) — ถ้าทราฟฟิกโตอาจ **ย้ายมาใช้ OA เอดร่วมกัน** เพื่อจ่ายแพลนเดียว
   - E&M **พร้อมเชื่อม bridge อยู่แล้ว:** มี webhook + verify signature (endpoint `/webhook`)
   - วันที่ย้าย (ต้องประสานห้องไส้ย่าง+คอนเทนต์ก่อน): `line_bridge` forward **raw body + X-Line-Signature เดิม** → เพิ่มปลายทาง `/webhook` ของ E&M · และ E&M ต้องสลับไปใช้ channel secret/token ของ OA เอด (จาก secret ของตัวเอง)
 
