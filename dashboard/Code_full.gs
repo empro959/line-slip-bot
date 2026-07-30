@@ -301,7 +301,8 @@ function dailyDate_(text){
   var m=text.match(new RegExp('(?:ตั้งแต่|From)[:\\s]*([0-9]{1,2})\\s+('+THAI_MONTHS.join('|')+')\\s+([0-9]{4})'));
   if(!m) return null;
   var mi=THAI_MONTHS.indexOf(m[2])+1;
-  return {key:m[3]+'-'+('0'+mi).slice(-2)+'-'+('0'+m[1]).slice(-2), period:m[2]+' '+(parseInt(m[3],10)+543)};
+  var y=parseInt(m[3],10); if(y>=2500) y-=543;   // normalize พ.ศ.→ค.ศ. (บางใบพิมพ์/OCR เป็น 2569 → กัน key เพี้ยนโดนข้าม)
+  return {key:y+'-'+('0'+mi).slice(-2)+'-'+('0'+m[1]).slice(-2), period:m[2]+' '+(y+543)};
 }
 
 function loadDaily_(){
