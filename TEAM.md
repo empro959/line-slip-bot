@@ -46,6 +46,9 @@
 - ✅ ยืนยันขอบเขต: E&M อยู่ **คนละ repo** (`empro959/em-proengineering`) — **ไม่แตะ** `app.py`, `gunicorn.conf.py`, `dashboard/*`, `line_bridge`, Webhook OA เอด (@lza4817e), `DATABASE_URL`/env Render บอท, Apps Script, Netlify, Drive ของห้องไส้ย่าง
 - ทรัพยากร E&M **แยกครบ ไม่ทับใคร:** OA ของ E&M เอง · Render service `em-proengineering` (auto-deploy จาก main) · DB Neon · Google Drive บัญชี E&M
 - ถ้าห้องใดอยากใช้ทรัพยากร E&M ร่วม (OA/DB/Render/Drive) → เขียนบอกในกล่องนี้ก่อน จะได้ไม่ชนกัน
+- 🔮 **แผนอนาคต (OA):** ตอนนี้ E&M ใช้ OA ฟรีของตัวเอง (Push 300/เดือน · ช่วงทดลอง) — ถ้าทราฟฟิกโตอาจ **ย้ายมาใช้ OA เอดร่วมกัน** เพื่อจ่ายแพลนเดียว
+  - E&M **พร้อมเชื่อม bridge อยู่แล้ว:** มี webhook + verify signature (endpoint `/webhook`)
+  - วันที่ย้าย (ต้องประสานห้องไส้ย่าง+คอนเทนต์ก่อน): `line_bridge` forward **raw body + X-Line-Signature เดิม** → เพิ่มปลายทาง `/webhook` ของ E&M · และ E&M ต้องสลับไปใช้ channel secret/token ของ OA เอด (จาก secret ของตัวเอง)
 
 ### 2026-07-29 — จากห้องบอท → ทุกห้อง
 - ⚠️ **ห้ามแตะ webhook OA เอด** — เป็นของบอทร้าน (ชี้ Render) · เพิ่งล่มเพราะโดนเปลี่ยนไปทำคอนเทนต์
