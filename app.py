@@ -3856,6 +3856,11 @@ def handle_text(event):
     print(f"[GROUP_ID] source_type={event.source.type} id={group_id} text={text}", flush=True)
     if group_id in IGNORE_GROUPS:
         return   # กลุ่มที่สั่งให้เมินทั้งหมด → ไม่ทำอะไรเลย
+    # กัน LINE webhook redelivery ยิงข้อความเดิมซ้ำ → คำสั่งทำงานซ้ำ/เด้งสรุปรัวๆ (สแปม)
+    # ข้อความเดิม (message_id เดียว) ประมวลผลครั้งเดียวพอ · redelivery = no-op ตอบ 200 เร็ว LINE เลิก retry
+    if not _msg_once(getattr(event.message, "id", None), "text"):
+        print(f"[skip] ข้อความนี้ประมวลผลแล้ว (message_id ซ้ำ) group={group_id}", flush=True)
+        return
     _clear_group_left(group_id)   # มีข้อความเข้ามา = บอทยังอยู่ในกลุ่ม → ปลดมาร์ค left ถ้าเคยติด (self-heal)
     # เมนูคำสั่ง
     if text.lower() in ("help", "คำสั่ง", "ช่วยเหลือ", "เมนู", "menu", "คำสั่งบอท"):
