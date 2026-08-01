@@ -2868,6 +2868,10 @@ def handle_reservation_text(event, text: str, group_id: str):
     ยกเว้นกลุ่มใน RESV_EXCLUDE_GROUPS → ไม่ยุ่งกับการจองเลย"""
     if group_id in RESV_EXCLUDE_GROUPS:
         return False
+    # ข้อความ 'ค้นหา/สรุป' (สรุปจอง, รายการจอง ฯลฯ) ไม่ใช่การจอง — กันโดนจับเป็นจองแล้วถามข้อมูลผิด
+    _lt = text.lower().strip()
+    if _lt.startswith("สรุป") or _lt.startswith("รายการ") or _lt.startswith("เช็ค") or _lt.startswith("ดูจอง"):
+        return False
     in_resv = bool(RESV_GROUPS) and group_id in RESV_GROUPS
     # ทำงานถ้า: เป็นกลุ่มรับจองวันนี้ หรือ ตั้งบาร์น้ำไว้ (เพื่อรับจองล่วงหน้าจากทุกกลุ่ม)
     if not in_resv and not BAR_GROUP_ID:
@@ -3943,7 +3947,10 @@ def handle_text(event):
         handle_payable_text(event, text, group_id)
         return
     # สรุปการจอง (วันนี้ + ล่วงหน้า) ของกลุ่มนี้ — ใช้ได้ทุกกลุ่ม
-    if text.lower() in ("สรุปจอง", "สรุปการจอง", "รายการจอง", "จองวันนี้"):
+    # รับ 'สรุปจอง...' แบบขึ้นต้น (เช่น 'สรุปจองโต๊ะ') ด้วย ไม่งั้นตกไปเข้าตัวจับจอง = ถามข้อมูลจองผิด
+    _lowq = text.lower().strip()
+    if (_lowq in ("รายการจอง", "จองวันนี้", "สรุปโต๊ะ", "สรุปจองโต๊ะ")
+            or _lowq.startswith("สรุปจอง") or _lowq.startswith("สรุปการจอง")):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=build_resv_summary(group_id, "📋 สรุปการจอง (วันนี้ + ล่วงหน้า)", upcoming=True, match_origin=True)))
         return
