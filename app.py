@@ -2132,37 +2132,6 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท")
         return True
 
-    # บันทึก 'เงินจ่าย' ด้วยข้อความ (เผื่อบอทอ่านสลิปจ่ายไม่ได้) เช่น "จ่าย 15980" หรือย้อนวัน "จ่าย 28/7 15980"
-    if low.startswith("จ่าย"):
-        rest = text[len("จ่าย"):].strip()
-        if not rest:
-            return False
-        toks = rest.split()
-        doc_date = None
-        if toks and "/" in toks[0]:                    # โทเคนแรกเป็นวันที่ → ลงย้อนหลัง
-            doc_date = _parse_thai_date(toks[0])
-            if doc_date is None:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                    text="❌ วันที่ไม่ถูก เช่น: จ่าย 28/7 15980 (วัน/เดือน ยอด)"))
-                return True
-            amount_str = " ".join(toks[1:])
-        else:
-            amount_str = rest
-        amount_str = amount_str.replace(",", "").replace("บาท", "").strip()
-        try:
-            val = float(amount_str)
-        except ValueError:
-            return False                                # ไม่มีตัวเลข (เช่น 'จ่ายเงินเดือน') → ปล่อยผ่าน
-        if val <= 0:
-            return False
-        # จ่ายมือ: ตัดยอดเข้าบิลเหมือนสลิป (settle) แล้วบันทึก + เด้งสรุป (เหมือน flow สลิปจ่าย)
-        allocated, settled, settle_note = _payable_settle(acct, doc_date, val)
-        save_payable_payment(acct, val, sender="พิมพ์", ref_number=None, slip_dt=None,
-                             doc_date=doc_date, allocated=allocated, settle_note=settle_note)
-        _payable_push_summary(event, group_id, acct)
-        _payable_cleanup_paid(acct)
-        return True
-
     # สรุปหนี้ (วันนี้ / ตามวันที่)
     if low in ("สรุปหนี้", "ยอดค้าง", "หนี้", f"หนี้{PAYABLE_VENDOR}".lower(), "สรุปยอดค้าง"):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_payable_summary(acct)))
