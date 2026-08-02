@@ -4,11 +4,11 @@
 import os
 
 workers          = int(os.environ.get("WEB_CONCURRENCY", "1"))  # 1 process (state/thread แชร์กันได้)
-threads          = int(os.environ.get("GUNICORN_THREADS", "4"))  # รับหลาย webhook พร้อมกัน (สลิป/จองรัวๆ) · ลด 8→4 ลด peak RAM
+threads          = int(os.environ.get("GUNICORN_THREADS", "3"))  # รับหลาย webhook พร้อมกัน (สลิป/จองรัวๆ) · ลด 8→4→3 ลด peak RAM (กัน OOM 512MB)
 timeout          = 120          # ต้อง >> เวลารอ storage ใน _db() (15s) กัน worker ถูกฆ่า
 graceful_timeout = 30
 
 # รีไซเคิล worker ทุก ~N request → คืนแรมที่รั่ว/สะสม (Gemini SDK/รูปสลิป) กันโตชน 512MB แล้วโดน OOM kill กลางคัน
 # graceful: gunicorn คิว request ระหว่าง worker ใหม่ boot (LINE/UptimeRobot retry ได้) — ดีกว่าโดน OOM kill แบบไม่ graceful
-max_requests        = int(os.environ.get("GUNICORN_MAX_REQUESTS", "600"))
+max_requests        = int(os.environ.get("GUNICORN_MAX_REQUESTS", "300"))  # ลด 600→300 · รีไซเคิลถี่ขึ้น คืนแรมที่รั่วก่อนโตชน 512MB (graceful ดีกว่าโดน OOM kill)
 max_requests_jitter = int(os.environ.get("GUNICORN_MAX_REQUESTS_JITTER", "80"))  # สุ่มกันรีสตาร์ทเป๊ะจังหวะเดียว
