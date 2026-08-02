@@ -1982,7 +1982,9 @@ def _process_payable_image(event, group_id: str):
                 print(f"[payable] pro-retry พลาด group={group_id}: {e}", flush=True)
     except Exception as e:
         print(f"[payable] อ่านรูปไม่สำเร็จ group={group_id}: {e}", flush=True)
-        notify("⚠️ อ่านรูปไม่สำเร็จ กรุณาส่งใหม่อีกครั้ง", force=True)
+        # แนบเหตุผลสั้นๆ ให้เห็นในแชท (ช่วยแยก 'โหลดรูปพลาด/410' vs 'Gemini พัง/quota' โดยไม่ต้องขุด log)
+        reason = f"{type(e).__name__}: {str(e)[:90]}"
+        notify(f"⚠️ อ่านรูปไม่สำเร็จ กรุณาส่งใหม่ หรือพิมพ์ 'จ่าย <ยอด>' แทน\n🐞 {reason}", force=True)
         return
 
     doc_type = (info.get("doc_type") or "other").lower()
