@@ -1955,9 +1955,10 @@ def _process_payable_image(event, group_id: str):
     out  = _payable_output_group(group_id)  # ที่เด้งผล (primary→mirror, ไม่งั้นกลุ่มเดิม)
     silent = group_id in PAYABLE_MIRROR     # กลุ่ม 1 (mirror primary): ไม่แจ้งเตือนรายตัว — เห็นผลที่ 'สรุปรายวัน' พอ
 
-    def notify(text):
-        """แจ้งผลบิล/สลิป — กลุ่ม mirror primary (กลุ่ม 1) เงียบ (ดูสรุปรายวันแทน); กลุ่มอื่นตอบปกติ"""
-        if not silent:
+    def notify(text, force=False):
+        """แจ้งผลบิล/สลิป — กลุ่ม mirror primary (กลุ่ม 1) เงียบเฉพาะ 'สำเร็จ' (ดูสรุปรายวันแทน)
+        force=True → พูดเสมอ (error/ปฏิเสธ/ซ้ำ) แม้กลุ่มเงียบ ไม่งั้นผู้ใช้ไม่รู้ว่าทำไมสลิปไม่เข้า"""
+        if force or not silent:
             _payable_send(event, group_id, out, text)
 
     try:
@@ -1975,7 +1976,7 @@ def _process_payable_image(event, group_id: str):
                 print(f"[payable] pro-retry พลาด group={group_id}: {e}", flush=True)
     except Exception as e:
         print(f"[payable] อ่านรูปไม่สำเร็จ group={group_id}: {e}", flush=True)
-        notify("⚠️ อ่านรูปไม่สำเร็จ กรุณาส่งใหม่อีกครั้ง")
+        notify("⚠️ อ่านรูปไม่สำเร็จ กรุณาส่งใหม่อีกครั้ง", force=True)
         return
 
     doc_type = (info.get("doc_type") or "other").lower()
@@ -1985,11 +1986,11 @@ def _process_payable_image(event, group_id: str):
     if doc_type == "bill":
         if amount <= 0:
             record_image_miss(acct, "payable_unread")
-            notify("🟡 อ่านยอดเงินบนบิลไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง")
+            notify("🟡 อ่านยอดเงินบนบิลไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่ หรือพิมพ์ 'บิล <ยอด>' เอง", force=True)
             return
         eff_date = doc_date or datetime.now(TZ).date().isoformat()
         if _payable_bill_exists(acct, eff_date, amount):   # กันส่งบิลซ้ำ (วันที่+ยอดเดียวกันมีแล้ว)
-            notify(f"🔁 บิลนี้ (วันที่ {eff_date} ยอด {amount:,.2f}) เคยบันทึกแล้ว — ไม่นับซ้ำ")
+            notify(f"🔁 บิลนี้ (วันที่ {eff_date} ยอด {amount:,.2f}) เคยบันทึกแล้ว — ไม่นับซ้ำ", force=True)
             return
         # บิลซื้อ: บันทึกเงียบ 'ไม่เด้งสรุป' (จะไปโผล่ในสรุปรอบที่มีการจ่ายถัดไป) — กลุ่ม 1 เงียบอยู่แล้ว
         rid = save_payable_bill(acct, amount, note="รูป", doc_date=doc_date)
@@ -1999,17 +2000,17 @@ def _process_payable_image(event, group_id: str):
     if doc_type == "payment":
         if amount <= 0:
             record_image_miss(acct, "payable_unread")
-            notify("🟡 อ่านยอดเงินบนสลิปไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่")
+            notify("🟡 อ่านยอดเงินบนสลิปไม่ได้ — โปรดถ่ายให้ชัดแล้วส่งใหม่", force=True)
             return
         # เช็คปลายทาง: ต้องโอนเข้าบัญชีดวงใจจริงถึงจะนับลดหนี้ (กันสลิปจ่ายเจ้าอื่นหลุดนับผิด)
         if not _payable_payee_ok(info):
             record_image_miss(acct, "payable_other_payee")
             notify(f"⛔ สลิปนี้จ่ายเข้า '{info.get('receiver') or '?'}' ไม่ใช่ {PAYABLE_VENDOR} → ไม่นับลดหนี้\n"
-                   "(ถ้าจ่ายดวงใจจริงแต่บอทอ่านปลายทางเพี้ยน พิมพ์ยอดเอง/แจ้งแอดมินได้)")
+                   "(ถ้าจ่ายดวงใจจริงแต่บอทอ่านปลายทางเพี้ยน พิมพ์ 'จ่าย <ยอด>' เอง/แจ้งแอดมินได้)", force=True)
             return
         ref = info.get("ref_number")
         if _payment_ref_exists(acct, ref):
-            notify(f"🔁 สลิปนี้ (อ้างอิง {ref}) เคยบันทึกแล้ว — ไม่นับซ้ำ")
+            notify(f"🔁 สลิปนี้ (อ้างอิง {ref}) เคยบันทึกแล้ว — ไม่นับซ้ำ", force=True)
             return
         # ตัดยอดเข้ากับบรรทัดค้าง: ดูวันที่ที่โน้ตบนสลิป → ถ้าไม่มี ลองจับยอดที่ตรงกับบรรทัดเดียว
         pay_for = _sane_doc_date(info.get("pay_for_date"))
@@ -2130,6 +2131,38 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         _payable_send(event, group_id, out,
             f"📥 บันทึกบิลซื้อ #{rid}\nยอด {val:,.2f} บาท{date_note}\n─────────────────\n"
             f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท")
+        return True
+
+    # บันทึก 'เงินจ่าย' ด้วยข้อความ (เผื่อบอทอ่านสลิปจ่ายไม่ได้/กลุ่มเงียบ) เช่น "จ่าย 15980" หรือย้อนวัน "จ่าย 28/7 15980"
+    # กัน redelivery ซ้ำด้วย _msg_once ที่หัว handle_text แล้ว → พิมพ์ครั้งเดียวพอ ไม่บันทึก/เด้งซ้ำ
+    if low.startswith("จ่าย"):
+        rest = text[len("จ่าย"):].strip()
+        if not rest:
+            return False
+        toks = rest.split()
+        doc_date = None
+        if toks and "/" in toks[0]:                    # โทเคนแรกเป็นวันที่ → ลงย้อนหลัง
+            doc_date = _parse_thai_date(toks[0])
+            if doc_date is None:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text="❌ วันที่ไม่ถูก เช่น: จ่าย 28/7 15980 (วัน/เดือน ยอด)"))
+                return True
+            amount_str = " ".join(toks[1:])
+        else:
+            amount_str = rest
+        amount_str = amount_str.replace(",", "").replace("บาท", "").strip()
+        try:
+            val = float(amount_str)
+        except ValueError:
+            return False                                # ไม่มีตัวเลข (เช่น 'จ่ายเงินเดือน') → ปล่อยผ่าน
+        if val <= 0:
+            return False
+        # จ่ายมือ: ตัดยอดเข้าบิลเหมือนสลิป (settle) แล้วบันทึก + เด้งสรุป (เหมือน flow สลิปจ่าย)
+        allocated, settled, settle_note = _payable_settle(acct, doc_date, val)
+        save_payable_payment(acct, val, sender="พิมพ์", ref_number=None, slip_dt=None,
+                             doc_date=doc_date, allocated=allocated, settle_note=settle_note)
+        _payable_push_summary(event, group_id, acct)
+        _payable_cleanup_paid(acct)
         return True
 
     # สรุปหนี้ (วันนี้ / ตามวันที่)
