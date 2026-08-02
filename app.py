@@ -1951,6 +1951,12 @@ def _process_payable_image(event, group_id: str):
     if group_id in _PAYABLE_PRIMARY_OF:
         print(f"[payable] กลุ่ม mirror (ดูสรุป) ข้ามการบันทึกรูป group={group_id}", flush=True)
         return
+    # กัน LINE ยิงรูปเดิมซ้ำ (webhook redelivery — มักเกิดตอน OOM restart) → บันทึก/ปฏิเสธ/พูดครั้งเดียวพอ
+    # ไม่งั้นสลิปที่อ่านไม่ผ่าน/ซ้ำ จะเด้ง error ทุกรอบ = สแปม (payable ไม่มี dedup ในตัวเหมือนสลิปรายได้)
+    _pay_mid = getattr(event.message, "id", None)
+    if not _msg_once(_pay_mid, "payimg"):
+        print(f"[payable] รูปนี้ประมวลผลแล้ว (message_id ซ้ำ) group={group_id} msg={_pay_mid}", flush=True)
+        return
     acct = _payable_account_key(group_id)   # ที่เก็บข้อมูลจริง (บัญชีเดียวกันสำหรับ primary/mirror)
     out  = _payable_output_group(group_id)  # ที่เด้งผล (primary→mirror, ไม่งั้นกลุ่มเดิม)
     silent = group_id in PAYABLE_MIRROR     # กลุ่ม 1 (mirror primary): ไม่แจ้งเตือนรายตัว — เห็นผลที่ 'สรุปรายวัน' พอ
