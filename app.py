@@ -218,16 +218,29 @@ def _parse_gemini_json(response, fallback: dict) -> dict:
     raw = (getattr(response, "text", None) or "").strip().replace("```json", "").replace("```", "").strip()
     if raw:
         try:
-            return json.loads(raw)
+            return _coerce_gemini_fields(json.loads(raw))
         except (json.JSONDecodeError, ValueError):
             m = re.search(r"\{.*\}", raw, re.S)
             if m:
                 try:
-                    return json.loads(m.group(0))
+                    return _coerce_gemini_fields(json.loads(m.group(0)))
                 except (json.JSONDecodeError, ValueError):
                     pass
     print(f"[gemini] parse JSON ไม่ได้ → ใช้ fallback: {raw[:120]!r}", flush=True)
     return dict(fallback)
+
+
+def _coerce_gemini_fields(d: dict) -> dict:
+    """กันโมเดล (โดยเฉพาะ flash-lite) คืน field ที่ควรเป็น 'ข้อความ' มาเป็น object (dict)
+    เช่น sender={'name':..,'account':..} → โค้ดปลายทางเรียก .strip()/.lower() แล้วพัง
+    ('dict' object has no attribute 'strip'). แบน dict → string; ปล่อย list (เช่น fraud_reasons)
+    /ตัวเลข/bool ไว้เหมือนเดิม"""
+    if not isinstance(d, dict):
+        return d
+    for k, v in list(d.items()):
+        if isinstance(v, dict):
+            d[k] = " ".join(str(x).strip() for x in v.values() if x not in (None, "")) or None
+    return d
 
 # ─── Persistent storage (PostgreSQL ถ้ามี DATABASE_URL ไม่งั้น SQLite) ────────
 # ย้ายมาใช้ Postgres (managed) เพราะ Render persistent disk mount ไม่เสถียร (mount ช้า/ไม่ขึ้น → ข้อมูลหาย)
