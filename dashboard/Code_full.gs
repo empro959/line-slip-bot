@@ -160,7 +160,11 @@ function parseSaleItems_(text){
       if(nums.length>=6){
         var inc=nums[nums.length-1].v, qn=nums[nums.length-6];
         var name=span.slice(0,qn.i).join(' ').trim();
-        if(name) items.push({category:cat,name:name,qty:qn.v,amount:inc});
+        // กันเมนูเพี้ยน: ตัดชื่อที่จริงๆ เป็น "ข้อความหัว/สรุปท้ายรายงาน" (ไม่ใช่ชื่อเมนู) หรือยาวผิดปกติ
+        //   เกิดตอนโค้ด+ตัวเลขของส่วนสรุปหลุดมาปนช่วงท้ายหมวดสุดท้าย → ได้ 'เมนู' ยอดมั่วก้อนโต
+        var badNm=/Sales Report|Item Code|Item Description|Category|Total Order|Total Customer|Real Sale|Take Home|Point Redeem|Sale by|Count |Transaction|\d{1,2}:\d{2}|รายงานสรุป|ตั้งแต่|หมวดสินค้า/;
+        if(name && name.length<=48 && !badNm.test(name))
+          items.push({category:cat,name:name,qty:qn.v,amount:inc});
       }
     }
   }
