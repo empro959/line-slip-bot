@@ -461,6 +461,16 @@ tr:last-child td{border-bottom:none}
   <div style="overflow-x:auto"><table id="pay-table"></table></div></div>
 </div>
 
+<!-- CREDIT (ค้างชำระ / ขายเชื่อ) -->
+<div id="view-credit" class="view">
+  <div class="seclbl">🧾 ค้างชำระ (ขายเชื่อ) — <span id="cr-period" style="color:var(--yellow)"></span></div>
+  <div class="krow anim" id="cr-kpis"></div>
+  <div class="twrap anim d1" style="margin-top:18px"><div class="ttop"><div class="ttitle"><span class="cdot" style="background:var(--red)"></span>ค้างชำระรายวัน + ยอดสะสม</div></div>
+  <div class="ch tall"><canvas id="ch-credit"></canvas></div></div>
+  <div class="twrap anim d2" style="margin-top:18px"><div class="ttop"><div class="ttitle"><span class="cdot" style="background:var(--red)"></span>แยกรายวัน</div></div>
+  <div style="overflow-x:auto"><table id="cr-table"></table></div></div>
+</div>
+
 <!-- COMPARE -->
 <div id="view-compare" class="view">
   <div class="seclbl">เปรียบเทียบระหว่างเดือน</div>
@@ -828,7 +838,7 @@ function loadMonth(idx){
   document.querySelectorAll('.mtab').forEach((t,i)=>t.classList.toggle('on',i===idx));
   const m=months[idx];
   document.getElementById('hdr-period').textContent=m.period;
-  buildKPIs(m);buildOV(m);buildDaily(m);buildDailyFood(m);buildWeekFood(m);buildDailyBev(m);buildWeekBev(m);buildWeekdayProfit(m);buildEX(m);buildSA(m);buildRec(m);buildPay(m);buildHealth(m);buildMenu(m);buildZone(m);
+  buildKPIs(m);buildOV(m);buildDaily(m);buildDailyFood(m);buildWeekFood(m);buildDailyBev(m);buildWeekBev(m);buildWeekdayProfit(m);buildEX(m);buildSA(m);buildRec(m);buildPay(m);buildCredit(m);buildHealth(m);buildMenu(m);buildZone(m);
   if(document.getElementById('view-annual').classList.contains('on'))buildAnn();
   if(document.getElementById('view-compare').classList.contains('on'))buildCmp();
 }
@@ -1114,6 +1124,7 @@ function sv(name,e){
   if(name==='annual')buildAnn();
   if(name==='compare')buildCmp();
   if(name==='payment'&&months[activeM])buildPay(months[activeM]);
+  if(name==='credit'&&months[activeM])buildCredit(months[activeM]);
   if(name==='health'&&months[activeM])buildHealth(months[activeM]);
   if(name==='menu'&&months[activeM])buildMenu(months[activeM]);
   if(name==='zone'&&months[activeM])buildZone(months[activeM]);
@@ -1236,6 +1247,46 @@ function buildPay(m){
   el('pay-table').innerHTML=head+'<tbody>'+(body||'<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:14px">ยังไม่มีข้อมูลรายวัน<\/td><\/tr>')+'<\/tbody>';
 }
 
+// ═══ CREDIT (ค้างชำระ / ขายเชื่อ) — ยอดรายวัน + สะสม ═══
+function buildCredit(m){
+  set('cr-period', m.period);
+  var series=(m.payment_days||[]).slice().sort(function(a,b){return a.date<b.date?-1:1;})
+    .map(function(d){return {date:d.date, amt:(d.payments&&d.payments['ค้างชำระ'])||0};});
+  var monthTot=series.reduce(function(a,d){return a+d.amt;},0);
+  var daysWith=series.filter(function(d){return d.amt>0.001;}).length;
+  var yearTot=(typeof months!=='undefined'?months:[]).reduce(function(a,mm){
+    var c=(mm.payment_methods||[]).filter(function(x){return x.method==='ค้างชำระ';})[0];
+    return a+(c?c.amount:0);},0);
+  var run=0, cum=series.map(function(d){run+=d.amt;return run;});
+  el('cr-kpis').innerHTML=
+    '<div class="kpi anim"><div class="klbl">ค้างชำระเดือนนี้<\/div><div class="kval" style="color:var(--red)">฿'+fmt(monthTot)+'<\/div><div class="ksub">'+daysWith+' วันที่มีค้าง<\/div><\/div>'+
+    '<div class="kpi anim d1"><div class="klbl">ค้างชำระสะสม (ทุกเดือน)<\/div><div class="kval" style="color:var(--yellow)">฿'+fmt(yearTot)+'<\/div><div class="ksub">ยอดขายเชื่อรวม<\/div><\/div>'+
+    '<div class="kpi anim d2"><div class="klbl">เฉลี่ย/วัน (เฉพาะวันที่มีค้าง)<\/div><div class="kval" style="color:var(--soft)">฿'+fmt(daysWith?monthTot/daysWith:0)+'<\/div><div class="ksub">'+m.period+'<\/div><\/div>';
+  dc('credit');
+  var cv=el('ch-credit'); if(!cv) return;
+  var box=cv.parentElement, oldMsg=box.querySelector('.nodaily'); if(oldMsg) oldMsg.remove();
+  if(!series.length){ cv.style.display='none'; var e=document.createElement('div'); e.className='nodaily'; e.innerHTML='<div class="empty" style="padding:20px 0"><div class="empty-h">ยังไม่มีข้อมูลค้างชำระ<\/div><div class="empty-p">เดือนนี้ยังไม่มีข้อมูลรายวันจาก POS<\/div><\/div>'; box.appendChild(e); return; }
+  cv.style.display='';
+  charts['credit']=new Chart(cv,{type:'bar',
+    data:{labels:dayLabels(series),datasets:[
+      {type:'bar',label:'ค้างชำระ/วัน',data:series.map(function(d){return d.amt;}),backgroundColor:'rgba(255,82,82,.8)',borderRadius:5,borderSkipped:false,order:2},
+      {type:'line',label:'สะสม',data:cum,borderColor:'rgba(255,215,64,1)',backgroundColor:'rgba(255,215,64,1)',borderWidth:2,pointRadius:2,pointHoverRadius:5,tension:.25,order:1,yAxisID:'y1'}
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+      plugins:{legend:{display:true,labels:{boxWidth:12,padding:12,font:{size:12}}},
+        tooltip:{callbacks:{title:function(c){return dateTH(series[c[0].dataIndex].date);},label:function(c){return ' '+c.dataset.label+': ฿'+fmt(c.parsed.y);}}},
+        datalabels:{display:false}},
+      scales:{x:{grid:{display:false},ticks:{font:{size:11},autoSkip:false,maxRotation:0}},
+        y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:function(v){return '฿'+fmt(v);}}},
+        y1:{position:'right',grid:{display:false},ticks:{callback:function(v){return '฿'+fmt(v);}}}}}
+  });
+  var body=series.slice().reverse().map(function(d){
+    var idx=series.map(function(s){return s.date;}).indexOf(d.date);
+    return '<tr><td class="mono">'+d.date+'<\/td><td style="text-align:right;color:var(--red)" class="mono">'+(d.amt?fmt(d.amt):'-')+'<\/td><td style="text-align:right;color:var(--yellow)" class="mono">'+fmt(cum[idx])+'<\/td><\/tr>';
+  }).join('');
+  el('cr-table').innerHTML='<thead><tr><th>วันที่<\/th><th style="text-align:right">ค้างชำระ<\/th><th style="text-align:right">สะสม (เดือน)<\/th><\/tr><\/thead><tbody>'+(body||'<tr><td colspan="3" style="text-align:center;color:var(--muted);padding:14px">ไม่มีข้อมูล<\/td><\/tr>')+'<\/tbody>';
+}
+
 // (ฟังก์ชัน export เก่าถูกลบออก — ใช้ปุ่ม Print + ซิงค์ Google Drive แทน)
 
 
@@ -1280,6 +1331,9 @@ function toast(msg){const t=el('toast');t.textContent=msg;t.classList.add('on');
   </button>
   <button class="nav-item" onclick="sv('payment',event)" data-view="payment">
     <span class="ni-icon">💳</span>ชำระเงิน
+  </button>
+  <button class="nav-item" onclick="sv('credit',event)" data-view="credit">
+    <span class="ni-icon">🧾</span>ค้างชำระ
   </button>
   <button class="nav-item" onclick="sv('annual',event)" data-view="annual">
     <span class="ni-icon">📅</span>รายปี
