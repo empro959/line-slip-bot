@@ -3327,6 +3327,10 @@ _slip_inflight = threading.BoundedSemaphore(int(os.environ.get("SLIP_MAX_INFLIGH
 # re-queue: สลิปที่ Gemini อ่านล้มทั้ง flash+pro (มัก 503/rate-limit ชั่วคราวช่วงพีค) → ลองใหม่แทนดรอปทันที
 SLIP_RETRY_MAX   = int(os.environ.get("SLIP_RETRY_MAX", "2"))     # ลองใหม่กี่รอบ (นอกจากรอบแรก)
 SLIP_RETRY_DELAY = int(os.environ.get("SLIP_RETRY_DELAY", "45"))  # หน่วงกี่วินาทีก่อนลองใหม่ (รอ burst ซา)
+# โหลดรูปพลาดเพราะเน็ตหลุดชั่วคราว (RemoteDisconnected/ConnectionError/timeout — มักตอน worker recycle ตัด connection)
+# → ลองโหลดใหม่เองสองสามครั้ง แทนดรอปให้ส่งซ้ำมือ (ไม่ retry 410 'content is gone' เพราะรูปถูกยกเลิก/หมดอายุ)
+SLIP_DL_RETRY       = int(os.environ.get("SLIP_DL_RETRY", "2"))
+SLIP_DL_RETRY_DELAY = float(os.environ.get("SLIP_DL_RETRY_DELAY", "1.5"))
 # กันคิว re-queue บวม RAM ตอน Gemini ล่มยาว (ทุกใบล้ม+ลองใหม่พร้อมกัน) — เกินนี้ = ยอมแพ้เลย ไม่เข้าคิว
 _slip_requeue_sem = threading.BoundedSemaphore(int(os.environ.get("SLIP_RETRY_QUEUE_MAX", "4")))
 # Circuit breaker 'เครดิต Gemini หมด' — เจอ 429 credits depleted → หยุดยิง Gemini ชั่วคราว (กันยิงเปล่าเปลือง/สแปม)
@@ -3356,13 +3360,23 @@ def _download_image_event(event):
     # จองสิทธิ์ 'รูปค้าง RAM' ก่อนโหลด — เต็มโควตาจะบล็อกที่นี่ (backpressure กัน memory บวมช่วง burst)
     # worker อ่านสลิป (_process_image_event) จะคืนสิทธิ์ให้เมื่อทำเสร็จ (holds_sem=True)
     _slip_inflight.acquire()
-    try:
-        content     = line_bot_api.get_message_content(event.message.id)
-        image_bytes = b"".join(chunk for chunk in content.iter_content())
-        _slip_pool.submit(_process_image_event, event, image_bytes, None, True)
-    except Exception as e:
-        print(f"[error] โหลดรูปไม่สำเร็จ (webhook) group={group_id}: {e}", flush=True)
-        _slip_pool.submit(_process_image_event, event, None, e, True)
+    last_err = None
+    for _try in range(SLIP_DL_RETRY + 1):
+        try:
+            content     = line_bot_api.get_message_content(event.message.id)
+            image_bytes = b"".join(chunk for chunk in content.iter_content())
+            _slip_pool.submit(_process_image_event, event, image_bytes, None, True)
+            return
+        except Exception as e:
+            last_err = e
+            # 410 = รูปถูกยกเลิก/หมดอายุ → ลองใหม่ก็ไม่มา ออกเลย (ไม่เสียเวลา retry)
+            if getattr(e, "status_code", None) == 410:
+                break
+            print(f"[error] โหลดรูปไม่สำเร็จ (webhook) รอบ {_try+1}/{SLIP_DL_RETRY+1} group={group_id}: {e}", flush=True)
+            if _try < SLIP_DL_RETRY:
+                time.sleep(SLIP_DL_RETRY_DELAY * (_try + 1))   # 1.5, 3 วิ (เผื่อเน็ต/ปลายทางฟื้น)
+    # โหลดพลาดทุกรอบ → เข้า error path (แจ้งแอดมิน + นับตกหล่น) · holds_sem=True เพื่อคืนสิทธิ์ inflight
+    _slip_pool.submit(_process_image_event, event, None, last_err, True)
 
 
 def _process_image_event(event, image_bytes=None, download_err=None, holds_sem=False, attempt=1, requeue_held=False):
