@@ -621,7 +621,7 @@ def extract_payable_doc(image_bytes: bytes, retry: bool = False) -> dict:
     prompt = (
         f"รูปนี้อยู่ในกลุ่มซื้อ-ขายระหว่างร้านอาหารกับร้านขายเครื่องดื่ม/สุรา ({PAYABLE_VENDOR}) "
         "ช่วยดูว่าเป็นเอกสารแบบไหน แล้วตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n\n"
-        '{"doc_type":"bill","amount":0.00,"ref_number":null,"sender":null,"receiver":null,"doc_date":null,"pay_for_date":null}\n\n'
+        '{"doc_type":"bill","amount":0.00,"ref_number":null,"sender":null,"receiver":null,"doc_date":null,"pay_for_date":null,"memo":null}\n\n'
         "doc_type:\n"
         "  - 'payment' = สลิปโอนเงินผ่านแอปธนาคาร (มี 'โอนเงินสำเร็จ'/ผู้โอน→ผู้รับ/เลขที่รายการ/จำนวนเงิน) "
         "⚠️ ถือเป็น payment 'เสมอ' แม้มีโน้ต/ข้อความเขียนกำกับ เช่น '(6/6) ค้าง 14,153' (โน้ตพวกนี้ไม่ทำให้เป็นบิล)\n"
@@ -643,8 +643,9 @@ def extract_payable_doc(image_bytes: bytes, retry: bool = False) -> dict:
         "(พ.ศ. เช่น 2569 = ค.ศ. 2026 ให้ลบ 543). "
         "⚠️ ถ้าบนบิลมีหลายวันที่ (เช่นมีรายการ 'ยอดยกมา/ค้างเก่า' ที่เป็นวันก่อนๆ) ให้เลือก 'วันที่ใหม่สุด' เท่านั้น "
         "ห้ามใช้วันที่ของยอดยกมา/ค้างเก่า; ถ้าอ่านวันที่ไม่ได้ใส่ null\n"
-        "pay_for_date (เฉพาะ payment): ถ้าบนสลิปมี 'โน้ตเขียน/พิมพ์กำกับ' ว่าจ่ายค่าของวันไหน "
-        "เช่น '(6/6)', 'ค่าของ 6/6', 'จ่าย 8/6' → ดึงวันนั้นเป็น ค.ศ. YYYY-MM-DD (พ.ศ. ลบ 543). "
+        "memo (เฉพาะ payment): ข้อความใน 'บันทึกช่วยจำ/หมายเหตุ' บนสลิปแบบดิบทั้งบรรทัด (เช่น 'ไส้ (23/7) ค้าง 7,993'); ไม่มีใส่ null\n"
+        "pay_for_date (เฉพาะ payment): ถ้าบันทึกช่วยจำ/โน้ตบอกว่า 'จ่ายค่าของวันไหน' "
+        "เช่น 'ไส้ (23/7)', '(6/6)', 'ค่าของ 6/6', 'จ่าย 8/6' → ดึง 'วัน/เดือน' นั้นเป็น ค.ศ. YYYY-MM-DD (พ.ศ. ลบ 543). "
         "เป็นคนละอย่างกับ doc_date (วันที่โอน) — เอาเฉพาะ 'วันที่ที่โน้ตบอกว่าจ่ายให้บิลไหน'; ถ้าไม่มีโน้ตใส่ null\n"
         "ถ้า doc_type='other' ให้ amount=0"
     )
@@ -2039,6 +2040,16 @@ def _payable_reconcile(acct: str):
     return total_before, total_after
 
 
+def _date_from_memo(memo) -> str:
+    """แกะ 'วัน/เดือน' จากบันทึกช่วยจำบนสลิป (เช่น 'ไส้ (23/7) ค้าง 7,993' → 2026-07-23)
+    ใช้เป็น fallback เมื่อ AI ไม่ได้ให้ pay_for_date — regex ในโค้ดชัวร์กว่าให้ AI เดา
+    รับ D/M หรือ D/M/Y (จะในวงเล็บหรือไม่ก็ได้); คืน YYYY-MM-DD หรือ None"""
+    if not memo or not isinstance(memo, str):
+        return None
+    m = re.search(r"(\d{1,2}/\d{1,2}(?:/\d{2,4})?)", memo)
+    return _sane_doc_date(_parse_thai_date(m.group(1))) if m else None
+
+
 _PAYABLE_SRC = {"block": "บล็อกค้าง", "พิมพ์": "พิมพ์เอง", "รูป": "รูปบิล"}
 
 def build_payable_bill_list(acct: str, limit: int = 40) -> str:
@@ -2150,7 +2161,7 @@ def _process_payable_image(event, group_id: str):
             notify(f"🔁 สลิปนี้ (อ้างอิง {ref}) เคยบันทึกแล้ว — ไม่นับซ้ำ", force=True)
             return
         # ตัดยอดเข้ากับบรรทัดค้าง: ดูวันที่ที่โน้ตบนสลิป → ถ้าไม่มี ลองจับยอดที่ตรงกับบรรทัดเดียว
-        pay_for = _sane_doc_date(info.get("pay_for_date"))
+        pay_for = _sane_doc_date(info.get("pay_for_date")) or _date_from_memo(info.get("memo"))
         allocated, settled, settle_note = _payable_settle(acct, pay_for, amount)
         save_payable_payment(acct, amount, sender=info.get("sender"),
                              ref_number=ref, slip_dt=info.get("datetime"),
