@@ -1406,7 +1406,10 @@ def _resv_line(r: dict) -> str:
     _wl  = _resv_when_label(r)
     when = f" | {_wl}" if _wl else ""
     zone = f" | {r['table_no']}" if r.get("table_no") else ""
-    by   = f" (โดย {r['confirmed_by']})" if r.get("status") == "CONFIRMED" and r.get("confirmed_by") else ""
+    if r.get("status") == "CONFIRMED":
+        by = f" (โดย {r['confirmed_by']})" if r.get("confirmed_by") else ""
+    else:
+        by = "  ⚠️ ยังไม่ยืนยัน"   # จองที่ยังไม่กดปุ่มคอนเฟิร์ม → ขึ้นสรุปด้วยแต่ติดป้ายชัด
     return f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}"
 
 
@@ -2608,9 +2611,9 @@ def maybe_send_resv_summary():
         lambda h: build_resv_summary(None, f"📅 จองล่วงหน้าวันนี้ ({h:02d}:00)", date_mode="advance_arrived", skip_if_empty=True))
     _maybe_send_resv_slot(
         now, RESV_TODAY_SUMMARY_HOUR, "resv_today_summary",
-        # รอบบ่าย: สรุป 'จองทั้งหมดของวันนี้' (ล่วงหน้าที่ถึงวันงาน + จองในวัน) — date_mode ดีฟอลต์
-        # ส่งทุกวันแม้ไม่มีจอง (skip_if_empty=False) → มีสรุป 16:00 แน่นอน กันเคส 'ไม่โผล่' แล้วงงว่ายิงไหม
-        lambda h: build_resv_summary(None, f"📋 สรุปจองโต๊ะวันนี้ ({h:02d}:00)", skip_if_empty=False))
+        # รอบบ่าย: สรุป 'จองทั้งหมดของวันนี้' (ล่วงหน้าที่ถึงวันงาน + จองในวัน รวมที่ยังไม่ยืนยัน) — date_mode ดีฟอลต์
+        # ไม่มีจอง = ไม่ส่ง (ประหยัด push) · จองที่ยังไม่กดยืนยันก็ขึ้น (ติดป้าย '⚠️ ยังไม่ยืนยัน' ใน _resv_line)
+        lambda h: build_resv_summary(None, f"📋 สรุปจองโต๊ะวันนี้ ({h:02d}:00)", skip_if_empty=True))
 
 
 def _maybe_send_resv_slot(now, start_hour, job, build_text):
