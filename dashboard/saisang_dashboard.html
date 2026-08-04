@@ -465,7 +465,9 @@ tr:last-child td{border-bottom:none}
 <div id="view-credit" class="view">
   <div class="seclbl">🧾 ค้างชำระ (ขายเชื่อ) — <span id="cr-period" style="color:var(--yellow)"></span></div>
   <div class="krow anim" id="cr-kpis"></div>
-  <div class="twrap anim d1" style="margin-top:18px"><div class="ttop"><div class="ttitle"><span class="cdot" style="background:var(--red)"></span>ค้างชำระรายวัน + ยอดสะสม</div></div>
+  <div class="twrap anim d1" style="margin-top:18px"><div class="ttop"><div class="ttitle"><span class="cdot" style="background:var(--yellow)"></span>ลูกค้าที่ค้างชำระ — ติ๊ก ✓ เมื่อจ่ายแล้ว</div></div>
+  <div id="cr-customers"></div></div>
+  <div class="twrap anim d2" style="margin-top:18px"><div class="ttop"><div class="ttitle"><span class="cdot" style="background:var(--red)"></span>ค้างชำระรายวัน + ยอดสะสม</div></div>
   <div class="ch tall"><canvas id="ch-credit"></canvas></div></div>
   <div class="twrap anim d2" style="margin-top:18px"><div class="ttop"><div class="ttitle"><span class="cdot" style="background:var(--red)"></span>แยกรายวัน</div></div>
   <div style="overflow-x:auto"><table id="cr-table"></table></div></div>
@@ -1262,6 +1264,29 @@ function buildCredit(m){
     '<div class="kpi anim"><div class="klbl">ค้างชำระเดือนนี้<\/div><div class="kval" style="color:var(--red)">฿'+fmt(monthTot)+'<\/div><div class="ksub">'+daysWith+' วันที่มีค้าง<\/div><\/div>'+
     '<div class="kpi anim d1"><div class="klbl">ค้างชำระสะสม (ทุกเดือน)<\/div><div class="kval" style="color:var(--yellow)">฿'+fmt(yearTot)+'<\/div><div class="ksub">ยอดขายเชื่อรวม<\/div><\/div>'+
     '<div class="kpi anim d2"><div class="klbl">เฉลี่ย/วัน (เฉพาะวันที่มีค้าง)<\/div><div class="kval" style="color:var(--soft)">฿'+fmt(daysWith?monthTot/daysWith:0)+'<\/div><div class="ksub">'+m.period+'<\/div><\/div>';
+  // ── ลูกค้าที่ค้างชำระ + ติ๊กเคลียร์ (สถานะ 'จ่ายแล้ว' เก็บใน localStorage ต่อเบราว์เซอร์) ──
+  var cust=(m.credit_customers||[]), CKEY='credit_cleared:'+m.period;
+  function _isCleared(nm){ try{return (JSON.parse(localStorage.getItem(CKEY)||'{}'))[nm]===true;}catch(e){return false;} }
+  window.crToggle=function(nm){ try{var o=JSON.parse(localStorage.getItem(CKEY)||'{}'); o[nm]=!o[nm]; localStorage.setItem(CKEY,JSON.stringify(o));}catch(e){} buildCredit(months[activeM]); };
+  var _bd='1px solid rgba(255,255,255,.08)';
+  if(!cust.length){
+    el('cr-customers').innerHTML='<div class="empty" style="padding:16px 0"><div class="empty-h">ยังไม่มีข้อมูลรายลูกค้า<\/div><div class="empty-p">รัน backfillCredit ให้เก็บ \'รายงานแยกลูกค้า\' (ชื่อที่มีคำว่า ค้างชำระ)<\/div><\/div>';
+  } else {
+    var owe=cust.filter(function(c){return !_isCleared(c.name);}), paid=cust.filter(function(c){return _isCleared(c.name);});
+    var oweSum=owe.reduce(function(a,c){return a+(c.amount||0);},0);
+    function _crow(c){ var cl=_isCleared(c.name), nm=(c.name||'').replace(/\s*ค้างชำระ\s*/,'').trim()||c.name;
+      return '<div style="display:flex;align-items:center;gap:10px;padding:9px 4px;border-bottom:'+_bd+'">'
+        +'<button onclick=\'crToggle('+JSON.stringify(c.name)+')\' style="cursor:pointer;border:'+_bd+';background:'+(cl?'var(--green)':'transparent')+';color:'+(cl?'#000':'var(--muted)')+';border-radius:6px;padding:3px 10px;font-size:13px;white-space:nowrap">'+(cl?'✓ จ่ายแล้ว':'○ ค้าง')+'<\/button>'
+        +'<div style="flex:1;'+(cl?'opacity:.5;text-decoration:line-through':'')+'">'+nm+'<span style="color:var(--muted);font-size:11px"> #'+(c.id||'')+'<\/span><\/div>'
+        +'<div class="mono" style="color:'+(cl?'var(--muted)':'var(--red)')+';font-weight:600">฿'+fmt(c.amount)+'<\/div><\/div>';
+    }
+    el('cr-customers').innerHTML=
+      '<div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:10px">'
+      +'<div><div style="color:var(--muted);font-size:12px">ยังค้างจริง ('+owe.length+' คน)<\/div><div class="mono" style="font-size:22px;color:var(--red)">฿'+fmt(oweSum)+'<\/div><\/div>'
+      +'<div><div style="color:var(--muted);font-size:12px">เคลียร์แล้ว<\/div><div class="mono" style="font-size:22px;color:var(--green)">'+paid.length+' คน<\/div><\/div><\/div>'
+      +owe.map(_crow).join('')
+      +(paid.length?('<div style="color:var(--muted);font-size:12px;margin:12px 0 4px">จ่ายแล้ว<\/div>'+paid.map(_crow).join('')):'');
+  }
   dc('credit');
   var cv=el('ch-credit'); if(!cv) return;
   var box=cv.parentElement, oldMsg=box.querySelector('.nodaily'); if(oldMsg) oldMsg.remove();

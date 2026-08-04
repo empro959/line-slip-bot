@@ -325,7 +325,7 @@ function rebuildMonths_(daily, slipMap){
   slipMap=slipMap||{};
   var byP={};
   daily.forEach(function(d){
-    if(!byP[d.period]) byP[d.period]={sales:{},records:[],pay:{},days:[],menu:{},zone:{},voids:{cancelled:0,deleted:0,returns:0,discount:0}};
+    if(!byP[d.period]) byP[d.period]={sales:{},records:[],pay:{},days:[],menu:{},zone:{},credit:{},voids:{cancelled:0,deleted:0,returns:0,discount:0}};
     (d.sales||[]).forEach(function(c){
       var s=byP[d.period].sales[c.category]||{amount:0,exc:0,vat:0};
       s.amount+=c.amount||0; s.exc+=c.exc||0; s.vat+=c.vat||0;
@@ -345,6 +345,9 @@ function rebuildMonths_(daily, slipMap){
       e.qty+=it.qty||0; e.amount+=it.amount||0; byP[d.period].menu[it.name]=e; });
     var zn=d.zones||{}; Object.keys(zn).forEach(function(z){ byP[d.period].zone[z]=(byP[d.period].zone[z]||0)+(zn[z]||0); });
     var vd=d.voids||{}, vv=byP[d.period].voids; vv.cancelled+=vd.cancelled||0; vv.deleted+=vd.deleted||0; vv.returns+=vd.returns||0; vv.discount+=vd.discount||0;
+    // ค้างชำระรายลูกค้า (จากรายงานแยกลูกค้า — ชื่อที่มีคำว่า 'ค้างชำระ') → รวมยอดต่อคนในเดือน
+    (d.credit||[]).forEach(function(c){ var e=byP[d.period].credit[c.name]||{id:c.id||'',amount:0,days:[]};
+      e.amount+=(c.amount||0); e.days.push({date:d.date,amount:c.amount||0}); byP[d.period].credit[c.name]=e; });
   });
   var months=[];
   Object.keys(byP).forEach(function(p){
@@ -372,9 +375,12 @@ function rebuildMonths_(daily, slipMap){
     var menuItems=Object.keys(b.menu).map(function(nm){var e=b.menu[nm];return {name:nm,category:e.category,qty:r2_(e.qty),amount:r2_(e.amount)};})
                                      .sort(function(a,b){return b.amount-a.amount;});
     var zoneSales=Object.keys(b.zone).map(function(z){return {zone:z,amount:r2_(b.zone[z])};}).sort(function(a,b){return b.amount-a.amount;});
+    var creditCust=Object.keys(b.credit).map(function(nm){var e=b.credit[nm];
+      return {name:nm,id:e.id,amount:r2_(e.amount),days:e.days.sort(function(a,b){return a.date<b.date?-1:1;})};})
+      .sort(function(a,b){return b.amount-a.amount;});
     months.push({period:p,total_sales:r2_(totS),total_expenses:r2_(totE),net_profit:r2_(totS-totE),
       expense_categories:eCats,sales_categories:sCats,expense_records:b.records,
-      payment_methods:payCats,payment_days:payDays,daily_totals:dailyTotals,menu_items:menuItems,zone_sales:zoneSales,
+      payment_methods:payCats,payment_days:payDays,daily_totals:dailyTotals,menu_items:menuItems,zone_sales:zoneSales,credit_customers:creditCust,
       voids:{cancelled:r2_(b.voids.cancelled),deleted:r2_(b.voids.deleted),returns:r2_(b.voids.returns),discount:r2_(b.voids.discount)},
       recon:{pos_transfer:r2_(posTransfer),bot_slip:r2_(botSlip),bot_count:botCnt,diff:r2_(posTransfer-botSlip)}});
   });
