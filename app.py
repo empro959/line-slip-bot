@@ -74,6 +74,8 @@ STAFF_GROUP_ID    = os.environ.get("STAFF_GROUP_ID", "") or (SLIP_GROUPS[0] if S
 RECON_GROUPS = [g.strip() for g in os.environ.get("RECON_GROUPS", "").split(",") if g.strip()]
 SYNC_URL = os.environ.get("SYNC_URL", "").strip()          # ลิงก์ Apps Script /exec (ตัวเดียวกับ dashboard) — ดึงยอด POS มาเทียบ
 RECON_MIN_DIFF = float(os.environ.get("RECON_MIN_DIFF", "1"))  # ต่างเกินกี่บาทถึงเตือน (กัน rounding)
+RECON_POS_WAIT  = int(os.environ.get("RECON_POS_WAIT", "300"))  # ถ้าจดมือมาก่อน POS → รอกี่วินาที/รอบ แล้วลองดึง POS ใหม่
+RECON_POS_TRIES = int(os.environ.get("RECON_POS_TRIES", "6"))   # ลองดึง POS กี่รอบ (6×5นาที = รอได้ ~30 นาที)
 # redirect รายงาน: ส่งรายงานของ "กลุ่มต้นทาง" ไปเข้า "กลุ่มปลายทาง" แทน (เนื้อห้ารายงานยังเป็นของต้นทาง)
 # รูปแบบ "ต้นทาง:ปลายทาง,ต้นทาง2:ปลายทาง2" — ครอบทุกรายงาน (สลิป/จอง/หนี้). ตั้งบน Render กัน repo public เห็น group id
 REPORT_REDIRECT   = {}
@@ -674,14 +676,15 @@ def extract_ledger(image_bytes: bytes) -> dict:
 
 
 _pos_load_cache = {}   # cache ผล action=load (ทั้งก้อน) 10 นาที กันยิง Apps Script ถี่
-def _fetch_pos_day(date_iso: str):
+def _fetch_pos_day(date_iso: str, fresh: bool = False):
     """ดึงยอด POS ของวัน (สด/โอน/บัตร/ยอดขาย) จาก Apps Script /exec?action=load — cache 10 นาที
+    fresh=True → ข้าม cache (ใช้ตอน retry รอ POS เข้าระบบ จะได้เห็นข้อมูลใหม่)
     คืน {cash,transfer,card,sales} หรือ None (ยังไม่ตั้ง SYNC_URL / ดึงไม่ได้ / ไม่มีวันนั้น)"""
     if not SYNC_URL:
         return None
     now = time.time()
     cached = _pos_load_cache.get("all")
-    if cached and cached[1] > now:
+    if cached and cached[1] > now and not fresh:
         months = cached[0]
     else:
         try:
@@ -724,12 +727,22 @@ def _process_recon_image(event, group_id):
         return
     date_iso = _sane_doc_date(info.get("date")) or datetime.now(TZ).date().isoformat()
     hw = {"cash": float(info.get("cash") or 0), "transfer": float(info.get("transfer") or 0), "card": float(info.get("card") or 0)}
-    pos = _fetch_pos_day(date_iso)
+    _recon_compare(group_id, date_iso, hw, RECON_POS_TRIES)   # เทียบทันที ถ้ายังไม่มี POS จะรอแล้วลองใหม่เอง
+
+
+def _recon_compare(group_id, date_iso, hw, tries_left):
+    """เทียบจดมือ↔POS — ถ้ายอด POS ของวันยังไม่เข้าระบบ (จดมือมาก่อน POS) รอ RECON_POS_WAIT แล้วลองใหม่
+    จนครบ RECON_POS_TRIES รอบ (รอ ~30 นาที) · เตือนเฉพาะตอนไม่ตรง"""
+    pos = _fetch_pos_day(date_iso, fresh=True)
     if not pos:
-        _push(group_id, TextSendMessage(text=(
-            f"📓 อ่านสมุดจดมือ {date_iso}\nสด {hw['cash']:,.0f} · โอน {hw['transfer']:,.0f}"
-            + (f" · บัตร {hw['card']:,.0f}" if hw['card'] else "")
-            + "\n⚠️ เทียบ POS ไม่ได้ (ยังไม่ได้ตั้ง SYNC_URL หรือยังไม่มียอด POS ของวันนี้)")))
+        if tries_left > 1:
+            print(f"[recon] {date_iso} ยังไม่มียอด POS — รอ {RECON_POS_WAIT}s ลองใหม่ (เหลือ {tries_left-1} รอบ)", flush=True)
+            threading.Timer(RECON_POS_WAIT, _recon_compare, args=(group_id, date_iso, hw, tries_left - 1)).start()
+        else:
+            _push(group_id, TextSendMessage(text=(
+                f"📓 อ่านสมุดจดมือ {date_iso}\nสด {hw['cash']:,.0f} · โอน {hw['transfer']:,.0f}"
+                + (f" · บัตร {hw['card']:,.0f}" if hw['card'] else "")
+                + "\n⚠️ รอ POS แล้วไม่เข้าระบบ (หรือยังไม่ตั้ง SYNC_URL) — เทียบไม่ได้ ตรวจเองนะครับ")))
         return
     rows, mismatch = [], False
     for label, k in (("สด", "cash"), ("โอน", "transfer"), ("บัตร", "card")):
