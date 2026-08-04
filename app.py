@@ -694,52 +694,59 @@ def extract_ledger(image_bytes: bytes) -> dict:
     return _parse_gemini_json(response, {"is_ledger": False})
 
 
-_pos_load_cache = {}   # cache ผล action=load (ทั้งก้อน) 10 นาที กันยิง Apps Script ถี่
+def _fetch_pos_one(date_iso: str):
+    """ดึงยอด POS 'เฉพาะวันเดียว' จาก Apps Script action=posday — payload เล็กมาก (ไม่กี่ร้อย byte)
+    ไม่โหลดทั้งปี (~1-2MB) ที่ทำ Apps Script เค้นไม่ไหว/คืน HTML error/timeout
+    คืน {cash,transfer,card,sales} หรือ None (ไม่มีวันนั้น / ดึงไม่ได้)"""
+    resp = None
+    try:
+        resp = requests.get(SYNC_URL, params={"action": "posday", "date": date_iso},
+                            timeout=SYNC_TIMEOUT, allow_redirects=True)
+        j = json.loads(resp.text)
+        day = j.get("day") if isinstance(j, dict) else None
+        if not day:
+            return None
+        return {"cash": float(day.get("cash") or 0), "transfer": float(day.get("transfer") or 0),
+                "card": float(day.get("card") or 0), "sales": float(day.get("sales") or 0)}
+    except Exception as e:
+        body = resp.text[:150] if resp is not None else ""
+        bl = body.lstrip().lower()
+        if bl.startswith("<") or "<!doctype" in bl or "<html" in bl:
+            # ยังได้ HTML = (ก) Apps Script ยังไม่อัปเดตโค้ด action=posday (คืนไฟล์ทั้งปีเหมือนเดิม → ใหญ่/พัง)
+            #             หรือ (ข) deployment ไม่ใช่ 'ทุกคน'
+            print("[recon] ดึง POS ไม่ได้: Apps Script คืน HTML แทน JSON — "
+                  "เช็ก (1) อัปเดตโค้ด action=posday ใน Apps Script + Deploy ใหม่แล้วยัง (2) deployment เป็น 'ทุกคน'",
+                  flush=True)
+        else:
+            print(f"[recon] ดึง POS ไม่ได้: {e} | body={body!r}", flush=True)
+        return None
+
+
 def _fetch_pos_day(date_iso: str, fresh: bool = False):
-    """ดึงยอด POS ของวัน (สด/โอน/บัตร/ยอดขาย) จาก Apps Script /exec?action=load — cache 10 นาที
-    fresh=True → ข้าม cache (ใช้ตอน retry รอ POS เข้าระบบ จะได้เห็นข้อมูลใหม่)
-    คืน {cash,transfer,card,sales} หรือ None (ยังไม่ตั้ง SYNC_URL / ดึงไม่ได้ / ไม่มีวันนั้น)"""
+    """ดึงยอด POS ของวัน (สด/โอน/บัตร/ยอดขาย) — ลองวันที่ตรงก่อน ถ้าไม่มีลองวันก่อนหน้า 1 วัน
+    (คืนร้านคาบเที่ยงคืน: จดมือ/บอทอาจลงวันเหลื่อมกับที่ POS ลง 1 วัน)
+    fresh: ไม่ใช้แล้ว (payload เล็ก ดึงสดทุกครั้ง) — คงพารามิเตอร์ไว้ให้ผู้เรียกเดิมเรียกได้เหมือนเดิม"""
     if not SYNC_URL:
         return None
-    now = time.time()
-    cached = _pos_load_cache.get("all")
-    if cached and cached[1] > now and not fresh:
-        months = cached[0]
-    else:
-        resp = None
-        try:
-            resp = requests.get(SYNC_URL, params={"action": "load"}, timeout=SYNC_TIMEOUT, allow_redirects=True)
-            j = json.loads(resp.text)
-            months = j.get("data") if isinstance(j, dict) else None
-            if not isinstance(months, list):
-                print(f"[recon] POS ไม่ใช่ list — body={resp.text[:150]!r}", flush=True)
-                return None
-            _pos_load_cache["all"] = (months, now + 600)
-        except Exception as e:
-            body = resp.text[:150] if resp is not None else ""
-            # ถ้า body เป็น HTML (< / <!DOCTYPE / <html) = Web App ตั้งสิทธิ์ผิด (ต้อง 'Anyone')
-            # บอทโดนหน้า login ของ Google แทน JSON → json.loads เลย error "Expecting value: line 1 column 1"
-            bl = body.lstrip().lower()
-            if bl.startswith("<") or "<!doctype" in bl or "<html" in bl:
-                print("[recon] ดึง POS ไม่ได้: Apps Script คืนหน้า HTML (login) แทน JSON — "
-                      "ต้องตั้ง Web App 'Who has access = Anyone' (ไม่ใช่ 'Anyone with Google account') "
-                      "แล้ว Deploy ใหม่ · เทสได้ที่ /exec?action=load ใน incognito ต้องเห็น JSON",
-                      flush=True)
-            else:
-                print(f"[recon] ดึง POS ไม่ได้: {e} | body={body!r}", flush=True)
-            return None
-    for m in months:
-        for d in (m.get("payment_days") or []):
-            if d.get("date") == date_iso:
-                p = d.get("payments") or {}
-                sales = 0
-                for dt in (m.get("daily_totals") or []):
-                    if dt.get("date") == date_iso:
-                        sales = dt.get("sales") or 0
-                        break
-                return {"cash": float(p.get("เงินสด") or 0), "transfer": float(p.get("เงินโอน") or 0),
-                        "card": float(p.get("บัตรเครดิต") or 0), "sales": float(sales)}
+    candidates = [date_iso]
+    if _is_iso_date(date_iso):
+        candidates.append((datetime.strptime(date_iso, "%Y-%m-%d").date() - timedelta(days=1)).isoformat())
+    for i, d in enumerate(candidates):
+        got = _fetch_pos_one(d)
+        if got:
+            if i > 0:
+                print(f"[recon] ใช้ยอด POS ของ {d} (จดมือลงวันที่ {date_iso} — คืนคาบเที่ยงคืน เลื่อน 1 วัน)", flush=True)
+            got["pos_date"] = d
+            return got
     return None
+
+
+def _is_iso_date(s: str) -> bool:
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
 def _process_recon_image(event, group_id):

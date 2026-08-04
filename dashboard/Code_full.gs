@@ -29,6 +29,24 @@ function doGet(e) {
     return json_({ ok: true, exists: !!file, updatedAt: file ? file.getLastUpdated().getTime() : 0 });
   }
   if (!file) return json_({ ok: true, exists: false, data: null, updatedAt: 0 });
+  // ดึงยอด 'เฉพาะวันเดียว' (สด/โอน/บัตร/ยอดขาย) — payload เล็กมาก ไว้ให้บอทเทียบยอด (ไม่ต้องโหลดทั้งปีที่ใหญ่/ช้า/พัง)
+  if (action === 'posday') {
+    var qd = (e && e.parameter && e.parameter.date) || '';
+    var data = JSON.parse(file.getBlob().getDataAsString('UTF-8') || 'null');
+    var months = Array.isArray(data) ? data : [];
+    for (var mi = 0; mi < months.length; mi++) {
+      var pds = months[mi].payment_days || [];
+      for (var di = 0; di < pds.length; di++) {
+        if (pds[di].date === qd) {
+          var p = pds[di].payments || {};
+          var sales = 0, dts = months[mi].daily_totals || [];
+          for (var si = 0; si < dts.length; si++) { if (dts[si].date === qd) { sales = dts[si].sales || 0; break; } }
+          return json_({ ok: true, exists: true, day: { date: qd, cash: p['เงินสด'] || 0, transfer: p['เงินโอน'] || 0, card: p['บัตรเครดิต'] || 0, sales: sales } });
+        }
+      }
+    }
+    return json_({ ok: true, exists: true, day: null });
+  }
   const content = file.getBlob().getDataAsString('UTF-8');
   return json_({ ok: true, exists: true, data: JSON.parse(content || 'null'), updatedAt: file.getLastUpdated().getTime() });
 }
