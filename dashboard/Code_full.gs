@@ -80,7 +80,7 @@ function findLatestPdf_(keyword){
     for(var m=0;m<msgs.length;m++){var dt=msgs[m].getDate().getTime(),atts=msgs[m].getAttachments();
       for(var a=0;a<atts.length;a++){var n=atts[a].getName();
         if(new RegExp(keyword,'i').test(n)&&/\.pdf$/i.test(n)&&dt>bestT){best=atts[a];bestT=dt;bestName=n;}}}}
-  return best?{blob:best.copyBlob(),name:bestName}:null;
+  return best?{blob:best.copyBlob(),name:bestName,time:bestT}:null;
 }
 
 // งวด เช่น "กรกฎาคม 2569" (แปลงปี ค.ศ.->พ.ศ.)
@@ -449,6 +449,10 @@ function backfillCredit(){
 function importPosReports(){
   var s=findLatestPdf_('SaleReport'), p=findLatestPdf_('PayoutReport');
   if(!s||!p){Logger.log('ไม่พบไฟล์รายงาน ข้ามรอบนี้');return;}
+  // กันทำงานซ้ำ/เปลือง OCR: ถ้าอีเมล SaleReport ฉบับล่าสุดถูก import ไปแล้ว (จาก trigger รอบก่อนคืนเดียวกัน) → ข้ามก่อน OCR
+  var props=PropertiesService.getScriptProperties();
+  var lastMs=Number(props.getProperty('LAST_IMPORTED_EMAIL_MS')||0);
+  if(s.time && s.time<=lastMs){ Logger.log('อีเมลรอบนี้ import ไปแล้ว ('+new Date(s.time)+') — ข้าม'); return; }
   var b=findLatestPdf_('BalanceCashDrawer');
   var st=pdfToText_(s.blob), pt=pdfToText_(p.blob);
   var dd=dailyDate_(st)||dailyDate_(pt);
@@ -461,11 +465,11 @@ function importPosReports(){
   var daily=loadDaily_().filter(function(x){return x.date!==dd.key;}); // กันซ้ำ
   daily.push(day); saveDaily_(daily);
   writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));
+  props.setProperty('LAST_IMPORTED_EMAIL_MS', String(s.time||0));   // จำว่าอีเมลฉบับนี้ import แล้ว (กัน trigger สำรองทำ OCR ซ้ำคืนเดียวกัน)
   var dayS=day.sales.reduce(function(a,c){return a+c.amount;},0);
   Logger.log('✅ เก็บวันที่ '+dd.key+' ('+dd.period+') ยอดขายวันนั้น '+dayS.toLocaleString()+' | สะสม '+daily.length+' วัน');
   // ส่งแจ้งเตือนเฉพาะถ้า "วันนี้ยังไม่เคยแจ้ง" — จำวันที่แจ้งล่าสุดใน Script Properties
   // (ใช้ค่านี้ ไม่ใช่ "มีใน pos_daily" เพราะ backfill ก็เก็บวันโดยไม่แจ้ง → จะพลาดการส่ง)
-  var props=PropertiesService.getScriptProperties();
   if(props.getProperty('LAST_ALERT_DATE')===dd.key){ Logger.log('⏸️ แจ้งเตือน '+dd.key+' ส่งไปแล้ว — ไม่ส่งซ้ำ'); return; }
   sendDailyAlert();                                   // ส่งสรุป+เตือนเข้า LINE เจ้าของ
   props.setProperty('LAST_ALERT_DATE', dd.key);       // จำว่าแจ้งวันนี้แล้ว
@@ -863,7 +867,11 @@ function testPushOwner(){ Logger.log(buildDailyMsg_()); sendDailyAlert(); }
 function setupDailyTrigger(){
   ScriptApp.getProjectTriggers().forEach(function(t){var h=t.getHandlerFunction();
     if(h==='importPosReports'||h==='sendWeeklyAlert') ScriptApp.deleteTrigger(t);});
-  ScriptApp.newTrigger('importPosReports').timeBased().atHour(1).nearMinute(0).everyDays(1).create();   // ดึง POS + สรุปรายวันเข้า LINE (ตี 1 — อีเมล POS เข้า 00:30 เผื่อ 30 นาที)
+  // ดึง POS ตี 1 + ลองซ้ำ ตี 2/3/4/5 — เผื่อรอบตี 1 พลาดด้วยเหตุใดก็ตาม (ไม่ยิง / สะดุดชั่วคราว / อีเมลเข้าช้า)
+  // importPosReports กันทำซ้ำเอง (เช็ค LAST_IMPORTED_EMAIL_MS) → รอบที่ import แล้วจะข้ามก่อน OCR ไม่เปลืองโควต้า
+  [1,2,3,4,5].forEach(function(hr){
+    ScriptApp.newTrigger('importPosReports').timeBased().atHour(hr).nearMinute(0).everyDays(1).create();
+  });
   ScriptApp.newTrigger('sendWeeklyAlert').timeBased().onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(9).nearMinute(0).create(); // สรุปรายสัปดาห์ จันทร์ 9 โมง
-  Logger.log('✅ ตั้งเวลา: ดึง POS+สรุปรายวัน ตี 1 ทุกวัน · สรุปรายสัปดาห์ จันทร์ 9 โมง');
+  Logger.log('✅ ตั้งเวลา: ดึง POS ตี 1–5 (ลองซ้ำจนสำเร็จ) · สรุปรายสัปดาห์ จันทร์ 9 โมง');
 }
