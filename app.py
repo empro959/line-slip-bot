@@ -687,7 +687,8 @@ def extract_ledger(image_bytes: bytes) -> dict:
         "cash = ยอด 'รับ-เงินสด' รวมของวัน = แถวสรุปล่าง (เช่น 'ยอดขาย+รายรับ') คอลัมน์ฝั่ง 'รับ' ช่อง 'สด'\n"
         "transfer = ยอด 'รับ-เงินโอน' รวมของวัน = แถวสรุปล่าง คอลัมน์ฝั่ง 'รับ' ช่อง 'โอน'\n"
         "card = ยอดบัตรเครดิตของวัน ถ้ามีแถวระบุ (เช่น 'ยอดบัตรเครดิต'); ไม่มีใส่ 0\n"
-        "⚠️ เอาเฉพาะ 'ยอดรวมรับของวัน' (แถวสรุป) ไม่ใช่ตัวเลขรายบรรทัดย่อย · อ่านให้แม่นที่สุด ถ้าไม่ชัดจริงๆ ใส่ 0 (อย่าเดา)"
+        "⚠️ เอาเฉพาะ 'ยอดรวมรับของวัน' (แถวสรุป) ไม่ใช่ตัวเลขรายบรรทัดย่อย · อ่านให้แม่นที่สุด ถ้าไม่ชัดจริงๆ ใส่ 0 (อย่าเดา)\n"
+        "⚠️ เลขลายมือระวังสับสน: 1↔7, 0↔6, 4↔9, 3↔8 — ดูหัวเลขให้ชัด · ทวนหลักแรกโดยเฉพาะ (อ่านผิดหลักแรกทำยอดเพี้ยนหลักหมื่น)"
     )
     img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
     response = _gemini_generate([prompt, img_part], model=GEMINI_MODEL_RETRY, json_mode=True)  # ลายมือ → ใช้ตัวเก่ง (pro/flash) เลย
@@ -769,9 +770,22 @@ def _process_recon_image(event, group_id):
     _recon_try_or_queue(group_id, date_iso, hw)   # เทียบทันทีถ้ามี POS แล้ว; ยังไม่มี → เข้าคิว DB ให้ตัวเดินตรวจลองใหม่จน POS เข้า
 
 
+def _recon_misread_hint(h, pv, pos_sales):
+    """เดาว่าค่าจดมือ 'น่าจะบอทอ่านลายมือผิด' ไหม (กรอง false alarm จากลายมือ 1↔7 ฯลฯ)
+    - ช่องเดียวเกินยอดขายรวมทั้งวัน = เป็นไปไม่ได้ → อ่านผิดชัวร์
+    - ต่างกับ POS แค่เลข 'หลักเดียว' (จำนวนหลักเท่ากัน ต่างตำแหน่งเดียว) → น่าจะอ่านผิด 1 ตัว"""
+    if pos_sales > 0 and h > pos_sales * 1.05:
+        return f"จด {h:,.0f} เกินยอดขายรวมทั้งวัน ({pos_sales:,.0f}) — เป็นไปไม่ได้ บอทน่าจะอ่านเลขผิด"
+    sh, sp = str(int(round(h))), str(int(round(pv)))
+    if len(sh) == len(sp) and sh != sp and sum(a != b for a, b in zip(sh, sp)) == 1:
+        return "ต่างกันแค่เลขหลักเดียว — น่าจะบอทอ่านลายมือผิด 1 ตัว (เช่น 1↔7, 0↔6)"
+    return None
+
+
 def _recon_emit(group_id, date_iso, hw, pos):
     """เทียบจดมือ↔POS ที่ดึงมาได้แล้ว → เตือนเฉพาะตอนไม่ตรง (ตรงกัน = เงียบ ตามเจ้าของสั่ง)
-    ช่องที่ไม่ตรงแยกเป็นข้อๆ + บอกทิศทาง (จดมากกว่า/น้อยกว่า POS) ให้ไล่หาง่าย"""
+    ช่องที่ไม่ตรงแยกเป็นข้อๆ + บอกทิศทาง + ตรวจความน่าจะเป็น (กันบอทอ่านลายมือผิดแล้วเตือนหลอก)"""
+    pos_sales = float(pos.get("sales") or 0)
     bad, ok_labels = [], []
     for label, k in (("เงินสด", "cash"), ("เงินโอน", "transfer"), ("บัตรเครดิต", "card")):
         h, pv = float(hw[k]), float(pos.get(k) or 0)
@@ -787,16 +801,29 @@ def _recon_emit(group_id, date_iso, hw, pos):
         return
     lines = [f"⚠️ จดมือ vs POS ไม่ตรง — {date_iso}",
              f"พบ {len(bad)} จุดที่ไม่ตรง", "─────────────────"]
+    suspect = False
     for i, (label, h, pv, diff) in enumerate(bad, 1):
         direction = (f"จดมากกว่า POS {diff:,.0f} บาท" if diff > 0
                      else f"จดน้อยกว่า POS {abs(diff):,.0f} บาท")
         lines += [f"{i}) {label}",
                   f"   จด {h:,.0f} · POS {pv:,.0f}",
                   f"   → {direction}"]
+        hint = _recon_misread_hint(h, pv, pos_sales)
+        if hint:
+            suspect = True
+            lines.append(f"   🔎 {hint}")
     lines.append("─────────────────")
-    lines.append(f"รวมส่วนต่าง (จด−POS): {sum(d for *_ , d in bad):+,.0f} บาท")
+    # ตรวจไขว้กับยอดอื่น: รวมรับ 3 ช่องจดมือ ควรใกล้เคียงรวมของ POS + ไม่เกินยอดขายรวมทั้งวัน
+    hw_total = float(hw["cash"]) + float(hw["transfer"]) + float(hw["card"])
+    pos_total = float(pos.get("cash") or 0) + float(pos.get("transfer") or 0) + float(pos.get("card") or 0)
+    lines.append(f"รวมรับ 3 ช่อง: จด {hw_total:,.0f} · POS {pos_total:,.0f}")
+    if pos_sales:
+        lines.append(f"(ยอดขายรวมทั้งวัน POS: {pos_sales:,.0f})")
+    lines.append(f"ส่วนต่างสุทธิ (จด−POS): {sum(d for *_ , d in bad):+,.0f} บาท")
     if ok_labels:
         lines.append(f"✅ ตรง: {', '.join(ok_labels)}")
+    if suspect:
+        lines.append("🔎 มีเลขที่ดู 'ผิดปกติ' — น่าจะบอทอ่านลายมือผิด ให้เช็กเลขที่มี 🔎 ก่อนตัดสินว่าไม่ตรงจริง")
     lines.append("(บอทอ่านลายมือ อาจคลาดเคลื่อน — เช็กตัวเลขก่อนตัดสิน)")
     _push(group_id, TextSendMessage(text="\n".join(lines)))
 
