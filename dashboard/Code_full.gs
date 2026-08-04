@@ -404,6 +404,47 @@ function parseBills_(text){
   return m?parseInt(m[1].replace(/,/g,''),10)||0:0;
 }
 
+// แกะ "ลูกค้าที่ค้างชำระ" จากรายงานแยกลูกค้า → [{name,id,amount(รวมภาษี)}]
+// ฟอร์แมต OCR ไทย: บล็อกละ 6 บรรทัด = รหัส / ชื่อ / จำนวน / ยอด(ไม่รวมภาษี) / ภาษี / ยอด(รวมภาษี)
+// นับเฉพาะลูกค้าที่ชื่อมีคำว่า 'ค้างชำระ' (บัญชีเปิดบิลค้าง)
+function parseCustomerCredit_(text){
+  if(!text) return [];
+  var L=text.split(/[\n\r]+/).map(function(x){return x.trim();}).filter(function(x){return x;});
+  var num=function(s){s=String(s).replace(/,/g,''); return /^-?\d+(\.\d+)?$/.test(s)?parseFloat(s):null;};
+  var isId=function(s){return /^\d{2,}$/.test(s);};   // รหัสลูกค้า = เลขล้วน (000000028 / 001)
+  var out=[];
+  for(var i=0;i+5<L.length;i++){
+    var id=L[i], name=L[i+1], cnt=num(L[i+2]), exc=num(L[i+3]), tax=num(L[i+4]), inc=num(L[i+5]);
+    if(isId(id) && !/^-?\d/.test(name) && /[ก-๙A-Za-z]/.test(name) && cnt!==null && exc!==null && tax!==null && inc!==null){
+      if(name.indexOf('ค้างชำระ')>=0) out.push({name:name,id:id,amount:Math.round(inc*100)/100});
+      i+=5;   // ข้ามทั้งบล็อก (ลูป i++ ต่อ → ไปบล็อกถัดไป)
+    }
+  }
+  return out;
+}
+
+// เติม "ค้างชำระรายลูกค้า" ให้วันเก่าใน pos_daily (OCR แค่รายงานลูกค้า 1 ไฟล์/วัน) — รันซ้ำได้จนครบ
+function backfillCredit(){
+  var threads=GmailApp.search('has:attachment filename:pdf newer_than:40d',0,80), cust={};
+  threads.forEach(function(t){t.getMessages().forEach(function(msg){msg.getAttachments().forEach(function(at){
+    var n=at.getName(), mm=n.match(/_(\d+)\.pdf$/i);
+    if(mm && /SalesSummaryReportByCustomer|แยกตามลูกค้า/i.test(n) && !cust[mm[1]]) cust[mm[1]]=at;
+  });});});
+  var daily=loadDaily_(), byDate={}; daily.forEach(function(d){byDate[d.date]=d;});
+  var sufs=Object.keys(cust).sort().reverse(), added=0, ocr=0;
+  for(var i=0;i<sufs.length && added<15;i++){
+    var txt; try{ txt=pdfToText_(cust[sufs[i]].copyBlob()); ocr++; }
+    catch(e){ Logger.log('⏳ OCR หยุดที่ '+sufs[i]+' (โควตา?) — รอแล้วรันซ้ำ: '+(e&&e.message?e.message:e)); break; }
+    var dd=dailyDate_(txt); if(!dd) continue;
+    var day=byDate[dd.key];
+    if(!day || Array.isArray(day.credit)) continue;   // ไม่มีวันนี้ / มี credit แล้ว (เช่นวันที่ 16 ใส่มือ) → ข้าม
+    day.credit=parseCustomerCredit_(txt); added++;
+    Logger.log('เก็บค้างชำระ '+dd.key+' — '+day.credit.length+' คน รวม '+day.credit.reduce(function(a,c){return a+c.amount;},0).toFixed(2));
+  }
+  saveDaily_(daily); writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));
+  Logger.log('✅ backfillCredit เพิ่ม '+added+' วัน (OCR '+ocr+' ครั้ง) — รันซ้ำได้ถ้ายังไม่ครบ');
+}
+
 // เก็บ 1 วัน (รายงานล่าสุด) แล้ว rebuild — ให้ trigger เรียกตัวนี้ทุกวัน
 function importPosReports(){
   var s=findLatestPdf_('SaleReport'), p=findLatestPdf_('PayoutReport');
@@ -414,8 +455,9 @@ function importPosReports(){
   if(!dd){Logger.log('อ่านวันที่ไม่ได้ ข้าม');return;}
   var balText=b?pdfToText_(b.blob):'';
   var pay=balText?parseBalance_(balText):{}, zones=balText?parseBalanceZones_(balText):{};
-  var c=findLatestPdf_('SalesSummaryReportByCustomer'); var bills=0; try{ if(c) bills=parseBills_(pdfToText_(c.blob)); }catch(e){}
-  var day={date:dd.key,period:dd.period,sales:parseSale_(st).cats,expenses:parsePayout_(pt).records,payments:pay,menu:parseSaleItems_(st),zones:zones,voids:parseVoids_(st),bills:bills};
+  var c=findLatestPdf_('SalesSummaryReportByCustomer'); var bills=0, credit=[];
+  try{ if(c){ var ct=pdfToText_(c.blob); bills=parseBills_(ct); credit=parseCustomerCredit_(ct); } }catch(e){}
+  var day={date:dd.key,period:dd.period,sales:parseSale_(st).cats,expenses:parsePayout_(pt).records,payments:pay,menu:parseSaleItems_(st),zones:zones,voids:parseVoids_(st),bills:bills,credit:credit};
   var daily=loadDaily_().filter(function(x){return x.date!==dd.key;}); // กันซ้ำ
   daily.push(day); saveDaily_(daily);
   writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));
@@ -469,9 +511,9 @@ function backfillPos(){
       bt=bal[sufs[i]]?pdfToText_(bal[sufs[i]].copyBlob()):'';
     }catch(e){ Logger.log('⏳ หยุดที่ suffix '+sufs[i]+' — error จริง: '+(e&&e.message?e.message:e)); break; }
     var pm=bt?parseBalance_(bt):{}, zn=bt?parseBalanceZones_(bt):{};
-    var bills=0; try{ if(cust[sufs[i]]) bills=parseBills_(pdfToText_(cust[sufs[i]].copyBlob())); }catch(e2){}  // จำนวนบิล (ถ้ามีรายงานลูกค้า)
+    var bills=0, credit=[]; try{ if(cust[sufs[i]]){ var ct=pdfToText_(cust[sufs[i]].copyBlob()); bills=parseBills_(ct); credit=parseCustomerCredit_(ct); } }catch(e2){}  // จำนวนบิล + ค้างชำระรายลูกค้า
     daily=daily.filter(function(x){return x.date!==dd.key;});
-    daily.push({date:dd.key,period:dd.period,sales:parseSale_(st).cats,expenses:parsePayout_(pt).records,payments:pm,menu:parseSaleItems_(st),zones:zn,voids:parseVoids_(st),bills:bills});
+    daily.push({date:dd.key,period:dd.period,sales:parseSale_(st).cats,expenses:parsePayout_(pt).records,payments:pm,menu:parseSaleItems_(st),zones:zn,voids:parseVoids_(st),bills:bills,credit:credit});
     haveFull[dd.key]=true; added++; Logger.log('เก็บ '+dd.key);
   }
   saveDaily_(daily); writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));
