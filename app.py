@@ -74,8 +74,9 @@ STAFF_GROUP_ID    = os.environ.get("STAFF_GROUP_ID", "") or (SLIP_GROUPS[0] if S
 RECON_GROUPS = [g.strip() for g in os.environ.get("RECON_GROUPS", "").split(",") if g.strip()]
 SYNC_URL = os.environ.get("SYNC_URL", "").strip()          # ลิงก์ Apps Script /exec (ตัวเดียวกับ dashboard) — ดึงยอด POS มาเทียบ
 RECON_MIN_DIFF = float(os.environ.get("RECON_MIN_DIFF", "1"))  # ต่างเกินกี่บาทถึงเตือน (กัน rounding)
-RECON_POS_WAIT  = int(os.environ.get("RECON_POS_WAIT", "900"))  # ถ้าจดมือมาก่อน POS → รอกี่วินาที/รอบ แล้วลองดึง POS ใหม่ (15 นาที)
-RECON_POS_TRIES = int(os.environ.get("RECON_POS_TRIES", "16"))  # ลองดึง POS กี่รอบ (16×15นาที = รอได้ ~4 ชม. · POS เข้าตี1 สมุดมาเร็วก็รอทัน)
+RECON_POS_WAIT  = int(os.environ.get("RECON_POS_WAIT", "900"))  # จดมือมาก่อน POS → เว้นกี่วินาทีค่อยลองดึง POS ใหม่ (15 นาที · ไม่กระทบเงิน แค่ยิง GET ถาม Apps Script)
+RECON_MAX_WAIT  = int(os.environ.get("RECON_MAX_WAIT", "28800"))  # รอ POS เข้าระบบได้นานสุดกี่วินาที (ดีฟอลต์ 8 ชม. · จดมือส่งหัวค่ำ POS เข้าตี1 ก็ยังรอทัน) แล้วค่อยยอมแพ้/เตือนว่าเทียบไม่ได้
+# (RECON_POS_TRIES เดิมเลิกใช้แล้ว — เปลี่ยนมาเก็บคิวใน DB ให้ตัวเดินตรวจลองใหม่จน POS เข้า ทน worker recycle · env เก่าตั้งไว้ไม่เป็นไร ระบบไม่อ่านแล้ว)
 # redirect รายงาน: ส่งรายงานของ "กลุ่มต้นทาง" ไปเข้า "กลุ่มปลายทาง" แทน (เนื้อห้ารายงานยังเป็นของต้นทาง)
 # รูปแบบ "ต้นทาง:ปลายทาง,ต้นทาง2:ปลายทาง2" — ครอบทุกรายงาน (สลิป/จอง/หนี้). ตั้งบน Render กัน repo public เห็น group id
 REPORT_REDIRECT   = {}
@@ -501,6 +502,22 @@ def init_db():
                 conn.execute(f"ALTER TABLE payable_bills ADD COLUMN paid {_REAL} DEFAULT 0")
             except Exception:
                 pass
+        # คิวเทียบยอด 'จดมือ ↔ POS' ที่จดมือมาก่อน POS — เก็บใน DB (ไม่ใช่ Timer ในหน่วยความจำ)
+        # → ทน worker recycle/รีสตาร์ท: ตัวเดินตรวจ (_recon_tick) อ่านคิวนี้มาลองเทียบใหม่เรื่อยๆ จน POS เข้าระบบ
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS recon_pending (
+                id             {_PK},
+                group_id       TEXT,
+                date_iso       TEXT,
+                cash           {_REAL},
+                transfer       {_REAL},
+                card           {_REAL},
+                created_epoch  {_REAL},
+                deadline_epoch {_REAL},
+                next_try_epoch {_REAL}
+            )
+        """)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS recon_pending_uk ON recon_pending(group_id, date_iso)")
         conn.commit()
 try:
     _ensure_init()
@@ -741,26 +758,14 @@ def _process_recon_image(event, group_id):
         return
     date_iso = _sane_doc_date(info.get("date")) or datetime.now(TZ).date().isoformat()
     hw = {"cash": float(info.get("cash") or 0), "transfer": float(info.get("transfer") or 0), "card": float(info.get("card") or 0)}
-    _recon_compare(group_id, date_iso, hw, RECON_POS_TRIES)   # เทียบทันที ถ้ายังไม่มี POS จะรอแล้วลองใหม่เอง
+    _recon_try_or_queue(group_id, date_iso, hw)   # เทียบทันทีถ้ามี POS แล้ว; ยังไม่มี → เข้าคิว DB ให้ตัวเดินตรวจลองใหม่จน POS เข้า
 
 
-def _recon_compare(group_id, date_iso, hw, tries_left):
-    """เทียบจดมือ↔POS — ถ้ายอด POS ของวันยังไม่เข้าระบบ (จดมือมาก่อน POS) รอ RECON_POS_WAIT แล้วลองใหม่
-    จนครบ RECON_POS_TRIES รอบ (รอ ~30 นาที) · เตือนเฉพาะตอนไม่ตรง"""
-    pos = _fetch_pos_day(date_iso, fresh=True)
-    if not pos:
-        if tries_left > 1:
-            print(f"[recon] {date_iso} ยังไม่มียอด POS — รอ {RECON_POS_WAIT}s ลองใหม่ (เหลือ {tries_left-1} รอบ)", flush=True)
-            threading.Timer(RECON_POS_WAIT, _recon_compare, args=(group_id, date_iso, hw, tries_left - 1)).start()
-        else:
-            _push(group_id, TextSendMessage(text=(
-                f"📓 อ่านสมุดจดมือ {date_iso}\nสด {hw['cash']:,.0f} · โอน {hw['transfer']:,.0f}"
-                + (f" · บัตร {hw['card']:,.0f}" if hw['card'] else "")
-                + "\n⚠️ รอ POS แล้วไม่เข้าระบบ (หรือยังไม่ตั้ง SYNC_URL) — เทียบไม่ได้ ตรวจเองนะครับ")))
-        return
+def _recon_emit(group_id, date_iso, hw, pos):
+    """เทียบจดมือ↔POS ที่ดึงมาได้แล้ว → เตือนเฉพาะตอนไม่ตรง (ตรงกัน = เงียบ ตามเจ้าของสั่ง)"""
     rows, mismatch = [], False
     for label, k in (("สด", "cash"), ("โอน", "transfer"), ("บัตร", "card")):
-        h, pv = hw[k], float(pos.get(k) or 0)
+        h, pv = float(hw[k]), float(pos.get(k) or 0)
         if h == 0 and pv == 0:
             continue
         diff = h - pv
@@ -773,6 +778,77 @@ def _recon_compare(group_id, date_iso, hw, tries_left):
         return
     _push(group_id, TextSendMessage(text=f"⚠️ จดมือ vs POS ไม่ตรง — {date_iso}\n─────────────\n"
         + "\n".join(rows) + "\n(บอทอ่านลายมือ อาจคลาดเคลื่อน — เช็กตัวเลขก่อนตัดสิน)"))
+
+
+def _recon_pending_del(group_id, date_iso):
+    try:
+        with _db() as conn:
+            conn.execute("DELETE FROM recon_pending WHERE group_id=? AND date_iso=?", (group_id, date_iso))
+            conn.commit()
+    except Exception as e:
+        print(f"[recon] ลบคิวไม่ได้ {date_iso}: {e}", flush=True)
+
+
+def _recon_try_or_queue(group_id, date_iso, hw):
+    """เทียบทันทีถ้ายอด POS ของวันเข้าระบบแล้ว; ถ้ายังไม่เข้า (จดมือมาก่อน POS) → บันทึกลงคิว DB
+    ให้ตัวเดินตรวจ (_recon_tick) มาลองเทียบใหม่เรื่อยๆ จน POS เข้า หรือหมดเวลา RECON_MAX_WAIT
+    เก็บใน DB แทน threading.Timer → ทน worker recycle/รีสตาร์ท (Timer ในหน่วยความจำหายเมื่อ gunicorn รีไซเคิล worker)"""
+    pos = _fetch_pos_day(date_iso, fresh=True)
+    if pos:
+        _recon_emit(group_id, date_iso, hw, pos)
+        _recon_pending_del(group_id, date_iso)   # เผื่อมีคิวค้างจากรอบก่อน
+        return
+    now = time.time()
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO recon_pending(group_id,date_iso,cash,transfer,card,created_epoch,deadline_epoch,next_try_epoch) "
+                "VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(group_id,date_iso) DO UPDATE SET "
+                "cash=excluded.cash, transfer=excluded.transfer, card=excluded.card, "
+                "deadline_epoch=excluded.deadline_epoch, next_try_epoch=excluded.next_try_epoch",
+                (group_id, date_iso, hw["cash"], hw["transfer"], hw["card"],
+                 now, now + RECON_MAX_WAIT, now + RECON_POS_WAIT))
+            conn.commit()
+        print(f"[recon] {date_iso} ยังไม่มียอด POS — เข้าคิวรอ (เช็คทุก {RECON_POS_WAIT}s สูงสุด ~{RECON_MAX_WAIT/3600:.0f} ชม. จน POS เข้า)", flush=True)
+    except Exception as e:
+        print(f"[recon] เข้าคิวไม่ได้ {date_iso}: {e}", flush=True)
+
+
+def _recon_tick():
+    """ตัวเดินตรวจคิวเทียบยอด — เรียกเป็นระยะจาก scheduler loop เดียว (ไม่สร้าง thread ต่อใบ)
+    อ่านคิวจาก DB → ถึงคิวไหน POS เข้าแล้วก็เทียบ+ลบ, ยังไม่เข้าก็เลื่อนไปลองรอบหน้า, เกินเวลาก็ยอมแพ้
+    DB-driven → ทำงานต่อได้แม้ worker เพิ่งรีสตาร์ท (ไม่พึ่ง state ในหน่วยความจำ)"""
+    now = time.time()
+    try:
+        with _db() as conn:
+            due = [dict(r) for r in conn.execute(
+                "SELECT * FROM recon_pending WHERE next_try_epoch<=?", (now,)).fetchall()]
+    except Exception as e:
+        print(f"[recon] tick อ่านคิวไม่ได้: {e}", flush=True)
+        return
+    for r in due:
+        gid, d = r["group_id"], r["date_iso"]
+        hw = {"cash": float(r["cash"] or 0), "transfer": float(r["transfer"] or 0), "card": float(r["card"] or 0)}
+        pos = _fetch_pos_day(d, fresh=True)
+        if pos:
+            _recon_emit(gid, d, hw, pos)
+            _recon_pending_del(gid, d)
+        elif now >= float(r["deadline_epoch"] or 0):
+            _push(gid, TextSendMessage(text=(
+                f"📓 อ่านสมุดจดมือ {d}\nสด {hw['cash']:,.0f} · โอน {hw['transfer']:,.0f}"
+                + (f" · บัตร {hw['card']:,.0f}" if hw['card'] else "")
+                + "\n⚠️ รอ POS นานแล้วยังไม่เข้าระบบ (หรือดึง POS ไม่ได้) — เทียบไม่ได้ ตรวจเองนะครับ")))
+            _recon_pending_del(gid, d)
+            print(f"[recon] {d} หมดเวลารอ POS ({RECON_MAX_WAIT/3600:.0f} ชม.) — เลิกรอ", flush=True)
+        else:
+            try:
+                with _db() as conn:
+                    conn.execute("UPDATE recon_pending SET next_try_epoch=? WHERE group_id=? AND date_iso=?",
+                                 (now + RECON_POS_WAIT, gid, d))
+                    conn.commit()
+            except Exception as e:
+                print(f"[recon] เลื่อนคิวไม่ได้ {d}: {e}", flush=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1306,8 +1382,10 @@ def _dining_schedule(group_id: str, info: dict):
     with _dining_q_lock:
         _dining_q.append((time.time() + DINING_MATCH_DELAY, group_id, info))
 
+_recon_last_tick = [0.0]   # กัน _recon_tick ยิง POS ถี่ — เดินตรวจคิวทุก ~60 วิพอ (POS เข้าวันละครั้ง)
 def _dining_scheduler_loop():
-    """thread เดียวเดินตรวจคิวทุก ~5 วิ — ถึงเวลาแล้วค่อยจับคู่+เตือน (ประหยัด thread/memory กว่า Timer ต่อใบ)"""
+    """thread เดียวเดินตรวจคิวทุก ~5 วิ — ถึงเวลาแล้วค่อยจับคู่+เตือน (ประหยัด thread/memory กว่า Timer ต่อใบ)
+    พ่วงเดินตรวจคิวเทียบยอด POS↔จดมือ (_recon_tick) ทุก ~60 วิ ในเธรดเดียวกัน (ไม่เพิ่ม thread)"""
     while True:
         try:
             now = time.time()
@@ -1319,6 +1397,12 @@ def _dining_scheduler_loop():
                 _dining_compare_and_push(gid, info)
         except Exception as e:
             print(f"[dining-sched] loop error: {e}", flush=True)
+        try:
+            if RECON_GROUPS and time.time() - _recon_last_tick[0] >= 60:
+                _recon_last_tick[0] = time.time()
+                _recon_tick()
+        except Exception as e:
+            print(f"[recon] tick error: {e}", flush=True)
         time.sleep(5)
 
 
