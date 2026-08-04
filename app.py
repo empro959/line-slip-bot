@@ -70,6 +70,10 @@ BAR_GROUP_ID      = os.environ.get("BAR_GROUP_ID", "")
 # กลุ่ม "staff" — จองวันนี้จากกลุ่มไหนก็ตามส่งการ์ด+ปุ่มมาที่นี่ให้ staff คอนเฟิร์ม + เป็นปลายทางสรุปจองรายวัน
 # ดีฟอลต์ = กลุ่มส่งสลิป (SLIP_GROUPS[0]) เพราะเจ้าของยืนยันว่า staff = กลุ่มเดียวกับกลุ่มส่งสลิป
 STAFF_GROUP_ID    = os.environ.get("STAFF_GROUP_ID", "") or (SLIP_GROUPS[0] if SLIP_GROUPS else "")
+# กลุ่ม "เทียบยอด POS ↔ จดมือ" — บอทอ่านรูป 'สมุดจดมือรายวัน' ในกลุ่มนี้อัตโนมัติ (Gemini แยกเองว่าเป็นสมุด ไม่ใช่สลิป/ใบ POS)
+RECON_GROUPS = [g.strip() for g in os.environ.get("RECON_GROUPS", "").split(",") if g.strip()]
+SYNC_URL = os.environ.get("SYNC_URL", "").strip()          # ลิงก์ Apps Script /exec (ตัวเดียวกับ dashboard) — ดึงยอด POS มาเทียบ
+RECON_MIN_DIFF = float(os.environ.get("RECON_MIN_DIFF", "1"))  # ต่างเกินกี่บาทถึงเตือน (กัน rounding)
 # redirect รายงาน: ส่งรายงานของ "กลุ่มต้นทาง" ไปเข้า "กลุ่มปลายทาง" แทน (เนื้อห้ารายงานยังเป็นของต้นทาง)
 # รูปแบบ "ต้นทาง:ปลายทาง,ต้นทาง2:ปลายทาง2" — ครอบทุกรายงาน (สลิป/จอง/หนี้). ตั้งบน Render กัน repo public เห็น group id
 REPORT_REDIRECT   = {}
@@ -646,6 +650,102 @@ def extract_payable_doc(image_bytes: bytes, retry: bool = False) -> dict:
     response = _gemini_generate([prompt, img_part], model=(GEMINI_MODEL_RETRY if retry else None), json_mode=True)
     # parse แบบทนทาน: ถ้าโมเดลตอบไม่เป็น JSON ให้ถือว่า 'อื่นๆ' (ไม่ใช่บิล/สลิป) แทนที่จะ error
     return _parse_gemini_json(response, {"doc_type": "other", "amount": 0})
+
+
+def extract_ledger(image_bytes: bytes) -> dict:
+    """อ่าน 'สมุดจดมือรายวัน' (ลายมือ) → ดึงเฉพาะยอดสรุปรับของวัน: สด/โอน/บัตร + วันที่
+    คืน JSON {is_ledger, date, cash, transfer, card} — is_ledger=false ถ้าไม่ใช่สมุด (ใบ POS พิมพ์/สลิป/รูปอื่น)"""
+    prompt = (
+        "รูปนี้อยู่ในกลุ่มสรุปบัญชีร้านอาหาร อาจเป็น 'สมุดบัญชีรายวันเขียนด้วยลายมือ' หรืออย่างอื่น (ใบ POS พิมพ์/ใบเสร็จ/สลิปโอนธนาคาร/รูปทั่วไป)\n"
+        "ตอบ JSON เท่านั้น ไม่มีข้อความอื่น:\n"
+        '{"is_ledger":true,"date":null,"cash":0,"transfer":0,"card":0}\n\n'
+        "is_ledger:\n"
+        "  - true = 'สมุด/ตารางเขียนด้วยลายมือ' ที่สรุปรับ-จ่ายรายวัน (มีคอลัมน์ รับ สด/โอน เขียนมือ)\n"
+        "  - false = เอกสารพิมพ์ (ใบ POS/ใบเสร็จ), สลิปโอนธนาคาร, หรือรูปอื่น → ที่เหลือใส่ 0/null\n"
+        "date: วันที่บนหน้าสมุด (มักมุมบนขวา เช่น '3/8') แปลงเป็น ค.ศ. YYYY-MM-DD (ปีปัจจุบัน 2026 ถ้าไม่ระบุ; พ.ศ.ลบ 543); อ่านไม่ได้ใส่ null\n"
+        "cash = ยอด 'รับ-เงินสด' รวมของวัน = แถวสรุปล่าง (เช่น 'ยอดขาย+รายรับ') คอลัมน์ฝั่ง 'รับ' ช่อง 'สด'\n"
+        "transfer = ยอด 'รับ-เงินโอน' รวมของวัน = แถวสรุปล่าง คอลัมน์ฝั่ง 'รับ' ช่อง 'โอน'\n"
+        "card = ยอดบัตรเครดิตของวัน ถ้ามีแถวระบุ (เช่น 'ยอดบัตรเครดิต'); ไม่มีใส่ 0\n"
+        "⚠️ เอาเฉพาะ 'ยอดรวมรับของวัน' (แถวสรุป) ไม่ใช่ตัวเลขรายบรรทัดย่อย · อ่านให้แม่นที่สุด ถ้าไม่ชัดจริงๆ ใส่ 0 (อย่าเดา)"
+    )
+    img_part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+    response = _gemini_generate([prompt, img_part], model=GEMINI_MODEL_RETRY, json_mode=True)  # ลายมือ → ใช้ตัวเก่ง (pro/flash) เลย
+    return _parse_gemini_json(response, {"is_ledger": False})
+
+
+_pos_load_cache = {}   # cache ผล action=load (ทั้งก้อน) 10 นาที กันยิง Apps Script ถี่
+def _fetch_pos_day(date_iso: str):
+    """ดึงยอด POS ของวัน (สด/โอน/บัตร/ยอดขาย) จาก Apps Script /exec?action=load — cache 10 นาที
+    คืน {cash,transfer,card,sales} หรือ None (ยังไม่ตั้ง SYNC_URL / ดึงไม่ได้ / ไม่มีวันนั้น)"""
+    if not SYNC_URL:
+        return None
+    now = time.time()
+    cached = _pos_load_cache.get("all")
+    if cached and cached[1] > now:
+        months = cached[0]
+    else:
+        try:
+            j = requests.get(SYNC_URL, params={"action": "load"}, timeout=25).json()
+            months = j.get("data") if isinstance(j, dict) else None
+            if not isinstance(months, list):
+                return None
+            _pos_load_cache["all"] = (months, now + 600)
+        except Exception as e:
+            print(f"[recon] ดึง POS ไม่ได้: {e}", flush=True)
+            return None
+    for m in months:
+        for d in (m.get("payment_days") or []):
+            if d.get("date") == date_iso:
+                p = d.get("payments") or {}
+                sales = 0
+                for dt in (m.get("daily_totals") or []):
+                    if dt.get("date") == date_iso:
+                        sales = dt.get("sales") or 0
+                        break
+                return {"cash": float(p.get("เงินสด") or 0), "transfer": float(p.get("เงินโอน") or 0),
+                        "card": float(p.get("บัตรเครดิต") or 0), "sales": float(sales)}
+    return None
+
+
+def _process_recon_image(event, group_id):
+    """รูปในกลุ่มเทียบยอด → ถ้าเป็น 'สมุดจดมือ' อ่านยอดรับ (สด/โอน/บัตร) เทียบ POS วันเดียวกัน → เตือนถ้าไม่ตรง
+    รูปอื่น (ใบ POS/สลิป) → เงียบ · ทำครั้งเดียว/รูป (กัน webhook redelivery)"""
+    if not _msg_once(getattr(event.message, "id", None), "recon"):
+        return
+    try:
+        content = line_bot_api.get_message_content(event.message.id)
+        image_bytes = b"".join(chunk for chunk in content.iter_content())
+        info = extract_ledger(image_bytes)
+    except Exception as e:
+        print(f"[recon] อ่านรูปไม่สำเร็จ group={group_id}: {e}", flush=True)
+        return
+    if not info.get("is_ledger"):
+        print(f"[recon] ไม่ใช่สมุดจดมือ (ข้าม) group={group_id}", flush=True)
+        return
+    date_iso = _sane_doc_date(info.get("date")) or datetime.now(TZ).date().isoformat()
+    hw = {"cash": float(info.get("cash") or 0), "transfer": float(info.get("transfer") or 0), "card": float(info.get("card") or 0)}
+    pos = _fetch_pos_day(date_iso)
+    if not pos:
+        _push(group_id, TextSendMessage(text=(
+            f"📓 อ่านสมุดจดมือ {date_iso}\nสด {hw['cash']:,.0f} · โอน {hw['transfer']:,.0f}"
+            + (f" · บัตร {hw['card']:,.0f}" if hw['card'] else "")
+            + "\n⚠️ เทียบ POS ไม่ได้ (ยังไม่ได้ตั้ง SYNC_URL หรือยังไม่มียอด POS ของวันนี้)")))
+        return
+    rows, mismatch = [], False
+    for label, k in (("สด", "cash"), ("โอน", "transfer"), ("บัตร", "card")):
+        h, pv = hw[k], float(pos.get(k) or 0)
+        if h == 0 and pv == 0:
+            continue
+        diff = h - pv
+        ok = abs(diff) <= RECON_MIN_DIFF
+        if not ok:
+            mismatch = True
+        rows.append(f"{label} · จด {h:,.0f} · POS {pv:,.0f} · {'✅' if ok else f'{diff:+,.0f} ⚠️'}")
+    if not mismatch:
+        print(f"[recon] {date_iso} ตรง — ไม่เตือน (เจ้าของสั่งเตือนเฉพาะไม่ตรง)", flush=True)
+        return
+    _push(group_id, TextSendMessage(text=f"⚠️ จดมือ vs POS ไม่ตรง — {date_iso}\n─────────────\n"
+        + "\n".join(rows) + "\n(บอทอ่านลายมือ อาจคลาดเคลื่อน — เช็กตัวเลขก่อนตัดสิน)"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3359,7 +3459,7 @@ def _download_image_event(event):
     """ขั้น 'โหลดรูป' ทำทันที (concurrency สูง) — สลิปโหลดที่นี่แล้วส่ง bytes เข้าคิวอ่าน
     กลุ่มเจ้าหนี้/เมิน/ไม่เปิดสลิป → ส่งต่อให้ worker เดิมจัดการ (payable โหลดเองในนั้น)"""
     group_id = getattr(event.source, "group_id", event.source.user_id)
-    if group_id in IGNORE_GROUPS or group_id in PAYABLE_GROUPS or not _slip_enabled(group_id):
+    if group_id in IGNORE_GROUPS or group_id in PAYABLE_GROUPS or group_id in RECON_GROUPS or not _slip_enabled(group_id):
         _slip_pool.submit(_process_image_event, event)
         return
     # จองสิทธิ์ 'รูปค้าง RAM' ก่อนโหลด — เต็มโควตาจะบล็อกที่นี่ (backpressure กัน memory บวมช่วง burst)
@@ -3418,6 +3518,9 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
     if group_id in IGNORE_GROUPS:
         return   # กลุ่มที่สั่งให้เมินทั้งหมด → ไม่ทำอะไรเลย
     _clear_group_left(group_id)   # มีรูปเข้ามา = บอทยังอยู่ในกลุ่ม → ปลดมาร์ค left ถ้าเคยติด (self-heal)
+    if group_id in RECON_GROUPS:
+        _process_recon_image(event, group_id)      # กลุ่มเทียบยอด → อ่านสมุดจดมือ เทียบ POS (Gemini แยกเองว่าเป็นสมุดไหม)
+        return
     if group_id in PAYABLE_GROUPS:
         _process_payable_image(event, group_id)   # กลุ่มเจ้าหนี้ → บิล/สลิปจ่าย (ไม่ทำระบบสลิปปกติ)
         return
