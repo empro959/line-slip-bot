@@ -762,22 +762,35 @@ def _process_recon_image(event, group_id):
 
 
 def _recon_emit(group_id, date_iso, hw, pos):
-    """เทียบจดมือ↔POS ที่ดึงมาได้แล้ว → เตือนเฉพาะตอนไม่ตรง (ตรงกัน = เงียบ ตามเจ้าของสั่ง)"""
-    rows, mismatch = [], False
-    for label, k in (("สด", "cash"), ("โอน", "transfer"), ("บัตร", "card")):
+    """เทียบจดมือ↔POS ที่ดึงมาได้แล้ว → เตือนเฉพาะตอนไม่ตรง (ตรงกัน = เงียบ ตามเจ้าของสั่ง)
+    ช่องที่ไม่ตรงแยกเป็นข้อๆ + บอกทิศทาง (จดมากกว่า/น้อยกว่า POS) ให้ไล่หาง่าย"""
+    bad, ok_labels = [], []
+    for label, k in (("เงินสด", "cash"), ("เงินโอน", "transfer"), ("บัตรเครดิต", "card")):
         h, pv = float(hw[k]), float(pos.get(k) or 0)
         if h == 0 and pv == 0:
             continue
         diff = h - pv
-        ok = abs(diff) <= RECON_MIN_DIFF
-        if not ok:
-            mismatch = True
-        rows.append(f"{label} · จด {h:,.0f} · POS {pv:,.0f} · {'✅' if ok else f'{diff:+,.0f} ⚠️'}")
-    if not mismatch:
+        if abs(diff) <= RECON_MIN_DIFF:
+            ok_labels.append(label)
+        else:
+            bad.append((label, h, pv, diff))
+    if not bad:
         print(f"[recon] {date_iso} ตรง — ไม่เตือน (เจ้าของสั่งเตือนเฉพาะไม่ตรง)", flush=True)
         return
-    _push(group_id, TextSendMessage(text=f"⚠️ จดมือ vs POS ไม่ตรง — {date_iso}\n─────────────\n"
-        + "\n".join(rows) + "\n(บอทอ่านลายมือ อาจคลาดเคลื่อน — เช็กตัวเลขก่อนตัดสิน)"))
+    lines = [f"⚠️ จดมือ vs POS ไม่ตรง — {date_iso}",
+             f"พบ {len(bad)} จุดที่ไม่ตรง", "─────────────────"]
+    for i, (label, h, pv, diff) in enumerate(bad, 1):
+        direction = (f"จดมากกว่า POS {diff:,.0f} บาท" if diff > 0
+                     else f"จดน้อยกว่า POS {abs(diff):,.0f} บาท")
+        lines += [f"{i}) {label}",
+                  f"   จด {h:,.0f} · POS {pv:,.0f}",
+                  f"   → {direction}"]
+    lines.append("─────────────────")
+    lines.append(f"รวมส่วนต่าง (จด−POS): {sum(d for *_ , d in bad):+,.0f} บาท")
+    if ok_labels:
+        lines.append(f"✅ ตรง: {', '.join(ok_labels)}")
+    lines.append("(บอทอ่านลายมือ อาจคลาดเคลื่อน — เช็กตัวเลขก่อนตัดสิน)")
+    _push(group_id, TextSendMessage(text="\n".join(lines)))
 
 
 def _recon_pending_del(group_id, date_iso):
