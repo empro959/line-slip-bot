@@ -688,14 +688,19 @@ def _fetch_pos_day(date_iso: str, fresh: bool = False):
     if cached and cached[1] > now and not fresh:
         months = cached[0]
     else:
+        resp = None
         try:
-            j = requests.get(SYNC_URL, params={"action": "load"}, timeout=25).json()
+            resp = requests.get(SYNC_URL, params={"action": "load"}, timeout=25, allow_redirects=True)
+            j = json.loads(resp.text)
             months = j.get("data") if isinstance(j, dict) else None
             if not isinstance(months, list):
+                print(f"[recon] POS ไม่ใช่ list — body={resp.text[:150]!r}", flush=True)
                 return None
             _pos_load_cache["all"] = (months, now + 600)
         except Exception as e:
-            print(f"[recon] ดึง POS ไม่ได้: {e}", flush=True)
+            body = resp.text[:150] if resp is not None else ""
+            # ถ้า body เป็น HTML (<) = Web App ตั้งสิทธิ์ผิด (ต้อง 'Anyone') บอทเลยโดนหน้า login แทน JSON
+            print(f"[recon] ดึง POS ไม่ได้: {e} | body={body!r}", flush=True)
             return None
     for m in months:
         for d in (m.get("payment_days") or []):
