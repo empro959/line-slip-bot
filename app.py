@@ -74,8 +74,8 @@ STAFF_GROUP_ID    = os.environ.get("STAFF_GROUP_ID", "") or (SLIP_GROUPS[0] if S
 RECON_GROUPS = [g.strip() for g in os.environ.get("RECON_GROUPS", "").split(",") if g.strip()]
 SYNC_URL = os.environ.get("SYNC_URL", "").strip()          # ลิงก์ Apps Script /exec (ตัวเดียวกับ dashboard) — ดึงยอด POS มาเทียบ
 RECON_MIN_DIFF = float(os.environ.get("RECON_MIN_DIFF", "1"))  # ต่างเกินกี่บาทถึงเตือน (กัน rounding)
-RECON_POS_WAIT  = int(os.environ.get("RECON_POS_WAIT", "300"))  # ถ้าจดมือมาก่อน POS → รอกี่วินาที/รอบ แล้วลองดึง POS ใหม่
-RECON_POS_TRIES = int(os.environ.get("RECON_POS_TRIES", "6"))   # ลองดึง POS กี่รอบ (6×5นาที = รอได้ ~30 นาที)
+RECON_POS_WAIT  = int(os.environ.get("RECON_POS_WAIT", "600"))  # ถ้าจดมือมาก่อน POS → รอกี่วินาที/รอบ แล้วลองดึง POS ใหม่ (10 นาที)
+RECON_POS_TRIES = int(os.environ.get("RECON_POS_TRIES", "5"))   # ลองดึง POS กี่รอบ (5×10นาที = รอได้ ~50 นาที)
 # redirect รายงาน: ส่งรายงานของ "กลุ่มต้นทาง" ไปเข้า "กลุ่มปลายทาง" แทน (เนื้อห้ารายงานยังเป็นของต้นทาง)
 # รูปแบบ "ต้นทาง:ปลายทาง,ต้นทาง2:ปลายทาง2" — ครอบทุกรายงาน (สลิป/จอง/หนี้). ตั้งบน Render กัน repo public เห็น group id
 REPORT_REDIRECT   = {}
