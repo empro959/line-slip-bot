@@ -699,8 +699,16 @@ def _fetch_pos_day(date_iso: str, fresh: bool = False):
             _pos_load_cache["all"] = (months, now + 600)
         except Exception as e:
             body = resp.text[:150] if resp is not None else ""
-            # ถ้า body เป็น HTML (<) = Web App ตั้งสิทธิ์ผิด (ต้อง 'Anyone') บอทเลยโดนหน้า login แทน JSON
-            print(f"[recon] ดึง POS ไม่ได้: {e} | body={body!r}", flush=True)
+            # ถ้า body เป็น HTML (< / <!DOCTYPE / <html) = Web App ตั้งสิทธิ์ผิด (ต้อง 'Anyone')
+            # บอทโดนหน้า login ของ Google แทน JSON → json.loads เลย error "Expecting value: line 1 column 1"
+            bl = body.lstrip().lower()
+            if bl.startswith("<") or "<!doctype" in bl or "<html" in bl:
+                print("[recon] ดึง POS ไม่ได้: Apps Script คืนหน้า HTML (login) แทน JSON — "
+                      "ต้องตั้ง Web App 'Who has access = Anyone' (ไม่ใช่ 'Anyone with Google account') "
+                      "แล้ว Deploy ใหม่ · เทสได้ที่ /exec?action=load ใน incognito ต้องเห็น JSON",
+                      flush=True)
+            else:
+                print(f"[recon] ดึง POS ไม่ได้: {e} | body={body!r}", flush=True)
             return None
     for m in months:
         for d in (m.get("payment_days") or []):
