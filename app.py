@@ -3384,6 +3384,22 @@ def _download_image_event(event):
     _slip_pool.submit(_process_image_event, event, None, last_err, True)
 
 
+import gc as _gc, ctypes as _ctypes
+try:
+    _libc = _ctypes.CDLL("libc.so.6")   # glibc (Render/Linux) — ไว้สั่ง malloc_trim คืน heap ให้ OS
+except Exception:
+    _libc = None
+def _release_mem():
+    """คืนหน่วยความจำหลังอ่านรูปเสร็จ — gc เก็บ object + malloc_trim คืน heap ที่ freed ให้ OS
+    แก้ RSS ค้างสูงตอน idle (glibc ไม่คืน freed memory เอง → บัฟเฟอร์รูป/Gemini ค้างใน RSS)"""
+    try:
+        _gc.collect()
+        if _libc is not None:
+            _libc.malloc_trim(0)
+    except Exception:
+        pass
+
+
 def _process_image_event(event, image_bytes=None, download_err=None, holds_sem=False, attempt=1, requeue_held=False):
     """ห่อ _process_slip_image ด้วย try/finally — คืนสิทธิ์ semaphore เสมอเมื่อทำเสร็จ (ทุก path/return/error)
     holds_sem = ถือสิทธิ์ 'รูปค้าง RAM' (_slip_inflight) / requeue_held = ถือสิทธิ์คิว re-queue (_slip_requeue_sem)"""
@@ -3394,6 +3410,7 @@ def _process_image_event(event, image_bytes=None, download_err=None, holds_sem=F
             _slip_inflight.release()
         if requeue_held:
             _slip_requeue_sem.release()
+        _release_mem()   # คืน heap หลังจบรูปแต่ละใบ → กัน RSS โตค้าง
 
 
 def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
