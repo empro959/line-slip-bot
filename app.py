@@ -76,6 +76,7 @@ SYNC_URL = os.environ.get("SYNC_URL", "").strip()          # ลิงก์ App
 RECON_MIN_DIFF = float(os.environ.get("RECON_MIN_DIFF", "1"))  # ต่างเกินกี่บาทถึงเตือน (กัน rounding)
 RECON_POS_WAIT  = int(os.environ.get("RECON_POS_WAIT", "900"))  # จดมือมาก่อน POS → เว้นกี่วินาทีค่อยลองดึง POS ใหม่ (15 นาที · ไม่กระทบเงิน แค่ยิง GET ถาม Apps Script)
 RECON_MAX_WAIT  = int(os.environ.get("RECON_MAX_WAIT", "28800"))  # รอ POS เข้าระบบได้นานสุดกี่วินาที (ดีฟอลต์ 8 ชม. · จดมือส่งหัวค่ำ POS เข้าตี1 ก็ยังรอทัน) แล้วค่อยยอมแพ้/เตือนว่าเทียบไม่ได้
+SYNC_TIMEOUT    = int(os.environ.get("SYNC_TIMEOUT", "90"))  # รอโหลด JSON จาก Apps Script กี่วินาที (ไฟล์ทั้งปีใหญ่ ~1-2MB · 25 วิสั้นไปโดน read timeout)
 # (RECON_POS_TRIES เดิมเลิกใช้แล้ว — เปลี่ยนมาเก็บคิวใน DB ให้ตัวเดินตรวจลองใหม่จน POS เข้า ทน worker recycle · env เก่าตั้งไว้ไม่เป็นไร ระบบไม่อ่านแล้ว)
 # redirect รายงาน: ส่งรายงานของ "กลุ่มต้นทาง" ไปเข้า "กลุ่มปลายทาง" แทน (เนื้อห้ารายงานยังเป็นของต้นทาง)
 # รูปแบบ "ต้นทาง:ปลายทาง,ต้นทาง2:ปลายทาง2" — ครอบทุกรายงาน (สลิป/จอง/หนี้). ตั้งบน Render กัน repo public เห็น group id
@@ -707,7 +708,7 @@ def _fetch_pos_day(date_iso: str, fresh: bool = False):
     else:
         resp = None
         try:
-            resp = requests.get(SYNC_URL, params={"action": "load"}, timeout=25, allow_redirects=True)
+            resp = requests.get(SYNC_URL, params={"action": "load"}, timeout=SYNC_TIMEOUT, allow_redirects=True)
             j = json.loads(resp.text)
             months = j.get("data") if isinstance(j, dict) else None
             if not isinstance(months, list):
