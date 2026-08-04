@@ -3547,7 +3547,11 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
     # ใช้รูปที่โหลดมาแล้วจากขั้น webhook (สด กัน 410) — โหลดพลาดตั้งแต่ตอนนั้น = เงียบในกลุ่ม เตือนเฉพาะแอดมิน
     if download_err is not None:
         record_image_miss(group_id, "error")
-        notify_admin_error(group_id, download_err)
+        # 410/404 'content is gone' = รูปถูกยกเลิก/หมดอายุ หรือ webhook redelivery รูปเก่า → ไม่ actionable ไม่ต้องปลุกแอดมิน
+        if _is_content_gone_error(download_err):
+            print(f"[skip] 410/404 รูปหาย (ไม่เตือน — มัก redelivery รูปเก่า) group={group_id} msg={msg_id}", flush=True)
+        else:
+            notify_admin_error(group_id, download_err)
         return
     if image_bytes is None:
         # fallback: ยังไม่มี bytes (เช่นถูกเรียกตรง ๆ ไม่ผ่านขั้นโหลด) → โหลดเองที่นี่
@@ -3557,7 +3561,8 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
         except Exception as e:
             print(f"[error] โหลดรูปไม่สำเร็จ group={group_id}: {e}", flush=True)
             record_image_miss(group_id, "error")
-            notify_admin_error(group_id, e)
+            if not _is_content_gone_error(e):   # 410/404 รูปหาย/redelivery → ไม่ปลุกแอดมิน
+                notify_admin_error(group_id, e)
             return
 
     # Circuit breaker 'เครดิต Gemini หมด' — ระหว่างหยุด: ข้ามการอ่าน (กันยิงเปล่า/สแปม) ยกเว้นปล่อย probe ทดสอบเป็นระยะ
