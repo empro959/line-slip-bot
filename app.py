@@ -2986,6 +2986,10 @@ threading.Thread(target=_report_backup_loop, daemon=True).start()
 
 # คำที่เป็นไปได้ว่าเกี่ยวกับการจอง (เกตเบื้องต้นแบบประหยัด ก่อนส่งให้ AI ตัดสินจริง)
 _RESV_HINTS = ("จอง", "โต๊ะ", "table", "reserve", "booking", "ลูกค้า")
+# คำที่แปลว่า "ลูกค้าจะมาเดี๋ยวนี้/เร็วๆ นี้" (walk-in) → ไม่มีเวลาชัด แต่ถือว่าจอง 'ตอนนี้' (เวลาปัจจุบัน วันนี้)
+_RESV_NOW_WORDS = ("ซักครู่", "สักครู่", "กำลังมา", "กำลังจะมา", "กำลังไป", "ใกล้ถึง", "จะถึง",
+                   "อีกแป๊บ", "อีกประเดี๋ยว", "เดี๋ยวมา", "เดี๋ยวเข้า", "เดี๋ยวถึง", "เดี๋ยวนี้",
+                   "ตอนนี้", "มาเลย", "เข้าเลย", "ถึงเลย", "จะเข้ามา", "กำลังเข้า")
 
 
 def get_display_name(source) -> str:
@@ -3193,6 +3197,15 @@ def handle_reservation_text(event, text: str, group_id: str):
     if not info.get("is_reservation"):
         print(f"[resv] AI ว่าไม่ใช่การจอง → ข้าม", flush=True)
         return False
+
+    # "ซักครู่/เดี๋ยว/กำลังมา/ตอนนี้/ใกล้ถึง" (walk-in จะมาเลย) = จองตอนนี้ → เวลา=ปัจจุบัน วันนี้ (ไม่ต้องถามเวลา)
+    if not info.get("time_hhmm") and any(w in text for w in _RESV_NOW_WORDS):
+        info["time_hhmm"] = datetime.now(TZ).strftime("%H:%M")
+        info["is_advance"] = False
+        info["date"] = info.get("date") or "วันนี้"
+        if not _valid_ymd(info.get("resv_date")):
+            info["resv_date"] = datetime.now(TZ).date().isoformat()
+        print(f"[resv] 'ซักครู่/เดี๋ยว/กำลังมา' = จองตอนนี้ → เวลา {info['time_hhmm']} วันนี้", flush=True)
 
     is_advance = bool(info.get("is_advance"))
     # กลุ่มไม่ได้เปิดรับจองวันนี้ และไม่ใช่จองล่วงหน้า → ไม่ทำอะไร
