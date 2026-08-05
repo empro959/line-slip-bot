@@ -76,7 +76,7 @@ SYNC_URL = os.environ.get("SYNC_URL", "").strip()          # ลิงก์ App
 RECON_MIN_DIFF = float(os.environ.get("RECON_MIN_DIFF", "1"))  # ต่างเกินกี่บาทถึงเตือน (กัน rounding)
 RECON_POS_WAIT  = int(os.environ.get("RECON_POS_WAIT", "900"))  # จดมือมาก่อน POS → เว้นกี่วินาทีค่อยลองดึง POS ใหม่ (15 นาที · ไม่กระทบเงิน แค่ยิง GET ถาม Apps Script)
 RECON_MAX_WAIT  = int(os.environ.get("RECON_MAX_WAIT", "28800"))  # รอ POS เข้าระบบได้นานสุดกี่วินาที (ดีฟอลต์ 8 ชม. · จดมือส่งหัวค่ำ POS เข้าตี1 ก็ยังรอทัน) แล้วค่อยยอมแพ้/เตือนว่าเทียบไม่ได้
-SYNC_TIMEOUT    = int(os.environ.get("SYNC_TIMEOUT", "90"))  # รอโหลด JSON จาก Apps Script กี่วินาที (ไฟล์ทั้งปีใหญ่ ~1-2MB · 25 วิสั้นไปโดน read timeout)
+SYNC_TIMEOUT    = int(os.environ.get("SYNC_TIMEOUT", "15"))  # รอ Apps Script กี่วินาที (action=posday payload เล็กมาก 15 วิพอ · สั้นไว้ กันบล็อกเธรดนานตอนพีค)
 # (RECON_POS_TRIES เดิมเลิกใช้แล้ว — เปลี่ยนมาเก็บคิวใน DB ให้ตัวเดินตรวจลองใหม่จน POS เข้า ทน worker recycle · env เก่าตั้งไว้ไม่เป็นไร ระบบไม่อ่านแล้ว)
 # redirect รายงาน: ส่งรายงานของ "กลุ่มต้นทาง" ไปเข้า "กลุ่มปลายทาง" แทน (เนื้อห้ารายงานยังเป็นของต้นทาง)
 # รูปแบบ "ต้นทาง:ปลายทาง,ต้นทาง2:ปลายทาง2" — ครอบทุกรายงาน (สลิป/จอง/หนี้). ตั้งบน Render กัน repo public เห็น group id
@@ -274,7 +274,10 @@ else:
 
 def _raw_connect():
     if USE_PG:
-        return psycopg2.connect(DATABASE_URL, connect_timeout=10)  # fail เร็วถ้า DB ล่ม ไม่ค้าง
+        # statement_timeout=15s: query ช้าเกิน 15 วิ โดนตัดทิ้ง (กัน DB ช้าลากเธรด webhook ค้างจนบอทหยุดรับสลิป)
+        # 15 วิ = สูงพอไม่ฆ่า query ปกติ (ของจริง <1 วิ) แต่ต่ำกว่า gunicorn timeout 120 วิมาก
+        return psycopg2.connect(DATABASE_URL, connect_timeout=10,
+                                options="-c statement_timeout=15000")  # fail เร็วถ้า DB ล่ม/ช้า ไม่ค้าง
     c = sqlite3.connect(DB_PATH, timeout=15)   # timeout กัน 'database is locked' ตอนรูปเยอะ
     c.row_factory = sqlite3.Row
     return c
@@ -838,14 +841,9 @@ def _recon_pending_del(group_id, date_iso):
 
 
 def _recon_try_or_queue(group_id, date_iso, hw):
-    """เทียบทันทีถ้ายอด POS ของวันเข้าระบบแล้ว; ถ้ายังไม่เข้า (จดมือมาก่อน POS) → บันทึกลงคิว DB
-    ให้ตัวเดินตรวจ (_recon_tick) มาลองเทียบใหม่เรื่อยๆ จน POS เข้า หรือหมดเวลา RECON_MAX_WAIT
-    เก็บใน DB แทน threading.Timer → ทน worker recycle/รีสตาร์ท (Timer ในหน่วยความจำหายเมื่อ gunicorn รีไซเคิล worker)"""
-    pos = _fetch_pos_day(date_iso, fresh=True)
-    if pos:
-        _recon_emit(group_id, date_iso, hw, pos)
-        _recon_pending_del(group_id, date_iso)   # เผื่อมีคิวค้างจากรอบก่อน
-        return
+    """เข้าคิวเทียบยอดลง DB — 'ไม่ดึง POS สดตรงนี้' เพราะฟังก์ชันนี้รันในเวิร์กเกอร์สลิป (มีแค่ 2)
+    ถ้าดึง POS สดจะบล็อกเวิร์กเกอร์นานตอนพีค → ให้เธรด recon เฉพาะ (_recon_scheduler_loop) ดึงมาเทียบแทน
+    ตั้ง next_try=now → เธรด recon หยิบไปเทียบรอบถัดไปทันที (ภายในไม่กี่วิ) · เก็บ DB → ทน worker recycle"""
     now = time.time()
     try:
         with _db() as conn:
@@ -856,9 +854,9 @@ def _recon_try_or_queue(group_id, date_iso, hw):
                 "cash=excluded.cash, transfer=excluded.transfer, card=excluded.card, "
                 "deadline_epoch=excluded.deadline_epoch, next_try_epoch=excluded.next_try_epoch",
                 (group_id, date_iso, hw["cash"], hw["transfer"], hw["card"],
-                 now, now + RECON_MAX_WAIT, now + RECON_POS_WAIT))
+                 now, now + RECON_MAX_WAIT, now))   # next_try=now → เทียบรอบถัดไปทันที
             conn.commit()
-        print(f"[recon] {date_iso} ยังไม่มียอด POS — เข้าคิวรอ (เช็คทุก {RECON_POS_WAIT}s สูงสุด ~{RECON_MAX_WAIT/3600:.0f} ชม. จน POS เข้า)", flush=True)
+        print(f"[recon] {date_iso} เข้าคิวเทียบยอด — เธรด recon จะดึง POS มาเทียบให้ (จนถึง ~{RECON_MAX_WAIT/3600:.0f} ชม. ถ้ายังไม่เข้า)", flush=True)
     except Exception as e:
         print(f"[recon] เข้าคิวไม่ได้ {date_iso}: {e}", flush=True)
 
@@ -1430,10 +1428,8 @@ def _dining_schedule(group_id: str, info: dict):
     with _dining_q_lock:
         _dining_q.append((time.time() + DINING_MATCH_DELAY, group_id, info))
 
-_recon_last_tick = [0.0]   # กัน _recon_tick ยิง POS ถี่ — เดินตรวจคิวทุก ~60 วิพอ (POS เข้าวันละครั้ง)
 def _dining_scheduler_loop():
-    """thread เดียวเดินตรวจคิวทุก ~5 วิ — ถึงเวลาแล้วค่อยจับคู่+เตือน (ประหยัด thread/memory กว่า Timer ต่อใบ)
-    พ่วงเดินตรวจคิวเทียบยอด POS↔จดมือ (_recon_tick) ทุก ~60 วิ ในเธรดเดียวกัน (ไม่เพิ่ม thread)"""
+    """thread เดียวเดินตรวจคิวทุก ~5 วิ — ถึงเวลาแล้วค่อยจับคู่+เตือน (ประหยัด thread/memory กว่า Timer ต่อใบ)"""
     while True:
         try:
             now = time.time()
@@ -1445,13 +1441,19 @@ def _dining_scheduler_loop():
                 _dining_compare_and_push(gid, info)
         except Exception as e:
             print(f"[dining-sched] loop error: {e}", flush=True)
+        time.sleep(5)
+
+
+def _recon_scheduler_loop():
+    """เธรดของตัวเองสำหรับเดินตรวจคิวเทียบยอด POS↔จดมือ — 'แยกจากงานสลิป/จับคู่บิล'
+    เพราะ _recon_tick ดึง POS ผ่าน HTTP (อาจช้า) → ถ้าปนเธรดหลักจะบล็อกงานสลิป/บิลตอนพีค · ตรวจทุก ~30 วิ"""
+    while True:
         try:
-            if RECON_GROUPS and time.time() - _recon_last_tick[0] >= 60:
-                _recon_last_tick[0] = time.time()
+            if RECON_GROUPS:
                 _recon_tick()
         except Exception as e:
             print(f"[recon] tick error: {e}", flush=True)
-        time.sleep(5)
+        time.sleep(30)
 
 
 def build_dining_summary(group_id: str, report_date: str = None) -> str:
@@ -3431,6 +3433,7 @@ def _reservation_reminder_loop():
 
 threading.Thread(target=_reservation_reminder_loop, daemon=True).start()
 threading.Thread(target=_dining_scheduler_loop, daemon=True).start()   # คิวจับคู่บิล-สลิป (1 thread แทน Timer ต่อใบ)
+threading.Thread(target=_recon_scheduler_loop, daemon=True).start()    # เดินตรวจคิวเทียบยอด POS↔จดมือ (แยกเธรด กัน POS ช้าบล็อกงานสลิป/บิล)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3858,7 +3861,12 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
         # สลิปผ่าน (PASS) → เงียบไว้ ไม่รกแชท (ยังบันทึกไว้ ดูรวมได้ที่ "สรุป")
         # เตือนในกรุ๊ปเฉพาะที่มีปัญหา (WARN/FAIL) — ตอบทันทีด้วย reply
         if verdict["status"] != "PASS":
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=verdict["group_msg"]))
+            try:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=verdict["group_msg"]))
+            except Exception:
+                # reply token หมดอายุ (~1 นาที) — ตอนพีคคิวสลิปยาว ประมวลผลช้าเกิน → push แทน
+                # ไม่งั้นเตือน 'โกง/ซ้ำ' หายจากกลุ่มตอนที่ต้องใช้สุด
+                _push(group_id, TextSendMessage(text=verdict["group_msg"]))
         if verdict["admin_msg"] and ADMIN_USER_ID:
             _push(ADMIN_USER_ID, TextSendMessage(text=verdict["admin_msg"]))
 
