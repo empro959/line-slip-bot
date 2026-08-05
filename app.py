@@ -75,7 +75,7 @@ RECON_GROUPS = [g.strip() for g in os.environ.get("RECON_GROUPS", "").split(",")
 SYNC_URL = os.environ.get("SYNC_URL", "").strip()          # ลิงก์ Apps Script /exec (ตัวเดียวกับ dashboard) — ดึงยอด POS มาเทียบ
 RECON_MIN_DIFF = float(os.environ.get("RECON_MIN_DIFF", "1"))  # ต่างเกินกี่บาทถึงเตือน (กัน rounding)
 RECON_POS_WAIT  = int(os.environ.get("RECON_POS_WAIT", "900"))  # จดมือมาก่อน POS → เว้นกี่วินาทีค่อยลองดึง POS ใหม่ (15 นาที · ไม่กระทบเงิน แค่ยิง GET ถาม Apps Script)
-RECON_MAX_WAIT  = int(os.environ.get("RECON_MAX_WAIT", "28800"))  # รอ POS เข้าระบบได้นานสุดกี่วินาที (ดีฟอลต์ 8 ชม. · จดมือส่งหัวค่ำ POS เข้าตี1 ก็ยังรอทัน) แล้วค่อยยอมแพ้/เตือนว่าเทียบไม่ได้
+RECON_MAX_WAIT  = int(os.environ.get("RECON_MAX_WAIT", "10800"))  # รอ POS วันที่ตรงเข้าระบบได้นานสุดกี่วินาที (ดีฟอลต์ 3 ชม. · POS ลงตี1-5) เกินนี้ยังไม่มา = บอก 'ไม่เจอ เทียบไม่ได้' (ไม่เทียบข้ามวัน)
 SYNC_TIMEOUT    = int(os.environ.get("SYNC_TIMEOUT", "15"))  # รอ Apps Script กี่วินาที (action=posday payload เล็กมาก 15 วิพอ · สั้นไว้ กันบล็อกเธรดนานตอนพีค)
 # (RECON_POS_TRIES เดิมเลิกใช้แล้ว — เปลี่ยนมาเก็บคิวใน DB ให้ตัวเดินตรวจลองใหม่จน POS เข้า ทน worker recycle · env เก่าตั้งไว้ไม่เป็นไร ระบบไม่อ่านแล้ว)
 # redirect รายงาน: ส่งรายงานของ "กลุ่มต้นทาง" ไปเข้า "กลุ่มปลายทาง" แทน (เนื้อห้ารายงานยังเป็นของต้นทาง)
@@ -726,33 +726,6 @@ def _fetch_pos_one(date_iso: str):
         return None
 
 
-def _fetch_pos_day(date_iso: str, fresh: bool = False):
-    """ดึงยอด POS ของวัน (สด/โอน/บัตร/ยอดขาย) — ลองวันที่ตรงก่อน ถ้าไม่มีลองวันก่อนหน้า 1 วัน
-    (คืนร้านคาบเที่ยงคืน: จดมือ/บอทอาจลงวันเหลื่อมกับที่ POS ลง 1 วัน)
-    fresh: ไม่ใช้แล้ว (payload เล็ก ดึงสดทุกครั้ง) — คงพารามิเตอร์ไว้ให้ผู้เรียกเดิมเรียกได้เหมือนเดิม"""
-    if not SYNC_URL:
-        return None
-    candidates = [date_iso]
-    if _is_iso_date(date_iso):
-        candidates.append((datetime.strptime(date_iso, "%Y-%m-%d").date() - timedelta(days=1)).isoformat())
-    for i, d in enumerate(candidates):
-        got = _fetch_pos_one(d)
-        if got:
-            if i > 0:
-                print(f"[recon] ใช้ยอด POS ของ {d} (จดมือลงวันที่ {date_iso} — คืนคาบเที่ยงคืน เลื่อน 1 วัน)", flush=True)
-            got["pos_date"] = d
-            return got
-    return None
-
-
-def _is_iso_date(s: str) -> bool:
-    try:
-        datetime.strptime(s, "%Y-%m-%d")
-        return True
-    except (ValueError, TypeError):
-        return False
-
-
 def _process_recon_image(event, group_id):
     """รูปในกลุ่มเทียบยอด → ถ้าเป็น 'สมุดจดมือ' อ่านยอดรับ (สด/โอน/บัตร) เทียบ POS วันเดียวกัน → เตือนถ้าไม่ตรง
     รูปอื่น (ใบ POS/สลิป) → เงียบ · ทำครั้งเดียว/รูป (กัน webhook redelivery)"""
@@ -876,17 +849,19 @@ def _recon_tick():
     for r in due:
         gid, d = r["group_id"], r["date_iso"]
         hw = {"cash": float(r["cash"] or 0), "transfer": float(r["transfer"] or 0), "card": float(r["card"] or 0)}
-        pos = _fetch_pos_day(d, fresh=True)
+        pos = _fetch_pos_one(d)   # หา POS 'วันที่ตรงเป๊ะ' เท่านั้น — ไม่ถอยไปวันก่อนหน้า (กันเทียบข้ามวัน = เตือนหลอก)
         if pos:
             _recon_emit(gid, d, hw, pos)
             _recon_pending_del(gid, d)
         elif now >= float(r["deadline_epoch"] or 0):
+            # รอ POS วันตรงจนหมดเวลาแล้วยังไม่มา → บอกตรงๆ ว่าเทียบไม่ได้ (ไม่เดา ไม่เทียบข้ามวัน)
             _push(gid, TextSendMessage(text=(
                 f"📓 อ่านสมุดจดมือ {d}\nสด {hw['cash']:,.0f} · โอน {hw['transfer']:,.0f}"
                 + (f" · บัตร {hw['card']:,.0f}" if hw['card'] else "")
-                + "\n⚠️ รอ POS นานแล้วยังไม่เข้าระบบ (หรือดึง POS ไม่ได้) — เทียบไม่ได้ ตรวจเองนะครับ")))
+                + f"\n⚠️ ไม่เจอยอด POS ของวันที่ {d} ในระบบ — เทียบไม่ได้"
+                + "\n(ยังไม่ลง POS วันนี้ หรือวันไม่ตรงกัน — เช็กวันที่บนสมุด vs วันที่ POS)")))
             _recon_pending_del(gid, d)
-            print(f"[recon] {d} หมดเวลารอ POS ({RECON_MAX_WAIT/3600:.0f} ชม.) — เลิกรอ", flush=True)
+            print(f"[recon] {d} หมดเวลารอ POS ({RECON_MAX_WAIT/3600:.0f} ชม.) — ไม่เจอวันตรง เลิกรอ (ไม่เทียบข้ามวัน)", flush=True)
         else:
             try:
                 with _db() as conn:
