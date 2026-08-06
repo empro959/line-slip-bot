@@ -3144,6 +3144,28 @@ def save_reservation(origin_group_id: str, requested_by: str, info: dict, raw_te
         return rid
 
 
+def _find_dup_reservation(info) -> dict:
+    """หาจอง 'เนื้อหาเดียวกัน' ที่ยังไม่ถูกยกเลิก (กันบันทึกซ้ำเมื่อพิมพ์จองเดิมใหม่หลายรอบ)
+    match: ลูกค้า + จำนวนคน + โต๊ะ/โซน + วันที่จอง (โต๊ะเดิม-วันเดิม-ลูกค้าเดิม มักคือจองเดียวกัน)
+    คืน dict ของจองเดิม หรือ None"""
+    cust = (info.get("customer") or "").strip()
+    if not cust:
+        return None   # ไม่มีชื่อลูกค้า → ตัดสินไม่ได้ว่าซ้ำ ปล่อยผ่าน
+    rd = info.get("resv_date") if _valid_ymd(info.get("resv_date")) else datetime.now(TZ).date().isoformat()
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT * FROM reservations WHERE status IN ('PENDING','CONFIRMED') "
+                "AND customer=? AND COALESCE(resv_date,?)=? "
+                "AND COALESCE(people,'')=? AND COALESCE(table_no,'')=? "
+                "ORDER BY id DESC LIMIT 1",
+                (cust, rd, rd, info.get("people") or "", info.get("table") or "")).fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        print(f"[resv] เช็คจองซ้ำไม่ได้: {e}", flush=True)
+        return None
+
+
 def _valid_ymd(s) -> bool:
     if not s:
         return False
@@ -3250,6 +3272,15 @@ def handle_reservation_text(event, text: str, group_id: str):
     _mid = getattr(getattr(event, "message", None), "id", None)
     if not _msg_once(_mid, "resv"):
         print(f"[resv] ข้ามจองซ้ำ (webhook redelivery) msg={_mid}", flush=True)
+        return True
+    # กันจองซ้ำ 'เนื้อหาเดียวกัน' (พิมพ์จองเดิมใหม่หลายรอบ) — คนละ message_id แต่ลูกค้า/โต๊ะ/วันเดียวกัน
+    _dup_resv = _find_dup_reservation(info)
+    if _dup_resv:
+        print(f"[resv] จองซ้ำกับ #{_dup_resv['id']} (ลูกค้า/โต๊ะ/วันเดียวกัน) → ไม่บันทึกซ้ำ", flush=True)
+        _reply_with_mention(event,
+            f"⚠️ จองนี้ซ้ำกับ #{_dup_resv['id']} ที่มีอยู่แล้ว — ไม่บันทึกซ้ำ\n"
+            f"👤 {_dup_resv.get('customer')} · {_dup_resv.get('people') or '-'} · โต๊ะ {_dup_resv.get('table_no') or '-'}\n"
+            f"(ถ้าตั้งใจจองเพิ่มจริง ให้ระบุ 'โต๊ะ' หรือ 'เวลา' ให้ต่างจากเดิม)")
         return True
     dest = (BAR_GROUP_ID if is_advance else STAFF_GROUP_ID) or group_id
     resv_id = save_reservation(group_id, requested_by, info, text, dest)
