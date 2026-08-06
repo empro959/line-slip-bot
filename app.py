@@ -1677,7 +1677,7 @@ def build_resv_summary(notify_group=None, title="📋 สรุปการจ�
         # วันนี้เท่านั้น: resv_date=วันนี้ (จองล่วงหน้าโผล่เฉพาะวันถึง) + จองที่ไม่มีวันชัดแต่แจ้งวันนี้
         date_cond = "((resv_date = ?) OR (resv_date IS NULL AND substr(created_at,1,10) = ?))"
         params = [today, today]
-    q = f"SELECT * FROM reservations WHERE {date_cond}"
+    q = f"SELECT * FROM reservations WHERE {date_cond} AND COALESCE(status,'') != 'CANCELLED'"
     if notify_group:
         if match_origin:
             q += " AND (notify_group_id=? OR origin_group_id=?)"
@@ -3192,6 +3192,17 @@ def mark_reservation_confirmed(resv_id: int, confirmed_by: str):
         conn.commit()
 
 
+def cancel_reservation(resv_id: int, by: str = "") -> bool:
+    """ยกเลิกจอง → status=CANCELLED (หยุดย้ำเตือน + ตัดออกจากสรุป + ให้จองเนื้อหาเดิมใหม่ได้)"""
+    with _db() as conn:
+        cur = conn.execute(
+            "UPDATE reservations SET status='CANCELLED', confirmed_by=?, confirmed_at=? "
+            "WHERE id=? AND COALESCE(status,'') != 'CANCELLED'",
+            (f"ยกเลิกโดย {by}"[:120], datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"), resv_id))
+        conn.commit()
+        return (getattr(cur, "rowcount", 0) or 0) > 0
+
+
 def handle_reservation_text(event, text: str, group_id: str):
     """จองวันนี้ → การ์ด+ปุ่มไปกลุ่ม staff (STAFF_GROUP_ID) คอนเฟิร์ม (รับจากกลุ่มใน RESV_GROUPS)
     จองล่วงหน้า → ส่งการ์ด+ปุ่มไปกลุ่มบาร์น้ำ (BAR_GROUP_ID) คอนเฟิร์ม จากกลุ่มไหนก็ได้
@@ -4352,6 +4363,22 @@ def handle_text(event):
             or _lowq.startswith("สรุปจอง") or _lowq.startswith("สรุปการจอง")):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=build_resv_summary(group_id, "📋 สรุปการจอง (วันนี้ + ล่วงหน้า)", upcoming=True, match_origin=True)))
+        return
+    # ยกเลิกจอง #X — "ยกเลิกจอง 38", "ยกเลิก #38", "ยกเลิกการจอง 38" → status=CANCELLED (หยุดย้ำเตือน+ตัดจากสรุป)
+    _mcx = re.match(r"^\s*ยกเลิก\s*(?:การ)?(?:จอง)?\s*#?\s*(\d+)\s*$", text)
+    if _mcx:
+        _rid = int(_mcx.group(1))
+        _rr = get_reservation(_rid)
+        if not _rr:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"❌ ไม่พบการจอง #{_rid}"))
+        elif _rr.get("status") == "CANCELLED":
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"ℹ️ การจอง #{_rid} ถูกยกเลิกไปแล้ว"))
+        else:
+            cancel_reservation(_rid, get_display_name(event.source))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"🗑️ ยกเลิกการจอง #{_rid} แล้ว\n"
+                     f"👤 {_rr.get('customer') or '-'} · {_rr.get('people') or '-'} · โต๊ะ {_rr.get('table_no') or '-'}\n"
+                     "(หยุดย้ำเตือน + ตัดออกจากสรุปแล้ว)"))
         return
     # ล้างข้อมูลทั้งหมดของกลุ่มนี้ (สลิป+จอง ทุกวัน) — เตรียมเลิกใช้/รีเซ็ตกลุ่ม (มีปุ่มยืนยัน)
     if text.lower() in ("ล้างทั้งหมด", "ล้างกลุ่มนี้", "ล้างข้อมูลทั้งหมด", "รีเซ็ตทั้งหมด"):
