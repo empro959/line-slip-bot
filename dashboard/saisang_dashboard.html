@@ -879,8 +879,8 @@ function buildOV(m){
   dc('main');
   charts['main']=new Chart(el('ch-main'),{type:'bar',
     data:{labels:['ยอดขาย','ค่าใช้จ่าย','กำไร/ขาดทุน'],datasets:[{data:[m.total_sales,m.total_expenses,Math.abs(m.net_profit)],backgroundColor:['rgba(105,255,71,.8)','rgba(255,82,82,.8)',m.net_profit>=0?'rgba(255,215,64,.8)':'rgba(255,82,82,.5)'],borderRadius:8,borderSkipped:false}]},
-    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y)}},
-      datalabels:{color:'#fff',font:{size:12,weight:'bold',family:"'IBM Plex Mono',monospace"},anchor:'end',align:'start',offset:-2,textAlign:'center',formatter:v=>'฿'+fmt(v)+'\n('+(v/m.total_sales*100).toFixed(1)+'%)'}},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>' '+((c.dataIndex===2&&m.net_profit<0)?'-฿':'฿')+fmt(c.parsed.y)}},
+      datalabels:{color:'#fff',font:{size:12,weight:'bold',family:"'IBM Plex Mono',monospace"},anchor:'end',align:'start',offset:-2,textAlign:'center',formatter:(v,ctx)=>((ctx.dataIndex===2&&m.net_profit<0)?'-฿':'฿')+fmt(v)+'\n('+(v/m.total_sales*100).toFixed(1)+'%)'}},
     scales:{x:{grid:{display:false},ticks:{font:{size:13,weight:'600'}}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}
   });
   const top8e=m.expense_categories.slice(0,8),totE=top8e.reduce((a,c)=>a+c.amount,0);
