@@ -3885,6 +3885,23 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
         if info.get("ref_number"):
             info["ref_number"] = "".join(str(info["ref_number"]).upper().split())
 
+        # กัน false 'ตัดต่อ' จาก OCR อ่าน ref ผิด: ถ้าสงสัยตัดต่อ (ref ตรงใบเก่า + ยอดต่าง)
+        # → อ่าน ref ซ้ำด้วยโมเดลแรง (นอกล็อก กันบล็อกคิว) · อ่านได้ 'ต่าง' = รอบแรกอ่านผิด ใช้เลขใหม่;
+        #   อ่าน 'ตรง' = ยืนยัน เตือนตัดต่อตามเดิม (คำเตือนคงเดิม + โชว์ ref ให้คนเทียบกับสลิปจริงเอง)
+        if image_bytes and info.get("ref_number"):
+            _pre_dup, _, _ = find_duplicate(group_id, info)
+            if _pre_dup == "ref_mismatch":
+                try:
+                    _info2 = extract_slip_info(image_bytes, retry=True, dining=_dining)
+                    _ref2 = "".join(str(_info2.get("ref_number") or "").upper().split())
+                    if _ref2 and _ref2 != info["ref_number"]:
+                        print(f"[fraud] ยืนยัน ref: โมเดลแรงอ่าน '{_ref2}' ต่างรอบแรก '{info['ref_number']}' → รอบแรกอ่านผิด ใช้เลขใหม่", flush=True)
+                        info["ref_number"] = _ref2
+                    else:
+                        print(f"[fraud] ยืนยัน ref: โมเดลแรงอ่านตรงรอบแรก '{info['ref_number']}' → เตือนตัดต่อตามเดิม", flush=True)
+                except Exception as _e:
+                    print(f"[fraud] อ่าน ref ซ้ำไม่สำเร็จ: {_e} — คงผลเดิม", flush=True)
+
         promptpay = verify_with_promptpay(image_bytes)
         # ล็อกช่วงเช็คซ้ำ+บันทึก ให้เป็นจังหวะเดียว กัน race ตอนส่งซ้ำพร้อมกันหลาย thread
         with _dup_lock:
