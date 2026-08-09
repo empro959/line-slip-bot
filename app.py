@@ -2266,10 +2266,10 @@ def _process_payable_image(event, group_id: str):
         if _payable_bill_exists(acct, eff_date, amount):   # กันส่งบิลซ้ำ (วันที่+ยอดเดียวกันมีแล้ว)
             notify(f"🔁 บิลนี้ (วันที่ {eff_date} ยอด {amount:,.2f}) เคยบันทึกแล้ว — ไม่นับซ้ำ", force=True)
             return
-        # บิลซื้อ: บันทึก แล้วเด้ง 'สรุปหนี้' เฉพาะกลุ่มที่ส่ง (reply ฟรี ไม่ push เข้า mirror — เจ้าของกลัวเปลือง push)
-        # บิลใหม่โผล่เป็นบรรทัด '📥+ยอด' ในสรุป; สลิปจ่ายยัง push ทุกกลุ่มเหมือนเดิม
+        # บิลซื้อ: บันทึก แล้วเด้ง 'สรุปหนี้' ทุกกลุ่ม (primary=reply ฟรี, mirror=push) — เจ้าของขอให้ mirror เห็นบิลด้วย
+        # หมายเหตุ: reply เข้าได้แค่กลุ่มที่ส่ง (LINE) → mirror ต้อง push (กิน quota 1/บิล); สลิปจ่าย push เหมือนกัน
         save_payable_bill(acct, amount, note="รูป", doc_date=doc_date)
-        _payable_push_summary(event, group_id, acct, source_only=True)
+        _payable_push_summary(event, group_id, acct)
         return
 
     if doc_type == "payment":
