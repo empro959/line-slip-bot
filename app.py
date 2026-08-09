@@ -2036,13 +2036,17 @@ def _payable_report_recipients(acct: str):
     return [(acct, True)]
 
 
-def _payable_push_summary(event, source_group: str, acct: str):
+def _payable_push_summary(event, source_group: str, acct: str, source_only: bool = False):
     """เด้ง 'สรุปหนี้รายวัน' ให้กลุ่มผู้รับ (กลุ่ม 1 ไม่มียอดรวม / กลุ่ม 2 มียอดรวม)
-    กลุ่มต้นทาง = reply (ฟรี), กลุ่มอื่น = push — ใช้ตอน 'มีบิลซื้อ' และ 'มีการจ่าย' (เด้งสรุปทั้งคู่)"""
+    กลุ่มต้นทาง = reply (ฟรี), กลุ่มอื่น = push
+    source_only=True → เด้งเฉพาะกลุ่มต้นทาง (reply ฟรี) ไม่ push เข้า mirror — ใช้กับ 'บิลซื้อ' กันเปลือง push
+      (mirror เห็นบิลตอนมีการจ่าย/รายงานตี1/พิมพ์ 'สรุปหนี้' เอง); การจ่าย = push ทุกกลุ่มเหมือนเดิม"""
     replied = False
     for grp, with_total in _payable_report_recipients(acct):
         if _group_left(grp) or grp in IGNORE_GROUPS:
             continue
+        if source_only and grp != source_group:
+            continue   # บิล: ไม่ push เข้ากลุ่มอื่น (คุมโควตา) — เด้งแค่กลุ่มที่ส่งบิลด้วย reply
         text = build_payable_ledger(acct, with_total)
         try:
             if grp == source_group and not replied and getattr(event, "reply_token", None):
@@ -2262,10 +2266,10 @@ def _process_payable_image(event, group_id: str):
         if _payable_bill_exists(acct, eff_date, amount):   # กันส่งบิลซ้ำ (วันที่+ยอดเดียวกันมีแล้ว)
             notify(f"🔁 บิลนี้ (วันที่ {eff_date} ยอด {amount:,.2f}) เคยบันทึกแล้ว — ไม่นับซ้ำ", force=True)
             return
-        # บิลซื้อ: บันทึก แล้วเด้ง 'สรุปหนี้' ทันที (เจ้าของขอ 2026-08-09: ส่งบิล→สรุป, ส่งสลิป→สรุป เหมือนกัน)
-        # บิลใหม่โผล่เป็นบรรทัด '📥+ยอด' + ยอดค้างสะสมรวมในสรุป → ไม่ต้อง notify สั้นแยก (คุมโควตา push)
+        # บิลซื้อ: บันทึก แล้วเด้ง 'สรุปหนี้' เฉพาะกลุ่มที่ส่ง (reply ฟรี ไม่ push เข้า mirror — เจ้าของกลัวเปลือง push)
+        # บิลใหม่โผล่เป็นบรรทัด '📥+ยอด' ในสรุป; สลิปจ่ายยัง push ทุกกลุ่มเหมือนเดิม
         save_payable_bill(acct, amount, note="รูป", doc_date=doc_date)
-        _payable_push_summary(event, group_id, acct)
+        _payable_push_summary(event, group_id, acct, source_only=True)
         return
 
     if doc_type == "payment":
