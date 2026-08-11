@@ -2050,7 +2050,12 @@ def _payable_push_summary(event, source_group: str, acct: str, source_only: bool
         text = build_payable_ledger(acct, with_total)
         try:
             if grp == source_group and not replied and getattr(event, "reply_token", None):
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
+                try:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
+                except Exception as e_reply:
+                    # reply token หมดอายุ/ใช้แล้ว (เช่น Gemini อ่านบิลนานจน token หมด) → fallback push กันสรุปหาย
+                    print(f"[payable] reply หมดอายุ grp={grp} → fallback push: {e_reply}", flush=True)
+                    _push(grp, TextSendMessage(text=text))
                 replied = True
             else:
                 _push(grp, TextSendMessage(text=text))
