@@ -2336,13 +2336,15 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     #   31/7/26=19941 (จ่าย 10000 ค้าง 9941) ← วงเล็บมีหลายเลข ใช้เลขหลังคำ 'ค้าง/เหลือ'
     #   8/6=18504                           ← ไม่มีวงเล็บ ใช้เลขปกติ
     # วางบล็อกใหม่ = แทนที่ยอดค้างยกมาเดิมทั้งหมด (ไม่บวกเพิ่ม); วันที่ซ้ำ = บวกรวม
+    # trigger: หัวบล็อกมีคำ 'ค้าง' (มีโคลอน/อิโมจิปนได้) หรือมี ≥2 บรรทัด 'วันที่=ยอด' ที่อ่านได้
+    # ของเดิมบังคับบรรทัดแรกเป็นคำว่า 'ค้าง' เป๊ะ → ก๊อปสรุปมาทั้งดุ้น (มีหัว 📋/เส้นคั่น) แล้วบอทเงียบสนิท
     lines = text.splitlines()
-    if len(lines) > 1 and lines[0].strip().lower() in ("ค้าง", "ยอดค้าง", "รายการค้าง", "บิลค้าง"):
+    if len(lines) > 1:
         entries, errors = [], []
-        for ln in lines[1:]:
+        for ln in lines:
             ln = ln.strip()
             if not ln or "=" not in ln:
-                continue   # ข้ามเส้นคั่น/บรรทัดว่าง (ไม่มี '=')
+                continue   # ข้ามหัวบล็อก/เส้นคั่น/บรรทัดว่าง (ไม่มี '=')
             dpart, apart = ln.split("=", 1)
             diso = _parse_thai_date(dpart.strip())
             if diso is None:
@@ -2364,11 +2366,17 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             if val < 0:
                 errors.append(ln); continue
             entries.append((diso, val))
+        # หัวบล็อกบอกเจตนาชัด (มีคำ 'ค้าง') → รับแม้บรรทัดเดียว; ไม่มีหัว → ต้องอ่านได้ ≥2 บรรทัด
+        # และอ่านได้ต้องไม่น้อยกว่าที่อ่านไม่ได้ (กันข้อความคุยกันปกติที่มี 'x=y' หลุดมาโดนตีความเป็นบล็อก)
+        hdr_carry = "ค้าง" in re.sub(r"[^\wก-๙]+", "", lines[0])
+        if hdr_carry and not entries:   # สั่งมาชัดว่าจะวางยอดค้าง แต่อ่านไม่ได้เลย → ต้องบอก ห้ามเงียบ
+            _payable_send(event, group_id, out,
+                          "❌ อ่านบล็อกค้างไม่ได้ — รูปแบบควรเป็น  วัน/เดือน=ยอด (ค้าง xxxx)")
+            return True
+        if not (entries and (hdr_carry or (len(entries) >= 2 and len(entries) >= len(errors)))):
+            return False   # ไม่ใช่บล็อกค้าง → ปล่อยให้คำสั่งอื่นจัดการต่อ
         if errors:
             print(f"[payable-import] ข้าม {len(errors)} บรรทัด: {errors[:5]}", flush=True)
-        if not entries:
-            _payable_send(event, group_id, out, "❌ อ่านบล็อกค้างไม่ได้ — รูปแบบควรเป็น  วัน/เดือน=ยอด (ค้าง xxxx)")
-            return True
         # วางบล็อกใหม่ = ลบยอดค้างยกมาเดิม + ล้าง opening ก้อนเก่า (กันนับเบิ้ล) แล้วลงใหม่เป็นบิลรายวัน
         with _db() as conn:
             conn.execute("DELETE FROM payable_bills WHERE group_id=? AND note=?", (acct, _PAYABLE_CARRY_NOTE))
