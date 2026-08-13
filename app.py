@@ -2124,22 +2124,52 @@ def _payable_reconcile(acct: str):
     if orphan < -0.01:
         raise ValueError(f"orphan ผิดปกติ ({orphan:,.2f}) — ข้อมูลไม่สอดคล้อง")
 
-    # (1) FIFO ใหม่ในหน่วยความจำ: ตัดบิล 'วันเดียวกับจ่าย', ยอดตรงก่อน แล้วยกมา แล้ว id
-    # ⚠️ กติกานี้ 'ไม่เหมือน' _payable_settle แล้ว (settle: ยอดตรงเป๊ะทั้งบัญชีชนะวันที่ — เจ้าของตกลง 2026-08-13)
-    #    ที่นี่ยังจำกัด 'วันเดียวกับจ่าย' → สั่ง 'จัดยอดใหม่' จะย้ายการตัดที่ settle ทำถูกไว้ กลับไปเป็นบิลวันเดียวกับสลิป
-    #    (ยอดค้างรวมไม่เพี้ยน มี self-verify คุมอยู่ — แต่ 'ตัดผิดใบ' ได้) ยังไม่แก้เพราะเจ้าของขอ 'ไม่ซ่อมย้อนหลัง'
+    # (1) จับคู่ใหม่ในหน่วยความจำ — 'มิเรอร์ _payable_settle' ลำดับเดียวกันเป๊ะ (เจ้าของตกลง 2026-08-13):
+    #     (1) ยอดค้างตรงเป๊ะ 'วันเดียวกับจ่าย'  (2) ยอดค้างตรงเป๊ะ 'ทั้งบัญชี' ค้างยกมาก่อน แล้วเก่าสุด
+    #     (3) ไม่มีใบยอดตรง → FIFO บิลวันเดียวกับจ่าย (ตัดบางส่วนได้)
+    #     ถ้ากติกาต่างจาก settle สั่ง 'จัดยอดใหม่' จะย้ายการตัดที่ settle ทำถูกไว้ กลับไปผิดใบ (ยอดรวมไม่เพี้ยน แต่ผิดใบ)
+    def _left(b):
+        return float(b["amount"] or 0) - b["new_paid"]
+
+    def _exact(pool, amt):
+        """ใบที่ยอดค้างตรงเป๊ะใบแรก — ค้างยกมาก่อน แล้วเก่าสุด (เทียบ ORDER BY ใน _payable_settle)"""
+        hit = [b for b in pool if _left(b) > 0.01 and abs(_left(b) - amt) < 0.01]
+        hit.sort(key=lambda b: (0 if b["note"] == _PAYABLE_CARRY_NOTE else 1, b["doc_date"], b["id"]))
+        return hit[:1]
+
     for b in bills:
         b["new_paid"] = 0.0
     for p in pays:
         p["new_alloc"] = 0.0
         p["dates"] = []
-        remaining = float(p["amount"] or 0)
-        cands = [b for b in bills
-                 if b["doc_date"] == p["doc_date"] and (float(b["amount"] or 0) - b["new_paid"]) > 0.01]
-        cands.sort(key=lambda b: (
-            0 if abs((float(b["amount"] or 0) - b["new_paid"]) - float(p["amount"] or 0)) < 0.01 else 1,
-            0 if b["note"] == _PAYABLE_CARRY_NOTE else 1,
-            b["id"]))
+
+    # (1.1) 'จองโควตา' orphan ไว้ก่อนจับคู่ — orphan = จ่ายที่ตัดบิลซึ่งถูก cleanup ลบไปแล้ว (ไม่มีบิลรองรับ)
+    # ต้องกันไว้ก่อน ไม่งั้นจ่ายก้อนนั้นจะถูกจับคู่บิลใหม่จนเต็ม แล้วไม่มีที่ให้ฉีด orphan กลับ → ทั้งรอบพัง
+    # (เดิมฉีดทีหลัง: สั่ง 'จัดยอดใหม่' 2 ครั้งซ้อนหลังมีบิลจ่ายครบ = ValueError ฉีดกลับไม่ครบ ใช้คำสั่งไม่ได้เลย)
+    if orphan > 0.01:
+        remaining = orphan
+        for p in pays:
+            if remaining <= 0.01:
+                break
+            add = min(float(p["amount"] or 0), remaining)
+            if add <= 0.01:
+                continue
+            p["new_alloc"] += add
+            remaining      -= add
+            p["dates"].append("บิลเก่า")
+        if remaining > 0.01:
+            raise ValueError(f"ฉีดยอดจ่ายบิลเก่ากลับไม่ครบ (เหลือ {remaining:,.2f})")
+
+    # (1.2) จับคู่ใหม่ด้วยโควตาที่เหลือของแต่ละจ่าย (amount − ที่จองให้ orphan)
+    for p in pays:
+        remaining = float(p["amount"] or 0) - p["new_alloc"]
+        if remaining <= 0.01:
+            continue
+        same_day = [b for b in bills if b["doc_date"] == p["doc_date"]]
+        cands = _exact(same_day, remaining) or _exact(bills, remaining)
+        if not cands:
+            cands = [b for b in same_day if _left(b) > 0.01]
+            cands.sort(key=lambda b: (0 if b["note"] == _PAYABLE_CARRY_NOTE else 1, b["id"]))
         for b in cands:
             if remaining <= 0.01:
                 break
@@ -2149,31 +2179,14 @@ def _payable_reconcile(acct: str):
             remaining      -= take
             p["dates"].append(_short(b["doc_date"]))
 
-    # (2) ฉีด orphan กลับเข้า allocated ของจ่าย (เรียงตามวัน) เท่าที่ยังมีช่องว่าง (amount − new_alloc)
-    if orphan > 0.01:
-        remaining = orphan
-        for p in pays:
-            if remaining <= 0.01:
-                break
-            spare = float(p["amount"] or 0) - p["new_alloc"]
-            if spare <= 0.01:
-                continue
-            add = min(spare, remaining)
-            p["new_alloc"] += add
-            remaining      -= add
-            if "บิลเก่า" not in p["dates"]:
-                p["dates"].append("บิลเก่า")
-        if remaining > 0.01:
-            raise ValueError(f"ฉีดยอดจ่ายบิลเก่ากลับไม่ครบ (เหลือ {remaining:,.2f})")
-
-    # (3) ตรวจยอดคงเดิมก่อนแตะ DB
+    # (2) ตรวจยอดคงเดิมก่อนแตะ DB
     total_after = (opening
                    + sum(float(b["amount"] or 0) - b["new_paid"] for b in bills)
                    - sum(float(p["amount"] or 0) - p["new_alloc"] for p in pays))
     if abs(total_after - total_before) > 0.01:
         raise ValueError(f"ยอดจะเพี้ยน {total_before:,.2f} → {total_after:,.2f}")
 
-    # (4) ผ่านการตรวจ → เขียนกลับใน transaction เดียว (พลาดกลางคัน = rollback อัตโนมัติ)
+    # (3) ผ่านการตรวจ → เขียนกลับใน transaction เดียว (พลาดกลางคัน = rollback อัตโนมัติ)
     with _db() as conn:
         for b in bills:
             conn.execute("UPDATE payable_bills SET paid=? WHERE id=?", (b["new_paid"], b["id"]))
@@ -2508,13 +2521,20 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
                 text="❌ วันที่ไม่ถูก เช่น: ลบวันที่ 6/6"))
             return True
+        stuck = 0.0
         with _db() as conn:
+            # คืนยอดที่จับคู่ข้ามวันไว้ก่อนลบ (บิลวันนี้อาจถูกจ่ายด้วยสลิปวันอื่น และกลับกัน)
+            for tbl in ("payable_payments", "payable_bills"):
+                for r in conn.execute(f"SELECT * FROM {tbl} WHERE group_id=? AND doc_date=?", (acct, d)).fetchall():
+                    stuck += _payable_unlink(conn, acct, tbl, r)
             nb = conn.execute("DELETE FROM payable_bills WHERE group_id=? AND doc_date=?", (acct, d)).rowcount
             np = conn.execute("DELETE FROM payable_payments WHERE group_id=? AND doc_date=?", (acct, d)).rowcount
             conn.commit()
+        warn = (f"\n⚠️ คืนยอดที่จับคู่ไว้ไม่ครบ {stuck:,.2f} บาท — ถ้ายอดดูไม่ถูก สั่ง 'จัดยอดใหม่'"
+                if stuck > 0.01 else "")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"🗑️ ลบรายการวันที่ {d}: บิล {nb} + จ่าย {np} รายการ\n─────────────────\n"
-                 f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท"))
+                 f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท{warn}"))
         return True
 
     # ทดสอบ: force ส่ง 'สรุปหนี้รายวัน' เข้ากลุ่มผู้รับเดี๋ยวนี้ (เหมือนตี1) — เช็คการส่ง/mirror/ยอดรวม
@@ -2565,18 +2585,60 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     return False
 
 
+def _payable_unlink(conn, group_id: str, table: str, row) -> float:
+    """คืนยอดที่ 'จับคู่ไว้' ของแถวที่กำลังจะลบ ให้ฝั่งตรงข้าม — ต้องทำก่อนลบ ไม่งั้นยอดค้างเพี้ยน
+    - ลบ 'จ่าย' ที่ตัดบิลไปแล้ว allocated=A → ต้องลด payable_bills.paid รวม A (ไม่ลด = หนี้ต่ำกว่าจริง A)
+    - ลบ 'บิล' ที่ถูกจ่ายไปแล้ว paid=A     → ต้องลด payable_payments.allocated รวม A (ไม่ลด = หนี้สูงกว่าจริง A)
+    ไม่รู้แน่ว่าคู่กับแถวไหน (เก็บแค่ settle_note = วัน/เดือน) → คืนแถวที่วันตรงกับ note ก่อน แล้วใหม่สุดก่อน
+    ยอดรวมถูกเสมอเพราะคืนครบจำนวน; การจับคู่รายใบเกลาได้ด้วยคำสั่ง 'จัดยอดใหม่'
+    คืนยอดที่คืนไม่ได้ (คู่ถูกลบไปแล้วตอน cleanup) — ผู้เรียกเอาไปเตือนผู้ใช้"""
+    if table == "payable_payments":
+        amt, other, col = float(row["allocated"] or 0), "payable_bills", "paid"
+        note = row["settle_note"]
+    else:
+        amt, other, col = float(row["paid"] or 0), "payable_payments", "allocated"
+        note = None
+    if amt <= 0.01:
+        return 0.0
+    rows = conn.execute(
+        f"SELECT id, doc_date, COALESCE({col},0) v FROM {other} WHERE group_id=? AND COALESCE({col},0)>0.01 "
+        "ORDER BY id DESC", (group_id,)).fetchall()
+    # เรียงใบที่วัน (d/m) ตรงกับ settle_note ขึ้นก่อน — น่าจะเป็นคู่จริงของก้อนนี้
+    days = {s.strip() for s in (note or "").split(",") if s.strip()}
+    def _dm(d):
+        try:
+            return datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m")
+        except (ValueError, TypeError):
+            return ""
+    ordered = sorted(rows, key=lambda r: 0 if _dm(r["doc_date"]) in days else 1)
+    left = amt
+    for r in ordered:
+        if left <= 0.01:
+            break
+        back = min(left, float(r["v"]))
+        conn.execute(f"UPDATE {other} SET {col}=COALESCE({col},0)-? WHERE id=?", (back, r["id"]))
+        left -= back
+    if left > 0.01:
+        print(f"[payable] คืนยอดจับคู่ไม่ครบ {left:,.2f} (คู่ถูกลบไปแล้ว) group={group_id} table={table}", flush=True)
+    return left
+
+
 def _delete_last_payable(event, group_id: str, table: str, label: str):
     with _db() as conn:
-        row = conn.execute(f"SELECT id, amount FROM {table} WHERE group_id=? ORDER BY id DESC LIMIT 1",
+        row = conn.execute(f"SELECT * FROM {table} WHERE group_id=? ORDER BY id DESC LIMIT 1",
                            (group_id,)).fetchone()
         if not row:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📭 ไม่มี{label}ให้ลบ"))
             return
+        # คืนยอดที่จับคู่ไว้ก่อนลบ (ของเดิมลบแถวเดียวโดยไม่คืน → ยอดค้างเพี้ยน)
+        stuck = _payable_unlink(conn, group_id, table, row)
         conn.execute(f"DELETE FROM {table} WHERE id=?", (row["id"],))
         conn.commit()
+    warn = (f"\n⚠️ คืนยอดที่จับคู่ไว้ไม่ครบ {stuck:,.2f} บาท (บรรทัดคู่ถูกลบไปแล้ว) "
+            "— ถ้ายอดดูไม่ถูก สั่ง 'จัดยอดใหม่'" if stuck > 0.01 else "")
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
         text=f"🗑️ ลบ{label}ล่าสุด #{row['id']} ({float(row['amount']):,.2f} บาท) แล้ว\n─────────────────\n"
-             f"💰 ค้างจ่ายสะสม: {_payable_outstanding(group_id):,.2f} บาท"))
+             f"💰 ค้างจ่ายสะสม: {_payable_outstanding(group_id):,.2f} บาท{warn}"))
 
 
 def _cleanup_old_data():
