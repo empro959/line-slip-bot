@@ -1874,7 +1874,10 @@ def save_payable_payment(group_id: str, amount: float, sender=None, ref_number=N
 
 
 def _payable_settle(group_id: str, pay_for_date: str, amount: float):
-    """ตัดยอดจ่ายเข้ากับ 'บรรทัดบิล/ค้าง' โดยตรง (ดูจากวันที่บนสลิป → ถ้าไม่มี ดูยอดเงินที่ตรง)
+    """ตัดยอดจ่ายเข้ากับ 'บรรทัดบิล/ค้าง' โดยตรง — ลำดับการเลือกใบ (เจ้าของตกลง 2026-08-13):
+      (1) ยอดค้างตรงเป๊ะ 'ในวันที่ที่โน้ตบนสลิป'  (2) ยอดค้างตรงเป๊ะ 'ทั้งบัญชี' เก่าสุดก่อน
+      (3) ไม่มีใบยอดตรง → FIFO บิลของวันที่ที่โน้ตไว้ (ตัดบางส่วนได้)
+    'ยอดตรงเป๊ะชนะวันที่' เพราะร้านจ่ายเป็นรายใบ — วันที่ที่ AI อ่านจากสลิปมักเป็นวันโอน ไม่ใช่วันของบิล
     จ่ายครบ = ลบบรรทัดนั้น, จ่ายบางส่วน = ลดยอดบรรทัดเหลือเท่าที่ค้าง (เรียงค้างยกมาก่อน แล้ว FIFO)
     คืน (allocated_total, [ข้อความสรุปบรรทัดที่ตัด], settle_note) — ส่วนที่ตัดได้จะถูกหักจาก amount ที่ลดยอดรวม กันนับซ้ำ
     settle_note = วันที่ของบรรทัดที่ถูกตัด (แบบสั้น คั่นด้วย ,) ไว้โชว์ในรายงานว่า 'จ่ายตัดของวันไหน'"""
@@ -1895,22 +1898,30 @@ def _payable_settle(group_id: str, pay_for_date: str, amount: float):
         except (ValueError, TypeError):
             return d or "-"
 
+    # หาบรรทัด 'ยังค้างจริง' (amount − paid > 0) ที่ยอดค้างตรงกับยอดจ่ายเป๊ะ — ค้างยกมาก่อน แล้วเก่าสุด
+    _EXACT = ("SELECT id, doc_date, amount, COALESCE(paid,0) paid FROM payable_bills "
+              "WHERE group_id=? AND ABS((amount - COALESCE(paid,0)) - ?)<0.01 "
+              "AND (amount - COALESCE(paid,0))>0.01 ")
+    _EXACT_ORDER = "ORDER BY CASE WHEN note=? THEN 0 ELSE 1 END, doc_date, id LIMIT 1"
+
     with _db() as conn:
-        # เลือกบรรทัดที่ 'ยังค้างจริง' (amount − paid > 0); ค้างยกมาก่อน
-        if pay_for_date:   # มีวันที่บนสลิป → ตัดบิล/ค้างของวันนั้น
-            # เลือก 'บิลที่ยอดค้างตรงกับยอดจ่ายเป๊ะ' ก่อน (เช่น จ่าย 6,835 → ตัดบิล 6,835 ให้ครบ)
-            # แล้วค่อยค้างยกมาก่อน → FIFO (กันเอาไปตัดบิลก้อนใหญ่บางส่วนทั้งที่มีบิลตรงยอด)
+        rows = []
+        if pay_for_date:   # (1) วันที่ที่โน้ตไว้ + ยอดตรงเป๊ะ = ชัวร์สุด
+            rows = conn.execute(_EXACT + "AND doc_date=? " + _EXACT_ORDER,
+                                (group_id, float(amount), pay_for_date, _PAYABLE_CARRY_NOTE)).fetchall()
+        if not rows:
+            # (2) ยอดตรงเป๊ะ 'ทั้งบัญชี' (เก่าสุดก่อน) — ชนะการตัดบางส่วนตามวันที่ที่โน้ตไว้
+            # เคสจริง 12/08/26: จ่าย 2,867 = ค่าบิล 03/08 เป๊ะ แต่สลิปให้วันที่ 12/08 มา
+            # ของเดิมจำกัดเฉพาะวันที่โน้ต → ไปตัดบางส่วนบิล 12/08 (15,091) ผิดใบ บิล 03/08 ค้างค้างอยู่
+            rows = conn.execute(_EXACT + _EXACT_ORDER,
+                                (group_id, float(amount), _PAYABLE_CARRY_NOTE)).fetchall()
+        if not rows and pay_for_date:
+            # (3) ไม่มีใบยอดตรงเลย → ตัดบิลของวันที่ที่โน้ตไว้แบบ FIFO (ตัดบางส่วนได้) เหมือนเดิม
             rows = conn.execute(
                 "SELECT id, doc_date, amount, COALESCE(paid,0) paid FROM payable_bills "
                 "WHERE group_id=? AND doc_date=? AND (amount - COALESCE(paid,0))>0.01 "
-                "ORDER BY CASE WHEN ABS((amount - COALESCE(paid,0)) - ?)<0.01 THEN 0 ELSE 1 END, "
-                "CASE WHEN note=? THEN 0 ELSE 1 END, id",
-                (group_id, pay_for_date, float(amount), _PAYABLE_CARRY_NOTE)).fetchall()
-        else:              # ไม่มีวันที่ → จับยอดค้างคงเหลือที่ตรงกับบรรทัดเดียว
-            rows = conn.execute(
-                "SELECT id, doc_date, amount, COALESCE(paid,0) paid FROM payable_bills "
-                "WHERE group_id=? AND ABS((amount - COALESCE(paid,0)) - ?)<0.01 AND (amount - COALESCE(paid,0))>0.01 "
-                "ORDER BY CASE WHEN note=? THEN 0 ELSE 1 END, id LIMIT 1", (group_id, float(amount), _PAYABLE_CARRY_NOTE)).fetchall()
+                "ORDER BY CASE WHEN note=? THEN 0 ELSE 1 END, id",
+                (group_id, pay_for_date, _PAYABLE_CARRY_NOTE)).fetchall()
         for r in rows:
             if remaining <= 0.01:
                 break
@@ -2109,7 +2120,10 @@ def _payable_reconcile(acct: str):
     if orphan < -0.01:
         raise ValueError(f"orphan ผิดปกติ ({orphan:,.2f}) — ข้อมูลไม่สอดคล้อง")
 
-    # (1) FIFO ใหม่ในหน่วยความจำ — มิเรอร์ _payable_settle: ตัดบิล 'วันเดียวกับจ่าย', ยอดตรงก่อน แล้วยกมา แล้ว id
+    # (1) FIFO ใหม่ในหน่วยความจำ: ตัดบิล 'วันเดียวกับจ่าย', ยอดตรงก่อน แล้วยกมา แล้ว id
+    # ⚠️ กติกานี้ 'ไม่เหมือน' _payable_settle แล้ว (settle: ยอดตรงเป๊ะทั้งบัญชีชนะวันที่ — เจ้าของตกลง 2026-08-13)
+    #    ที่นี่ยังจำกัด 'วันเดียวกับจ่าย' → สั่ง 'จัดยอดใหม่' จะย้ายการตัดที่ settle ทำถูกไว้ กลับไปเป็นบิลวันเดียวกับสลิป
+    #    (ยอดค้างรวมไม่เพี้ยน มี self-verify คุมอยู่ — แต่ 'ตัดผิดใบ' ได้) ยังไม่แก้เพราะเจ้าของขอ 'ไม่ซ่อมย้อนหลัง'
     for b in bills:
         b["new_paid"] = 0.0
     for p in pays:
