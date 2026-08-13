@@ -2038,7 +2038,8 @@ def _payable_report_recipients(acct: str):
 
 def _payable_push_summary(event, source_group: str, acct: str):
     """เด้ง 'สรุปหนี้รายวัน' ให้กลุ่มผู้รับ (กลุ่ม 1 ไม่มียอดรวม / กลุ่ม 2 มียอดรวม)
-    กลุ่มต้นทาง = reply (ฟรี), กลุ่มอื่น = push — ใช้ตอน 'มีการจ่าย' (ไม่ใช้กับบิลซื้อ)"""
+    กลุ่มต้นทาง = reply (ฟรี), กลุ่มอื่น = push — ใช้ทั้งตอน 'บันทึกบิลซื้อ' และ 'มีการจ่าย'
+    reply พลาด (token หมดอายุเพราะ Gemini อ่านรูปนาน) → fallback เป็น push ไม่ให้สรุปหาย"""
     replied = False
     for grp, with_total in _payable_report_recipients(acct):
         if _group_left(grp) or grp in IGNORE_GROUPS:
@@ -2046,7 +2047,11 @@ def _payable_push_summary(event, source_group: str, acct: str):
         text = build_payable_ledger(acct, with_total)
         try:
             if grp == source_group and not replied and getattr(event, "reply_token", None):
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
+                try:
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
+                except Exception as e_reply:
+                    print(f"[payable] reply หมดอายุ grp={grp} → fallback push: {e_reply}", flush=True)
+                    _push(grp, TextSendMessage(text=text))
                 replied = True
             else:
                 _push(grp, TextSendMessage(text=text))
@@ -2262,9 +2267,9 @@ def _process_payable_image(event, group_id: str):
         if _payable_bill_exists(acct, eff_date, amount):   # กันส่งบิลซ้ำ (วันที่+ยอดเดียวกันมีแล้ว)
             notify(f"🔁 บิลนี้ (วันที่ {eff_date} ยอด {amount:,.2f}) เคยบันทึกแล้ว — ไม่นับซ้ำ", force=True)
             return
-        # บิลซื้อ: บันทึกเงียบ 'ไม่เด้งสรุป' (จะไปโผล่ในสรุปรอบที่มีการจ่ายถัดไป) — กลุ่ม 1 เงียบอยู่แล้ว
-        rid = save_payable_bill(acct, amount, note="รูป", doc_date=doc_date)
-        notify(f"📥 บันทึกบิลซื้อ #{rid} — {amount:,.2f} บาท")
+        # บิลซื้อ: บันทึก แล้วเด้ง 'สรุปหนี้' ทุกกลุ่ม (primary=reply ฟรี, mirror=push)
+        save_payable_bill(acct, amount, note="รูป", doc_date=doc_date)
+        _payable_push_summary(event, group_id, acct)
         return
 
     if doc_type == "payment":
@@ -4118,7 +4123,7 @@ def build_help(group_id: str) -> str:
             "• ลบวันที่ 6/6 → ลบทุกบิล/จ่ายของวันนั้น",
             "• ล้างบัญชีหนี้ → ล้างทั้งหมด เริ่มนับใหม่ (มีปุ่มยืนยัน)",
             "• ทดสอบรายงานหนี้ → ส่งสรุปหนี้เดี๋ยวนี้ (เช็คการส่ง/redirect)",
-            "⏰ บอทเด้งสรุปหนี้ให้เองทุกครั้งที่มี 'การจ่าย' (บิลซื้อไม่เด้ง)",
+            "⏰ บอทเด้งสรุปหนี้ให้เองทุกครั้งที่บันทึก 'บิลซื้อ/การจ่าย' (เด้งสรุปทั้งคู่)",
             "─────────────────",
             "• groupid → ดู Group ID | help → เมนูนี้",
         ])
@@ -4193,7 +4198,7 @@ def build_manual(group_id: str) -> str:
             "🧹 แก้ที่ผิด\n"
             "• ลบบิลล่าสุด / ลบจ่ายล่าสุด\n"
             "• ล้างบัญชีหนี้ → ล้างทั้งหมด เริ่มนับใหม่ (มีปุ่มยืนยัน)\n\n"
-            "⏰ บอทเด้งสรุปหนี้ให้เองทุกครั้งที่มี 'การจ่าย' (บิลซื้อไม่เด้ง; บรรทัดจ่ายครบโชว์รอบนั้นแล้วรอบถัดไปหาย)\n"
+            "⏰ บอทเด้งสรุปหนี้ให้เองทุกครั้งที่บันทึก 'บิลซื้อ/การจ่าย' (เด้งสรุปทั้งคู่; บรรทัดจ่ายครบโชว์รอบนั้นแล้วรอบถัดไปหาย)\n"
             "ℹ️ help → เมนูคำสั่ง | groupid → ดูข้อมูลกลุ่ม"
         )
     slip_on = _slip_enabled(group_id)
