@@ -1798,7 +1798,10 @@ def _payable_outstanding(group_id: str) -> float:
 def _parse_thai_date(token: str):
     """แปลง 'd/m', 'd/m/yy', 'd/m/yyyy' → ISO 'YYYY-MM-DD' (คืน None ถ้าผิดรูป)
     - ไม่ใส่ปี → ใช้ปีปัจจุบัน (ถ้าวันที่กลายเป็นอนาคต ถอยไปปีก่อน — กันเคสข้ามปี)
-    - ปี 2 หลัก หรือ ≥2400 → ถือเป็น พ.ศ. แปลงเป็น ค.ศ. ให้อัตโนมัติ"""
+    - ปี ≥2400 → พ.ศ. เต็ม แปลงเป็น ค.ศ.
+    - ปี 2 หลัก → เดาทั้ง 2 แบบ (ค.ศ. 20xx / พ.ศ. 25xx) แล้วเลือกที่ 'ใกล้ปีนี้ที่สุด'
+      เพราะเจอทั้งสองแบบจริง: คนไทยพิมพ์ '13/8/69' (พ.ศ. 2569) แต่บอทเองพิมพ์สรุปเป็น '13/08/26' (ค.ศ.)
+      ของเดิมตีเป็น พ.ศ. เสมอ → ก๊อปสรุปของบอทกลับไปวางเป็นบล็อกค้าง วันที่หลุดไปปี 1983 ทั้งแผง"""
     parts = [p.strip() for p in token.strip().split("/")]
     if len(parts) < 2 or len(parts) > 3:
         return None
@@ -1813,8 +1816,9 @@ def _parse_thai_date(token: str):
             year = int(parts[2])
         except ValueError:
             return None
-        if year < 100:        # เลข 2 หลัก → พ.ศ. ย่อ 25xx
-            year = 2500 + year - 543
+        if year < 100:        # เลข 2 หลัก → เลือกแบบที่ใกล้ปีนี้สุด (เสมอ → ค.ศ.)
+            year = min((2000 + year, 2500 + year - 543),
+                       key=lambda y: (abs(y - today.year), y != 2000 + year))
         elif year >= 2400:    # พ.ศ. เต็ม
             year = year - 543
         # ไม่งั้นถือเป็น ค.ศ. เต็มอยู่แล้ว
@@ -2328,8 +2332,9 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
 
     # บล็อก 'ค้าง' = ยอดค้างยกมาแต่ละวัน → ลงเป็น 'บิลรายวัน' (กระจายทุกบรรทัดในรายงาน แล้วเดินยอดต่อ)
     #   ค้าง
-    #   6/6=24153 (ค้าง 14153)   ← มีวงเล็บ = จ่ายบางส่วน ใช้เลขในวงเล็บ
-    #   8/6=18504                ← ไม่มีวงเล็บ ใช้เลขปกติ
+    #   6/6=24153 (ค้าง 14153)              ← มีวงเล็บ = จ่ายบางส่วน ใช้เลขในวงเล็บ
+    #   31/7/26=19941 (จ่าย 10000 ค้าง 9941) ← วงเล็บมีหลายเลข ใช้เลขหลังคำ 'ค้าง/เหลือ'
+    #   8/6=18504                           ← ไม่มีวงเล็บ ใช้เลขปกติ
     # วางบล็อกใหม่ = แทนที่ยอดค้างยกมาเดิมทั้งหมด (ไม่บวกเพิ่ม); วันที่ซ้ำ = บวกรวม
     lines = text.splitlines()
     if len(lines) > 1 and lines[0].strip().lower() in ("ค้าง", "ยอดค้าง", "รายการค้าง", "บิลค้าง"):
@@ -2345,11 +2350,15 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             # มีวงเล็บ → ใช้ยอดในวงเล็บ (ค้างจริงหลังจ่ายบางส่วน); ไม่มี → ใช้ยอดปกติ (เลขก่อนวงเล็บ)
             paren = re.search(r"\(([^)]*)\)", apart)
             target = paren.group(1) if paren else apart.split("(")[0]
-            num = re.search(r"\d[\d,]*(?:\.\d+)?", target)
+            # ในวงเล็บมีหลายเลข เช่น '(จ่าย 10,000 ค้าง 9,941)' → เอาเลข 'หลังคำค้าง/เหลือ' ไม่ใช่เลขตัวแรก
+            # (ของเดิมคว้า 10,000 = ยอดที่จ่าย มาเป็นยอดค้าง → หนี้เกินจริง)
+            num = (re.search(r"(?:ค้าง|เหลือ)\D{0,3}(\d[\d,]*(?:\.\d+)?)", target)
+                   or re.search(r"\d[\d,]*(?:\.\d+)?", target))
             if not num:
                 errors.append(ln); continue
             try:
-                val = float(num.group(0).replace(",", ""))
+                # เจอคำ 'ค้าง/เหลือ' → group(1) = เลขหลังคำนั้น; ไม่เจอ → group(0) = เลขตัวแรก
+                val = float(num.group(num.lastindex or 0).replace(",", ""))
             except ValueError:
                 errors.append(ln); continue
             if val < 0:
@@ -2367,7 +2376,18 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         _set_meta(f"payable_opening:{acct}", "0")
         for diso, val in entries:
             save_payable_bill(acct, val, note=_PAYABLE_CARRY_NOTE, doc_date=diso)
-        # ไม่ส่งข้อความยืนยัน — เด้ง 'สรุปหนี้' (ผลลัพธ์จริง) ให้ดูแทน
+        # รายงานผลอ่านก่อนโชว์สรุป — งานเงินห้ามข้ามบรรทัดเงียบ (ของเดิมข้ามแล้วไม่บอก เจ้าของไม่รู้ว่าหนี้หาย)
+        # ไม่ทำปุ่มยืนยันก่อนบันทึกเพราะกู้ง่าย: วางบล็อกใหม่ทับได้เลย (แทนที่ยอดค้างยกมาเดิมทั้งชุด)
+        if errors:
+            skipped = "\n".join(f"   • {e[:40]}" for e in errors[:5])
+            more = f"\n   • (อีก {len(errors) - 5} บรรทัด)" if len(errors) > 5 else ""
+            _payable_send(event, group_id, out,
+                f"⚠️ บันทึกยอดค้างยกมา {len(entries)} บรรทัด รวม {sum(v for _, v in entries):,.2f} บาท\n"
+                f"❌ อ่านไม่ได้ {len(errors)} บรรทัด — ยังไม่ได้บันทึก โปรดแก้แล้ววางใหม่ทั้งบล็อก:\n{skipped}{more}")
+        else:
+            _payable_send(event, group_id, out,
+                f"✅ บันทึกยอดค้างยกมา {len(entries)} บรรทัด รวม {sum(v for _, v in entries):,.2f} บาท "
+                f"({entries[0][0]} → {entries[-1][0]})")
         _payable_push_summary(event, group_id, acct)
         return True
 
