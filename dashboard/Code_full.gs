@@ -848,7 +848,7 @@ function _importPosOneDate_(iso){
 // 👉 ใส่วันที่ที่ต้องการกู้ตรงนี้ — ใส่กี่วันก็ได้ คั่นด้วยจุลภาค แล้วรันฟังก์ชันนี้ครั้งเดียว
 // ใช้ OCR ~4 ครั้ง/วัน · ชนลิมิต (⏳) ให้พัก ~5 นาทีแล้วรันซ้ำได้เลย — วันที่กู้สำเร็จแล้วจะถูกทับด้วยข้อมูลเดิม ไม่เสียหาย
 function importPosByDate(){
-  var DATES = ['2026-07-25', '2026-07-29'];
+  var DATES = ['2026-08-11'];   // ← เปลี่ยนเป็นวันที่ที่ขาดจริง (ดูจาก debugDaily)
   DATES.forEach(function(iso, i){
     Logger.log('───── ' + (i + 1) + '/' + DATES.length + '  กู้วันที่ ' + iso + ' ─────');
     try { _importPosOneDate_(iso); }
@@ -878,6 +878,12 @@ function debugReports(){
   Logger.log('— มีคู่ SALE+PAY '+paired.length+' ชุด (suffix: '+paired.sort().reverse().join(', ')+')');
 }
 
+// วันที่ "ร้านหยุด" — ไม่มีรายงาน POS โดยธรรมชาติ ไม่ใช่ข้อมูลหาย
+// มีไว้กัน debugDaily รายงานว่า "ขาด" ซ้ำทุกครั้ง แล้วมีคนไปไล่กู้เปล่าๆ (เสียโควตา OCR ฟรีๆ
+// และเคยหลุดไปอยู่ในลิสต์งานค้างจริงมาแล้ว — 29 ก.ค. 2026)
+// 👉 ร้านหยุดวันไหนเพิ่ม ใส่เพิ่มตรงนี้ได้เลย
+var CLOSED_DAYS = ['2026-07-29'];
+
 // ===== ตรวจสอบว่าเดือนไหนมี "ข้อมูลรายวัน (daily_totals)" — รันแล้วก๊อป log มาดู =====
 function debugDaily(){
   var daily=loadDaily_();
@@ -892,9 +898,16 @@ function debugDaily(){
     var y=parseInt(ym.slice(0,4),10), mo=parseInt(ym.slice(5,7),10);
     var lastDay=new Date(y,mo,0).getDate(), today=new Date(), miss=[];
     var maxD=(today.getFullYear()===y && (today.getMonth()+1)===mo)?today.getDate():lastDay;
-    for(var d2=1;d2<=maxD;d2++){ var k=ym+'-'+('0'+d2).slice(-2); if(!have[k]) miss.push(k); }
-    Logger.log('🔎 เดือนล่าสุด '+ym+': มี '+Object.keys(have).length+' วัน · ขาด '+miss.length+' วัน'+(miss.length?' → '+miss.join(', '):' ✅ ครบ'));
-    if(miss.length) Logger.log('   👉 กู้ด้วย backfillPos() (รันซ้ำได้จนครบ) แล้วปิดท้าย rebuildNow()');
+    var closed=[];
+    for(var d2=1;d2<=maxD;d2++){ var k=ym+'-'+('0'+d2).slice(-2);
+      if(have[k]) continue;
+      if(CLOSED_DAYS.indexOf(k)>=0) closed.push(k);   // ร้านหยุด = ไม่มียอดถูกแล้ว ไม่ต้องไปกู้
+      else miss.push(k);
+    }
+    Logger.log('🔎 เดือนล่าสุด '+ym+': มี '+Object.keys(have).length+' วัน · ขาด '+miss.length+' วัน'+(miss.length?' → '+miss.join(', '):' ✅ ครบ')+
+               (closed.length?'  (ไม่นับวันร้านหยุด '+closed.length+' วัน: '+closed.join(', ')+')':''));
+    if(miss.length) Logger.log('   👉 กู้ด้วย backfillPos() (รันซ้ำได้จนครบ) แล้วปิดท้าย rebuildNow()'+
+                               '\n   ℹ️ ถ้าวันไหนในลิสต์คือวันร้านหยุด ให้ใส่ใน CLOSED_DAYS แทนการไปไล่กู้');
   }
   var f=getFile_(), arr=[]; if(f){try{arr=JSON.parse(f.getBlob().getDataAsString('UTF-8'))||[];}catch(e){}}
   Logger.log('📊 saisang_data.json มี '+arr.length+' เดือน — เช็ก daily_totals:');
