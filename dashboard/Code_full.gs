@@ -3,10 +3,23 @@
 //  รวม: (1) Drive sync ให้ dashboard  +  (2) ดึงข้อมูล Easy POS อัตโนมัติ
 //  วิธีใช้: เลือกโค้ดทั้งหมดในไฟล์นี้ -> ลบ -> วางทับ -> Save
 //  ต้องเปิด Advanced Drive Service (Drive API v2) ที่ "บริการ" ด้วย
+//
+//  ── แก้ไข 2026-08-17 (หลังย้ายเซิร์ฟเวอร์บอทจาก E&M มาเป็นของร้าน) ──
+//  ปัญหา: สรุปยอดไม่เข้า LINE หลายวัน แต่อีเมลเข้าปกติ
+//  เหตุ:  pushOwner_ ใช้ host จาก SLIP_API_URL ซึ่งยังชี้บอทตัวเก่า (65gt)
+//         และ error ถูกกลืน 2 ชั้น (catch ในตัวเอง + catch(e){} ตอนเรียก)
+//         → LINE พังเงียบ ไม่ขึ้นเป็น failed execution ให้เห็นเลย
+//  แก้:   1) เพิ่ม showSlipUrl() / fixSlipUrl() — ดู/เปลี่ยน host โดยคง token เดิม
+//         2) pushOwner_ คืนข้อความ error ('' = สำเร็จ) + บอก HTTP code
+//         3) sendDailyAlert/sendWeeklyAlert ฟ้องใน "หัวเรื่องอีเมล" ถ้า LINE ส่งไม่ออก
+//         4) testPushOwner ทดสอบเฉพาะ LINE (ไม่ยิงอีเมลซ้ำ) + โชว์ผลชัดเจน
 // ==========================================================================
 
 const FOLDER_NAME = 'สรุปรายรับรายจ่าย';
 const FILE_NAME   = 'saisang_data.json';
+
+// host ของบอทตัวใหม่ (ร้าน) — ใช้โดย fixSlipUrl()/setSlipUrl()
+const BOT_HOST = 'https://line-slip-bot-1-iq8e.onrender.com';
 
 function getFolder_() {
   const it = DriveApp.getFoldersByName(FOLDER_NAME);
@@ -268,9 +281,30 @@ var PAY_MAP={'Prompay':'เงินโอน','เงินสด':'เงิ�
 
 // ▼▼ ตั้งลิงก์สลิปครั้งเดียว: ใส่ URL+token ในบรรทัดล่าง รัน setSlipUrl 1 ครั้ง แล้วลบ token ออกจากบรรทัดนี้ได้ ▼▼
 function setSlipUrl(){
-  var url='https://xxxx.onrender.com/api/slip_daily?token=ใส่รหัสที่นี่'; // <<< แก้ตรงนี้
+  var url=BOT_HOST+'/api/slip_daily?token=ใส่รหัสที่นี่'; // <<< แก้ตรงนี้ (token = SLIP_API_TOKEN บน Render)
   PropertiesService.getScriptProperties().setProperty('SLIP_API_URL', url);
   Logger.log('✅ บันทึกลิงก์สลิปลง Script Properties แล้ว (รัน rebuildNow ต่อได้เลย)');
+}
+
+// ▼▼ [ใหม่ 17/08/26] ดู SLIP_API_URL ที่ตั้งไว้ — ปิด token ไม่ให้โชว์ค่าจริง ▼▼
+function showSlipUrl(){
+  var u=PropertiesService.getScriptProperties().getProperty('SLIP_API_URL');
+  if(!u){ Logger.log('❌ ยังไม่ตั้ง SLIP_API_URL — รัน setSlipUrl() ก่อน'); return; }
+  Logger.log('SLIP_API_URL = '+u.replace(/token=.*/,'token=***'));
+  var host=(u.match(/^https:\/\/[^\/]+/)||[''])[0];
+  Logger.log(host===BOT_HOST ? '✅ host ถูกต้อง (บอทตัวใหม่ของร้าน)'
+                             : '🔴 host ยังเป็นตัวเก่า! → รัน fixSlipUrl() เพื่อเปลี่ยนเป็น '+BOT_HOST);
+}
+
+// ▼▼ [ใหม่ 17/08/26] เปลี่ยนแค่ host เป็นบอทตัวใหม่ — คง token เดิมไว้ ▼▼
+function fixSlipUrl(){
+  var p=PropertiesService.getScriptProperties();
+  var u=p.getProperty('SLIP_API_URL')||'';
+  if(!u){ Logger.log('❌ ยังไม่ตั้ง SLIP_API_URL — ใช้ setSlipUrl() ก่อน'); return; }
+  var n=u.replace(/^https:\/\/[^\/]+/, BOT_HOST);
+  p.setProperty('SLIP_API_URL', n);
+  Logger.log('✅ เปลี่ยน host แล้ว → '+n.replace(/token=.*/,'token=***'));
+  Logger.log('👉 ต่อไปรัน testPushOwner() เพื่อเช็คว่าเข้า LINE ได้จริง');
 }
 
 // แกะ BalanceCashDrawer เฉพาะช่วง "Net Sale" -> {เงินโอน,เงินสด,บัตรเครดิต,ค้างชำระ,อื่นๆ}
@@ -747,6 +781,73 @@ function analyzeWeekday(){
   if(rows.length) Logger.log('🔴 สูงสุด = วัน'+rows[0].name+' (฿'+Math.round(rows[0].avg).toLocaleString()+'/วัน · '+rows[0].pct.toFixed(1)+'%)');
 }
 
+// ==========================================================================
+//  [ใหม่ 17/08/26] กู้ยอดของ "วันที่ระบุ" — ใช้เมื่อรายงานถูกส่งซ้ำภายหลัง
+//  ปัญหาที่แก้: importPosReports()/backfillPos() จับไฟล์ด้วย "เลขท้ายชื่อไฟล์" = วันที่พิมพ์
+//    เคสจริง: รายงานของ 11 + 12 ส.ค. ถูกส่งใหม่พร้อมกันวันที่ 13 ส.ค.
+//    → ไฟล์ทั้งสองวันลงท้าย _2026813.pdf เหมือนกัน → คีย์ชนกัน ตัวหนึ่งถูกทับ
+//    → วันที่ 11 ไม่เคยถูก import และ backfillPos ก็หาไม่เจอ (มองแต่ชื่อไฟล์)
+//  ตัวนี้เลือกอีเมลจาก "วันที่ในหัวเรื่อง" (รองรับทั้ง พ.ศ. 2569 และ ค.ศ. 2026)
+//  แล้วอ่านวันที่จริงจากเนื้อหา PDF ยืนยันอีกชั้น
+//  วิธีใช้: แก้วันที่ในบรรทัดล่างสุดของบล็อกนี้ แล้วรัน importPosByDate
+// ==========================================================================
+
+// ดึงวันที่จากหัวเรื่องอีเมล "รายงานยอดขายวันSYS4 11/08/2569" -> '2026-08-11'
+function _subjDateIso_(subject){
+  var m=String(subject||'').match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if(!m) return null;
+  var d=parseInt(m[1],10), mo=parseInt(m[2],10), y=parseInt(m[3],10);
+  if(y>=2500) y-=543;                       // พ.ศ. -> ค.ศ.
+  if(!(mo>=1&&mo<=12&&d>=1&&d<=31)) return null;
+  return y+'-'+('0'+mo).slice(-2)+'-'+('0'+d).slice(-2);
+}
+
+function _importPosOneDate_(iso){
+  var threads=GmailApp.search('has:attachment filename:pdf newer_than:60d',0,100), hit=null;
+  threads.forEach(function(t){ t.getMessages().forEach(function(msg){
+    if(!hit && _subjDateIso_(msg.getSubject())===iso && msg.getAttachments().length) hit=msg;
+  });});
+  if(!hit){ Logger.log('❌ ไม่พบอีเมลรายงานของ '+iso+' — หัวเรื่องต้องมีวันที่แบบ dd/mm/yyyy (พ.ศ. หรือ ค.ศ. ก็ได้)'); return; }
+  Logger.log('📧 ใช้อีเมล: "'+hit.getSubject()+'"  (เข้ามา '+hit.getDate()+')');
+  var att={};
+  hit.getAttachments().forEach(function(a){ var n=a.getName();
+    if(!/\.pdf$/i.test(n)) return;
+    if(/SaleReport/i.test(n)) att.sale=att.sale||a;
+    else if(/PayoutReport/i.test(n)) att.pay=att.pay||a;
+    else if(/BalanceCashDrawer/i.test(n)) att.bal=att.bal||a;
+    else if(/SalesSummaryReportByCustomer|แยกตามลูกค้า/i.test(n)) att.cust=att.cust||a;
+  });
+  if(!att.sale){ Logger.log('❌ อีเมลนี้ไม่มีไฟล์ SaleReport — กู้ไม่ได้'); return; }
+  var st=pdfToText_(att.sale.copyBlob());
+  var dd=dailyDate_(st);
+  if(!dd || dd.key!==iso){                  // เนื้อหาอ่านไม่ออก/ไม่ตรง → เชื่อวันที่ที่ระบุ (มาจากหัวเรื่อง)
+    Logger.log('⚠️ วันที่ในเนื้อหา PDF = '+(dd?dd.key:'อ่านไม่ออก')+' ไม่ตรงกับที่ขอ ('+iso+') → ใช้ '+iso+' ตามหัวเรื่อง');
+    var p=iso.split('-');
+    dd={key:iso, period:THAI_MONTHS[parseInt(p[1],10)-1]+' '+(parseInt(p[0],10)+543)};
+  }
+  var pt=att.pay?pdfToText_(att.pay.copyBlob()):'';
+  var bt=att.bal?pdfToText_(att.bal.copyBlob()):'';
+  var bills=0, credit=[];
+  try{ if(att.cust){ var ct=pdfToText_(att.cust.copyBlob()); bills=parseBills_(ct); credit=parseCustomerCredit_(ct); } }catch(e){}
+  var day={date:dd.key, period:dd.period,
+    sales:parseSale_(st).cats, expenses:pt?parsePayout_(pt).records:[],
+    payments:bt?parseBalance_(bt):{}, menu:parseSaleItems_(st),
+    zones:bt?parseBalanceZones_(bt):{}, voids:parseVoids_(st), bills:bills, credit:credit};
+  var daily=loadDaily_().filter(function(x){return x.date!==dd.key;});   // ทับวันเดิมถ้ามี
+  daily.push(day); saveDaily_(daily);
+  writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));                  // rebuild ให้ dashboard เลย
+  var totS=day.sales.reduce(function(a,c){return a+c.amount;},0);
+  var totE=day.expenses.reduce(function(a,c){return a+c.amount;},0);
+  Logger.log('✅ กู้วันที่ '+dd.key+' ('+dd.period+') สำเร็จ — ยอดขาย '+totS.toLocaleString()+
+             ' · ค่าใช้จ่าย '+totE.toLocaleString()+' · เมนู '+day.menu.length+' รายการ · บิล '+bills+
+             (pt?'':'  ⚠️ ไม่มี PayoutReport ในอีเมลนี้ → ค่าใช้จ่าย = 0')+
+             (bt?'':'  ⚠️ ไม่มี BalanceCashDrawer → ไม่มีวิธีชำระ/โซน'));
+  Logger.log('👉 เปิด dashboard เช็คได้เลย (rebuild ให้แล้ว) · ถ้าจะกู้วันอื่นแก้วันที่ใน importPosByDate แล้วรันซ้ำ');
+}
+
+// 👉 แก้วันที่ที่ต้องการกู้ตรงนี้ แล้วรันฟังก์ชันนี้ (กู้ได้ทีละวัน · ใช้ OCR ~4 ครั้ง/วัน)
+function importPosByDate(){ _importPosOneDate_('2026-08-11'); }
+
 // ===== ดูว่ามีไฟล์รายงาน POS วันไหนในเมลบ้าง (ไม่ OCR เลย = ไม่กินโควตา) =====
 function debugReports(){
   var threads=GmailApp.search('has:attachment filename:pdf newer_than:40d',0,80);
@@ -774,6 +875,18 @@ function debugDaily(){
   var byP={}; daily.forEach(function(d){byP[d.period]=(byP[d.period]||0)+1;});
   Logger.log('📁 pos_daily.json มี '+daily.length+' วัน แยกตามเดือน:');
   Object.keys(byP).forEach(function(p){Logger.log('   • '+p+' = '+byP[p]+' วัน');});
+  // [ใหม่ 17/08/26] โชว์ "วันที่ขาด" ของเดือนล่าสุด — ไว้เช็กว่าวันไหนหาย (เช่น 11 ส.ค.)
+  if(daily.length){
+    var latest=daily.reduce(function(a,b){return b.date>a.date?b:a;});
+    var ym=(latest.date||'').slice(0,7), have={};
+    daily.forEach(function(d){ if((d.date||'').indexOf(ym)===0) have[d.date]=true; });
+    var y=parseInt(ym.slice(0,4),10), mo=parseInt(ym.slice(5,7),10);
+    var lastDay=new Date(y,mo,0).getDate(), today=new Date(), miss=[];
+    var maxD=(today.getFullYear()===y && (today.getMonth()+1)===mo)?today.getDate():lastDay;
+    for(var d2=1;d2<=maxD;d2++){ var k=ym+'-'+('0'+d2).slice(-2); if(!have[k]) miss.push(k); }
+    Logger.log('🔎 เดือนล่าสุด '+ym+': มี '+Object.keys(have).length+' วัน · ขาด '+miss.length+' วัน'+(miss.length?' → '+miss.join(', '):' ✅ ครบ'));
+    if(miss.length) Logger.log('   👉 กู้ด้วย backfillPos() (รันซ้ำได้จนครบ) แล้วปิดท้าย rebuildNow()');
+  }
   var f=getFile_(), arr=[]; if(f){try{arr=JSON.parse(f.getBlob().getDataAsString('UTF-8'))||[];}catch(e){}}
   Logger.log('📊 saisang_data.json มี '+arr.length+' เดือน — เช็ก daily_totals:');
   arr.forEach(function(m){
@@ -789,16 +902,28 @@ function debugDaily(){
 // ==========================================================================
 function fmtT_(n){ return Math.round(n||0).toLocaleString('en-US'); }
 
+// [แก้ 17/08/26] คืนข้อความ error ('' = สำเร็จ) เพื่อให้ผู้เรียกรู้ว่า LINE ส่งไม่ออก
+// ของเดิม: กลืน error ไว้เงียบๆ → สรุปไม่เข้า LINE หลายวันโดยไม่มีใครรู้ (เห็นแต่อีเมล)
 function pushOwner_(msg){
   var s=PropertiesService.getScriptProperties().getProperty('SLIP_API_URL');
-  if(!s||!msg){ Logger.log('ยังไม่ตั้ง SLIP_API_URL หรือข้อความว่าง'); return; }
+  if(!s||!msg){ var e0='ยังไม่ตั้ง SLIP_API_URL หรือข้อความว่าง'; Logger.log(e0); return e0; }
   var url=s.replace('/api/slip_daily','/api/push_owner');
   try{
     var r=UrlFetchApp.fetch(url,{method:'post',contentType:'application/json',payload:JSON.stringify({message:msg}),muteHttpExceptions:true});
-    var d=JSON.parse(r.getContentText());
-    if(!d.ok) Logger.log('push ไม่สำเร็จ: '+r.getContentText().substring(0,150));
-    else Logger.log('✅ ส่ง LINE เจ้าของแล้ว');
-  }catch(e){ Logger.log('push error: '+e); }
+    var code=r.getResponseCode(), body=r.getContentText(), d={};
+    try{ d=JSON.parse(body)||{}; }catch(e2){}   // ถ้า host ผิดจะได้ HTML 404 → parse ไม่ได้ ก็ยังรายงาน code ได้
+    if(!d.ok){
+      var e1='HTTP '+code+' → '+String(body).substring(0,150);
+      Logger.log('push ไม่สำเร็จ: '+e1);
+      if(code===401) Logger.log('   ↳ token ไม่ตรง: เทียบ SLIP_API_TOKEN บน Render กับ token ใน SLIP_API_URL (รัน showSlipUrl)');
+      if(code===403) Logger.log('   ↳ บอทยังไม่ตั้ง env SLIP_API_TOKEN/DASHBOARD_PASSWORD');
+      if(code===400) Logger.log('   ↳ บอทยังไม่ตั้ง env LINE_ADMIN_USER_ID');
+      if(code===404) Logger.log('   ↳ host ผิด/บอทตัวเก่า: รัน showSlipUrl() แล้ว fixSlipUrl()');
+      return e1;
+    }
+    Logger.log('✅ ส่ง LINE เจ้าของแล้ว');
+    return '';
+  }catch(e){ var e3=String(e); Logger.log('push error: '+e3+'  ↳ host เข้าไม่ได้? รัน showSlipUrl()'); return e3; }
 }
 
 function daySum_(d){ return {
@@ -870,16 +995,30 @@ function setOwnerEmails(){
   PropertiesService.getScriptProperties().setProperty('OWNER_EMAILS','ใส่อีเมล1@gmail.com,อีเมล2@gmail.com'); // <<< แก้ตรงนี้
   Logger.log('✅ ตั้งอีเมลเจ้าของแล้ว: '+PropertiesService.getScriptProperties().getProperty('OWNER_EMAILS'));
 }
+
+// [แก้ 17/08/26] ถ้า LINE ส่งไม่ออก → ฟ้องใน "หัวเรื่องอีเมล" + ต่อท้ายเนื้อหา
+// (ของเดิม try{}catch(e){} กลืนเงียบ → ได้แต่อีเมล ไม่รู้ว่าไลน์พัง)
 function sendDailyAlert(){ var m=buildDailyMsg_(); if(!m) return;
-  try{ pushOwner_(m); }catch(e){}                       // LINE (best-effort — ถ้าโควตาเต็มก็ข้าม)
-  emailOwners_('📊 สรุปยอดขายเมื่อวาน — ไส้ย่างซอย๔', m); // อีเมล (ฟรี ชัวร์)
+  var err=''; try{ err=pushOwner_(m)||''; }catch(e){ err=String(e); }
+  var subj='📊 สรุปยอดขายเมื่อวาน — ไส้ย่างซอย๔'+(err?' ⚠️ (LINE ส่งไม่ออก)':'');
+  emailOwners_(subj, m+(err?('\n\n─────────────\n⚠️ ส่งเข้า LINE ไม่สำเร็จ: '+err+
+    '\nวิธีเช็ก: เปิด Apps Script → รัน showSlipUrl() ดู host → ถ้าเป็นบอทตัวเก่าให้รัน fixSlipUrl()'):''));
 }
 function sendWeeklyAlert(){ var m=buildWeeklyMsg_(); if(!m) return;
-  try{ pushOwner_(m); }catch(e){}
-  emailOwners_('📅 สรุปรายสัปดาห์ — ไส้ย่างซอย๔', m);
+  var err=''; try{ err=pushOwner_(m)||''; }catch(e){ err=String(e); }
+  var subj='📅 สรุปรายสัปดาห์ — ไส้ย่างซอย๔'+(err?' ⚠️ (LINE ส่งไม่ออก)':'');
+  emailOwners_(subj, m+(err?('\n\n─────────────\n⚠️ ส่งเข้า LINE ไม่สำเร็จ: '+err):''));
 }
-// ทดสอบส่งเข้า LINE เจ้าของ (รันดูว่าข้อความเข้าไหม)
-function testPushOwner(){ Logger.log(buildDailyMsg_()); sendDailyAlert(); }
+
+// [แก้ 17/08/26] ทดสอบเฉพาะ LINE (ไม่ยิงอีเมลซ้ำ) + บอกผลชัดเจน
+function testPushOwner(){
+  var m=buildDailyMsg_();
+  if(!m){ Logger.log('❌ ไม่มีข้อมูลรายวัน — รัน backfillPos() ก่อน'); return; }
+  Logger.log(m);
+  Logger.log('─────────────');
+  var err=pushOwner_(m);
+  Logger.log(err ? ('🔴 LINE ไม่เข้า: '+err) : '🎉 LINE เข้าเรียบร้อย — จบ');
+}
 
 // ===== ตั้งเวลาอัตโนมัติ ตี 1:00 ทุกวัน (หลัง POS ส่งเมล 00:30 เผื่อ 30 นาที) — รันครั้งเดียว =====
 function setupDailyTrigger(){
@@ -892,4 +1031,8 @@ function setupDailyTrigger(){
   });
   ScriptApp.newTrigger('sendWeeklyAlert').timeBased().onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(9).nearMinute(0).create(); // สรุปรายสัปดาห์ จันทร์ 9 โมง
   Logger.log('✅ ตั้งเวลา: ดึง POS ตี 1–5 (ลองซ้ำจนสำเร็จ) · สรุปรายสัปดาห์ จันทร์ 9 โมง');
+}
+function testFetch() {
+  var r = UrlFetchApp.fetch('https://www.google.com', {muteHttpExceptions:true});
+  Logger.log('external_request OK: ' + r.getResponseCode());
 }

@@ -60,7 +60,7 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 - `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET`, `LINE_ADMIN_USER_ID`
 - **แผน B (แยกกลุ่มคนละ OA):** `LINE_CHANNEL_ACCESS_TOKEN_2/_3/_4` (token OA สำรอง) + `LINE_CHANNEL_SECRET_2/_3/_4` (secret — ไว้ตอบ `groupid`) + `OA_ROUTE` (แมป `groupid:เลขOA`) + `RESV_INFO_GROUPS` (กลุ่มเด้งข้อมูลจอง เช่น บาร์น้ำ,sound). `PUSH_FREE_LIMIT`(300), `PUSH_WARN_RATIO`(0.8), `MEMBER_COUNT_TTL`(3600)
 - `GEMINI_API_KEY`, `GEMINI_MODEL` (ดีฟอลต์ gemini-2.5-flash)
-- `DATABASE_URL` (Neon Postgres — host `...neon.tech`; ควร region เดียวกับ Render เพื่อ latency ต่ำ)
+- `DATABASE_URL` (**Supabase Postgres** ตั้งแต่ 2026-07-25 — ต้องเป็น **Session pooler** `aws-0-...pooler.supabase.com:5432` ซึ่งเป็น IPv4; Direct connection เป็น IPv6 Render ต่อไม่ได้ · ควร region เดียวกับ Render เพื่อ latency ต่ำ · เว้นว่าง = ใช้ SQLite ในเครื่อง ไว้ทดสอบ)
 - `SLIP_GROUPS`, `RESV_GROUPS`, `RESV_EXCLUDE_GROUPS`, `BAR_GROUP_ID`, `PAYEE_KEYWORDS`
 - `IGNORE_GROUPS` — กลุ่มที่ "บอทเมินทั้งหมด" (ไม่เช็คสลิป/ไม่จอง/ไม่ตอบคำสั่ง/ไม่ส่งรายงาน-เตือน) ใช้กับกลุ่มที่เลิกใช้
 - `PAYABLE_GROUPS` — กลุ่มบัญชีเจ้าหนี้ (เช่น กลุ่มดวงใจ); `PAYABLE_VENDOR` (ดีฟอลต์ "ดวงใจการสุรา"); `PAYABLE_SUMMARY_HOUR` (ดีฟอลต์ 1 = ตี1)
@@ -86,6 +86,10 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 - **pin เวอร์ชันใน requirements.txt** แล้ว — กัน auto-upgrade ทำพัง (อัปเดตเมื่อทดสอบแล้วเท่านั้น)
 - ดูสถานะ: `<render-url>/health` → `{status, slips_today, active_groups, storage, memory_mb}`
 - **เฝ้า memory:** `_check_memory()` (เรียกจาก /health ping + backup loop ทุก ~5 นาที) — RSS เกิน `MEM_WARN_MB`(430) → DM เตือนแอดมิน (จำกัด 1 ครั้ง/30 นาที) กันก่อน OOM/restart
+- **⚠️ SQL ที่มี `%` เป็นตัวอักษรจริง (เช่น `LIKE 'sent:%'`) ต้อง escape ก่อนส่ง psycopg2** — `_Conn._pg_sql()` แปลง `%`→`%%` ก่อน `?`→`%s` ให้อัตโนมัติ (ลำดับสำคัญ ไม่งั้น `%s` ที่เพิ่งสร้างจะกลายเป็น `%%s`) ถ้าไม่ escape จะได้ `IndexError: tuple index out of range` — เคสจริง 2026-08-17: `_cleanup_old_data()` พังทุกวันเงียบๆ ตั้งแต่ย้ายมา Postgres ทำให้ transaction rollback = **ลบข้อมูลเก่าไม่เคยทำงาน** (SQLite ไม่มีปัญหานี้ บั๊กจึงโผล่เฉพาะ Postgres)
+- **ย้ายเซิร์ฟเวอร์/เปลี่ยน URL = ต้องไล่ทุกที่ที่จำ URL เก่า** ไม่ใช่แค่ webhook: UptimeRobot (ตัวปลุกรายงาน 00:30 ผ่าน `/health`) · Script Property `SLIP_API_URL` ใน Apps Script (ใช้ทั้งดึงยอดสลิปและ push แจ้งเตือนเข้า LINE) · โน้ต/เอกสารในห้องอื่น
+- **การจับคู่ 'จ่าย'↔'บิล' (`_payable_settle`)** ลำดับคือ ยอดค้างตรงเป๊ะในวันที่โน้ตบนสลิป → ยอดค้างตรงเป๊ะทั้งบัญชี (เก่าสุดก่อน) → FIFO บิลของวันที่โน้ตไว้ · **`_payable_reconcile` ('จัดยอดใหม่') ต้องใช้ลำดับเดียวกันเสมอ** ไม่งั้นสั่งคำสั่งนี้จะย้ายการจับคู่ที่ถูกไปผิดใบเงียบๆ (ยอดรวมไม่เพี้ยนเพราะมี self-verify แต่ผิดใบ)
+- **ลบบิล/จ่าย ต้องคืนยอดที่จับคู่ไว้ก่อนลบ** (`_payable_unlink`) — ลบแถวเดียวโดยไม่คืน `paid`/`allocated` ของฝั่งตรงข้าม = ยอดค้างเพี้ยน และทำให้ `จัดยอดใหม่` ขึ้น `orphan ผิดปกติ` ซ่อมไม่ได้
 
 ## ข้อจำกัดที่รู้อยู่
 - AI อ่านสลิปจากรูป ~98% (1-2 ใบ/วันอาจพลาด) — 100% ต้องเปิด SlipOK API
