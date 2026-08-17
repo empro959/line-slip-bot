@@ -1,8 +1,8 @@
 # 📦 ส่งงานต่อ — บอทเอด + Dashboard ไส้ย่างซอย๔
 
 > อัปเดต: **2026-08-17** — เอกสารส่งงาน "ฉบับปัจจุบัน" ของทั้งโปรเจกต์ (แทนที่ฉบับ 2026-08-13)
-> repo หลัก: **`saiyangsoi-sketch/Line-Slip-Bot`** branch `main` → Render auto-deploy
-> ⚠️ อย่าไปยุ่ง `empro959/line-slip-bot` (repo เก่าฝั่ง E&M)
+> repo หลัก: **`empro959/line-slip-bot`** branch `main` → Render auto-deploy
+> ⚠️ `saiyangsoi-sketch/Line-Slip-Bot` = **repo เก่า เลิกใช้แล้ว** (ห้าม push เพิ่ม — งานทั้งหมดถูกรวมกลับมาที่ empro959 แล้วด้วย merge `bcb7020`)
 >
 > **เอกสารอื่นในโปรเจกต์:** `ARCHITECTURE.md` (สถาปัตยกรรมบอท + ENV ครบ) · `COORDINATION.md` (กล่องจดหมายระหว่างห้อง — อ่านก่อนเริ่มงานทุกครั้ง) · `dashboard/HANDOFF.md` (รายละเอียดฝั่ง dashboard/POS) · `TEAM.md` (ใครดูแลอะไร)
 
@@ -16,7 +16,7 @@
 | 🔴 2 | **Export Supabase ของ E&M เก็บไว้** ก่อนถูก pause (แจ้งแล้ว 16 ส.ค. · unpause ได้แค่ 90 วัน) | supabase (บัญชี empro959) |
 | 🟡 3 | **ล้างบัญชีหนี้ + วางฟอร์มยอดค้าง 11 บรรทัด** ให้ได้ยอดรวม **169,427.00** | กลุ่มหนี้ในไลน์ |
 | 🟡 4 | **กู้ยอด 25 ก.ค. / 29 ก.ค.** ที่ยังขาดใน dashboard (ใช้ `importPosByDate()`) | Apps Script |
-| 🟡 5 | **กู้/จดรหัส GitHub `saiyangsoi-sketch`** — 17 ส.ค. สิทธิ์หลุดกลางทาง 2 ครั้ง push ไม่ได้ | github.com |
+| ✅ 5 | ~~กู้รหัส GitHub `saiyangsoi-sketch`~~ — **ไม่ต้องแล้ว** ย้ายต้นทาง deploy กลับมา `empro959` และรวมโค้ดครบแล้ว (repo นั้นปล่อยทิ้งได้) | — |
 | 🟢 6 | เช็กยกเลิกบิล ฿3,599 ของวันที่ 16 ส.ค. (ระบบเตือนขึ้นเอง) | Easy POS |
 | 🟢 7 | แจ้งห้องคอนเทนต์เรื่อง webhook URL ใหม่ (ค้างจากฉบับก่อน) | กลุ่มคอนเทนต์ |
 | 🟢 8 | (ถ้าอยาก) ย้ายปลายทางรายงานสลิป — ตอนนี้ redirect ไปกลุ่ม `C91b4fc6ff9…` | env `REPORT_REDIRECT` ที่ Render |
@@ -63,9 +63,11 @@
 | Gemini | Saiyang Soi4 / project-for-key-3 (restrict Gemini API + เปิด billing) |
 | Apps Script + Drive + เมล POS | saiyangsoi@gmail.com |
 | Netlify (dashboard) | team saiyangsoi |
-| GitHub (deploy) | **saiyangsoi-sketch/Line-Slip-Bot** |
+| GitHub (deploy) | **empro959/line-slip-bot** ← Render service ต่อกับ repo นี้ (สลับแล้ว 17 ส.ค.) |
 
-**ของเก่า E&M (ยัง suspend ไว้):** Render `line-slip-bot-65gt`, Supabase empro959 (⚠️ จะถูก pause), Gemini E&M
+**ของเก่า/เลิกใช้:** Render `line-slip-bot-65gt` (suspend), Supabase empro959 (⚠️ จะถูก pause), Gemini E&M, **GitHub `saiyangsoi-sketch/Line-Slip-Bot`** (โค้ดถูกรวมกลับมาแล้ว)
+
+> ⚠️ **บัญชี GitHub กับบัญชีบริการอื่นคนละตัวกัน** — repo deploy อยู่ที่ `empro959` แต่ Render/Supabase/Apps Script/Netlify อยู่บัญชีร้าน (`saiyangsoi@gmail.com`) ไม่ใช่ความผิดพลาด ตั้งใจให้เป็นแบบนี้หลังย้าย
 
 ---
 
@@ -81,6 +83,16 @@
 | `ee2ef5f` | วางบล็อกยอดค้างได้ทุกแบบ — ก๊อปสรุปของบอทมาทั้งดุ้นก็ได้ (เดิมบรรทัดแรกต้องเป็นคำว่า `ค้าง` เป๊ะ ไม่งั้นเงียบสนิท) |
 | `462c892` | **ลบบิล/จ่าย ต้องคืนยอดที่จับคู่ไว้** (เดิมยอดค้างเพี้ยน) · `จัดยอดใหม่` ใช้กติกาเดียวกับ settle · แก้ reconcile พังตอนสั่ง 2 ครั้งซ้อน |
 | `33ac046` | แก้ `[cleanup] error: tuple index out of range` — psycopg2 ตีความ `%` ใน `LIKE 'sent:%'` เป็น format spec → **การลบข้อมูลเก่าไม่เคยทำงานเลยตั้งแต่ย้ายมา Postgres** |
+
+### 4.1.1 รวม repo กลับมา `empro959` + เพิ่มชุดเทสต์ (ท้ายวัน)
+
+| commit | เรื่อง |
+|---|---|
+| `bcb7020` | **merge รวม 2 สายที่แยกกันตั้งแต่ `cf1aeb2`** — ตรวจแล้วไม่มีงานฝั่งไหนหาย: `app.py` เอาฝั่ง saiyangsoi ทั้งไฟล์ (อีก 4 commit ของ empro959 คือฟีเจอร์ 'บิลซื้อเด้งสรุป' เรื่องเดียวกัน ทำซ้ำกัน) · dashboard/doc ของ empro959 merge เข้าเองไม่ชน · พารามิเตอร์ `source_only` เป็น dead code จึงไม่รับเข้ามา |
+| `51da09e` | **เพิ่ม `tests/` — 18 เคส** ครอบ settle/reconcile/unlink/`_pg_sql`/fallback push (ดูหัวข้อ "เทสต์" ใน `ARCHITECTURE.md`) · ไม่แตะ `app.py` |
+
+**สลับต้นทาง deploy:** Render service ชี้มา `empro959/line-slip-bot` แล้ว → push `main` = deploy จริง
+(ก่อนหน้านี้ต่อกับ `saiyangsoi-sketch` — ถ้าเจออาการ "push แล้วของไม่เปลี่ยน" ให้เช็คข้อนี้ก่อน)
 
 ### 4.2 Apps Script — แก้ 5 จุด (วางไฟล์ใหม่ทับแล้ว)
 
@@ -153,4 +165,6 @@
 
 - งานเล็ก/ด่วน (ไม่แตะ DB schema, การเงิน, logic หลายจุด) → commit + push `main` ตรง (Render auto-deploy)
 - งานใหญ่/เสี่ยง (DB schema, การเงิน, แก้หลายจุด) → feature branch + PR ให้เจ้าของดู diff ก่อน merge
-- ทดสอบก่อน push: `python3 -c "import ast; ast.parse(open('app.py').read())"` + รันชุดเทสต์ด้วย SQLite ในเครื่อง (ไม่ตั้ง `DATABASE_URL` = ใช้ SQLite อัตโนมัติ ทดสอบได้ปลอดภัยไม่แตะของจริง)
+- ทดสอบก่อน push: `python3 -m unittest discover -s tests -v` (~0.1 วิ · ไม่ตั้ง `DATABASE_URL` = ใช้ SQLite ชั่วคราวอัตโนมัติ ไม่แตะของจริง ไม่ต้องมีคีย์/เน็ต)
+- **แก้ logic การเงิน (บิล/จ่าย/ยอดค้าง) ต้องรันเทสต์ก่อน push เสมอ** — บั๊กกลุ่มนี้ตาเปล่าไม่เห็น เคยพังเงียบมาแล้วหลายรอบ
+- push ไป **`empro959/line-slip-bot`** เท่านั้น (`saiyangsoi-sketch` เลิกใช้แล้ว)
