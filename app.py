@@ -288,10 +288,20 @@ class _Conn:
     placeholder ในโค้ดใช้ '?' ทั้งหมด แล้วแปลงเป็น '%s' ให้อัตโนมัติเมื่อใช้ Postgres"""
     def __init__(self, raw):
         self._raw = raw
+
+    @staticmethod
+    def _pg_sql(sql: str) -> str:
+        """แปลง SQL สไตล์ sqlite → psycopg2: escape '%' ที่เป็นตัวอักษรจริงก่อน แล้วค่อยแปลง ? → %s
+        จำเป็นเพราะ psycopg2 ตีความ '%' เป็น format spec เมื่อมีการส่ง params
+        (เคสจริง: "LIKE 'sent:%'" → IndexError: tuple index out of range → _cleanup_old_data
+        พังทุกวันแบบเงียบๆ ตั้งแต่ย้ายมา Postgres และ rollback การลบข้อมูลเก่าทั้งก้อน)
+        ลำดับสำคัญ: escape ก่อน ไม่งั้น '%s' ที่เพิ่งสร้างจะถูก escape ซ้ำกลายเป็น '%%s'"""
+        return sql.replace("%", "%%").replace("?", "%s")
+
     def execute(self, sql, params=()):
         if USE_PG:
             cur = self._raw.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute(sql.replace("?", "%s"), params)
+            cur.execute(self._pg_sql(sql), params)
         else:
             cur = self._raw.cursor()
             cur.execute(sql, params)
@@ -300,7 +310,7 @@ class _Conn:
         # คืน id แถวที่เพิ่ง insert (Postgres ใช้ RETURNING id, SQLite ใช้ lastrowid)
         cur = self._raw.cursor()
         if USE_PG:
-            cur.execute(sql.replace("?", "%s") + " RETURNING id", params)
+            cur.execute(self._pg_sql(sql) + " RETURNING id", params)
             return cur.fetchone()[0]
         cur.execute(sql, params)
         return cur.lastrowid
