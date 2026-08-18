@@ -2405,16 +2405,29 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         # หัวบล็อกบอกเจตนาชัด (มีคำ 'ค้าง') → รับแม้บรรทัดเดียว; ไม่มีหัว → ต้องอ่านได้ ≥2 บรรทัด
         # และอ่านได้ต้องไม่น้อยกว่าที่อ่านไม่ได้ (กันข้อความคุยกันปกติที่มี 'x=y' หลุดมาโดนตีความเป็นบล็อก)
         hdr_carry = "ค้าง" in re.sub(r"[^\wก-๙]+", "", lines[0])
+        # 🔴 ต้องมีคำว่า 'ค้าง' หรือ 'ยกมา' อยู่ในข้อความด้วย ถึงจะถือว่าตั้งใจวางบล็อกยอดค้าง
+        # เพราะการวางบล็อก = 'ลบยอดค้างยกมาเดิมทั้งชุดแล้วเขียนทับ' ไม่ใช่เพิ่มเข้าไป
+        # เคสจริง 18/08/26: พนักงานรายงานค่าเนื้อในกลุ่ม ("ยอดเนื้อกาดสามแยก / 13/8=430 / ...")
+        # เข้าเงื่อนไข '≥2 บรรทัด' พอดี → บอทลบยอดค้างยกมาทั้งชุด (169,427) ทิ้ง เหลือ 2,050
+        # เงื่อนไขนับบรรทัดอย่างเดียวหลวมเกินไปสำหรับงานที่ 'ลบของเดิม' — ต้องมีเจตนาชัด
+        has_carry_word = bool(re.search(r"ค้าง|ยกมา", re.sub(r"[^\wก-๙]+", "", text)))
         if hdr_carry and not entries:   # สั่งมาชัดว่าจะวางยอดค้าง แต่อ่านไม่ได้เลย → ต้องบอก ห้ามเงียบ
             _payable_send(event, group_id, out,
                           "❌ อ่านบล็อกค้างไม่ได้ — รูปแบบควรเป็น  วัน/เดือน=ยอด (ค้าง xxxx)")
             return True
-        if not (entries and (hdr_carry or (len(entries) >= 2 and len(entries) >= len(errors)))):
+        if not (entries and has_carry_word
+                and (hdr_carry or (len(entries) >= 2 and len(entries) >= len(errors)))):
             return False   # ไม่ใช่บล็อกค้าง → ปล่อยให้คำสั่งอื่นจัดการต่อ
         if errors:
             print(f"[payable-import] ข้าม {len(errors)} บรรทัด: {errors[:5]}", flush=True)
         # วางบล็อกใหม่ = ลบยอดค้างยกมาเดิม + ล้าง opening ก้อนเก่า (กันนับเบิ้ล) แล้วลงใหม่เป็นบิลรายวัน
+        # นับของเดิมไว้ก่อนลบ เพื่อบอกในข้อความตอบว่า 'ทับของเดิมไปเท่าไร' — คำสั่งนี้ทำลายข้อมูล
+        # ถ้าไม่บอก คนสั่งจะไม่รู้เลยว่าเพิ่งลบยอดค้างทั้งชุดไป (เคสจริง 18/08/26 หายไป 169,427)
         with _db() as conn:
+            _old = conn.execute(
+                "SELECT COUNT(*) c, COALESCE(SUM(amount - COALESCE(paid,0)),0) s FROM payable_bills "
+                "WHERE group_id=? AND note=?", (acct, _PAYABLE_CARRY_NOTE)).fetchone()
+            old_n, old_sum = int(_old["c"] or 0), float(_old["s"] or 0)
             conn.execute("DELETE FROM payable_bills WHERE group_id=? AND note=?", (acct, _PAYABLE_CARRY_NOTE))
             conn.commit()
         _set_meta(f"payable_opening:{acct}", "0")
@@ -2424,12 +2437,15 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         # ไม่ทำปุ่มยืนยันก่อนบันทึกเพราะกู้ง่าย: วางบล็อกใหม่ทับได้เลย (แทนที่ยอดค้างยกมาเดิมทั้งชุด)
         total = sum(v for _, v in entries)
         # ถ้าบล็อกมีบรรทัดสรุปท้ายมาด้วย ใช้เป็นตัวตรวจว่าบอทอ่านครบตรงกับที่คนบวกไว้ไหม
+        # บอกให้เห็นชัดว่าเพิ่งทับของเดิมไปเท่าไร (คำสั่งนี้ทำลายข้อมูล ห้ามเงียบ)
+        chk = (f"\n♻️ แทนที่ยอดค้างยกมาเดิม {old_n} บรรทัด ({old_sum:,.2f} บาท) ทั้งชุด"
+               if old_n else "")
         if stated_total is None:
-            chk = ""
+            chk += ""
         elif abs(stated_total - total) < 0.01:
-            chk = f"\n✅ ตรงกับยอดรวมท้ายบล็อกที่เขียนมา ({stated_total:,.2f})"
+            chk += f"\n✅ ตรงกับยอดรวมท้ายบล็อกที่เขียนมา ({stated_total:,.2f})"
         else:
-            chk = (f"\n🔴 ไม่ตรงกับยอดรวมท้ายบล็อกที่เขียนมา ({stated_total:,.2f}) "
+            chk += (f"\n🔴 ไม่ตรงกับยอดรวมท้ายบล็อกที่เขียนมา ({stated_total:,.2f}) "
                    f"— ต่างกัน {abs(stated_total - total):,.2f} บาท โปรดตรวจว่าบรรทัดไหนตกหล่น")
         if errors:
             skipped = "\n".join(f"   • {e[:40]}" for e in errors[:5])

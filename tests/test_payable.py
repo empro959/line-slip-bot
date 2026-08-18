@@ -44,6 +44,12 @@ def _d(days_ago: int) -> str:
     return (datetime.now(app.TZ).date() - timedelta(days=days_ago)).isoformat()
 
 
+def _dm(iso: str) -> str:
+    """แปลง 'YYYY-MM-DD' → 'd/m' แบบที่คนพิมพ์ในกลุ่มจริงๆ"""
+    d = datetime.strptime(iso, "%Y-%m-%d").date()
+    return f"{d.day}/{d.month}"
+
+
 def setUpModule():
     """ชี้ DB ไปไฟล์ชั่วคราว — ไม่แตะ slips.db ของจริง"""
     app.DB_PATH = os.path.join(_tmpdir.name, "test.db")   # _db() อ่านค่านี้ตอนเรียก
@@ -361,12 +367,46 @@ class TestCarryBlock(PayableTestCase):
         handled = app.handle_payable_text(self._Event(), block, ACCT)
         return handled, (self.sent[0] if self.sent else "")
 
+    def test_staff_meat_report_must_not_wipe_carry_forward(self):
+        """🔴 เคสจริง 18/08/26 ที่ทำยอดหนี้หาย — ต้องไม่เกิดอีกเด็ดขาด
+
+        พนักงานรายงานค่าเนื้อในกลุ่ม (ไม่มีคำว่า 'ค้าง'/'ยกมา' เลย) แต่เข้าเงื่อนไข
+        '≥2 บรรทัด d/m=ยอด' พอดี → บอทตีเป็นบล็อกยอดค้าง แล้ว **ลบยอดค้างยกมาเดิม
+        ทั้งชุด (169,427) ทิ้ง** เหลือ 2,050"""
+        day1, day2, day3 = _d(5), _d(4), _d(3)
+        for d, v in ((day1, 100000.0), (day2, 50000.0), (day3, 19427.0)):
+            app.save_payable_bill(ACCT, v, note=app._PAYABLE_CARRY_NOTE, doc_date=d)
+        before = app._payable_outstanding(ACCT)
+        self.assertAlmostEqual(before, 169427.0, places=2)
+
+        block = ("ยอดเนื้อกาดสามแยก\n"
+                 f"{_dm(day1)}=430 ม้าม1/2 แดง 1\n"
+                 f"{_dm(day2)}=760ตับ 1/2 แดง 1 เศษเนื้อ 2\n"
+                 f"{_dm(day3)} = 860 ไส้2ลาบ 200น่อง1\n"
+                 "= 2,050")
+        handled, msg = self._paste(block)
+
+        self.assertFalse(handled, "ข้อความรายงานค่าเนื้อ ไม่ใช่คำสั่งวางบล็อกยอดค้าง")
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), before, places=2,
+                               msg="ยอดค้างยกมาต้องไม่ถูกแตะเลย")
+
+    def test_replacing_carry_forward_says_what_it_overwrote(self):
+        """วางบล็อกทับ = ลบของเดิมทั้งชุด ต้องบอกให้เห็นว่าทับไปเท่าไร ห้ามเงียบ"""
+        app.save_payable_bill(ACCT, 169427.0, note=app._PAYABLE_CARRY_NOTE, doc_date=_d(9))
+
+        handled, msg = self._paste(f"ค้าง\n{_dm(_d(5))}=430\n{_dm(_d(4))}=760")
+
+        self.assertTrue(handled)
+        self.assertIn("♻️", msg)
+        self.assertIn("169,427.00", msg, "ต้องบอกยอดเดิมที่เพิ่งทับทิ้ง")
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 1190.0, places=2)
+
     def test_real_case_trailing_total_line_is_a_checksum(self):
         """เคสจริงเป๊ะ: 3 บรรทัดยอดค้าง + บรรทัด '= 2,050' ที่คนบวกไว้ท้ายบล็อก"""
-        block = ("ยอดเนื้อกาดสามแยก\n"
-                 "13/8=430 ม้าม1/2 แดง 1\n"
-                 "14/8=760ตับ 1/2 แดง 1 เศษเนื้อ 2\n"
-                 "15/8 = 860 ไส้2ลาบ 200น่อง1\n"
+        block = ("ยอดค้างเนื้อกาดสามแยก\n"
+                 f"{_dm(_d(5))}=430 ม้าม1/2 แดง 1\n"
+                 f"{_dm(_d(4))}=760ตับ 1/2 แดง 1 เศษเนื้อ 2\n"
+                 f"{_dm(_d(3))} = 860 ไส้2ลาบ 200น่อง1\n"
                  "= 2,050")
         handled, msg = self._paste(block)
 
@@ -379,7 +419,7 @@ class TestCarryBlock(PayableTestCase):
 
     def test_mismatched_trailing_total_is_flagged(self):
         """คนบวกเลขท้ายบล็อกผิด/ตกบรรทัด → ต้องเตือน ไม่ปล่อยผ่าน"""
-        block = "ค้าง\n13/8=430\n14/8=760\n= 9,999"
+        block = f"ค้าง\n{_dm(_d(5))}=430\n{_dm(_d(4))}=760\n= 9,999"
         handled, msg = self._paste(block)
 
         self.assertTrue(handled)
@@ -390,7 +430,7 @@ class TestCarryBlock(PayableTestCase):
 
     def test_block_without_trailing_total_still_works(self):
         """ไม่มีบรรทัดสรุปท้าย = ไม่ต้องมีตัวตรวจ ไม่ควรมีข้อความเพี้ยนโผล่"""
-        block = "ค้าง\n13/8=430\n14/8=760"
+        block = f"ค้าง\n{_dm(_d(5))}=430\n{_dm(_d(4))}=760"
         handled, msg = self._paste(block)
 
         self.assertTrue(handled)
@@ -399,7 +439,7 @@ class TestCarryBlock(PayableTestCase):
 
     def test_unreadable_line_still_reported(self):
         """บรรทัดที่อ่านไม่ได้จริงๆ ต้องยังขึ้น ❌ เหมือนเดิม (ห้ามกลบเงียบ)"""
-        block = "ค้าง\n13/8=430\nอะไรไม่รู้=ไม่มีเลข"
+        block = f"ค้าง\n{_dm(_d(5))}=430\nอะไรไม่รู้=ไม่มีเลข"
         handled, msg = self._paste(block)
 
         self.assertTrue(handled)
