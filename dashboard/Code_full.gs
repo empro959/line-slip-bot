@@ -827,8 +827,13 @@ function _importPosOneDate_(iso){
   }
   var pt=att.pay?pdfToText_(att.pay.copyBlob()):'';
   var bt=att.bal?pdfToText_(att.bal.copyBlob()):'';
-  var bills=0, credit=[];
-  try{ if(att.cust){ var ct=pdfToText_(att.cust.copyBlob()); bills=parseBills_(ct); credit=parseCustomerCredit_(ct); } }catch(e){}
+  // บิล/ลูกหนี้ มาจากไฟล์ 'แยกตามลูกค้า' — ของเดิมเป็น catch(e){} เปล่าๆ + ไม่เตือนตอนไฟล์หาย
+  // ทำให้ 'บิล 0' แยกไม่ออกว่า (ก) ไม่มีบิลจริง (ข) ไม่มีไฟล์ในเมล (ค) OCR พัง → ต้องบอกให้รู้
+  var bills=0, credit=[], custWarn='';
+  try{
+    if(att.cust){ var ct=pdfToText_(att.cust.copyBlob()); bills=parseBills_(ct); credit=parseCustomerCredit_(ct); }
+    else custWarn='  ⚠️ ไม่มีไฟล์ SalesSummaryReportByCustomer → บิล/ลูกหนี้ = 0 (ไม่ใช่ว่าไม่มีจริง)';
+  }catch(e){ custWarn='  ⚠️ อ่าน SalesSummaryReportByCustomer ไม่ได้ ('+e+') → บิล/ลูกหนี้ = 0'; }
   var day={date:dd.key, period:dd.period,
     sales:parseSale_(st).cats, expenses:pt?parsePayout_(pt).records:[],
     payments:bt?parseBalance_(bt):{}, menu:parseSaleItems_(st),
@@ -841,7 +846,7 @@ function _importPosOneDate_(iso){
   Logger.log('✅ กู้วันที่ '+dd.key+' ('+dd.period+') สำเร็จ — ยอดขาย '+totS.toLocaleString()+
              ' · ค่าใช้จ่าย '+totE.toLocaleString()+' · เมนู '+day.menu.length+' รายการ · บิล '+bills+
              (pt?'':'  ⚠️ ไม่มี PayoutReport ในอีเมลนี้ → ค่าใช้จ่าย = 0')+
-             (bt?'':'  ⚠️ ไม่มี BalanceCashDrawer → ไม่มีวิธีชำระ/โซน'));
+             (bt?'':'  ⚠️ ไม่มี BalanceCashDrawer → ไม่มีวิธีชำระ/โซน')+custWarn);
   Logger.log('👉 เปิด dashboard เช็คได้เลย (rebuild ให้แล้ว) · ถ้าจะกู้วันอื่นแก้วันที่ใน importPosByDate แล้วรันซ้ำ');
 }
 
@@ -897,7 +902,9 @@ function debugDaily(){
     daily.forEach(function(d){ if((d.date||'').indexOf(ym)===0) have[d.date]=true; });
     var y=parseInt(ym.slice(0,4),10), mo=parseInt(ym.slice(5,7),10);
     var lastDay=new Date(y,mo,0).getDate(), today=new Date(), miss=[];
-    var maxD=(today.getFullYear()===y && (today.getMonth()+1)===mo)?today.getDate():lastDay;
+    // รายงาน POS ของวัน D เข้าเมลตอน ~00:3x ของวัน D+1 → 'วันนี้' ยังไม่มีข้อมูลเป็นเรื่องปกติ
+    // ไม่หักออก = ขึ้น 'ขาดวันนี้' ทุกครั้งที่รัน (เตือนหลอกถาวร) และเผลอใส่ CLOSED_DAYS ก็ผิด เพราะร้านไม่ได้หยุด
+    var maxD=(today.getFullYear()===y && (today.getMonth()+1)===mo)?today.getDate()-1:lastDay;
     var closed=[];
     for(var d2=1;d2<=maxD;d2++){ var k=ym+'-'+('0'+d2).slice(-2);
       if(have[k]) continue;
