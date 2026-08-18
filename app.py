@@ -2363,12 +2363,25 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     # ของเดิมบังคับบรรทัดแรกเป็นคำว่า 'ค้าง' เป๊ะ → ก๊อปสรุปมาทั้งดุ้น (มีหัว 📋/เส้นคั่น) แล้วบอทเงียบสนิท
     lines = text.splitlines()
     if len(lines) > 1:
-        entries, errors = [], []
+        entries, errors, stated_total = [], [], None
         for ln in lines:
             ln = ln.strip()
             if not ln or "=" not in ln:
                 continue   # ข้ามหัวบล็อก/เส้นคั่น/บรรทัดว่าง (ไม่มี '=')
             dpart, apart = ln.split("=", 1)
+            if not dpart.strip():
+                # บรรทัดสรุปท้ายบล็อกที่คนเขียนเอง เช่น '= 2,050' (ไม่มีวันที่นำหน้า)
+                # = 'ยอดรวมที่เจ้าของบวกมาแล้ว' → เก็บไว้เป็นตัวตรวจ ไม่ใช่บรรทัดข้อมูล
+                # ของเดิมตีเป็น 'อ่านไม่ได้' ขึ้น ❌ 'โปรดแก้แล้ววางใหม่ทั้งบล็อก' ทั้งที่บันทึกถูกครบแล้ว
+                # (เคสจริง 18/08/26 กลุ่ม management — เจ้าของตกใจว่าหนี้ไม่เข้า)
+                m_sum = re.search(r"(\d[\d,]*(?:\.\d+)?)", apart)
+                if m_sum:
+                    try:
+                        stated_total = float(m_sum.group(1).replace(",", ""))
+                        continue
+                    except ValueError:
+                        pass
+                errors.append(ln); continue
             diso = _parse_thai_date(dpart.strip())
             if diso is None:
                 errors.append(ln); continue
@@ -2409,16 +2422,25 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             save_payable_bill(acct, val, note=_PAYABLE_CARRY_NOTE, doc_date=diso)
         # รายงานผลอ่านก่อนโชว์สรุป — งานเงินห้ามข้ามบรรทัดเงียบ (ของเดิมข้ามแล้วไม่บอก เจ้าของไม่รู้ว่าหนี้หาย)
         # ไม่ทำปุ่มยืนยันก่อนบันทึกเพราะกู้ง่าย: วางบล็อกใหม่ทับได้เลย (แทนที่ยอดค้างยกมาเดิมทั้งชุด)
+        total = sum(v for _, v in entries)
+        # ถ้าบล็อกมีบรรทัดสรุปท้ายมาด้วย ใช้เป็นตัวตรวจว่าบอทอ่านครบตรงกับที่คนบวกไว้ไหม
+        if stated_total is None:
+            chk = ""
+        elif abs(stated_total - total) < 0.01:
+            chk = f"\n✅ ตรงกับยอดรวมท้ายบล็อกที่เขียนมา ({stated_total:,.2f})"
+        else:
+            chk = (f"\n🔴 ไม่ตรงกับยอดรวมท้ายบล็อกที่เขียนมา ({stated_total:,.2f}) "
+                   f"— ต่างกัน {abs(stated_total - total):,.2f} บาท โปรดตรวจว่าบรรทัดไหนตกหล่น")
         if errors:
             skipped = "\n".join(f"   • {e[:40]}" for e in errors[:5])
             more = f"\n   • (อีก {len(errors) - 5} บรรทัด)" if len(errors) > 5 else ""
             _payable_send(event, group_id, out,
-                f"⚠️ บันทึกยอดค้างยกมา {len(entries)} บรรทัด รวม {sum(v for _, v in entries):,.2f} บาท\n"
+                f"⚠️ บันทึกยอดค้างยกมา {len(entries)} บรรทัด รวม {total:,.2f} บาท{chk}\n"
                 f"❌ อ่านไม่ได้ {len(errors)} บรรทัด — ยังไม่ได้บันทึก โปรดแก้แล้ววางใหม่ทั้งบล็อก:\n{skipped}{more}")
         else:
             _payable_send(event, group_id, out,
-                f"✅ บันทึกยอดค้างยกมา {len(entries)} บรรทัด รวม {sum(v for _, v in entries):,.2f} บาท "
-                f"({entries[0][0]} → {entries[-1][0]})")
+                f"✅ บันทึกยอดค้างยกมา {len(entries)} บรรทัด รวม {total:,.2f} บาท "
+                f"({entries[0][0]} → {entries[-1][0]}){chk}")
         _payable_push_summary(event, group_id, acct)
         return True
 

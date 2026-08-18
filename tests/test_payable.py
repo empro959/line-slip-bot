@@ -336,6 +336,76 @@ class TestPayableBillGuards(PayableTestCase):
             self.assertLessEqual(int(got[:4]), year)
 
 
+class TestCarryBlock(PayableTestCase):
+    """บล็อก 'ค้าง' ที่เจ้าของก๊อปมาวางในกลุ่ม — เคสจริงจากกลุ่ม management 18/08/26
+
+    ของเดิม: บรรทัดสรุปท้ายบล็อกที่คนเขียนเอง ('= 2,050') ถูกตีเป็น 'อ่านไม่ได้'
+    ขึ้น ❌ 'โปรดแก้แล้ววางใหม่ทั้งบล็อก' ทั้งที่บันทึก 3 บรรทัดถูกครบแล้ว
+    ตอนนี้ใช้เป็น 'ตัวตรวจ' แทน — ตรงกันก็ยืนยันให้ ไม่ตรงถึงเตือน"""
+
+    def setUp(self):
+        super().setUp()
+        self._orig = (app._payable_send, app._payable_push_summary)
+        self.sent = []
+        app._payable_send = lambda ev, gid, out, text: self.sent.append(text)
+        app._payable_push_summary = lambda *a, **k: None
+
+    def tearDown(self):
+        app._payable_send, app._payable_push_summary = self._orig
+
+    class _Event:
+        reply_token = "tok"
+
+    def _paste(self, block):
+        self.sent = []
+        handled = app.handle_payable_text(self._Event(), block, ACCT)
+        return handled, (self.sent[0] if self.sent else "")
+
+    def test_real_case_trailing_total_line_is_a_checksum(self):
+        """เคสจริงเป๊ะ: 3 บรรทัดยอดค้าง + บรรทัด '= 2,050' ที่คนบวกไว้ท้ายบล็อก"""
+        block = ("ยอดเนื้อกาดสามแยก\n"
+                 "13/8=430 ม้าม1/2 แดง 1\n"
+                 "14/8=760ตับ 1/2 แดง 1 เศษเนื้อ 2\n"
+                 "15/8 = 860 ไส้2ลาบ 200น่อง1\n"
+                 "= 2,050")
+        handled, msg = self._paste(block)
+
+        self.assertTrue(handled)
+        self.assertIn("✅", msg)
+        self.assertNotIn("❌", msg, "บรรทัดสรุปท้ายบล็อกไม่ใช่ error")
+        self.assertIn("ตรงกับยอดรวมท้ายบล็อก", msg)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 2050.0, places=2)
+        self.assertEqual(len(self.bills()), 3, "ต้องลง 3 บรรทัด ไม่ใช่ 4")
+
+    def test_mismatched_trailing_total_is_flagged(self):
+        """คนบวกเลขท้ายบล็อกผิด/ตกบรรทัด → ต้องเตือน ไม่ปล่อยผ่าน"""
+        block = "ค้าง\n13/8=430\n14/8=760\n= 9,999"
+        handled, msg = self._paste(block)
+
+        self.assertTrue(handled)
+        self.assertIn("🔴", msg)
+        self.assertIn("ไม่ตรงกับยอดรวมท้ายบล็อก", msg)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 1190.0, places=2,
+                               msg="ยังต้องบันทึกบรรทัดที่อ่านได้ตามปกติ")
+
+    def test_block_without_trailing_total_still_works(self):
+        """ไม่มีบรรทัดสรุปท้าย = ไม่ต้องมีตัวตรวจ ไม่ควรมีข้อความเพี้ยนโผล่"""
+        block = "ค้าง\n13/8=430\n14/8=760"
+        handled, msg = self._paste(block)
+
+        self.assertTrue(handled)
+        self.assertNotIn("ยอดรวมท้ายบล็อก", msg)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 1190.0, places=2)
+
+    def test_unreadable_line_still_reported(self):
+        """บรรทัดที่อ่านไม่ได้จริงๆ ต้องยังขึ้น ❌ เหมือนเดิม (ห้ามกลบเงียบ)"""
+        block = "ค้าง\n13/8=430\nอะไรไม่รู้=ไม่มีเลข"
+        handled, msg = self._paste(block)
+
+        self.assertTrue(handled)
+        self.assertIn("❌", msg)
+
+
 class TestDbExportCoverage(unittest.TestCase):
     """/api/db_export ต้อง backup 'ทุกตาราง' จริงตามที่โฆษณาไว้
 
