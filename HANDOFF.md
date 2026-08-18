@@ -55,19 +55,55 @@
 
 ---
 
-## 3. บัญชี/บริการ (ทุกอย่างอยู่บัญชีร้านแล้ว)
+## 3. ทะเบียนบริการทั้งหมด (นับครบ 18 ส.ค. 2026 — 12 ตัวใช้งาน + 1 เตรียมไว้)
 
-| ระบบ | บัญชี / ค่า |
+### 3.1 ตัวที่ระบบใช้งานอยู่
+
+| # | บริการ | บ้าน (บัญชี) | หน้าที่ | เงิน | สถานะ |
+|---|---|---|---|---|---|
+| 1 | LINE OA "เอด" | LINE Business | ตัวบอทหลัก — webhook → iq8e `/callback` | ฟรี (push ~300/ด./OA) | ✅ ปกติ |
+| 2 | LINE OA สำรอง (OA2..) | LINE Business | สลับช่องเมื่อโควตา push เต็ม (`OA_ROUTE`) | ฟรี | ✅ ตามที่ตั้ง token |
+| 3 | Render `Line-Slip-Bot-1` (iq8e) | ร้าน (saiyangsoi@gmail) | รันบอทตัวจริง | **Starter ~$7/ด. — ตัวเดียวที่จ่ายรายเดือน** | 🔴 ยังดึงโค้ดบ้านเก่า `33ac046` |
+| 4 | Supabase org `saiyangsoi4` | ร้าน | DB production (Session pooler IPv4) | ฟรี | ⚠️ ยังไม่เปิดยืนยัน `DATABASE_URL` |
+| 5 | Gemini API (`project-for-key-3`) | Google Cloud ร้าน | อ่านสลิป/บิลจากรูป | จ่ายตามใช้ (เปิด billing กัน 429) | ✅ ปกติ |
+| 6 | Gmail | ร้าน | รับเมลรายงาน PDF จาก POS ทุกคืน ~00:3x | ฟรี | ✅ ปกติ |
+| 7 | Apps Script + Drive | ร้าน | OCR ใบ POS → ข้อมูล dashboard + สรุปรายรับเข้าไลน์/เมล | ฟรี (โควตา OCR/วัน) | ✅ วางโค้ดล่าสุดแล้ว |
+| 8 | Netlify (team saiyangsoi) | ร้าน | โฮสต์หน้า dashboard | ฟรี | ✅ (deploy มือ ลาก zip) |
+| 9 | UptimeRobot | ⚠️ **บัญชี E&M ProEng — ปนกับงานอื่น** | ตัวปลุกรายงาน 00:30 (ping `/health` ทุก 5 นาที) | ฟรี | ✅ เขียว · ควรย้ายมาบัญชีร้านสักวัน |
+| 10 | GitHub `empro959/line-slip-bot` | ส่วนตัว (empro959) | **บ้านของโค้ด** — โค้ดล่าสุดทั้งหมด | ฟรี | ✅ เข้าถึงได้ · รอชี้ Render มา |
+| 11 | GitHub `saiyangsoi-sketch/Line-Slip-Bot` | ร้าน — **ล็อกอินหาย** | โค้ดเก่าที่ iq8e ยังดึงอยู่ | ฟรี | 🔴 จะประกาศเลิกใช้เมื่อสลับ Render เสร็จ |
+| 12 | Easy POS | ผู้ขาย POS (ภายนอก) | ระบบขายหน้าร้าน + ส่งเมลรายงานทุกคืน — ต้นทางข้อมูลทั้งหมดของ dashboard | ตามสัญญา POS | ✅ ปกติ |
+
+### 3.2 ของเก่าที่ปลดระวางแล้ว
+
+| บริการ | สถานะ |
 |---|---|
-| LINE OA เอด (webhook) | `https://line-slip-bot-1-iq8e.onrender.com/callback` |
-| Render (บอท) | saiyangsoi@gmail.com · service **Line-Slip-Bot-1** |
-| Supabase (DB บอท) | org saiyangsoi4 · Session pooler IPv4 |
-| Gemini | Saiyang Soi4 / project-for-key-3 (restrict Gemini API + เปิด billing) |
-| Apps Script + Drive + เมล POS | saiyangsoi@gmail.com |
-| Netlify (dashboard) | team saiyangsoi |
-| GitHub (deploy) | 🔴 **Render ยังต่อกับ `saiyangsoi-sketch/Line-Slip-Bot` อยู่** (ตรวจหน้า Render 18 ส.ค. 23:10 — live ที่ `33ac046` ตั้งแต่ 17 ส.ค. 13:22) · โค้ดใหม่อยู่ที่ `empro959/line-slip-bot` แต่ **ยังไม่ได้สลับ** → push แล้วไม่ขึ้นระบบ |
+| Render `Line-Slip-Bot` (s772) | Suspended · ต่อ empro959 @`785bbb7` — ลบ/เปลี่ยนชื่อ `DO-NOT-USE` เมื่อย้ายเสร็จ |
+| Render `65gt` (E&M เก่า) | Suspended |
+| Supabase `empro959` | จะโดน pause — **export เก็บครบแล้ว 18 ส.ค.** ✅ |
+| Gemini E&M | เลิกใช้ |
 
-**ของเก่า/เลิกใช้:** Render `line-slip-bot-65gt` (suspend), Supabase empro959 (⚠️ จะถูก pause — **export เก็บไว้แล้ว 18 ส.ค.**), Gemini E&M, **GitHub `saiyangsoi-sketch/Line-Slip-Bot`** (โค้ดถูกรวมกลับมาแล้ว)
+### 3.3 เตรียมไว้แต่ยังไม่เปิดใช้
+
+| บริการ | หมายเหตุ |
+|---|---|
+| SlipOK API (`api.slipok.com`) | ตรวจสลิปแม่น 100% (ตอนนี้ Gemini ~98%) — โค้ดรองรับแล้ว แค่ตั้ง `PROMPTPAY_API_KEY` · มีค่ารายเดือน ชั่งน้ำหนักก่อนเปิด |
+
+### 3.4 เส้นเชื่อม "ใครจำ URL/กุญแจใคร" — ไล่ให้ครบทุกครั้งที่ย้ายอะไร
+
+ทุกครั้งที่ระบบพังเงียบในโปรเจกต์นี้ ต้นเหตุคือเส้นพวกนี้ชี้ไปที่เก่า:
+
+```
+LINE OA ────── webhook ─────→ iq8e /callback
+UptimeRobot ── ping ────────→ iq8e /health
+Apps Script ── SLIP_API_URL ─→ iq8e (มี token ฝังใน property)
+บอท ────────── SYNC_URL ────→ Apps Script /exec
+บอท ────────── DATABASE_URL → Supabase saiyangsoi4
+บอท ────────── GEMINI_API_KEY → Google Cloud ร้าน
+Render iq8e ── ดึงโค้ด ─────→ GitHub (จุดที่กำลังแก้: sketch → empro959)
+```
+
+**กติกา: ย้ายอะไรก็ตาม ให้เปิดตารางนี้แล้วถามว่า "เส้นไหนชี้มาที่ของที่ย้าย" แล้วไล่แก้ + ยืนยันด้วยตาให้ครบก่อนปิดงาน**
 
 > ⚠️ **บัญชี GitHub กับบัญชีบริการอื่นคนละตัวกัน** — repo deploy อยู่ที่ `empro959` แต่ Render/Supabase/Apps Script/Netlify อยู่บัญชีร้าน (`saiyangsoi@gmail.com`) ไม่ใช่ความผิดพลาด ตั้งใจให้เป็นแบบนี้หลังย้าย
 
