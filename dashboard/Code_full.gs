@@ -125,10 +125,16 @@ function parseSale_(text){
   var period=periodFrom_(text);
   // ตัดบรรทัดหัว/ท้ายกระดาษทิ้ง (กันเลขปลอม เช่น 50000, ปี ค.ศ. มาขวาง)
   var raw=text.split(/[\n\r]+/), lines=[];
-  var junk=/บริษัท|^เลขที่|รายงานสรุป|^ตั้งแต่|^หมวดสินค้า|\d{4}\/\d{2}\/\d{2}/;
+  // ⚠️ ต้องกรอง 'หัว/ท้ายกระดาษ' ให้หมด เพราะมันแทรกอยู่ระหว่าง 'ยอดรวมหมวด' กับ 'ชื่อหมวดถัดไป'
+  // ถ้าไม่กรอง ตัวไล่เลขย้อนหลังจะไปเจอปี '2569' จากบรรทัด From/To ก่อนถึงแถวยอดรวม
+  // → หมวดนั้นถูกข้ามทั้งหมวด (เคสจริง 11/08/26: เครื่องดื่ม+เมนูต้ม+อาหารญี่ปุ่นหายไป 70,266.30
+  //   ยอดขายเลยเหลือ 33,370.20 แทนที่จะเป็น 103,636.50)
+  var junk=/บริษัท|^เลขที่|รายงานสรุป|^ตั้งแต่|^หมวดสินค้า|\d{4}\/\d{2}\/\d{2}|^Sales Report|^From \d|^Category$|^PrintDate/;
   for(var i=0;i<raw.length;i++){
     var ln=raw[i].trim();
-    if(ln.indexOf('ยอดรวม(รวมภาษี)')>=0) ln=ln.replace(/^.*ยอดรวม\(รวมภาษี\)\s*/,'').trim(); // ตัดหัวตาราง เหลือส่วนที่เกาะท้าย
+    // ตัดหัวตารางทิ้ง เหลือเฉพาะส่วนที่เกาะท้ายบรรทัดเดียวกัน (ชื่อหมวด หรือ แถวยอดรวมของหน้าถัดไป)
+    if(ln.indexOf('ยอดรวม(รวมภาษี)')>=0) ln=ln.replace(/^.*ยอดรวม\(รวมภาษี\)\s*/,'').trim();
+    if(ln.indexOf('Total(Inc. tax)')>=0)  ln=ln.replace(/^.*Total\(Inc\. tax\)\s*/,'').trim();
     if(!ln||junk.test(ln)) continue;
     lines.push(ln);
   }
@@ -137,9 +143,12 @@ function parseSale_(text){
   var catHdr=/^\d{1,2}\.[^\d]/;
   var KNOWN=['อาหารญี่ปุ่น','ร้านขนมเส้น','ร้านก๋วยเตี๋ยว']; // หมวดที่ไม่มีเลขนำหน้า
   var headers=[]; for(var j=0;j<toks.length;j++) if(catHdr.test(toks[j])||KNOWN.indexOf(toks[j])>=0) headers.push(j);
-  var sumIdx=-1;
-  for(var q=0;q<toks.length;q++) if(toks[q].indexOf('สรุปยอดขาย')>=0){sumIdx=q;break;}
-  var bset=headers.slice(); if(sumIdx>=0) bset.push(sumIdx);
+  var sumIdx=-1, grandIdx=-1;
+  for(var q=0;q<toks.length;q++){
+    if(sumIdx<0 && toks[q].indexOf('สรุปยอดขาย')>=0) sumIdx=q;
+    if(grandIdx<0 && toks[q]==='Grand' && toks[q+1]==='Total') grandIdx=q;   // ขอบเขตท้ายของหมวดสุดท้าย (ใบอังกฤษ)
+  }
+  var bset=headers.slice(); if(sumIdx>=0) bset.push(sumIdx); if(grandIdx>=0) bset.push(grandIdx);
   bset.sort(function(a,b){return a-b;});
   var cats=[];
   for(var k=0;k<headers.length;k++){
@@ -309,7 +318,12 @@ function fixSlipUrl(){
 
 // แกะ BalanceCashDrawer เฉพาะช่วง "Net Sale" -> {เงินโอน,เงินสด,บัตรเครดิต,ค้างชำระ,อื่นๆ}
 function parseBalance_(text){
-  var i=text.indexOf('Net Sale'); if(i<0) return {};
+  // บล็อกสรุปวิธีชำระ: ใบอังกฤษเป็น 'Type of Payment Description Amount ... Total <ยอด>'
+  // ⚠️ ในใบมี 2 บล็อกหน้าตาเหมือนกัน — อันแรก = เงินที่รับ · อันที่สอง = Payout (ติดลบ) ต้องเอาอันแรก
+  // ของเดิมยึด 'Net Sale' แล้วตัดที่ 'Total' ตัวแรก ซึ่งไปโดน 'Recorded Total' ในหัวตารางหน้าถัดไป → ได้ {} เปล่า
+  var i=text.search(/Type\s+of\s+Payment\s+Description\s+Amount/i);
+  if(i<0) i=text.indexOf('Net Sale');
+  if(i<0) return {};
   var seg=text.slice(i); var e=seg.indexOf('Total'); if(e>=0) seg=seg.slice(0,e);
   var toks=seg.replace(/[\n\r]+/g,' ').split(/\s+/).filter(function(x){return x!=='';});
   var isNum=function(s){return /^-?[\d,]+(\.\d+)?$/.test(s);};
@@ -317,7 +331,8 @@ function parseBalance_(text){
   for(var k=0;k<toks.length;k++){
     if(PAY_MAP.hasOwnProperty(toks[k])){
       var j=k+1; while(j<toks.length && !isNum(toks[j])) j++;  // ข้ามคำ เช่น "ทชท"
-      if(j<toks.length) out[PAY_MAP[toks[k]]]=num_(toks[j]);
+      // บวกสะสม ไม่ใช่ทับ — 'อื่นๆ' โผล่ 2 แถว (1,660 + ทชท 1,683 = 3,343) ถ้าทับจะหายไปแถวหนึ่ง
+      if(j<toks.length){ var key=PAY_MAP[toks[k]]; out[key]=(out[key]||0)+num_(toks[j]); }
     }
   }
   return out;
@@ -326,7 +341,7 @@ function parseBalance_(text){
 // แกะยอดขายแยกโซนจาก BalanceCashDrawer -> {โซน: ยอดรวม}
 function parseBalanceZones_(text){
   text=text.split('Net Sale')[0];  // เอาเฉพาะส่วนแยกโซน (ก่อนสรุป)
-  var re=/รวมของโซน\s+(.+?)\s+([\d,]+\.\d{2})/g, out={}, m;
+  var re=/(?:รวมของโซน|Total of Zone)\s+(.+?)\s+([\d,]+\.\d{2})/g, out={}, m;
   while((m=re.exec(text))!==null){
     var z=m[1].trim(); out[z]=(out[z]||0)+num_(m[2]);
   }
@@ -870,7 +885,9 @@ function _dumpOcr_(label, text){
 // จุดสำคัญ: ดูเลข "ที่อยู่ติดป้าย" ทั้งข้างหน้าและข้างหลัง จึงไม่ขึ้นกับว่า OCR เรียงคอลัมน์แบบไหน
 // → ยังจับผิดได้แม้รูปแบบรายงานเปลี่ยนไปจนตัวอ่านตารางพัง (ซึ่งเป็นเคสที่อันตรายที่สุด)
 function _statedTotals_(text){
-  var LABELS=['Real Sale','Grand Total','Total Received','ยอดขายสุทธิ','ยอดรวมทั้งหมด'];
+  // ป้ายที่เป็น 'คู่ ป้าย→ค่า' จริงๆ เท่านั้น — ห้ามใส่ 'Grand Total' เพราะแถวนั้นเป็นตารางหลายคอลัมน์
+  // (Grand Total 967.00 104,661.00 ... ) เลขตัวติดป้ายคือ 'จำนวนชิ้น' ไม่ใช่ยอดเงิน
+  var LABELS=['Real Sale','Total Received','ยอดขายสุทธิ','ยอดรับสุทธิ'];
   var toks=String(text||'').replace(/[\n\r]+/g,' ').split(/\s+/).filter(function(x){return x!=='';});
   var isNum=function(s){return /^[\d,]+\.\d{2}$/.test(String(s));};
   var out=[];
@@ -880,24 +897,24 @@ function _statedTotals_(text){
       var ok=true;
       for(var k=0;k<parts.length;k++){ if(toks[i+k]!==parts[k]){ ok=false; break; } }
       if(!ok) continue;
-      for(var d=0;d<3;d++){                       // เลขที่ใกล้ป้ายที่สุด (หน้า/หลัง อันไหนเจอก่อนเอาอันนั้น)
-        if(isNum(toks[i-1-d])){ out.push(num_(toks[i-1-d])); break; }
-        if(isNum(toks[i+parts.length+d])){ out.push(num_(toks[i+parts.length+d])); break; }
+      for(var d=0;d<2;d++){                      // เลขถัดจากป้าย (OCR อ่านเป็น 'ป้าย แล้วค่า')
+        var v=toks[i+parts.length+d];
+        if(isNum(v)){ out.push(num_(v)); break; }
       }
     }
   });
-  return out;
+  // ต้องมีอย่างน้อย 2 ป้ายที่ให้ค่า 'ตรงกัน' ถึงจะเชื่อเป็นยอดอ้างอิง
+  // ป้ายเดียว/ไม่ตรงกัน = อาจหยิบผิดช่อง → คืนว่าง ดีกว่าเตือนมั่ว (สัญญาณหลอกแย่กว่าไม่เตือน)
+  var cnt={}; out.forEach(function(v){ cnt[v]=(cnt[v]||0)+1; });
+  return out.filter(function(v){ return cnt[v]>=2; });
 }
+
 
 // เทียบ "ผลรวมที่แกะได้" กับ "ยอดที่พิมพ์ในใบ" — ไม่ตรงเมื่อไหร่ต้องส่งเสียง ห้ามเงียบ
 // เคสจริง 11/08/26: แกะได้ 33,370.2 แต่ในใบเขียน 103,636 — ต่ำกว่าจริง ~70,000 โดยไม่มีสัญญาณอะไรเลย
 function _saleWarn_(text, parsedTotal){
   var stated=_statedTotals_(text);
   if(!stated.length) return '';                                     // ไม่เจอป้าย = เทียบไม่ได้ ไม่เดา
-  // ตัดตัวเลือกที่เล็กผิดปกติทิ้ง — ป้ายบางอันมี 'จำนวนชิ้น' นั่งติดอยู่ (เช่น 967 ข้าง Grand Total)
-  // ถ้าไม่ตัด ข้อความเตือนจะรก และเผลอ 'ตรง' กับเลขจำนวนชิ้นโดยบังเอิญได้
-  var mx=Math.max.apply(null, stated);
-  stated=stated.filter(function(v){ return v>=mx/10; });
   if(stated.some(function(v){ return Math.abs(v-parsedTotal)<1; })) return '';
   var uniq=stated.filter(function(v,i,a){return a.indexOf(v)===i;})
                  .map(function(v){return v.toLocaleString();});
