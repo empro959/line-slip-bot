@@ -828,6 +828,7 @@ function _importPosOneDate_(iso){
   }
   var pt=att.pay?pdfToText_(att.pay.copyBlob()):'';
   var bt=att.bal?pdfToText_(att.bal.copyBlob()):'';
+  if(DUMP_OCR){ _dumpOcr_('SaleReport', st); _dumpOcr_('BalanceCashDrawer', bt); }
   // รายงานที่ส่งย้อนหลังมัก export เป็น 'ช่วงวันที่' (From 11 To 12) แต่โค้ดนี้ลงเป็นวันเดียว
   // → ยอดวิธีชำระ/โซน/ค่าใช้จ่าย ของทุกวันในช่วงจะถูกยัดรวมเข้าวันเดียว = ตัวเลขเกินจริง
   var rangeWarn = _rangeWarn_(bt) || _rangeWarn_(pt);
@@ -856,6 +857,13 @@ function _importPosOneDate_(iso){
              (bt&&!Object.keys(day.zones).length?'\n   ⚠️ มี BalanceCashDrawer แต่แกะ "โซน" ไม่ออกเลย → รัน debugBalanceOcr() ดูข้อความจริง':'')+
              rangeWarn);
   Logger.log('👉 เปิด dashboard เช็คได้เลย (rebuild ให้แล้ว) · ถ้าจะกู้วันอื่นแก้วันที่ใน importPosByDate แล้วรันซ้ำ');
+}
+
+// พิมพ์ข้อความ OCR ลง log แบบซอยเป็นท่อน (Logger ตัดข้อความยาวทิ้ง)
+function _dumpOcr_(label, text){
+  if(!text){ Logger.log('📄 '+label+': (ไม่มีไฟล์)'); return; }
+  Logger.log('📄 ===== ข้อความ OCR ของ '+label+' — ยาว '+text.length+' ตัวอักษร =====');
+  for(var i=0;i<text.length;i+=3500) Logger.log('['+label+' '+(i/3500+1)+'] '+text.slice(i,i+3500));
 }
 
 // ยอดรวมที่ "ใบเขียนไว้เอง" (Real Sale / Grand Total ฯลฯ) — ใช้เป็นตัวจับผิดผลรวมที่แกะจากตารางหมวด
@@ -893,8 +901,9 @@ function _saleWarn_(text, parsedTotal){
   if(stated.some(function(v){ return Math.abs(v-parsedTotal)<1; })) return '';
   var uniq=stated.filter(function(v,i,a){return a.indexOf(v)===i;})
                  .map(function(v){return v.toLocaleString();});
-  return '\n   🔴 ยอดขายที่แกะได้ ('+parsedTotal.toLocaleString()+') ไม่ตรงกับยอดที่พิมพ์ในใบ ('+uniq.join(' / ')+')'+
-         '\n      → อย่าเพิ่งเชื่อตัวเลขของวันนี้ · รูปแบบรายงานอาจเปลี่ยน (เรียงคอลัมน์/ภาษาต่างจากเดิม)';
+  return '\n   🔴 ยอดขายที่แกะได้ ('+parsedTotal.toLocaleString()+') ไม่ตรงกับเลขที่อยู่ข้างป้ายยอดรวมในใบ ('+uniq.join(' / ')+')'+
+         '\n      → อย่าเพิ่งเชื่อตัวเลขของวันนี้ เปิดใบจริงเทียบเอง · รูปแบบรายงานอาจเปลี่ยน'+
+         '\n      → หาสาเหตุ: ตั้ง DUMP_OCR = true ที่หัวไฟล์ แล้วรันซ้ำ (ไม่กินโควตา OCR เพิ่ม)';
 }
 
 // ตรวจว่าใบรายงานครอบ 'หลายคืนทำการ' ไหม — คืนข้อความเตือน หรือ '' ถ้าคืนเดียว
@@ -916,7 +925,8 @@ function _rangeWarn_(text){
          '\n      → ให้ export ใหม่ทีละคืน แล้วส่งเข้าเมล จากนั้นรัน importPosByDate อีกรอบ';
 }
 
-// ===== ดูข้อความ OCR จริงของ BalanceCashDrawer วันที่ระบุ (ไว้ให้คนเขียนโค้ดดูรูปแบบรายงาน) =====
+// ===== ดูข้อความ OCR จริงของ BalanceCashDrawer วันที่ระบุ =====
+// ⚠️ ตัวนี้ยิง OCR ใหม่ = กินโควตา — ปกติให้ใช้ DUMP_OCR = true แทน (ฟรี ใช้ข้อความที่ import อ่านไปแล้ว)
 // ใช้ตอน log เตือนว่า 'แกะวิธีชำระ/โซนไม่ออก' — จะได้รู้ว่ารายงานหน้าตาเปลี่ยนไปยังไง
 function debugBalanceOcr(){
   var ISO='2026-08-11';   // ← แก้เป็นวันที่ที่มีปัญหา
@@ -932,6 +942,11 @@ function debugBalanceOcr(){
   Logger.log('📄 ข้อความ OCR ของ '+bal.getName()+' (ยาว '+txt.length+' ตัวอักษร) — ก๊อปทั้งหมดส่งให้คนแก้โค้ดดู:');
   for(var i=0;i<txt.length;i+=4000) Logger.log(txt.slice(i,i+4000));   // Logger ตัดข้อความยาว เลยซอยเป็นท่อน
 }
+
+// 👉 ตั้ง true แล้วรัน importPosByDate = พิมพ์ข้อความ OCR ที่อ่านได้ลง log ด้วย
+// **ไม่กินโควตา OCR เพิ่มเลย** เพราะใช้ข้อความก้อนเดียวกับที่ import ใช้อยู่แล้ว
+// (ต่างจาก debugBalanceOcr ที่ยิง OCR ใหม่อีกรอบ) — ใช้ตอนตัวอ่านแกะตัวเลขไม่ออก
+var DUMP_OCR = false;
 
 // 👉 ใส่วันที่ที่ต้องการกู้ตรงนี้ — ใส่กี่วันก็ได้ คั่นด้วยจุลภาค แล้วรันฟังก์ชันนี้ครั้งเดียว
 // ใช้ OCR ~4 ครั้ง/วัน · ชนลิมิต (⏳) ให้พัก ~5 นาทีแล้วรันซ้ำได้เลย — วันที่กู้สำเร็จแล้วจะถูกทับด้วยข้อมูลเดิม ไม่เสียหาย
