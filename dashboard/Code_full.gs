@@ -519,7 +519,8 @@ function importPosReports(){
   writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));
   props.setProperty('LAST_IMPORTED_EMAIL_MS', String(s.time||0));   // จำว่าอีเมลฉบับนี้ import แล้ว (กัน trigger สำรองทำ OCR ซ้ำคืนเดียวกัน)
   var dayS=day.sales.reduce(function(a,c){return a+c.amount;},0);
-  Logger.log('✅ เก็บวันที่ '+dd.key+' ('+dd.period+') ยอดขายวันนั้น '+dayS.toLocaleString()+' | สะสม '+daily.length+' วัน');
+  Logger.log('✅ เก็บวันที่ '+dd.key+' ('+dd.period+') ยอดขายวันนั้น '+dayS.toLocaleString()+' | สะสม '+daily.length+' วัน'+
+             _saleWarn_(st, dayS)+_rangeWarn_(st));
   // ส่งแจ้งเตือนเฉพาะถ้า "วันนี้ยังไม่เคยแจ้ง" — จำวันที่แจ้งล่าสุดใน Script Properties
   // (ใช้ค่านี้ ไม่ใช่ "มีใน pos_daily" เพราะ backfill ก็เก็บวันโดยไม่แจ้ง → จะพลาดการส่ง)
   if(props.getProperty('LAST_ALERT_DATE')===dd.key){ Logger.log('⏸️ แจ้งเตือน '+dd.key+' ส่งไปแล้ว — ไม่ส่งซ้ำ'); return; }
@@ -849,12 +850,51 @@ function _importPosOneDate_(iso){
   Logger.log('✅ กู้วันที่ '+dd.key+' ('+dd.period+') สำเร็จ — ยอดขาย '+totS.toLocaleString()+
              ' · ค่าใช้จ่าย '+totE.toLocaleString()+' · เมนู '+day.menu.length+' รายการ · บิล '+bills+
              (pt?'':'  ⚠️ ไม่มี PayoutReport ในอีเมลนี้ → ค่าใช้จ่าย = 0')+
-             (bt?'':'  ⚠️ ไม่มี BalanceCashDrawer → ไม่มีวิธีชำระ/โซน')+custWarn+
+             (bt?'':'  ⚠️ ไม่มี BalanceCashDrawer → ไม่มีวิธีชำระ/โซน')+custWarn+_saleWarn_(st, totS)+
              // อ่านไฟล์ได้แต่แกะตัวเลขไม่ออก = เงียบที่สุด ต้องบอก ไม่งั้น dashboard โชว์ว่างโดยไม่มีใครรู้
              (bt&&!Object.keys(day.payments).length?'\n   ⚠️ มี BalanceCashDrawer แต่แกะ "วิธีชำระ" ไม่ออกเลย (รูปแบบรายงานอาจเปลี่ยน) → รัน debugBalanceOcr() ดูข้อความจริง':'')+
              (bt&&!Object.keys(day.zones).length?'\n   ⚠️ มี BalanceCashDrawer แต่แกะ "โซน" ไม่ออกเลย → รัน debugBalanceOcr() ดูข้อความจริง':'')+
              rangeWarn);
   Logger.log('👉 เปิด dashboard เช็คได้เลย (rebuild ให้แล้ว) · ถ้าจะกู้วันอื่นแก้วันที่ใน importPosByDate แล้วรันซ้ำ');
+}
+
+// ยอดรวมที่ "ใบเขียนไว้เอง" (Real Sale / Grand Total ฯลฯ) — ใช้เป็นตัวจับผิดผลรวมที่แกะจากตารางหมวด
+// จุดสำคัญ: ดูเลข "ที่อยู่ติดป้าย" ทั้งข้างหน้าและข้างหลัง จึงไม่ขึ้นกับว่า OCR เรียงคอลัมน์แบบไหน
+// → ยังจับผิดได้แม้รูปแบบรายงานเปลี่ยนไปจนตัวอ่านตารางพัง (ซึ่งเป็นเคสที่อันตรายที่สุด)
+function _statedTotals_(text){
+  var LABELS=['Real Sale','Grand Total','Total Received','ยอดขายสุทธิ','ยอดรวมทั้งหมด'];
+  var toks=String(text||'').replace(/[\n\r]+/g,' ').split(/\s+/).filter(function(x){return x!=='';});
+  var isNum=function(s){return /^[\d,]+\.\d{2}$/.test(String(s));};
+  var out=[];
+  LABELS.forEach(function(lb){
+    var parts=lb.split(' ');
+    for(var i=0;i+parts.length<=toks.length;i++){
+      var ok=true;
+      for(var k=0;k<parts.length;k++){ if(toks[i+k]!==parts[k]){ ok=false; break; } }
+      if(!ok) continue;
+      for(var d=0;d<3;d++){                       // เลขที่ใกล้ป้ายที่สุด (หน้า/หลัง อันไหนเจอก่อนเอาอันนั้น)
+        if(isNum(toks[i-1-d])){ out.push(num_(toks[i-1-d])); break; }
+        if(isNum(toks[i+parts.length+d])){ out.push(num_(toks[i+parts.length+d])); break; }
+      }
+    }
+  });
+  return out;
+}
+
+// เทียบ "ผลรวมที่แกะได้" กับ "ยอดที่พิมพ์ในใบ" — ไม่ตรงเมื่อไหร่ต้องส่งเสียง ห้ามเงียบ
+// เคสจริง 11/08/26: แกะได้ 33,370.2 แต่ในใบเขียน 103,636 — ต่ำกว่าจริง ~70,000 โดยไม่มีสัญญาณอะไรเลย
+function _saleWarn_(text, parsedTotal){
+  var stated=_statedTotals_(text);
+  if(!stated.length) return '';                                     // ไม่เจอป้าย = เทียบไม่ได้ ไม่เดา
+  // ตัดตัวเลือกที่เล็กผิดปกติทิ้ง — ป้ายบางอันมี 'จำนวนชิ้น' นั่งติดอยู่ (เช่น 967 ข้าง Grand Total)
+  // ถ้าไม่ตัด ข้อความเตือนจะรก และเผลอ 'ตรง' กับเลขจำนวนชิ้นโดยบังเอิญได้
+  var mx=Math.max.apply(null, stated);
+  stated=stated.filter(function(v){ return v>=mx/10; });
+  if(stated.some(function(v){ return Math.abs(v-parsedTotal)<1; })) return '';
+  var uniq=stated.filter(function(v,i,a){return a.indexOf(v)===i;})
+                 .map(function(v){return v.toLocaleString();});
+  return '\n   🔴 ยอดขายที่แกะได้ ('+parsedTotal.toLocaleString()+') ไม่ตรงกับยอดที่พิมพ์ในใบ ('+uniq.join(' / ')+')'+
+         '\n      → อย่าเพิ่งเชื่อตัวเลขของวันนี้ · รูปแบบรายงานอาจเปลี่ยน (เรียงคอลัมน์/ภาษาต่างจากเดิม)';
 }
 
 // ตรวจว่าใบรายงานครอบ 'หลายคืนทำการ' ไหม — คืนข้อความเตือน หรือ '' ถ้าคืนเดียว
