@@ -2364,6 +2364,7 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     lines = text.splitlines()
     if len(lines) > 1:
         entries, errors, stated_total = [], [], None
+        bill_rows, pay_lines = [], 0
         for ln in lines:
             ln = ln.strip()
             if not ln:
@@ -2372,6 +2373,20 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
             # เอกสาร/คอมมิตเก่าบอกว่า "ก๊อปสรุปของบอทมาวางทั้งดุ้นได้" แต่จริงๆ อ่านไม่ได้เลย
             # เพราะโค้ดบังคับว่าต้องมี '=' → คนก๊อปสรุปมาวางเพื่อกู้ยอด แล้วบอทเงียบสนิท
             # (เคสจริง 18/08/26: ล้างบัญชีแล้ววางสรุปกลับ ยอดขึ้น 0 ทั้งที่วางถูกต้อง)
+            # บรรทัด 'บิลซื้อ' ในสรุปของบอท: '14/08/26  📥+30,403.00'
+            # หรือพิมพ์เองในบล็อกว่า '14/8 บิล 30403' — เก็บไว้ลงเป็นบิล ไม่ใช่ยอดยกมา
+            m_bill = re.match(r"(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s*(?:📥\s*\+?|บิล\s*)([\d,]+(?:\.\d+)?)", ln)
+            if m_bill:
+                diso_b = _parse_thai_date(m_bill.group(1))
+                if diso_b:
+                    m_left_b = re.search(r"เหลือ\s*([\d,]+(?:\.\d+)?)", ln)
+                    raw_b = m_left_b.group(1) if m_left_b else m_bill.group(2)
+                    try:
+                        bill_rows.append((diso_b, float(raw_b.replace(",", ""))))
+                        continue
+                    except ValueError:
+                        pass
+                errors.append(ln); continue
             m_carry = re.match(r"(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s*ยกมา\s*([\d,]+(?:\.\d+)?)", ln)
             if m_carry:
                 diso_c = _parse_thai_date(m_carry.group(1))
@@ -2385,8 +2400,13 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                     except ValueError:
                         pass
                 errors.append(ln); continue
+            # ⚠️ ต้องเช็คหลังจับบรรทัดยกมา/บิลแล้วเท่านั้น — บรรทัดยกมาที่จ่ายบางส่วน
+            # มี '💸 จ่าย x (เหลือ y)' ต่อท้ายบรรทัดเดียวกัน ถ้าดักก่อนจะกลืนบรรทัดนั้นทิ้ง
+            if "💸" in ln:
+                pay_lines += 1     # บรรทัด 'จ่าย' ล้วนๆ — คืนอัตโนมัติไม่ได้ (ต้องจับคู่บิล) → แจ้งให้รู้
+                continue
             if "=" not in ln:
-                continue   # ข้ามหัวบล็อก/เส้นคั่น/บรรทัดบิล(📥)/บรรทัดจ่าย(💸)
+                continue   # ข้ามหัวบล็อก/เส้นคั่น/บรรทัดว่าง
             dpart, apart = ln.split("=", 1)
             if not dpart.strip():
                 # บรรทัดสรุปท้ายบล็อกที่คนเขียนเอง เช่น '= 2,050' (ไม่มีวันที่นำหน้า)
@@ -2429,13 +2449,14 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         # เคสจริง 18/08/26: พนักงานรายงานค่าเนื้อในกลุ่ม ("ยอดเนื้อกาดสามแยก / 13/8=430 / ...")
         # เข้าเงื่อนไข '≥2 บรรทัด' พอดี → บอทลบยอดค้างยกมาทั้งชุด (169,427) ทิ้ง เหลือ 2,050
         # เงื่อนไขนับบรรทัดอย่างเดียวหลวมเกินไปสำหรับงานที่ 'ลบของเดิม' — ต้องมีเจตนาชัด
-        has_carry_word = bool(re.search(r"ค้าง|ยกมา", re.sub(r"[^\wก-๙]+", "", text)))
+        has_carry_word = bool(re.search(r"ค้าง|ยกมา|สรุปหนี้", re.sub(r"[^\wก-๙]+", "", text)))
         if hdr_carry and not entries:   # สั่งมาชัดว่าจะวางยอดค้าง แต่อ่านไม่ได้เลย → ต้องบอก ห้ามเงียบ
             _payable_send(event, group_id, out,
                           "❌ อ่านบล็อกค้างไม่ได้ — รูปแบบควรเป็น  วัน/เดือน=ยอด (ค้าง xxxx)")
             return True
-        if not (entries and has_carry_word
-                and (hdr_carry or (len(entries) >= 2 and len(entries) >= len(errors)))):
+        _rows = len(entries) + len(bill_rows)
+        if not ((entries or bill_rows) and has_carry_word
+                and (hdr_carry or (_rows >= 2 and _rows >= len(errors)))):
             return False   # ไม่ใช่บล็อกค้าง → ปล่อยให้คำสั่งอื่นจัดการต่อ
         if errors:
             print(f"[payable-import] ข้าม {len(errors)} บรรทัด: {errors[:5]}", flush=True)
@@ -2452,6 +2473,15 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         _set_meta(f"payable_opening:{acct}", "0")
         for diso, val in entries:
             save_payable_bill(acct, val, note=_PAYABLE_CARRY_NOTE, doc_date=diso)
+        # บิลซื้อ: 'เพิ่มเข้าไป' ไม่ใช่แทนที่ (ต่างจากยอดยกมา) — ข้ามใบที่วันที่+ยอดตรงกันอยู่แล้ว
+        # ทำให้วางบล็อกซ้ำได้โดยไม่นับเบิ้ล (กติกาเดียวกับตอนส่งรูปบิล)
+        n_bill_new = n_bill_dup = 0
+        for diso, val in bill_rows:
+            if _payable_bill_exists(acct, diso, val):
+                n_bill_dup += 1
+                continue
+            save_payable_bill(acct, val, note="block", doc_date=diso)
+            n_bill_new += 1
         # รายงานผลอ่านก่อนโชว์สรุป — งานเงินห้ามข้ามบรรทัดเงียบ (ของเดิมข้ามแล้วไม่บอก เจ้าของไม่รู้ว่าหนี้หาย)
         # ไม่ทำปุ่มยืนยันก่อนบันทึกเพราะกู้ง่าย: วางบล็อกใหม่ทับได้เลย (แทนที่ยอดค้างยกมาเดิมทั้งชุด)
         total = sum(v for _, v in entries)
@@ -2459,6 +2489,13 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         # บอกให้เห็นชัดว่าเพิ่งทับของเดิมไปเท่าไร (คำสั่งนี้ทำลายข้อมูล ห้ามเงียบ)
         chk = (f"\n♻️ แทนที่ยอดค้างยกมาเดิม {old_n} บรรทัด ({old_sum:,.2f} บาท) ทั้งชุด"
                if old_n else "")
+        if n_bill_new or n_bill_dup:
+            chk += f"\n📥 บิลซื้อ +{n_bill_new} ใบ"
+            if n_bill_dup:
+                chk += f" (ข้ามที่มีอยู่แล้ว {n_bill_dup} ใบ)"
+        if pay_lines:
+            chk += (f"\n⚠️ มีบรรทัด 'จ่าย' {pay_lines} รายการในบล็อก — คืนอัตโนมัติไม่ได้ "
+                    f"(ต้องจับคู่บิล) ให้พิมพ์ 'จ่าย <วันที่> <ยอด>' เอง")
         if stated_total is None:
             chk += ""
         elif abs(stated_total - total) < 0.01:

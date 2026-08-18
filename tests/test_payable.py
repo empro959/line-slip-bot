@@ -393,9 +393,51 @@ class TestCarryBlock(PayableTestCase):
 
         self.assertTrue(handled, "ต้องอ่านสรุปของบอทเองออก")
         self.assertIn("✅", msg)
-        self.assertNotIn("❌", msg, "บรรทัดบิล 📥 ไม่ใช่ error ให้ข้ามเฉยๆ")
-        self.assertAlmostEqual(app._payable_outstanding(ACCT), 48237.0, places=2)
-        self.assertEqual(len(self.bills()), 3, "รับเฉพาะบรรทัด 'ยกมา' ไม่เอาบรรทัดบิล")
+        self.assertNotIn("❌", msg, "บรรทัดบิล 📥 ไม่ใช่ error")
+        # ยกมา 48,237 + บิล 30,403 + 22,449 = 101,089 (บล็อกกู้บิลได้ด้วยแล้ว)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 101089.0, places=2)
+        self.assertEqual(len(self.bills()), 5, "ยกมา 3 + บิล 2")
+
+    def test_pasting_full_summary_restores_carry_and_bills(self):
+        """กู้ทั้งบัญชีด้วยการวางสรุปทีเดียว — ไม่ต้องพิมพ์บิลทีละบรรทัด
+
+        เคสจริง 18/08/26: หลังล้างบัญชี ต้องกู้ยกมา 3 + บิล 8 ใบ = 165,117
+        ของเดิมวางบล็อกได้แค่ยอดยกมา บิลต้องพิมพ์เอง 8 ข้อความ (พิมพ์ผิดง่าย)"""
+        carry = [(_d(10), 19614.0), (_d(7), 15835.0), (_d(5), 12788.0)]
+        bills = [(_d(4), 30403.0), (_d(3), 22449.0), (_d(3), 7155.0), (_d(2), 13135.0),
+                 (_d(1), 20250.0), (_d(1), 6210.0), (_d(0), 1740.0), (_d(0), 15538.0)]
+        summary = "📋 สรุปหนี้  — รายวัน\n━━━━━━━━━━━━━\n"
+        summary += "".join(f"{_dmy(d)}  ยกมา {v:,.2f}\n" for d, v in carry)
+        summary += "━━━━━━━━━━━━━\n"
+        summary += "".join(f"{_dmy(d)}  📥+{v:,.2f}\n" for d, v in bills)
+
+        handled, msg = self._paste(summary)
+
+        self.assertTrue(handled)
+        self.assertIn("📥 บิลซื้อ +8 ใบ", msg)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 165117.0, places=2)
+
+    def test_pasting_full_summary_twice_does_not_double(self):
+        """วางซ้ำต้องไม่นับเบิ้ล — บิลที่วันที่+ยอดตรงกันอยู่แล้วให้ข้าม"""
+        summary = (f"📋 สรุปหนี้\n{_dmy(_d(5))}  ยกมา 1,000.00\n"
+                   f"{_dmy(_d(3))}  📥+2,000.00\n{_dmy(_d(2))}  📥+3,000.00")
+        self._paste(summary)
+        first = app._payable_outstanding(ACCT)
+        handled, msg = self._paste(summary)
+
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), first, places=2)
+        self.assertAlmostEqual(first, 6000.0, places=2)
+        self.assertIn("ข้ามที่มีอยู่แล้ว 2 ใบ", msg)
+
+    def test_payment_lines_cannot_be_restored_and_say_so(self):
+        """บรรทัด 'จ่าย' คืนอัตโนมัติไม่ได้ (ต้องจับคู่บิล) — ต้องบอก ไม่ใช่เงียบ"""
+        handled, msg = self._paste(
+            f"📋 สรุปหนี้\n{_dmy(_d(5))}  ยกมา 1,000.00\n{_dmy(_d(4))}  ยกมา 500.00\n"
+            f"{_dmy(_d(3))}  💸−500.00")
+
+        self.assertTrue(handled)
+        self.assertIn("จ่าย", msg)
+        self.assertIn("คืนอัตโนมัติไม่ได้", msg)
 
     def test_summary_line_with_partial_payment_uses_remaining(self):
         """บรรทัดยกมาที่จ่ายบางส่วนแล้วมี '(เหลือ x)' ต่อท้าย → ต้องใช้ยอดที่เหลือ"""
