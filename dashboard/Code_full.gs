@@ -827,6 +827,9 @@ function _importPosOneDate_(iso){
   }
   var pt=att.pay?pdfToText_(att.pay.copyBlob()):'';
   var bt=att.bal?pdfToText_(att.bal.copyBlob()):'';
+  // รายงานที่ส่งย้อนหลังมัก export เป็น 'ช่วงวันที่' (From 11 To 12) แต่โค้ดนี้ลงเป็นวันเดียว
+  // → ยอดวิธีชำระ/โซน/ค่าใช้จ่าย ของทุกวันในช่วงจะถูกยัดรวมเข้าวันเดียว = ตัวเลขเกินจริง
+  var rangeWarn = _rangeWarn_(bt) || _rangeWarn_(pt);
   // บิล/ลูกหนี้ มาจากไฟล์ 'แยกตามลูกค้า' — ของเดิมเป็น catch(e){} เปล่าๆ + ไม่เตือนตอนไฟล์หาย
   // ทำให้ 'บิล 0' แยกไม่ออกว่า (ก) ไม่มีบิลจริง (ข) ไม่มีไฟล์ในเมล (ค) OCR พัง → ต้องบอกให้รู้
   var bills=0, credit=[], custWarn='';
@@ -846,8 +849,44 @@ function _importPosOneDate_(iso){
   Logger.log('✅ กู้วันที่ '+dd.key+' ('+dd.period+') สำเร็จ — ยอดขาย '+totS.toLocaleString()+
              ' · ค่าใช้จ่าย '+totE.toLocaleString()+' · เมนู '+day.menu.length+' รายการ · บิล '+bills+
              (pt?'':'  ⚠️ ไม่มี PayoutReport ในอีเมลนี้ → ค่าใช้จ่าย = 0')+
-             (bt?'':'  ⚠️ ไม่มี BalanceCashDrawer → ไม่มีวิธีชำระ/โซน')+custWarn);
+             (bt?'':'  ⚠️ ไม่มี BalanceCashDrawer → ไม่มีวิธีชำระ/โซน')+custWarn+
+             // อ่านไฟล์ได้แต่แกะตัวเลขไม่ออก = เงียบที่สุด ต้องบอก ไม่งั้น dashboard โชว์ว่างโดยไม่มีใครรู้
+             (bt&&!Object.keys(day.payments).length?'\n   ⚠️ มี BalanceCashDrawer แต่แกะ "วิธีชำระ" ไม่ออกเลย (รูปแบบรายงานอาจเปลี่ยน) → รัน debugBalanceOcr() ดูข้อความจริง':'')+
+             (bt&&!Object.keys(day.zones).length?'\n   ⚠️ มี BalanceCashDrawer แต่แกะ "โซน" ไม่ออกเลย → รัน debugBalanceOcr() ดูข้อความจริง':'')+
+             rangeWarn);
   Logger.log('👉 เปิด dashboard เช็คได้เลย (rebuild ให้แล้ว) · ถ้าจะกู้วันอื่นแก้วันที่ใน importPosByDate แล้วรันซ้ำ');
+}
+
+// ตรวจว่าใบรายงานครอบ 'หลายวัน' ไหม (From ≠ To) — คืนข้อความเตือน หรือ '' ถ้าวันเดียว
+function _rangeWarn_(text){
+  if(!text) return '';
+  var pat='[:\\s]*([0-9]{1,2})\\s+('+THAI_MONTHS.join('|')+')\\s+([0-9]{4})';
+  var f=text.match(new RegExp('(?:ตั้งแต่|From)'+pat)), t=text.match(new RegExp('(?:ถึง|To)'+pat));
+  if(!f||!t) return '';
+  var iso=function(m){ var y=parseInt(m[3],10); if(y>=2500) y-=543;
+    return y+'-'+('0'+(THAI_MONTHS.indexOf(m[2])+1)).slice(-2)+'-'+('0'+m[1]).slice(-2); };
+  var a=iso(f), b=iso(t);
+  if(a===b) return '';
+  return '\n   🔴 ใบนี้ครอบหลายวัน ('+a+' ถึง '+b+') แต่ถูกบันทึกเป็นวันเดียว = '+a+
+         '\n      → ยอดวิธีชำระ/โซน/ค่าใช้จ่าย เป็นของทั้งช่วงรวมกัน ไม่ใช่ของวันเดียว **ตัวเลขเกินจริง**'+
+         '\n      → ให้ export ใหม่ทีละวัน (From=To) แล้วส่งเข้าเมล จากนั้นรัน importPosByDate อีกรอบ';
+}
+
+// ===== ดูข้อความ OCR จริงของ BalanceCashDrawer วันที่ระบุ (ไว้ให้คนเขียนโค้ดดูรูปแบบรายงาน) =====
+// ใช้ตอน log เตือนว่า 'แกะวิธีชำระ/โซนไม่ออก' — จะได้รู้ว่ารายงานหน้าตาเปลี่ยนไปยังไง
+function debugBalanceOcr(){
+  var ISO='2026-08-11';   // ← แก้เป็นวันที่ที่มีปัญหา
+  var threads=GmailApp.search('has:attachment filename:pdf newer_than:60d',0,100), hit=null;
+  threads.forEach(function(t){ t.getMessages().forEach(function(msg){
+    if(!hit && _subjDateIso_(msg.getSubject())===ISO && msg.getAttachments().length) hit=msg;
+  });});
+  if(!hit){ Logger.log('❌ ไม่พบอีเมลของ '+ISO); return; }
+  var bal=null;
+  hit.getAttachments().forEach(function(a){ if(/BalanceCashDrawer/i.test(a.getName())) bal=bal||a; });
+  if(!bal){ Logger.log('❌ อีเมลนี้ไม่มีไฟล์ BalanceCashDrawer'); return; }
+  var txt=pdfToText_(bal.copyBlob());
+  Logger.log('📄 ข้อความ OCR ของ '+bal.getName()+' (ยาว '+txt.length+' ตัวอักษร) — ก๊อปทั้งหมดส่งให้คนแก้โค้ดดู:');
+  for(var i=0;i<txt.length;i+=4000) Logger.log(txt.slice(i,i+4000));   // Logger ตัดข้อความยาว เลยซอยเป็นท่อน
 }
 
 // 👉 ใส่วันที่ที่ต้องการกู้ตรงนี้ — ใส่กี่วันก็ได้ คั่นด้วยจุลภาค แล้วรันฟังก์ชันนี้ครั้งเดียว
