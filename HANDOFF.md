@@ -10,7 +10,7 @@
 
 ## 1. TL;DR — เหลืออะไรบ้าง
 
-> **สถานะ 18 ส.ค. 2026: งานหลักปิดครบทุกข้อแล้ว** เหลือแค่ 2 ข้อสีเขียว (งานเล็ก ไม่กระทบระบบ)
+> 🔴 **สถานะ 18 ส.ค. 2026 23:10: Render ยังต่อ repo เก่า (`saiyangsoi-sketch`) — โค้ดใหม่ทั้งหมดยังไม่ขึ้นระบบ** ดูข้อ 5
 
 | ลำดับ | งาน | ทำที่ไหน |
 |---|---|---|
@@ -18,7 +18,7 @@
 | ✅ 2 | ~~Export Supabase ของ E&M~~ — **เซฟไฟล์แล้ว 18 ส.ค.** ดึงผ่าน SQL Editor แบบไล่ทุกตารางอัตโนมัติ (ตอนดึง status ยัง Healthy ทันก่อน pause) | supabase (บัญชี empro959) |
 | ✅ 3 | ~~ล้างบัญชีหนี้ + วางฟอร์มยอดค้าง~~ — **เสร็จแล้ว 18 ส.ค.** เจ้าของยืนยันยอดหนี้ถูกต้องแล้ว | กลุ่มหนี้ในไลน์ |
 | ✅ 4 | ~~กู้ยอด 25 ก.ค. / 29 ก.ค.~~ — **ไม่ต้องกู้** เจ้าของยืนยัน 17 ส.ค.: **25 ก.ค. มีข้อมูลแล้ว · 29 ก.ค. ร้านหยุด** (ไม่มียอดถูกแล้ว) | — |
-| ✅ 5 | ~~กู้รหัส GitHub `saiyangsoi-sketch`~~ — **ไม่ต้องแล้ว** ย้ายต้นทาง deploy กลับมา `empro959` และรวมโค้ดครบแล้ว (repo นั้นปล่อยทิ้งได้) | — |
+| 🔴 5 | **สลับ Render ให้ deploy จาก `empro959/line-slip-bot`** — ตอนนี้ยังต่อ `saiyangsoi-sketch` อยู่ ทำให้ push แล้วไม่ขึ้นระบบ (Settings → Repository → เปลี่ยน repo → Manual Deploy) | Render |
 | 🟢 6 | เช็กยกเลิกบิล ฿3,599 ของวันที่ 16 ส.ค. (ระบบเตือนขึ้นเอง) | Easy POS |
 | 🟢 7 | แจ้งห้องคอนเทนต์เรื่อง webhook URL ใหม่ (ค้างจากฉบับก่อน) | กลุ่มคอนเทนต์ |
 | 🟢 8 | (ถ้าอยาก) ย้ายปลายทางรายงานสลิป — ตอนนี้ redirect ไปกลุ่ม `C91b4fc6ff9…` | env `REPORT_REDIRECT` ที่ Render |
@@ -65,7 +65,7 @@
 | Gemini | Saiyang Soi4 / project-for-key-3 (restrict Gemini API + เปิด billing) |
 | Apps Script + Drive + เมล POS | saiyangsoi@gmail.com |
 | Netlify (dashboard) | team saiyangsoi |
-| GitHub (deploy) | **empro959/line-slip-bot** ← Render service ต่อกับ repo นี้ (สลับแล้ว 17 ส.ค.) |
+| GitHub (deploy) | 🔴 **Render ยังต่อกับ `saiyangsoi-sketch/Line-Slip-Bot` อยู่** (ตรวจหน้า Render 18 ส.ค. 23:10 — live ที่ `33ac046` ตั้งแต่ 17 ส.ค. 13:22) · โค้ดใหม่อยู่ที่ `empro959/line-slip-bot` แต่ **ยังไม่ได้สลับ** → push แล้วไม่ขึ้นระบบ |
 
 **ของเก่า/เลิกใช้:** Render `line-slip-bot-65gt` (suspend), Supabase empro959 (⚠️ จะถูก pause — **export เก็บไว้แล้ว 18 ส.ค.**), Gemini E&M, **GitHub `saiyangsoi-sketch/Line-Slip-Bot`** (โค้ดถูกรวมกลับมาแล้ว)
 
@@ -93,8 +93,13 @@
 | `bcb7020` | **merge รวม 2 สายที่แยกกันตั้งแต่ `cf1aeb2`** — ตรวจแล้วไม่มีงานฝั่งไหนหาย: `app.py` เอาฝั่ง saiyangsoi ทั้งไฟล์ (อีก 4 commit ของ empro959 คือฟีเจอร์ 'บิลซื้อเด้งสรุป' เรื่องเดียวกัน ทำซ้ำกัน) · dashboard/doc ของ empro959 merge เข้าเองไม่ชน · พารามิเตอร์ `source_only` เป็น dead code จึงไม่รับเข้ามา |
 | `51da09e` | **เพิ่ม `tests/` — 18 เคส** ครอบ settle/reconcile/unlink/`_pg_sql`/fallback push (ดูหัวข้อ "เทสต์" ใน `ARCHITECTURE.md`) · ไม่แตะ `app.py` |
 
-**สลับต้นทาง deploy:** Render service ชี้มา `empro959/line-slip-bot` แล้ว → push `main` = deploy จริง
-(ก่อนหน้านี้ต่อกับ `saiyangsoi-sketch` — ถ้าเจออาการ "push แล้วของไม่เปลี่ยน" ให้เช็คข้อนี้ก่อน)
+**⚠️ สลับต้นทาง deploy: ยังไม่ได้ทำ** — 17 ส.ค. เจ้าของเข้าใจว่าสลับแล้ว ผมเลยจดลงเอกสารตามนั้น
+แต่ 18 ส.ค. 23:10 เปิดหน้า Render ดูจริง พบว่ายังต่อกับ `saiyangsoi-sketch/Line-Slip-Bot` อยู่
+live ที่ `33ac046` ตั้งแต่ 17 ส.ค. 13:22 → **ทุก commit ที่ push เข้า empro959 หลังจากนั้นไม่เคยขึ้นระบบ**
+เสียเวลาไล่บั๊กทั้งคืนเพราะเข้าใจว่าโค้ดใหม่รันอยู่แล้ว
+
+**บทเรียน: อย่าเชื่อคำบอกเล่าเรื่องสถานะระบบ ให้เปิดหน้าคอนโซลดูของจริงเสมอ**
+วิธีเช็คใน 5 วินาที: Render → service → ดูบรรทัด GitHub + commit hash ใต้ชื่อ service
 
 ### 4.1.2 ปิดงานค้าง 18 ส.ค.
 
