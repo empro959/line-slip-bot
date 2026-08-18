@@ -4853,7 +4853,23 @@ def api_slip_daily():
 # (เคยมี db_import/db_migrate ไว้ย้าย Neon→Supabase — ลบทิ้งแล้วหลังย้ายเสร็จ 2026-07-25 กันเขียน/ลบข้อมูลหลุด)
 _MIGRATE_TABLES = ["meta", "groups", "slips", "reservations",
                    "payable_bills", "payable_payments",
-                   "dining_bills", "dining_pairs", "image_misses"]
+                   "dining_bills", "dining_pairs", "image_misses",
+                   "recon_pending"]
+
+
+def _db_all_tables() -> list:
+    """ชื่อตารางจริงที่มีใน DB (รองรับทั้ง Postgres/SQLite)
+    มีไว้ยันว่า _MIGRATE_TABLES ไม่ตกตารางไหน — เพิ่มตารางใหม่แล้วลืมใส่ในลิสต์
+    = backup ขาดไปเงียบๆ ไม่มีใครรู้ (เคสจริง 18/08/26: recon_pending ตกไป 1 ตาราง
+    เพิ่งมาเจอตอนไล่นับตารางในมือก่อนปิด Supabase เก่า)"""
+    with _db() as conn:
+        if USE_PG:
+            rows = conn.execute("SELECT table_name AS n FROM information_schema.tables "
+                                "WHERE table_schema='public' AND table_type='BASE TABLE'").fetchall()
+        else:
+            rows = conn.execute("SELECT name AS n FROM sqlite_master "
+                                "WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
+    return sorted(r["n"] for r in rows)
 
 def _migrate_auth() -> bool:
     need = os.environ.get("SLIP_API_TOKEN") or os.environ.get("DASHBOARD_PASSWORD") or ""
@@ -4872,8 +4888,14 @@ def api_db_export():
                 rows = conn.execute(f"SELECT * FROM {t}").fetchall()
                 dump[t] = [dict(r) for r in rows]
                 counts[t] = len(rows)
+        # ตารางที่มีใน DB จริงแต่ไม่อยู่ใน _MIGRATE_TABLES = backup ขาด — ต้องโผล่ในผลลัพธ์ ห้ามเงียบ
+        missing = [t for t in _db_all_tables() if t not in _MIGRATE_TABLES]
+        if missing:
+            print(f"[db_export] ⚠️ ตารางที่ไม่ได้ backup: {', '.join(missing)} "
+                  f"— เพิ่มใน _MIGRATE_TABLES ด่วน", flush=True)
         body = json.dumps({"ok": True, "ts": datetime.now(TZ).isoformat(),
-                           "counts": counts, "tables": dump}, ensure_ascii=False, default=str)
+                           "counts": counts, "missing_tables": missing,
+                           "tables": dump}, ensure_ascii=False, default=str)
         return app.response_class(body, mimetype="application/json")
     except Exception as e:
         return {"ok": False, "error": str(e)[:200]}, 500

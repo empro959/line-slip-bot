@@ -1,6 +1,6 @@
 # 📦 ส่งงานต่อ — บอทเอด + Dashboard ไส้ย่างซอย๔
 
-> อัปเดต: **2026-08-17** — เอกสารส่งงาน "ฉบับปัจจุบัน" ของทั้งโปรเจกต์ (แทนที่ฉบับ 2026-08-13)
+> อัปเดต: **2026-08-18** — เอกสารส่งงาน "ฉบับปัจจุบัน" ของทั้งโปรเจกต์ (แทนที่ฉบับ 2026-08-13)
 > repo หลัก: **`empro959/line-slip-bot`** branch `main` → Render auto-deploy
 > ⚠️ `saiyangsoi-sketch/Line-Slip-Bot` = **repo เก่า เลิกใช้แล้ว** (ห้าม push เพิ่ม — งานทั้งหมดถูกรวมกลับมาที่ empro959 แล้วด้วย merge `bcb7020`)
 >
@@ -12,8 +12,8 @@
 
 | ลำดับ | งาน | ทำที่ไหน |
 |---|---|---|
-| ✅ 1 | ~~UptimeRobot จี้ URL เก่า~~ — **แก้แล้ว 17 ส.ค.** สร้าง monitor `https://line-slip-bot-1-iq8e.onrender.com/health` ทุก 5 นาที + alert เข้าเมล → ขึ้นเขียว 100% แล้ว (ก่อนหน้านี้ **ไม่มีใครปลุกรายงาน 00:30 นาน 5 วัน 17 ชม.**) · เหลือลบ monitor เก่า `65gt` ทิ้ง | uptimerobot.com |
-| 🔴 2 | **Export Supabase ของ E&M เก็บไว้** ก่อนถูก pause (แจ้งแล้ว 16 ส.ค. · unpause ได้แค่ 90 วัน) | supabase (บัญชี empro959) |
+| ✅ 1 | ~~UptimeRobot จี้ URL เก่า~~ — **แก้แล้ว 17 ส.ค.** สร้าง monitor `https://line-slip-bot-1-iq8e.onrender.com/health` ทุก 5 นาที + alert เข้าเมล → ขึ้นเขียว 100% + ลบ monitor เก่า `65gt` ทิ้งแล้ว (ก่อนหน้านี้ **ไม่มีใครปลุกรายงาน 00:30 นาน 5 วัน 17 ชม.**) · **ยืนยันผลแล้ว: คืน 18 ส.ค. รายงาน 00:30 เข้ากลุ่มปกติ** | uptimerobot.com |
+| ✅ 2 | ~~Export Supabase ของ E&M~~ — **เซฟไฟล์แล้ว 18 ส.ค.** ดึงผ่าน SQL Editor แบบไล่ทุกตารางอัตโนมัติ (ตอนดึง status ยัง Healthy ทันก่อน pause) | supabase (บัญชี empro959) |
 | 🟡 3 | **ล้างบัญชีหนี้ + วางฟอร์มยอดค้าง 11 บรรทัด** ให้ได้ยอดรวม **169,427.00** | กลุ่มหนี้ในไลน์ |
 | ✅ 4 | ~~กู้ยอด 25 ก.ค. / 29 ก.ค.~~ — **ไม่ต้องกู้** เจ้าของยืนยัน 17 ส.ค.: **25 ก.ค. มีข้อมูลแล้ว · 29 ก.ค. ร้านหยุด** (ไม่มียอดถูกแล้ว) | — |
 | ✅ 5 | ~~กู้รหัส GitHub `saiyangsoi-sketch`~~ — **ไม่ต้องแล้ว** ย้ายต้นทาง deploy กลับมา `empro959` และรวมโค้ดครบแล้ว (repo นั้นปล่อยทิ้งได้) | — |
@@ -65,7 +65,7 @@
 | Netlify (dashboard) | team saiyangsoi |
 | GitHub (deploy) | **empro959/line-slip-bot** ← Render service ต่อกับ repo นี้ (สลับแล้ว 17 ส.ค.) |
 
-**ของเก่า/เลิกใช้:** Render `line-slip-bot-65gt` (suspend), Supabase empro959 (⚠️ จะถูก pause), Gemini E&M, **GitHub `saiyangsoi-sketch/Line-Slip-Bot`** (โค้ดถูกรวมกลับมาแล้ว)
+**ของเก่า/เลิกใช้:** Render `line-slip-bot-65gt` (suspend), Supabase empro959 (⚠️ จะถูก pause — **export เก็บไว้แล้ว 18 ส.ค.**), Gemini E&M, **GitHub `saiyangsoi-sketch/Line-Slip-Bot`** (โค้ดถูกรวมกลับมาแล้ว)
 
 > ⚠️ **บัญชี GitHub กับบัญชีบริการอื่นคนละตัวกัน** — repo deploy อยู่ที่ `empro959` แต่ Render/Supabase/Apps Script/Netlify อยู่บัญชีร้าน (`saiyangsoi@gmail.com`) ไม่ใช่ความผิดพลาด ตั้งใจให้เป็นแบบนี้หลังย้าย
 
@@ -94,6 +94,16 @@
 **สลับต้นทาง deploy:** Render service ชี้มา `empro959/line-slip-bot` แล้ว → push `main` = deploy จริง
 (ก่อนหน้านี้ต่อกับ `saiyangsoi-sketch` — ถ้าเจออาการ "push แล้วของไม่เปลี่ยน" ให้เช็คข้อนี้ก่อน)
 
+### 4.1.2 ปิดงานค้าง 18 ส.ค.
+
+| commit | เรื่อง |
+|---|---|
+| `893d0d6` | `importPosByDate()` รับหลายวันในรอบเดียว (เดิมฮาร์ดโค้ดวันเดียว ต้องแก้โค้ดแล้วรันซ้ำ) |
+| `9058af8` | เพิ่ม `CLOSED_DAYS` — แยก "วันร้านหยุด" ออกจาก "วันข้อมูลหาย" ใน `debugDaily()` |
+| `f453191` | เอกสาร: ปิดข้อ UptimeRobot |
+
+⚠️ 2 commit แรกเป็นไฟล์ **Apps Script** — ต้องก๊อปไปวางใน editor เองถึงจะมีผลจริง (git ต่อตรงไม่ได้)
+
 ### 4.2 Apps Script — แก้ 5 จุด (วางไฟล์ใหม่ทับแล้ว)
 
 - 🎯 **ต้นเหตุ "รายรับไม่เข้าไลน์หลายวัน"**: `SLIP_API_URL` ใน Script Properties ยังชี้บอทตัวเก่า `65gt` → `pushOwner_` ใช้ host เดียวกันจึงยิงไปที่ตายแล้ว **และ error ถูกกลืน 2 ชั้น** (`catch` ในตัวเอง + `try{}catch(e){}` ตอนเรียก) → ไม่ขึ้นเป็น failed execution เลย เหลือแต่อีเมลที่ส่งได้เสมอ
@@ -118,9 +128,10 @@
 8. **`PAYEE_KEYWORDS`** = บัญชีรับเงินของร้าน (ไส้ย่าง/SAI YANG/944107…) · **`PAYABLE_PAYEE_KEYWORDS`** = บัญชีดวงใจ (เจ้าหนี้) — ใส่สลับกันแล้วเตือนผิดทุกใบ · OCR ชื่ออ่านเพี้ยนบ่อย ให้จับที่เลขบัญชี
 9. **กลุ่มหนี้ mirror**: primary = กลุ่มส่งบิล/สลิป (reply ฟรี) · mirror = ดูสรุป (push) · ยอดค้างรวมโชว์เฉพาะ mirror · กลุ่ม mirror ส่งรูปจะไม่บันทึก
 10. **`DATABASE_URL`** ต้องเป็น Supabase **Session pooler** (IPv4) — Direct connection เป็น IPv6 Render ต่อไม่ได้
-11. **env vars อยู่ที่ Render service** ไม่ใช่ repo → สร้าง service ใหม่ต้องก๊อป env ให้ครบ (กลุ่มที่มักลืม: `SLIP_API_TOKEN`, `LINE_ADMIN_USER_ID`, `REPORT_REDIRECT`)
-12. **โควตา push LINE ฟรี ~300/เดือน/OA** — reply ฟรี · รายงาน/สรุปใช้ push · เช็คด้วยคำสั่ง `โควต้า`
-13. **repo public** → ห้าม hardcode token/เลขบัญชี/group id (ใช้ env ทั้งหมด)
+11. **`/api/db_export` เคย backup ไม่ครบแบบเงียบๆ** — `_MIGRATE_TABLES` เป็นลิสต์ hardcode พอเพิ่มตาราง `recon_pending` ทีหลังแล้วลืมใส่ในลิสต์ endpoint ที่เขียนว่า "dump ทุกตาราง" ก็ข้ามมันไปโดยไม่บอกใคร (เพิ่งเจอตอนไล่นับตารางด้วยมือก่อนปิด DB เก่า 18 ส.ค.) · **แก้แล้ว:** ใส่ `recon_pending` เข้าลิสต์ + endpoint คืนฟิลด์ `missing_tables` (ต้องเป็น `[]` เสมอ — ไม่ว่างเมื่อไหร่คือ backup ขาด) + มีเทสต์ยันว่าลิสต์ครอบทุกตารางใน DB จริง
+12. **env vars อยู่ที่ Render service** ไม่ใช่ repo → สร้าง service ใหม่ต้องก๊อป env ให้ครบ (กลุ่มที่มักลืม: `SLIP_API_TOKEN`, `LINE_ADMIN_USER_ID`, `REPORT_REDIRECT`)
+13. **โควตา push LINE ฟรี ~300/เดือน/OA** — reply ฟรี · รายงาน/สรุปใช้ push · เช็คด้วยคำสั่ง `โควต้า`
+14. **repo public** → ห้าม hardcode token/เลขบัญชี/group id (ใช้ env ทั้งหมด)
 
 ---
 

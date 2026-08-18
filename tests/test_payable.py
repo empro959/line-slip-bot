@@ -336,5 +336,27 @@ class TestPayableBillGuards(PayableTestCase):
             self.assertLessEqual(int(got[:4]), year)
 
 
+class TestDbExportCoverage(unittest.TestCase):
+    """/api/db_export ต้อง backup 'ทุกตาราง' จริงตามที่โฆษณาไว้
+
+    เคสจริง 18/08/26: recon_pending ไม่อยู่ใน _MIGRATE_TABLES → endpoint ที่บอกว่า
+    'dump ทุกตาราง' ข้ามมันไปเงียบๆ เพิ่งมาเจอตอนไล่นับตารางในมือก่อนปิด DB เก่า
+    เทสต์นี้จะแดงทันทีที่มีคนเพิ่มตารางใหม่แล้วลืมใส่ในลิสต์"""
+
+    def test_migrate_tables_covers_every_table_in_db(self):
+        actual = set(app._db_all_tables())
+        listed = set(app._MIGRATE_TABLES)
+        self.assertEqual(
+            actual - listed, set(),
+            "มีตารางใน DB ที่ /api/db_export ไม่ได้ backup — เพิ่มใน _MIGRATE_TABLES")
+
+    def test_no_phantom_table_in_list(self):
+        """กันทางกลับ: ลิสต์อ้างตารางที่ไม่มีจริง → export จะ 500 ทั้งก้อน"""
+        actual = set(app._db_all_tables())
+        self.assertEqual(
+            set(app._MIGRATE_TABLES) - actual, set(),
+            "_MIGRATE_TABLES อ้างตารางที่ไม่มีใน DB")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
