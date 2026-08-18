@@ -50,6 +50,12 @@ def _dm(iso: str) -> str:
     return f"{d.day}/{d.month}"
 
 
+def _dmy(iso: str) -> str:
+    """แปลง 'YYYY-MM-DD' → 'DD/MM/YY' แบบที่บอทพิมพ์ในสรุปหนี้"""
+    d = datetime.strptime(iso, "%Y-%m-%d").date()
+    return f"{d.day:02d}/{d.month:02d}/{d.year % 100:02d}"
+
+
 def setUpModule():
     """ชี้ DB ไปไฟล์ชั่วคราว — ไม่แตะ slips.db ของจริง"""
     app.DB_PATH = os.path.join(_tmpdir.name, "test.db")   # _db() อ่านค่านี้ตอนเรียก
@@ -366,6 +372,39 @@ class TestCarryBlock(PayableTestCase):
         self.sent = []
         handled = app.handle_payable_text(self._Event(), block, ACCT)
         return handled, (self.sent[0] if self.sent else "")
+
+    def test_pasting_the_bots_own_summary_restores_carry(self):
+        """🔴 เคสจริง 18/08/26 — ล้างบัญชีแล้วก๊อป 'สรุปหนี้' ของบอทเองมาวางกลับ
+
+        สรุปของบอทเขียนว่า '08/08/26  ยกมา 19,614.00' ไม่มี '=' แต่โค้ดบังคับว่า
+        บรรทัดต้องมี '=' → บอทเงียบสนิท ยอดขึ้น 0 ทั้งที่วางถูกต้อง
+        (คอมมิตเก่าโฆษณาว่า 'ก๊อปสรุปมาทั้งดุ้นก็ได้' แต่ใช้ไม่ได้จริง)"""
+        d1, d2, d3 = _d(10), _d(7), _d(5)
+        summary = (
+            "📋 สรุปหนี้  — รายวัน\n"
+            "━━━━━━━━━━━━━\n"
+            f"{_dmy(d1)}  ยกมา 19,614.00\n"
+            f"{_dmy(d2)}  ยกมา 15,835.00\n"
+            f"{_dmy(d3)}  ยกมา 12,788.00\n"
+            "━━━━━━━━━━━━━\n"
+            f"{_dmy(_d(4))}  📥+30,403.00\n"
+            f"{_dmy(_d(3))}  📥+22,449.00")
+        handled, msg = self._paste(summary)
+
+        self.assertTrue(handled, "ต้องอ่านสรุปของบอทเองออก")
+        self.assertIn("✅", msg)
+        self.assertNotIn("❌", msg, "บรรทัดบิล 📥 ไม่ใช่ error ให้ข้ามเฉยๆ")
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 48237.0, places=2)
+        self.assertEqual(len(self.bills()), 3, "รับเฉพาะบรรทัด 'ยกมา' ไม่เอาบรรทัดบิล")
+
+    def test_summary_line_with_partial_payment_uses_remaining(self):
+        """บรรทัดยกมาที่จ่ายบางส่วนแล้วมี '(เหลือ x)' ต่อท้าย → ต้องใช้ยอดที่เหลือ"""
+        handled, msg = self._paste(
+            f"📋 สรุปหนี้\n{_dmy(_d(6))}  ยกมา 10,000.00  💸 จ่าย 4,000.00 (เหลือ 6,000.00)\n"
+            f"{_dmy(_d(5))}  ยกมา 2,000.00")
+
+        self.assertTrue(handled)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 8000.0, places=2)
 
     def test_staff_meat_report_must_not_wipe_carry_forward(self):
         """🔴 เคสจริง 18/08/26 ที่ทำยอดหนี้หาย — ต้องไม่เกิดอีกเด็ดขาด

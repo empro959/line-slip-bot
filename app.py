@@ -2366,8 +2366,27 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         entries, errors, stated_total = [], [], None
         for ln in lines:
             ln = ln.strip()
-            if not ln or "=" not in ln:
-                continue   # ข้ามหัวบล็อก/เส้นคั่น/บรรทัดว่าง (ไม่มี '=')
+            if not ln:
+                continue
+            # รับ 'สรุปหนี้' ที่บอทพิมพ์เองด้วย — รูปแบบ '08/08/26  ยกมา 19,614.00' (ไม่มี '=')
+            # เอกสาร/คอมมิตเก่าบอกว่า "ก๊อปสรุปของบอทมาวางทั้งดุ้นได้" แต่จริงๆ อ่านไม่ได้เลย
+            # เพราะโค้ดบังคับว่าต้องมี '=' → คนก๊อปสรุปมาวางเพื่อกู้ยอด แล้วบอทเงียบสนิท
+            # (เคสจริง 18/08/26: ล้างบัญชีแล้ววางสรุปกลับ ยอดขึ้น 0 ทั้งที่วางถูกต้อง)
+            m_carry = re.match(r"(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s*ยกมา\s*([\d,]+(?:\.\d+)?)", ln)
+            if m_carry:
+                diso_c = _parse_thai_date(m_carry.group(1))
+                if diso_c:
+                    # จ่ายบางส่วนแล้วจะมี '(เหลือ x)' ต่อท้าย → ใช้ยอดที่เหลือจริง
+                    m_left = re.search(r"เหลือ\s*([\d,]+(?:\.\d+)?)", ln)
+                    raw_c = m_left.group(1) if m_left else m_carry.group(2)
+                    try:
+                        entries.append((diso_c, float(raw_c.replace(",", ""))))
+                        continue
+                    except ValueError:
+                        pass
+                errors.append(ln); continue
+            if "=" not in ln:
+                continue   # ข้ามหัวบล็อก/เส้นคั่น/บรรทัดบิล(📥)/บรรทัดจ่าย(💸)
             dpart, apart = ln.split("=", 1)
             if not dpart.strip():
                 # บรรทัดสรุปท้ายบล็อกที่คนเขียนเอง เช่น '= 2,050' (ไม่มีวันที่นำหน้า)
