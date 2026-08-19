@@ -3,6 +3,7 @@ import re
 import json
 import hmac
 import hashlib
+import difflib
 import base64
 import uuid
 import requests
@@ -1002,12 +1003,41 @@ def _payee_hay(info: dict) -> str:
     return _norm_match_text(f"{info.get('receiver') or ''} {info.get('receiver_account') or ''} {info.get('bank') or ''}")
 
 
+# ยอมให้ชื่อร้านบนสลิป "เพี้ยนได้บ้าง" ก่อนตัดสินว่าไม่ใช่เงินร้าน
+# เหตุจริง 19/08/26: OCR อ่าน 'ไส้ย่าง' เป็น 'ไส้บ้าง'/'ไยย่าง' → เทียบตรงตัวไม่ติด
+#   → สลิปโอนเข้าร้าน 2 ใบ (120 + 897 = 1,017 บาท) ถูกตัดทิ้งเงียบๆ ว่า 'ไม่ใช่รายรับ'
+# วัดกับของจริงแล้วช่องว่างกว้างมาก: ใบของร้าน 0.71–0.86 · ใบคนอื่น 0.15–0.31
+#   → ตั้งเกณฑ์ 0.65 ยังห่างจากใบคนอื่นเกินเท่าตัว (ปรับได้ทาง env ถ้าเจอเคสแปลก)
+_PAYEE_FUZZY_MIN = float(os.environ.get("PAYEE_FUZZY_MIN", "0.65"))
+
+def _kw_hit(kw: str, hay: str) -> bool:
+    """คีย์เวิร์ดนี้อยู่ใน 'ปลายทางบนสลิป' ไหม — ตรงตัวก่อน ถ้าไม่ติดค่อยยอมให้เพี้ยนเล็กน้อย
+    ⚠️ คีย์เวิร์ดสั้น (<5) หรือเป็นตัวเลขล้วน (เลขบัญชี) ต้องตรงเป๊ะเท่านั้น —
+       เลขบัญชีเพี้ยนหลักเดียวคือคนละบัญชี ห้ามเดา"""
+    k = _norm_match_text(kw)
+    if not k or not hay:
+        return False
+    if k in hay:
+        return True
+    if len(k) < 5 or k.isdigit():
+        return False
+    n = len(k)
+    for w in (n - 1, n, n + 1):          # เผื่อ OCR ทำตัวอักษรหาย/เกิน 1 ตัว
+        if w < 4:
+            continue
+        for i in range(0, len(hay) - w + 1):
+            if difflib.SequenceMatcher(None, k, hay[i:i + w]).ratio() >= _PAYEE_FUZZY_MIN:
+                print(f"[payee] เข้าแบบใกล้เคียง: '{hay[i:i + w]}' ≈ '{k}'", flush=True)
+                return True
+    return False
+
+
 def _payee_matches(info: dict) -> bool:
     """ปลายทางบนสลิปตรงกับบัญชีร้านไหม (เทียบกับ PAYEE_KEYWORDS) — ถ้าไม่ตั้งค่าไว้ถือว่าผ่าน"""
     if not PAYEE_KEYWORDS:
         return True
     hay = _payee_hay(info)
-    return any(_norm_match_text(k) in hay for k in PAYEE_KEYWORDS)
+    return any(_kw_hit(k, hay) for k in PAYEE_KEYWORDS)
 
 
 def _slip_account_label(info: dict):
@@ -1016,7 +1046,7 @@ def _slip_account_label(info: dict):
         return None
     hay = _payee_hay(info)
     for label, kws in PAYEE_ACCOUNTS:
-        if any(_norm_match_text(k) in hay for k in kws):
+        if any(_kw_hit(k, hay) for k in kws):
             return label
     return None
 
@@ -1024,7 +1054,7 @@ def _slip_account_label(info: dict):
 def _is_income(info: dict) -> bool:
     """สลิปนี้เป็น 'รายรับ' (โอนเข้าบัญชีร้าน) ไหม — ตรง PAYEE_KEYWORDS หรือ PAYEE_ACCOUNTS อย่างใดอย่างหนึ่ง"""
     hay = _payee_hay(info)
-    if any(_norm_match_text(k) in hay for k in PAYEE_KEYWORDS):
+    if any(_kw_hit(k, hay) for k in PAYEE_KEYWORDS):
         return True
     return _slip_account_label(info) is not None
 

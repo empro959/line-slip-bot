@@ -697,6 +697,48 @@ class TestPayeeMatching(unittest.TestCase):
         self.assertEqual(app._norm_match_text("ใส้ ย่าง-ซอย 4"), app._norm_match_text("ไส้ย่างซอย4"))
         self.assertEqual(app._norm_match_text("460-5949"), "4605949")
 
+    def test_ocr_typo_in_shop_name_still_counts_as_income(self):
+        """เคสจริง 19/08/26 — ปลายทางที่บอทอ่านได้จาก 3 ใบที่ถูกตัดทิ้งผิด (รวม 1,017 บาท)
+        ต้องกลับมานับเป็นรายรับ ทั้งที่ชื่อร้านเพี้ยน"""
+        orig = app.PAYEE_ACCOUNTS[:]
+        app.PAYEE_ACCOUNTS[:] = [("ไส้ย่างซอย4", ["ไส้ย่าง"])]
+        try:
+            real_cases = [
+                {"receiver": "บจก. ไส้บ้างซอย4", "receiver_account": "202608193367819", "bank": "K PLUS"},
+                {"receiver": "ไส้บ้างซอย 4", "receiver_account": "202608193485741", "bank": "กสิกรไทย"},
+                {"receiver": "ไยย่างซอย 4", "receiver_account": "202608193367819", "bank": "K PLUS"},
+            ]
+            for c in real_cases:
+                self.assertTrue(app._is_income(c), f"ต้องนับเป็นรายรับ: {c['receiver']}")
+        finally:
+            app.PAYEE_ACCOUNTS[:] = orig
+
+    def test_other_companies_must_not_be_counted(self):
+        """ด้านกลับที่สำคัญกว่า: ยอมให้เพี้ยนได้ ต้องไม่แปลว่าเงินคนอื่นกลายเป็นเงินร้าน"""
+        orig = app.PAYEE_ACCOUNTS[:]
+        app.PAYEE_ACCOUNTS[:] = [("ไส้ย่างซอย4", ["ไส้ย่าง"])]
+        try:
+            for c in [
+                {"receiver": "บจก. โปร พลัส มัลติเทค", "receiver_account": "x-9431", "bank": "ธนาคาร"},
+                {"receiver": "นาง พิมนภัทร์ สุวภาพ และ นาย สุวัฒน์ บุญเรือง", "receiver_account": "x-6120"},
+                {"receiver": "บจก. ไทยเบฟเวอเรจ", "receiver_account": "x-1111"},
+                {"receiver": "นาย สมชาย ใจดี", "receiver_account": "x-2222"},
+            ]:
+                self.assertFalse(app._is_income(c), f"ต้องไม่นับเป็นรายรับ: {c['receiver']}")
+        finally:
+            app.PAYEE_ACCOUNTS[:] = orig
+
+    def test_account_number_must_match_exactly(self):
+        """เลขบัญชีห้ามเดา — เพี้ยนหลักเดียวคือคนละบัญชี"""
+        orig = app.PAYEE_ACCOUNTS[:]
+        app.PAYEE_ACCOUNTS[:] = [("ร้าน", ["4818"])]
+        try:
+            self.assertTrue(app._is_income({"receiver_account": "xxx-x-x4818-x"}))
+            self.assertFalse(app._is_income({"receiver_account": "xxx-x-x4819-x"}))
+            self.assertFalse(app._is_income({"receiver_account": "xxx-x-x4881-x"}))
+        finally:
+            app.PAYEE_ACCOUNTS[:] = orig
+
     def test_generic_keyword_catches_ocr_typos(self):
         """คีย์เวิร์ดที่เลี่ยงคำที่ OCR พลาดบ่อย ('ซอย4') ต้องจับได้ทุกแบบที่เจอจริงวันนี้"""
         orig = app.PAYEE_ACCOUNTS[:]
