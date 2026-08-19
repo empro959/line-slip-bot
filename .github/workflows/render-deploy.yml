@@ -1,0 +1,23 @@
+# Auto-deploy ไป Render ทุกครั้งที่ push main
+# (service ใช้ Public Git Repository จึงไม่มี webhook อัตโนมัติ — ยิงผ่าน Deploy Hook แทน)
+# ต้องตั้ง secret ชื่อ RENDER_DEPLOY_HOOK ใน repo: Settings → Secrets and variables → Actions
+name: Deploy to Render
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy hook
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "RENDER_DEPLOY_HOOK secret ยังไม่ได้ตั้ง — ข้ามการ deploy"
+            exit 0
+          fi
+          curl -fsS -X POST "$HOOK" -o /dev/null
+          echo "สั่ง deploy ไป Render แล้ว"
