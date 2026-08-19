@@ -146,9 +146,9 @@ GitHub Actions ─ push main ยิง Deploy Hook → Render iq8e (secret RENDE
 
 | ของ | ที่อยู่ | ทำอะไร |
 |---|---|---|
-| Render `Line-Slip-Bot` (URL ลงท้าย `s772`, Suspended) | Render บัญชีร้าน — **ระวังสับสนกับ `Line-Slip-Bot-1`/iq8e ที่เป็นตัวจริง** ยืนยันด้วย URL ต้องมี `s772` | Settings → General → Name → `DO-NOT-USE-old` |
+| Render `Line-Slip-Bot` (URL ลงท้าย `s772`, Suspended) | Render บัญชีร้าน — **ระวังสับสนกับ `Line-Slip-Bot-1`/iq8e ที่เป็นตัวจริง** ยืนยันด้วย URL ต้องมี `s772` | ✅ **เปลี่ยนชื่อเป็น `DO-NOT-USE-old` แล้ว 19 ส.ค. 12:35** (ยืนยันหน้า service: srv-d9qrob9…, URL `line-slip-bot-s772`, Suspended by you — ไม่คิดเงิน) |
 | monitor บอทร้าน | UptimeRobot **บัญชี E&M ProEngineering** (บัญชีเดียว ปนสองกิจการ) | ตั้งชื่อ `[ร้าน] LineSlipBot` |
-| monitor เว็บ E&M | ที่เดียวกัน | ตั้งชื่อ `[E&M] ProEng` |
+| monitor เว็บ E&M | ที่เดียวกัน | ✅ ตั้งชื่อ `[E&M] ProEng` แล้ว 19 ส.ค. |
 
 **นัดลบ 31 ส.ค. 2026 (ตั้งเตือนอัตโนมัติไว้แล้ว):**
 
