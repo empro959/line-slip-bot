@@ -96,7 +96,10 @@
 ทุกครั้งที่ระบบพังเงียบในโปรเจกต์นี้ ต้นเหตุคือเส้นพวกนี้ชี้ไปที่เก่า:
 
 ```
-LINE OA ────── webhook ─────→ iq8e /callback
+LINE OA ── webhook ──→ line_bridge (Apps Script ห้องคอนเทนต์) ──forward──→ iq8e /callback
+   ⚠️ ยืนยันด้วยตา 19 ส.ค.: webhook = script.google.com/macros/s/AKfycb24qjDXw…/exec
+   ⚠️ = บอทร้านฝากทางเข้าไว้กับสคริปต์ของอีกห้อง · เขา deploy พลาดเมื่อไหร่ร้านดับ
+   ทางลด: app.py มี WEBHOOK_FORWARD_URLS (ปิดอยู่) ไว้สลับให้ Render เป็นทางเข้าแทน
 UptimeRobot ── ping ────────→ iq8e /health
 Apps Script ── SLIP_API_URL ─→ iq8e (มี token ฝังใน property)
 บอท ────────── SYNC_URL ────→ Apps Script /exec
