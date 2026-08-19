@@ -1152,6 +1152,57 @@ function debugDaily(){
   });
 }
 
+// ===== เจาะหาว่า "รายเมนู" ของวันหนึ่งเพี้ยนตรงไหน — ไม่ยิง OCR (ใช้ข้อมูลที่บันทึกไว้แล้ว) =====
+// ใช้ตอน checkSaleTotals ขึ้น 🔵 (ยอดขายถูก แต่รายเมนูไม่ตรง)
+// เทียบรายหมวด: ยอดรวมหมวด (จากตารางสรุป) vs ผลบวกรายเมนูในหมวดนั้น — หมวดไหนต่างคือจุดที่ตัวแกะพลาด
+// แล้วโชว์เมนูยอดสูงสุดในหมวดนั้น เพื่อดูว่ามี "แถวยอดรวม" หลุดมาเป็นเมนูหรือเปล่า
+function debugMenuVsCat(iso){
+  iso=iso||'';
+  var day=null;
+  loadDaily_().forEach(function(d){ if(d.date===iso) day=d; });
+  if(!day){ Logger.log('❌ ไม่มีข้อมูลวันที่ '+iso+' — ใส่แบบ debugMenuVsCat("2026-07-31")'); return; }
+
+  var catTot={}, catOrder=[];
+  (day.sales||[]).forEach(function(c){
+    var k=c.category||'(ไม่มีชื่อหมวด)';
+    if(!(k in catTot)){ catTot[k]=0; catOrder.push(k); }
+    catTot[k]+=c.amount||0;
+  });
+  var menuTot={}, byCat={};
+  (day.menu||[]).forEach(function(m){
+    var k=m.category||'(ไม่มีชื่อหมวด)';
+    menuTot[k]=(menuTot[k]||0)+(m.amount||0);
+    (byCat[k]=byCat[k]||[]).push(m);
+    if(catOrder.indexOf(k)<0) catOrder.push(k);
+  });
+
+  var sumC=0,sumM=0;
+  Logger.log('🔬 '+iso+' — เทียบรายหมวด (ยอดรวมหมวด vs ผลบวกรายเมนู)');
+  catOrder.forEach(function(k){
+    var c=catTot[k]||0, m=menuTot[k]||0, d=m-c; sumC+=c; sumM+=m;
+    var mark=(Math.abs(d)<=Math.max(50,c*0.005))?'  ':(d>0?'🔺':'🔻');
+    Logger.log(mark+' '+k+'  หมวด '+Math.round(c).toLocaleString()+
+               '  | เมนู '+Math.round(m).toLocaleString()+
+               '  | ต่าง '+Math.round(d).toLocaleString()+
+               '  ('+((byCat[k]||[]).length)+' รายการ)');
+  });
+  Logger.log('รวม: หมวด '+Math.round(sumC).toLocaleString()+' | เมนู '+Math.round(sumM).toLocaleString()+
+             ' | ต่าง '+Math.round(sumM-sumC).toLocaleString());
+
+  // หมวดที่เพี้ยน → โชว์ 5 เมนูยอดสูงสุด · แถวที่ยอดโตผิดปกติมักคือ 'ยอดรวมหมวด' ที่หลุดมาเป็นเมนู
+  catOrder.forEach(function(k){
+    var c=catTot[k]||0, m=menuTot[k]||0;
+    if(Math.abs(m-c)<=Math.max(50,c*0.005)) return;
+    var list=(byCat[k]||[]).slice().sort(function(a,b){return (b.amount||0)-(a.amount||0);}).slice(0,5);
+    Logger.log('   ↳ 5 เมนูยอดสูงสุดใน "'+k+'":');
+    list.forEach(function(m2){
+      Logger.log('      · '+String(m2.name).slice(0,40)+'  x'+m2.qty+'  = '+Math.round(m2.amount||0).toLocaleString());
+    });
+  });
+  Logger.log('ℹ️ ถ้าเห็นแถวที่ยอดใกล้เคียง "ยอดรวมหมวด" = แถวสรุปหลุดมาเป็นเมนู (ตัวแกะตัดขอบเขตพลาด)');
+  Logger.log('   ถ้าเมนูรวมต่ำกว่าหมวด = มีเมนูบางรายการถูกข้าม (มักเป็นแถวที่คร่อมหน้ากระดาษ)');
+}
+
 // ===== ตรวจว่า "ยอดขายที่บันทึกไว้" วันไหนเพี้ยนบ้าง — ไม่ยิง OCR เลย ไม่กินโควตา =====
 // ที่มา: ตัวอ่านใบ POS เคยทำ "หมวดหายทั้งหมวด" (เคสจริง 11/08/26 หายไป 70,266.30)
 // แก้โค้ดแล้วข้อมูลที่บันทึกไปก่อนหน้า "ไม่ได้ถูกแก้ตาม" — ต้องสั่งอ่านใบใหม่ทับเท่านั้น
