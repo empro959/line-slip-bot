@@ -1172,13 +1172,21 @@ function checkSaleTotals(){
   var sumObj_=function(o){ var t=0; o=o||{};
     Object.keys(o).forEach(function(k){ if(typeof o[k]==='number') t+=o[k]; }); return t; };
 
-  var bad=[], soft=[], noRef=[];
+  var bad=[], soft=[], noRef=[], menuOdd=[];
   Logger.log('🔍 ตรวจ '+daily.length+' วัน (ไม่ใช้ OCR):');
   daily.forEach(function(d){
     var cat=sum_(d.sales), menu=sum_(d.menu), pay=sumObj_(d.payments), zone=sumObj_(d.zones);
     if(menu<=0 && pay<=0 && zone<=0){ noRef.push(d.date); return; }   // ไม่มีตัวเทียบ = ตรวจไม่ได้ ต้องบอก
     var row={date:d.date, cat:cat, menu:menu, pay:pay, zone:zone};
-    // 🔴 หลักฐานแน่น: 'หมวด' กับ 'เมนู' มาจากใบขายใบเดียวกัน ต้องเท่ากันเสมอ — ไม่เท่า = แกะหมวดตกไปจริง
+    // ใบ BalanceCashDrawer (เงินรับ/โซน) เป็นคนละไฟล์กับใบขาย — ถ้ายอดหมวดตรงกับมัน = ยืนยันข้ามไฟล์แล้ว
+    // เคสจริง 19/08/26: 31/07 หมวด=เงินรับ=โซน=129,277 เป๊ะ แต่รายเมนู 136,388 → ตัวที่เพี้ยนคือ 'รายเมนู'
+    // ถ้าไม่แยกข้อนี้ ตัวตรวจจะสั่งให้อ่านใหม่ทุกครั้ง แล้วได้เลขเดิม = วนลูปเสียโควตาไม่จบ
+    var payRef=Math.max(pay, zone);
+    if(payRef>0 && Math.abs(cat-payRef)<=Math.max(200, payRef*0.01)){
+      if(menu>0 && Math.abs(menu-cat)>Math.max(500, cat*0.03)) menuOdd.push(row);
+      return;                                   // ยอดขายเชื่อถือได้แล้ว ไม่ต้องอ่านใหม่
+    }
+    // 🔴 ไม่มีใบเงินรับมายืนยัน + รายเมนูสูงกว่าหมวด = แกะหมวดตกไปจริง
     if(menu>0 && menu-cat>500 && menu-cat>menu*0.03){ row.miss=menu-cat; bad.push(row); return; }
     // 🟡 เงินรับสูงกว่ายอดขาย = คนละใบกัน อธิบายได้หลายทางที่ไม่ใช่บั๊ก
     //    (ลูกหนี้เก่ามาจ่ายวันนี้ · ใบ Balance ที่ export เป็นช่วงวันที่ · มัดจำ) → ห้ามเหมาว่าพัง
@@ -1216,6 +1224,16 @@ function checkSaleTotals(){
     soft.sort(function(a,b){ return b.miss-a.miss; }).forEach(function(b){ Logger.log(fmtRow_(b)); });
     Logger.log('   สาเหตุที่ไม่ใช่บั๊ก: ลูกหนี้เก่ามาจ่ายวันนี้ · มัดจำ · ใบ Balance ที่ export เป็นช่วงวันที่ (From..To)');
     Logger.log('   👉 เช็กก่อนด้วย debugReports() ว่าเมลวันนั้นมาช้าไหม (ใบส่งย้อนหลัง = ฟอร์แมตอังกฤษ ตัวอ่านเคยพัง)');
+  }
+  if(menuOdd.length){
+    Logger.log('\n🔵 '+menuOdd.length+' วัน ยอดขายถูกต้องแล้ว (ตรงกับเงินรับ/โซน) แต่ "ยอดรายเมนู" ไม่ตรง');
+    menuOdd.sort(function(a,b){ return Math.abs(b.menu-b.cat)-Math.abs(a.menu-a.cat); }).forEach(function(b){
+      Logger.log('   • '+b.date+'  ยอดขาย '+Math.round(b.cat).toLocaleString()+
+                 '  | รายเมนู '+Math.round(b.menu).toLocaleString()+
+                 '  → ต่าง '+Math.round(b.menu-b.cat).toLocaleString()+' บาท');
+    });
+    Logger.log('   ⚠️ อย่าอ่านใหม่ — อ่านกี่รอบก็ได้เลขเดิม · เป็นบั๊กของตัวแกะ "รายเมนู" คนละตัวกับยอดขาย');
+    Logger.log('   กระทบเฉพาะหน้า "เมนูขายดี" · ยอดขายรวม/รายงานการเงินไม่กระทบ');
   }
   if(noRef.length) Logger.log('⚠️ ตรวจไม่ได้ '+noRef.length+' วัน (ไม่มีเมนู/เงินรับ/โซนให้เทียบ): '+noRef.join(', '));
   Logger.log('ℹ️ ต่างกันเล็กน้อย (<3%) ถือว่าปกติ — ค่าบริการ/ส่วนลด/ปัดเศษทำให้ไม่เท่ากันเป๊ะ');
