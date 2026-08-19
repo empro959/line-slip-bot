@@ -1042,6 +1042,63 @@ function debugDaily(){
   });
 }
 
+// ===== ตรวจว่า "ยอดขายที่บันทึกไว้" วันไหนเพี้ยนบ้าง — ไม่ยิง OCR เลย ไม่กินโควตา =====
+// ที่มา: ตัวอ่านใบ POS เคยทำ "หมวดหายทั้งหมวด" (เคสจริง 11/08/26 หายไป 70,266.30)
+// แก้โค้ดแล้วข้อมูลที่บันทึกไปก่อนหน้า "ไม่ได้ถูกแก้ตาม" — ต้องสั่งอ่านใบใหม่ทับเท่านั้น
+// แต่การอ่านใหม่กินโควตา OCR (~4 ครั้ง/วัน) จึงต้องรู้ก่อนว่าวันไหนพังบ้าง ไม่ใช่ไล่อ่านใหม่ทั้งเดือน
+//
+// วิธีจับ: ในข้อมูลวันเดียวกันมีตัวเลข 4 ชุดที่โดยธรรมชาติต้องใกล้เคียงกัน
+//   (ก) ยอดรวมรายหมวด = sales   ← ชุดที่เคยพัง
+//   (ข) ยอดรวมรายเมนู  = menu
+//   (ค) เงินที่รับจริง  = payments (BalanceCashDrawer)
+//   (ง) ยอดแยกโซน      = zones
+// หมวดหายทั้งหมวด → (ก) ต่ำกว่าชุดอื่นอย่างชัดเจน · ต่างเกิน 3% และเกิน 500 บาท = น่าสงสัย
+function checkSaleTotals(){
+  var daily=loadDaily_();
+  if(!daily.length){ Logger.log('❌ pos_daily.json ว่าง — ยังไม่มีข้อมูลให้ตรวจ'); return; }
+  daily.sort(function(a,b){ return a.date<b.date?-1:1; });
+
+  var sum_=function(arr){ return (arr||[]).reduce(function(a,c){ return a+(c.amount||0); },0); };
+  var sumObj_=function(o){ var t=0; o=o||{};
+    Object.keys(o).forEach(function(k){ if(typeof o[k]==='number') t+=o[k]; }); return t; };
+
+  var bad=[], noRef=[];
+  Logger.log('🔍 ตรวจ '+daily.length+' วัน (ไม่ใช้ OCR):');
+  daily.forEach(function(d){
+    var cat=sum_(d.sales), menu=sum_(d.menu), pay=sumObj_(d.payments), zone=sumObj_(d.zones);
+    var ref=Math.max(menu,pay,zone);
+    // ไม่มีตัวเทียบเลย (ไม่มีเมนู/ไม่มีใบ Balance) = ตรวจไม่ได้ ต้องบอก ไม่ใช่เงียบแล้วนับว่าผ่าน
+    if(ref<=0){ noRef.push(d.date); return; }
+    var miss=ref-cat;
+    if(miss>500 && miss>ref*0.03){
+      bad.push({date:d.date, cat:cat, menu:menu, pay:pay, zone:zone, miss:miss});
+    }
+  });
+
+  if(!bad.length){
+    Logger.log('✅ ทุกวันที่ตรวจได้ ยอดหมวดตรงกับเมนู/เงินรับ/โซน — ไม่มีวันไหนต้องอ่านใหม่');
+  }else{
+    Logger.log('🔴 พบ '+bad.length+' วันที่ยอดขายน่าจะขาดหมวด (เรียงจากขาดมากสุด):');
+    bad.sort(function(a,b){ return b.miss-a.miss; }).forEach(function(b){
+      Logger.log('   • '+b.date+'  บันทึกไว้ '+Math.round(b.cat).toLocaleString()+
+                 '  | เมนู '+Math.round(b.menu).toLocaleString()+
+                 '  | เงินรับ '+Math.round(b.pay).toLocaleString()+
+                 '  | โซน '+Math.round(b.zone).toLocaleString()+
+                 '  → ขาดราว '+Math.round(b.miss).toLocaleString()+' บาท');
+    });
+    // ให้ก๊อปไปวางใน importPosByDate ได้เลย ไม่ต้องพิมพ์วันที่เองทีละตัว (พิมพ์ผิด = อ่านผิดวัน เสียโควตาฟรี)
+    var iso=bad.map(function(b){ return b.date; }).sort();
+    Logger.log('\n👉 ก๊อปบรรทัดนี้ไปแทนใน importPosByDate() แล้วรัน:');
+    for(var s=0;s<iso.length;s+=8){    // ซอยทีละ 8 วัน — กันชนลิมิต OCR กลางคัน (ราว 4 ครั้ง/วัน)
+      Logger.log("   var DATES = ['"+iso.slice(s,s+8).join("','")+"'];"+
+                 (iso.length>8?'   // ชุดที่ '+(s/8+1)+' จาก '+Math.ceil(iso.length/8):''));
+    }
+    if(iso.length>8) Logger.log('   ⚠️ รันทีละชุด เว้นห่างกันสัก 5 นาที กันชนลิมิต OCR');
+  }
+  if(noRef.length) Logger.log('⚠️ ตรวจไม่ได้ '+noRef.length+' วัน (ไม่มีเมนู/เงินรับ/โซนให้เทียบ): '+noRef.join(', '));
+  Logger.log('ℹ️ ตัวเลขที่ต่างกันเล็กน้อย (<3%) เป็นเรื่องปกติ — ค่าบริการ/ลูกหนี้/ส่วนลดทำให้ไม่เท่ากันเป๊ะ');
+}
+
 // ==========================================================================
 //  แจ้งเตือน LINE เจ้าของ (ส่งผ่าน bot /api/push_owner — reuse token จาก SLIP_API_URL)
 // ==========================================================================
