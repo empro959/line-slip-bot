@@ -681,5 +681,34 @@ class TestModelGoneDetection(unittest.TestCase):
         self.assertEqual(len(calls), 3)
 
 
+class TestPayeeMatching(unittest.TestCase):
+    """เทียบ 'ปลายทางบนสลิป' กับบัญชีร้าน — ด่านที่ตัดสินว่าเงินเข้าร้านหรือไม่
+
+    ทำไมต้องมี: 19/08/26 สลิปโอนเข้าร้าน 2 ใบ (120 + 897) ถูกตัดทิ้งว่า 'ไม่ใช่รายรับ'
+    เพราะ OCR อ่านชื่อร้านเพี้ยน (ไส้ย่าง → ไส้บ้าง / ไยย่าง) แล้วเทียบคีย์เวิร์ดไม่ตรง
+    ด่านนี้พลาด = รายรับหายเงียบ ไม่มี error ไม่มีใครรู้"""
+
+    def test_thai_digits_normalized(self):
+        """สลิปเขียน 'ซอย๔' (เลขไทย) ต้องเทียบติดกับคีย์เวิร์ด 'ซอย4' (เลขอารบิก)"""
+        self.assertEqual(app._norm_match_text("ไส้ย่างซอย๔"), app._norm_match_text("ไส้ย่างซอย4"))
+
+    def test_existing_normalizations_still_work(self):
+        """กันแก้เกิน: ของเดิม (ใ→ไ, ตัดช่องว่าง/ขีด) ต้องยังทำงาน"""
+        self.assertEqual(app._norm_match_text("ใส้ ย่าง-ซอย 4"), app._norm_match_text("ไส้ย่างซอย4"))
+        self.assertEqual(app._norm_match_text("460-5949"), "4605949")
+
+    def test_generic_keyword_catches_ocr_typos(self):
+        """คีย์เวิร์ดที่เลี่ยงคำที่ OCR พลาดบ่อย ('ซอย4') ต้องจับได้ทุกแบบที่เจอจริงวันนี้"""
+        orig = app.PAYEE_ACCOUNTS[:]
+        app.PAYEE_ACCOUNTS[:] = [("ไส้ย่างซอย4", ["ซอย4"])]
+        try:
+            for name in ["บจก. ไส้บ้างซอย4", "ไส้บ้างซอย 4", "ไยย่างซอย 4", "ไส้ย่างซอย๔"]:
+                self.assertTrue(app._is_income({"receiver": name}), f"ต้องนับเป็นรายรับ: {name}")
+            # คนละบริษัท ต้องไม่ถูกนับเป็นรายรับ (ใบ 710 ของวันนั้น)
+            self.assertFalse(app._is_income({"receiver": "บจก. โปร พลัส มัลติเทค"}))
+        finally:
+            app.PAYEE_ACCOUNTS[:] = orig
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
