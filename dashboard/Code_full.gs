@@ -86,7 +86,7 @@ var THAI_MONTHS = ['มกราคม','กุมภาพันธ์','มี
 function num_(s){ s=String(s).replace(/,/g,'').trim(); if(s==='.00'||s==='.'||s==='')return 0; var v=parseFloat(s); return isNaN(v)?null:v; }
 
 // แปลง PDF -> ข้อความ ผ่าน OCR ของ Google
-function pdfToText_(blob){ return _ocrTry_(blob, 2); }  // ลองใหม่ได้ถึง 2 ครั้งถ้าชน rate limit
+function pdfToText_(blob){ return _ocrTry_(blob, 3); }  // ลองใหม่ได้ถึง 3 ครั้งถ้าชน rate limit
 function _ocrTry_(blob, retriesLeft){
   try{
     var tmp=Drive.Files.insert({title:'TMP_'+Utilities.getUuid(),mimeType:'application/pdf'},blob,{ocr:true,ocrLanguage:'th'});
@@ -95,8 +95,11 @@ function _ocrTry_(blob, retriesLeft){
     return txt;
   }catch(e){
     if(retriesLeft>0 && /rate limit/i.test(String(e))){
-      Logger.log('   …ชน rate limit พัก 60 วิ แล้วลองใหม่ (เหลือ '+retriesLeft+' ครั้ง)');
-      Utilities.sleep(60000);                 // พัก 60 วิ ให้ rate limit คลาย
+      // พัก 60 วิเท่ากันทุกรอบไม่พอ — เคสจริง 19/08/26 พัก 60 วิ 3 รอบติดก็ยังโดน
+      // ถอยเป็นเท่าตัว (60 → 120 → 240) ให้โควตาคลายจริง ก่อนยอมแพ้
+      var wait=60000*Math.pow(2, 3-retriesLeft);
+      Logger.log('   …ชน rate limit พัก '+(wait/1000)+' วิ แล้วลองใหม่ (เหลืออีก '+retriesLeft+' ครั้ง)');
+      Utilities.sleep(wait);
       return _ocrTry_(blob, retriesLeft-1);
     }
     throw e;
@@ -841,8 +844,18 @@ function _importPosOneDate_(iso){
     var p=iso.split('-');
     dd={key:iso, period:THAI_MONTHS[parseInt(p[1],10)-1]+' '+(parseInt(p[0],10)+543)};
   }
-  var pt=att.pay?pdfToText_(att.pay.copyBlob()):'';
-  var bt=att.bal?pdfToText_(att.bal.copyBlob()):'';
+  // ใบเสริม (Payout/Balance/ลูกค้า) อ่านไม่ได้ = ต้องไม่ทำให้ทั้งวันพัง
+  // เคสจริง 19/08/26: ใบขาย OCR ผ่านแล้ว แต่ใบ Payout ชน rate limit → throw ทิ้งทั้งวัน
+  // = เสียโควตา OCR ที่จ่ายไปแล้วฟรีๆ และยอดขายที่อ่านถูกก็ไม่ได้ถูกบันทึก
+  var prev=null;
+  loadDaily_().forEach(function(x){ if(x.date===dd.key) prev=x; });   // ของเดิมของวันนี้ (ถ้ามี)
+  var ocrOpt_=function(att1, label){
+    if(!att1) return {text:'', err:''};
+    try{ return {text:pdfToText_(att1.copyBlob()), err:''}; }
+    catch(e){ Logger.log('   ⚠️ อ่าน '+label+' ไม่ได้: '+e); return {text:'', err:String(e)}; }
+  };
+  var pr=ocrOpt_(att.pay,'PayoutReport'), br=ocrOpt_(att.bal,'BalanceCashDrawer');
+  var pt=pr.text, bt=br.text;
   if(DUMP_OCR){ _dumpOcr_('SaleReport', st); _dumpOcr_('BalanceCashDrawer', bt); }
   // รายงานที่ส่งย้อนหลังมัก export เป็น 'ช่วงวันที่' (From 11 To 12) แต่โค้ดนี้ลงเป็นวันเดียว
   // → ยอดวิธีชำระ/โซน/ค่าใช้จ่าย ของทุกวันในช่วงจะถูกยัดรวมเข้าวันเดียว = ตัวเลขเกินจริง
@@ -850,14 +863,24 @@ function _importPosOneDate_(iso){
   // บิล/ลูกหนี้ มาจากไฟล์ 'แยกตามลูกค้า' — ของเดิมเป็น catch(e){} เปล่าๆ + ไม่เตือนตอนไฟล์หาย
   // ทำให้ 'บิล 0' แยกไม่ออกว่า (ก) ไม่มีบิลจริง (ข) ไม่มีไฟล์ในเมล (ค) OCR พัง → ต้องบอกให้รู้
   var bills=0, credit=[], custWarn='';
-  try{
-    if(att.cust){ var ct=pdfToText_(att.cust.copyBlob()); bills=parseBills_(ct); credit=parseCustomerCredit_(ct); }
-    else custWarn='  ⚠️ ไม่มีไฟล์ SalesSummaryReportByCustomer → บิล/ลูกหนี้ = 0 (ไม่ใช่ว่าไม่มีจริง)';
-  }catch(e){ custWarn='  ⚠️ อ่าน SalesSummaryReportByCustomer ไม่ได้ ('+e+') → บิล/ลูกหนี้ = 0'; }
+  if(!att.cust) custWarn='  ⚠️ ไม่มีไฟล์ SalesSummaryReportByCustomer → บิล/ลูกหนี้ = 0 (ไม่ใช่ว่าไม่มีจริง)';
+  else{
+    var cr=ocrOpt_(att.cust,'SalesSummaryReportByCustomer');
+    if(cr.text){ try{ bills=parseBills_(cr.text); credit=parseCustomerCredit_(cr.text); }
+                 catch(e){ custWarn='  ⚠️ แกะบิล/ลูกหนี้ไม่ออก ('+e+') → 0'; } }
+    else if(prev){ bills=prev.bills||0; credit=prev.credit||[]; custWarn='  ♻️ อ่านใบลูกค้าไม่ได้ → คงบิล/ลูกหนี้เดิมไว้'; }
+    else custWarn='  ⚠️ อ่านใบลูกค้าไม่ได้ → บิล/ลูกหนี้ = 0';
+  }
+  // อ่านไม่ได้ (err) → คงของเดิมไว้ · ไม่มีไฟล์จริงๆ → ว่างตามจริง
+  var keepE = (pr.err && prev) ? prev.expenses : [];
+  var keepP = (br.err && prev) ? prev.payments : {};
+  var keepZ = (br.err && prev) ? prev.zones : {};
   var day={date:dd.key, period:dd.period,
-    sales:parseSale_(st).cats, expenses:pt?parsePayout_(pt).records:[],
-    payments:bt?parseBalance_(bt):{}, menu:parseSaleItems_(st),
-    zones:bt?parseBalanceZones_(bt):{}, voids:parseVoids_(st), bills:bills, credit:credit};
+    sales:parseSale_(st).cats, expenses:pt?parsePayout_(pt).records:keepE,
+    payments:bt?parseBalance_(bt):keepP, menu:parseSaleItems_(st),
+    zones:bt?parseBalanceZones_(bt):keepZ, voids:parseVoids_(st), bills:bills, credit:credit};
+  var keptWarn=((pr.err&&prev?'\n   ♻️ ใบ Payout อ่านไม่ได้ → คงค่าใช้จ่ายเดิมไว้ (ไม่ทับด้วยศูนย์)':'')+
+                (br.err&&prev?'\n   ♻️ ใบ Balance อ่านไม่ได้ → คงวิธีชำระ/โซนเดิมไว้':''));
   var daily=loadDaily_().filter(function(x){return x.date!==dd.key;});   // ทับวันเดิมถ้ามี
   daily.push(day); saveDaily_(daily);
   writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));                  // rebuild ให้ dashboard เลย
@@ -870,7 +893,7 @@ function _importPosOneDate_(iso){
              // อ่านไฟล์ได้แต่แกะตัวเลขไม่ออก = เงียบที่สุด ต้องบอก ไม่งั้น dashboard โชว์ว่างโดยไม่มีใครรู้
              (bt&&!Object.keys(day.payments).length?'\n   ⚠️ มี BalanceCashDrawer แต่แกะ "วิธีชำระ" ไม่ออกเลย (รูปแบบรายงานอาจเปลี่ยน) → รัน debugBalanceOcr() ดูข้อความจริง':'')+
              (bt&&!Object.keys(day.zones).length?'\n   ⚠️ มี BalanceCashDrawer แต่แกะ "โซน" ไม่ออกเลย → รัน debugBalanceOcr() ดูข้อความจริง':'')+
-             rangeWarn);
+             keptWarn+rangeWarn);
   Logger.log('👉 เปิด dashboard เช็คได้เลย (rebuild ให้แล้ว) · ถ้าจะกู้วันอื่นแก้วันที่ใน importPosByDate แล้วรันซ้ำ');
 }
 
