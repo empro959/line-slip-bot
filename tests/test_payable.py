@@ -549,5 +549,76 @@ class TestDbExportCoverage(unittest.TestCase):
             "_MIGRATE_TABLES อ้างตารางที่ไม่มีใน DB")
 
 
+class TestWebhookForward(unittest.TestCase):
+    """ส่งต่อ event ให้ระบบคอนเทนต์ (OA ตัวเดียว หลายระบบ)
+
+    ทำไมต้องมี: จุดนี้อยู่บนเส้นทางของ *ทุก* ข้อความที่เข้าบอท —
+    พลาดแล้วบอทร้านดับทั้งระบบ (เคยดับมาแล้วตอน webhook ถูกเปลี่ยนไปทำคอนเทนต์)
+    กฎเหล็ก 3 ข้อ: ปลายทางล่มต้องไม่ทำบอทพัง · ต้องส่ง body ดิบ+ลายเซ็นเดิม · ไม่ตั้ง env = ไม่ยิงอะไรเลย"""
+
+    def setUp(self):
+        self._orig = app.WEBHOOK_FORWARD_URLS[:]
+        self.calls = []
+
+    def tearDown(self):
+        app.WEBHOOK_FORWARD_URLS[:] = self._orig
+
+    def _fake_post(self, ok=True, boom=False):
+        class _R:
+            status_code = 200 if ok else 500
+        def _post(url, data=None, timeout=None, headers=None):
+            self.calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
+            if boom:
+                raise RuntimeError("ปลายทางล่ม")
+            return _R()
+        return _post
+
+    def test_forwards_raw_body_and_signature(self):
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://example.test/hook"]
+        orig = app.requests.post
+        app.requests.post = self._fake_post()
+        try:
+            app._forward_webhook(b'{"events":[]}', "SIG123")
+        finally:
+            app.requests.post = orig
+        self.assertEqual(len(self.calls), 1)
+        c = self.calls[0]
+        self.assertEqual(c["data"], b'{"events":[]}')          # ต้องเป็น byte ดิบ ไม่ใช่ dict/str ที่ถูกแปลง
+        self.assertEqual(c["headers"]["X-Line-Signature"], "SIG123")
+        self.assertEqual(c["headers"]["Content-Type"], "application/json")
+
+    def test_endpoint_down_must_not_raise(self):
+        """ปลายทางล่ม/ช้า = เรื่องของเขา ห้ามเด้งขึ้นมาถึง /callback"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://dead.test/hook"]
+        orig = app.requests.post
+        app.requests.post = self._fake_post(boom=True)
+        try:
+            app._forward_webhook(b"{}", "SIG")   # ต้องไม่ throw
+        finally:
+            app.requests.post = orig
+        self.assertEqual(len(self.calls), 1)
+
+    def test_multiple_targets_all_receive(self):
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://a.test/h", "https://b.test/h"]
+        orig = app.requests.post
+        app.requests.post = self._fake_post()
+        try:
+            app._forward_webhook(b"{}", "SIG")
+        finally:
+            app.requests.post = orig
+        self.assertEqual([c["url"] for c in self.calls], ["https://a.test/h", "https://b.test/h"])
+
+    def test_no_env_means_no_traffic(self):
+        """ไม่ตั้ง env = ต้องไม่ยิงเน็ตออกเลย (ดีฟอลต์ต้องปลอดภัย)"""
+        app.WEBHOOK_FORWARD_URLS[:] = []
+        orig = app.requests.post
+        app.requests.post = self._fake_post()
+        try:
+            app._forward_webhook(b"{}", "SIG")
+        finally:
+            app.requests.post = orig
+        self.assertEqual(self.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

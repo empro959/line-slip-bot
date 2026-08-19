@@ -73,6 +73,12 @@ STAFF_GROUP_ID    = os.environ.get("STAFF_GROUP_ID", "") or (SLIP_GROUPS[0] if S
 # กลุ่ม "เทียบยอด POS ↔ จดมือ" — บอทอ่านรูป 'สมุดจดมือรายวัน' ในกลุ่มนี้อัตโนมัติ (Gemini แยกเองว่าเป็นสมุด ไม่ใช่สลิป/ใบ POS)
 RECON_GROUPS = [g.strip() for g in os.environ.get("RECON_GROUPS", "").split(",") if g.strip()]
 SYNC_URL = os.environ.get("SYNC_URL", "").strip()          # ลิงก์ Apps Script /exec (ตัวเดียวกับ dashboard) — ดึงยอด POS มาเทียบ
+# ส่งต่อ event ดิบจาก LINE ให้ระบบอื่นที่ใช้ OA เดียวกัน (เช่น ระบบคอนเทนต์) — คั่นด้วยจุลภาค
+# ทำไมต้องมี: OA มี webhook ได้ URL เดียว · เดิมใช้ Apps Script bridge เป็นทางเข้าแล้วกระจายต่อ
+# แต่บอทร้านจึงไปฝากชีวิตไว้กับสคริปต์ของอีกห้อง (bridge พังทีร้านดับ) · ทางนี้ให้ Render เป็นทางเข้า
+# (อุ่นเครื่องอยู่แล้ว ไม่มี cold start) แล้ว forward ต่อแบบ fire-and-forget ไม่มีทางทำให้บอทช้าหรือพัง
+WEBHOOK_FORWARD_URLS = [u.strip() for u in os.environ.get("WEBHOOK_FORWARD_URLS", "").split(",") if u.strip()]
+WEBHOOK_FORWARD_TIMEOUT = float(os.environ.get("WEBHOOK_FORWARD_TIMEOUT", "5"))
 RECON_MIN_DIFF = float(os.environ.get("RECON_MIN_DIFF", "1"))  # ต่างเกินกี่บาทถึงเตือน (กัน rounding)
 RECON_POS_WAIT  = int(os.environ.get("RECON_POS_WAIT", "900"))  # จดมือมาก่อน POS → เว้นกี่วินาทีค่อยลองดึง POS ใหม่ (15 นาที · ไม่กระทบเงิน แค่ยิง GET ถาม Apps Script)
 RECON_MAX_WAIT  = int(os.environ.get("RECON_MAX_WAIT", "10800"))  # รอ POS วันที่ตรงเข้าระบบได้นานสุดกี่วินาที (ดีฟอลต์ 3 ชม. · POS ลงตี1-5) เกินนี้ยังไม่มา = บอก 'ไม่เจอ เทียบไม่ได้' (ไม่เทียบข้ามวัน)
@@ -3762,10 +3768,29 @@ def _handle_secondary_callback(body: str, signature: str) -> bool:
     return False
 
 
+def _forward_webhook(raw: bytes, signature: str):
+    """ส่ง event ดิบต่อให้ระบบอื่นที่ใช้ OA เดียวกัน — ต้องส่ง body ดิบ + ลายเซ็นเดิม
+    ปลายทางจึงตรวจ signature ผ่าน · พังที่ปลายทางต้องไม่กระทบบอทร้าน จึงกลืน error ทั้งหมด
+    แต่ต้อง print ไว้เสมอ (ปัญหาเงียบคือศัตรูตัวจริงของระบบนี้)"""
+    for url in WEBHOOK_FORWARD_URLS:
+        try:
+            r = requests.post(url, data=raw, timeout=WEBHOOK_FORWARD_TIMEOUT,
+                              headers={"Content-Type": "application/json",
+                                       "X-Line-Signature": signature})
+            if r.status_code >= 400:
+                print(f"[forward] {url[:60]} → HTTP {r.status_code}", flush=True)
+        except Exception as e:
+            print(f"[forward] {url[:60]} ไม่สำเร็จ: {str(e)[:120]}", flush=True)
+
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
     body = request.get_data(as_text=True)
+    if WEBHOOK_FORWARD_URLS:
+        # แยกเธรด: LINE ต้องได้ 200 เร็ว ไม่งั้นมัน retry แล้วงานซ้ำ
+        threading.Thread(target=_forward_webhook, args=(request.get_data(), signature),
+                         daemon=True).start()
     try:
         handler.handle(body, signature)
         return "OK"
