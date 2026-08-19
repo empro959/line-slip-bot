@@ -1152,6 +1152,34 @@ function debugDaily(){
   });
 }
 
+// ===== ดูข้อความจริงในใบขาย เฉพาะรอบๆ คำที่ระบุ — OCR แค่ใบเดียว (ประหยัดโควตา) =====
+// ใช้ตอนรู้แล้วว่าเมนูไหนเพี้ยน (จาก debugMenuVsCat) แล้วอยากเห็นว่าในใบจริงบรรทัดนั้นหน้าตายังไง
+// ตัวอย่าง: debugSaleAround('2026-07-31', 'ผัดผักรวม')
+function debugSaleAround(iso, keyword, span){
+  span=span||8;
+  var found=_findPosMsg_(iso);
+  if(!found){ Logger.log('❌ ไม่พบเมลรายงานของ '+iso); return; }
+  var sale=null;
+  found.msg.getAttachments().forEach(function(a){
+    if(!sale && /SaleReport/i.test(a.getName()) && /\.pdf$/i.test(a.getName())) sale=a;
+  });
+  if(!sale){ Logger.log('❌ เมลนี้ไม่มีไฟล์ SaleReport'); return; }
+  var txt;
+  try{ txt=pdfToText_(sale.copyBlob()); }
+  catch(e){ Logger.log('❌ OCR ไม่ผ่าน: '+e+'  → พักแล้วลองใหม่'); return; }
+  var lines=txt.split(/[\n\r]+/);
+  var hits=[];
+  for(var i=0;i<lines.length;i++) if(lines[i].indexOf(keyword)>=0) hits.push(i);
+  if(!hits.length){ Logger.log('⚠️ ไม่เจอคำว่า "'+keyword+'" ในใบ (OCR อาจอ่านตัวอักษรเพี้ยน)'); return; }
+  Logger.log('🔎 '+iso+' — เจอ "'+keyword+'" '+hits.length+' แห่ง (โชว์รอบละ ±'+span+' บรรทัด)');
+  hits.forEach(function(h, n){
+    Logger.log('───── แห่งที่ '+(n+1)+' (บรรทัด '+h+') ─────');
+    for(var j=Math.max(0,h-span); j<=Math.min(lines.length-1,h+span); j++){
+      Logger.log((j===h?'>> ':'   ')+j+': '+lines[j]);
+    }
+  });
+}
+
 // ===== เจาะหาว่า "รายเมนู" ของวันหนึ่งเพี้ยนตรงไหน — ไม่ยิง OCR (ใช้ข้อมูลที่บันทึกไว้แล้ว) =====
 // ใช้ตอน checkSaleTotals ขึ้น 🔵 (ยอดขายถูก แต่รายเมนูไม่ตรง)
 // เทียบรายหมวด: ยอดรวมหมวด (จากตารางสรุป) vs ผลบวกรายเมนูในหมวดนั้น — หมวดไหนต่างคือจุดที่ตัวแกะพลาด
