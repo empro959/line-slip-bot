@@ -10,7 +10,7 @@
 
 ## 1. TL;DR — เหลืออะไรบ้าง
 
-> 🔴 **สถานะ 18 ส.ค. 2026 23:10: Render ยังต่อ repo เก่า (`saiyangsoi-sketch`) — โค้ดใหม่ทั้งหมดยังไม่ขึ้นระบบ** ดูข้อ 5
+> ✅ **สถานะ 19 ส.ค. 2026 ~11:45: Render ต่อ `empro959/line-slip-bot` แล้ว — deploy `b6d7a24` สำเร็จ งานย้ายบ้านจบ** (รายละเอียดข้อ 5)
 
 | ลำดับ | งาน | ทำที่ไหน |
 |---|---|---|
@@ -18,7 +18,7 @@
 | ✅ 2 | ~~Export Supabase ของ E&M~~ — **เซฟไฟล์แล้ว 18 ส.ค.** ดึงผ่าน SQL Editor แบบไล่ทุกตารางอัตโนมัติ (ตอนดึง status ยัง Healthy ทันก่อน pause) | supabase (บัญชี empro959) |
 | ✅ 3 | ~~บัญชีหนี้~~ — **กู้ครบแล้ว 18 ส.ค. 23:5x** หลังเหตุยอดถูกลบ: ยกมา 3 บรรทัด (48,237) ผ่านบล็อก `ค้าง` + บิล 8 ใบ (116,880) ผ่านคำสั่ง `บิล` ทีละข้อความ → **รวม 165,117.00 เจ้าของยืนยันตรง** | กลุ่มหนี้ในไลน์ |
 | ✅ 4 | ~~กู้ยอด 25 ก.ค. / 29 ก.ค.~~ — **ไม่ต้องกู้** เจ้าของยืนยัน 17 ส.ค.: **25 ก.ค. มีข้อมูลแล้ว · 29 ก.ค. ร้านหยุด** (ไม่มียอดถูกแล้ว) | — |
-| 🔴 5 | **สลับ Render ให้ deploy จาก `empro959/line-slip-bot`** — ตอนนี้ยังต่อ `saiyangsoi-sketch` อยู่ ทำให้ push แล้วไม่ขึ้นระบบ (Settings → Repository → เปลี่ยน repo → Manual Deploy) | Render |
+| ✅ 5 | ~~สลับ Render ให้ deploy จาก `empro959/line-slip-bot`~~ — **สลับแล้ว 19 ส.ค. ~11:45** · dropdown Credentials ของ Render ผูกกับตัวตน sketch จึงเพิ่ม empro959 ไม่ได้ → ใช้ทาง **Public Git Repository** (repo เป็น public) ชี้ `https://github.com/empro959/line-slip-bot` branch `main` → build+deploy `b6d7a24` สำเร็จ · env vars เดิมอยู่ครบ (เปลี่ยนแค่ source ไม่ได้สร้าง service ใหม่) · ทางนี้ไม่มี webhook → **auto-deploy ทำผ่าน GitHub Actions** (`.github/workflows/render-deploy.yml` ยิง Deploy Hook, secret `RENDER_DEPLOY_HOOK` ตั้งใน repo แล้ว) | Render + GitHub |
 | 🟢 6 | เช็กยกเลิกบิล ฿3,599 ของวันที่ 16 ส.ค. (ระบบเตือนขึ้นเอง) | Easy POS |
 | 🟢 7 | แจ้งห้องคอนเทนต์เรื่อง webhook URL ใหม่ (ค้างจากฉบับก่อน) | กลุ่มคอนเทนต์ |
 | 🟢 8 | (ถ้าอยาก) ย้ายปลายทางรายงานสลิป — ตอนนี้ redirect ไปกลุ่ม `C91b4fc6ff9…` | env `REPORT_REDIRECT` ที่ Render |
@@ -63,15 +63,15 @@
 |---|---|---|---|---|---|
 | 1 | LINE OA "เอด" | LINE Business | ตัวบอทหลัก — webhook → iq8e `/callback` | ฟรี (push ~300/ด./OA) | ✅ ปกติ |
 | 2 | LINE OA สำรอง (OA2..) | LINE Business | สลับช่องเมื่อโควตา push เต็ม (`OA_ROUTE`) | ฟรี | ✅ ตามที่ตั้ง token |
-| 3 | Render `Line-Slip-Bot-1` (iq8e) | ร้าน (saiyangsoi@gmail) | รันบอทตัวจริง | **Starter ~$7/ด. — ตัวเดียวที่จ่ายรายเดือน** | 🔴 ยังดึงโค้ดบ้านเก่า `33ac046` |
+| 3 | Render `Line-Slip-Bot-1` (iq8e) | ร้าน (saiyangsoi@gmail) | รันบอทตัวจริง | **Starter ~$7/ด. — ตัวเดียวที่จ่ายรายเดือน** | ✅ ดึง `empro959/line-slip-bot` แบบ Public Git URL (deploy `b6d7a24` 19 ส.ค.) · auto-deploy ผ่าน GitHub Actions + Deploy Hook |
 | 4 | Supabase org `saiyangsoi4` | ร้าน | DB production (Session pooler IPv4) | ฟรี | ⚠️ ยังไม่เปิดยืนยัน `DATABASE_URL` |
 | 5 | Gemini API (`project-for-key-3`) | Google Cloud ร้าน | อ่านสลิป/บิลจากรูป | จ่ายตามใช้ (เปิด billing กัน 429) | ✅ ปกติ |
 | 6 | Gmail | ร้าน | รับเมลรายงาน PDF จาก POS ทุกคืน ~00:3x | ฟรี | ✅ ปกติ |
 | 7 | Apps Script + Drive | ร้าน | OCR ใบ POS → ข้อมูล dashboard + สรุปรายรับเข้าไลน์/เมล | ฟรี (โควตา OCR/วัน) | ✅ วางโค้ดล่าสุดแล้ว |
 | 8 | Netlify (team saiyangsoi) | ร้าน | โฮสต์หน้า dashboard | ฟรี | ✅ (deploy มือ ลาก zip) |
 | 9 | UptimeRobot | ⚠️ **บัญชี E&M ProEng — ปนกับงานอื่น** | ตัวปลุกรายงาน 00:30 (ping `/health` ทุก 5 นาที) | ฟรี | ✅ เขียว · ควรย้ายมาบัญชีร้านสักวัน |
-| 10 | GitHub `empro959/line-slip-bot` | ส่วนตัว (empro959) | **บ้านของโค้ด** — โค้ดล่าสุดทั้งหมด | ฟรี | ✅ เข้าถึงได้ · รอชี้ Render มา |
-| 11 | GitHub `saiyangsoi-sketch/Line-Slip-Bot` | ร้าน — **ล็อกอินหาย** | โค้ดเก่าที่ iq8e ยังดึงอยู่ | ฟรี | 🔴 จะประกาศเลิกใช้เมื่อสลับ Render เสร็จ |
+| 10 | GitHub `empro959/line-slip-bot` | ส่วนตัว (empro959) | **บ้านของโค้ด** — โค้ดล่าสุดทั้งหมด | ฟรี | ✅ Render ชี้มาที่นี่แล้ว (19 ส.ค.) |
+| 11 | GitHub `saiyangsoi-sketch/Line-Slip-Bot` | ร้าน — **ล็อกอินหาย** | โค้ดเก่า — ไม่มีอะไรดึงแล้ว | ฟรี | 🪦 เลิกใช้แล้ว 19 ส.ค. (iq8e สลับออกแล้ว — ห้าม push/ดึงอีก) |
 | 12 | Easy POS | ผู้ขาย POS (ภายนอก) | ระบบขายหน้าร้าน + ส่งเมลรายงานทุกคืน — ต้นทางข้อมูลทั้งหมดของ dashboard | ตามสัญญา POS | ✅ ปกติ |
 
 ### 3.2 ของเก่าที่ปลดระวางแล้ว
@@ -100,7 +100,8 @@ Apps Script ── SLIP_API_URL ─→ iq8e (มี token ฝังใน proper
 บอท ────────── SYNC_URL ────→ Apps Script /exec
 บอท ────────── DATABASE_URL → Supabase saiyangsoi4
 บอท ────────── GEMINI_API_KEY → Google Cloud ร้าน
-Render iq8e ── ดึงโค้ด ─────→ GitHub (จุดที่กำลังแก้: sketch → empro959)
+Render iq8e ── ดึงโค้ด (Public Git URL) → GitHub empro959/line-slip-bot ✅
+GitHub Actions ─ push main ยิง Deploy Hook → Render iq8e (secret RENDER_DEPLOY_HOOK)
 ```
 
 **กติกา: ย้ายอะไรก็ตาม ให้เปิดตารางนี้แล้วถามว่า "เส้นไหนชี้มาที่ของที่ย้าย" แล้วไล่แก้ + ยืนยันด้วยตาให้ครบก่อนปิดงาน**
@@ -127,9 +128,9 @@ Render iq8e ── ดึงโค้ด ─────→ GitHub (จุดท
 | **🪦 เลิกใช้ — ห้ามหยิบมาใช้อีก** | GitHub `saiyangsoi-sketch` (รหัสหาย ไม่ต้องกู้) · Render `s772` (ลบ/เปลี่ยนชื่อ DO-NOT-USE) · Render `65gt` · Supabase `empro959` (export แล้ว) · Gemini E&M |
 
 **งานเก็บตกจากข้อยุตินี้ (ไม่มีการย้ายบัญชีเลย):**
-1. ชี้ iq8e → `empro959/line-slip-bot` (= งานข้อ 5 ใน TL;DR — ซ่อมของพัง ไม่ใช่ย้ายบ้าน)
-2. ลบ/เปลี่ยนชื่อ Render `s772` กันหยิบผิด
-3. เปลี่ยนชื่อ monitor ใน UptimeRobot เป็น `[ร้าน] LineSlipBot` / `[E&M] ProEng` (1 นาที)
+1. ✅ ~~ชี้ iq8e → `empro959/line-slip-bot`~~ — เสร็จ 19 ส.ค. (ดูข้อ 5 ใน TL;DR)
+2. 🟢 ลบ/เปลี่ยนชื่อ Render `s772` กันหยิบผิด
+3. 🟢 เปลี่ยนชื่อ monitor ใน UptimeRobot เป็น `[ร้าน] LineSlipBot` / `[E&M] ProEng` (1 นาที)
 
 > ข้อยุตินี้เจ้าของเคาะเองหลังชั่งน้ำหนักครบ — ห้ามหยิบมาตัดสินใหม่โดยไม่มีข้อเท็จจริงใหม่
 

@@ -29,7 +29,8 @@ Apps Script อัปเดตแล้ว · ไล่ช่องว่าง�
 ## 2026-08-17 (ท้ายวัน) — จากห้องบอท → ทุกห้อง  🔀 ย้าย repo กลับมา `empro959` + มีชุดเทสต์แล้ว
 
 **⚠️ เปลี่ยนต้นทาง deploy — อ่านก่อน push:**
-- repo หลักตอนนี้คือ **`empro959/line-slip-bot`** · Render service สลับมาต่อ repo นี้แล้ว → push `main` = deploy จริง
+- repo หลักตอนนี้คือ **`empro959/line-slip-bot`** · Render service สลับมาต่อ repo นี้แล้ว **(สลับจริง 19 ส.ค. ~11:45 — ก่อนหน้านั้นยังต่อบ้านเก่าอยู่)** → push `main` = deploy จริง
+- กลไก deploy: Render ดึงแบบ **Public Git URL** (ไม่มี webhook) → auto-deploy ทำงานผ่าน **GitHub Actions** `.github/workflows/render-deploy.yml` ยิง Deploy Hook (secret `RENDER_DEPLOY_HOOK` ใน repo) — push `main` แล้วรอ ~3-5 นาทีค่อยเช็คผลบน Render
 - **`saiyangsoi-sketch/Line-Slip-Bot` เลิกใช้แล้ว ห้าม push เพิ่ม** (โน้ตเก่าในไฟล์นี้/`HANDOFF.md` ที่บอกว่า "อย่าไปยุ่ง empro959" **ยกเลิก** — กลับทิศแล้ว)
 - 2 repo แยกทางกันที่ `cf1aeb2` แล้วเดินคนละสาย → รวมด้วย merge `bcb7020` ตรวจแล้วไม่มีงานฝั่งไหนหาย
   (`app.py` ใช้ของฝั่ง saiyangsoi ทั้งไฟล์ เพราะอีกฝั่งทำฟีเจอร์ 'บิลซื้อเด้งสรุปหนี้' เรื่องเดียวกันซ้ำกัน · ฝั่ง empro959 ไม่ได้แก้ `app.py` เรื่องอื่นเลย · dashboard/doc merge เข้าเองไม่ชน)
