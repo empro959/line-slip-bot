@@ -839,10 +839,17 @@ function _fileDateIso_(name){
 
 // เมลรายงานของวันนั้น — เงื่อนไขบังคับคือ "ต้องมีไฟล์ SaleReport" ไม่ใช่แค่วันที่ตรง
 // (เคสจริง 19/08/26: 31/07 ไปเจอ 'Grab: Receipt/Tax Invoice … Date 31/07/2026' แล้วหยุดหาเลย)
-var _POS_MSG_CACHE_=null;
+// เลื่อนวันแบบ ISO (yyyy-mm-dd) — ใช้ UTC กันปัญหาข้ามเขตเวลา/DST
+function _shiftIso_(iso, days){
+  var p=String(iso).split('-');
+  var t=Date.UTC(+p[0], +p[1]-1, +p[2]) + days*86400000, d=new Date(t);
+  return d.getUTCFullYear()+'-'+('0'+(d.getUTCMonth()+1)).slice(-2)+'-'+('0'+d.getUTCDate()).slice(-2);
+}
+
+var _POS_MSG_CACHE_=null, _POS_ALT_CACHE_=null;
 function _findPosMsg_(iso){
   if(!_POS_MSG_CACHE_){                      // สแกนเมลครั้งเดียว ใช้ได้ทุกวันที่ในรอบเดียวกัน
-    _POS_MSG_CACHE_={};
+    _POS_MSG_CACHE_={}; _POS_ALT_CACHE_={};
     GmailApp.search('has:attachment filename:pdf newer_than:90d',0,150).forEach(function(t){
       t.getMessages().forEach(function(msg){
         var hasSale=false, fileIso=null;
@@ -851,14 +858,27 @@ function _findPosMsg_(iso){
           if(/SaleReport/i.test(n)) hasSale=true;
           var fi=_fileDateIso_(n); if(fi&&!fileIso) fileIso=fi;
         });
-        if(!hasSale) return;                 // ไม่มีใบขาย = ไม่ใช่เมลรายงาน POS
+        if(!hasSale) return;                 // ไม่มีใบขาย = ไม่ใช่เมลรายงาน POS (กันไปเจอใบเสร็จ Grab)
         var sIso=_subjDateIso_(msg.getSubject());
-        if(sIso && !_POS_MSG_CACHE_[sIso])   _POS_MSG_CACHE_[sIso]={msg:msg, how:'หัวเรื่อง'};
-        if(fileIso && !_POS_MSG_CACHE_[fileIso]) _POS_MSG_CACHE_[fileIso]={msg:msg, how:'ชื่อไฟล์แนบ'};
+        // หัวเรื่องบอก "วันไหน" ขึ้นกับว่าใครส่ง:
+        //   • ระบบส่งเองตอนตี 1 → หัวเรื่อง = วันที่ส่ง = วันทำการ + 1
+        //     (หลักฐาน 19/08/26: หัวเรื่อง 31/07 ส่ง 31/07 01:29 แต่เนื้อในเป็นของ 30/07)
+        //   • คน export ย้อนหลัง → หัวเรื่อง = วันทำการตรงๆ (11/08 ส่ง 13/08 21:34)
+        // แยกด้วย "ส่งวันเดียวกับหัวเรื่อง และก่อน 8 โมงเช้า" = เมลกลางคืนของระบบ
+        var bizIso=sIso, how='หัวเรื่อง';
+        if(sIso){
+          var aIso=Utilities.formatDate(msg.getDate(),'GMT+7','yyyy-MM-dd');
+          var aHr=parseInt(Utilities.formatDate(msg.getDate(),'GMT+7','H'),10);
+          if(aIso===sIso && aHr<8){ bizIso=_shiftIso_(sIso,-1); how='เมลกลางคืน (หัวเรื่อง−1วัน)'; }
+        }
+        if(bizIso && !_POS_MSG_CACHE_[bizIso]) _POS_MSG_CACHE_[bizIso]={msg:msg, how:how};
+        // ตัวสำรอง เผื่อกฎข้างบนเดาพลาด — ใช้ต่อเมื่อหาแบบหลักไม่เจอ
+        if(sIso && sIso!==bizIso && !_POS_ALT_CACHE_[sIso])   _POS_ALT_CACHE_[sIso]={msg:msg, how:'หัวเรื่องตรง (สำรอง)'};
+        if(fileIso && !_POS_MSG_CACHE_[fileIso] && !_POS_ALT_CACHE_[fileIso]) _POS_ALT_CACHE_[fileIso]={msg:msg, how:'ชื่อไฟล์แนบ'};
       });
     });
   }
-  return _POS_MSG_CACHE_[iso]||null;
+  return _POS_MSG_CACHE_[iso]||_POS_ALT_CACHE_[iso]||null;
 }
 
 function _importPosOneDate_(iso){
@@ -877,8 +897,16 @@ function _importPosOneDate_(iso){
   if(!att.sale){ Logger.log('❌ อีเมลนี้ไม่มีไฟล์ SaleReport — กู้ไม่ได้'); return; }
   var st=pdfToText_(att.sale.copyBlob());
   var dd=dailyDate_(st);
-  if(!dd || dd.key!==iso){                  // เนื้อหาอ่านไม่ออก/ไม่ตรง → เชื่อวันที่ที่ระบุ (มาจากหัวเรื่อง)
-    Logger.log('⚠️ วันที่ในเนื้อหา PDF = '+(dd?dd.key:'อ่านไม่ออก')+' ไม่ตรงกับที่ขอ ('+iso+') → ใช้ '+iso+' ตามหัวเรื่อง');
+  // ⛔ เนื้อในเป็นของวันอื่น = หยิบเมลผิดใบ ห้ามบันทึกเด็ดขาด
+  // ของเดิม "เชื่อหัวเรื่องไว้ก่อน" → เคสจริง 19/08/26: ใบของ 30/07 ถูกบันทึกทับเป็น 31/07
+  // (ยอดจริง 118,449 ของ 31/07 หายไปเป็น 0)
+  if(dd && dd.key!==iso){
+    Logger.log('❌ ไม่บันทึก — เมลนี้เนื้อในเป็นของวันที่ '+dd.key+' ไม่ใช่ '+iso+
+               '\n   👉 ถ้าต้องการวันที่ '+dd.key+' ให้ใส่วันนั้นใน DATES แทน');
+    return;
+  }
+  if(!dd){                                  // อ่านวันที่ในเนื้อไม่ออกจริงๆ → เชื่อวันที่ที่ขอ (มาจากหัวเรื่อง/ชื่อไฟล์)
+    Logger.log('⚠️ อ่านวันที่ในเนื้อ PDF ไม่ออก → ใช้ '+iso+' ตามที่ระบุ');
     var p=iso.split('-');
     dd={key:iso, period:THAI_MONTHS[parseInt(p[1],10)-1]+' '+(parseInt(p[0],10)+543)};
   }
@@ -919,6 +947,13 @@ function _importPosOneDate_(iso){
     zones:bt?parseBalanceZones_(bt):keepZ, voids:parseVoids_(st), bills:bills, credit:credit};
   var keptWarn=((pr.err&&prev?'\n   ♻️ ใบ Payout อ่านไม่ได้ → คงค่าใช้จ่ายเดิมไว้ (ไม่ทับด้วยศูนย์)':'')+
                 (br.err&&prev?'\n   ♻️ ใบ Balance อ่านไม่ได้ → คงวิธีชำระ/โซนเดิมไว้':''));
+  var totCheck=day.sales.reduce(function(a,c){return a+(c.amount||0);},0);
+  // ⛔ อ่านยอดขายไม่ออกเลย (0) แต่ของเดิมมีตัวเลขอยู่ = ทับแล้วข้อมูลหาย ต้องไม่บันทึก
+  if(totCheck<=0 && prev && (prev.sales||[]).length){
+    Logger.log('❌ ไม่บันทึก — แกะยอดขายจากใบนี้ไม่ได้เลย (0) แต่ของเดิมมีอยู่แล้ว จะทับให้หาย'+
+               '\n   👉 รูปแบบใบอาจเปลี่ยน — ตั้ง DUMP_OCR=true แล้วรันซ้ำเพื่อดูข้อความจริง');
+    return;
+  }
   var daily=loadDaily_().filter(function(x){return x.date!==dd.key;});   // ทับวันเดิมถ้ามี
   daily.push(day); saveDaily_(daily);
   writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));                  // rebuild ให้ dashboard เลย
