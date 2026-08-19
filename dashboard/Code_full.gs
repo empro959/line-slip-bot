@@ -174,18 +174,31 @@ function parseSale_(text){
 // ---- แกะ SaleReport ระดับ "รายเมนู" -> [{category,name,qty,amount(inc)}] ----
 function parseSaleItems_(text){
   var raw=text.split(/[\n\r]+/), lines=[];
-  var junk=/บริษัท|^เลขที่|รายงานสรุป|^ตั้งแต่|^หมวดสินค้า|\d{4}\/\d{2}\/\d{2}/;
+  // ต้องกรองหัว/ท้ายกระดาษแบบเดียวกับ parseSale_ (ของเดิมรู้จักแต่ใบไทย → ใบอังกฤษที่ส่งย้อนหลังพัง)
+  var junk=/บริษัท|^เลขที่|รายงานสรุป|^ตั้งแต่|^หมวดสินค้า|\d{4}\/\d{2}\/\d{2}|^Sales Report|^From \d|^Category$|^PrintDate/;
   for(var i=0;i<raw.length;i++){var ln=raw[i].trim();
     if(ln.indexOf('ยอดรวม(รวมภาษี)')>=0) ln=ln.replace(/^.*ยอดรวม\(รวมภาษี\)\s*/,'').trim();
+    if(ln.indexOf('Total(Inc. tax)')>=0)  ln=ln.replace(/^.*Total\(Inc\. tax\)\s*/,'').trim();
     if(!ln||junk.test(ln)) continue; lines.push(ln);}
   var toks=lines.join(' ').split(/\s+/).filter(function(x){return x!=='';});
   var isNum=function(s){return /^-?[\d,]+(\.\d+)?$/.test(s)||s==='.00';};
-  var isCode=function(s){return /^[A-Za-z]{2,}-?\d/.test(s);};
+  // รหัสสินค้าจริงในระบบ POS มี 3 แบบ (ตรวจกับไฟล์ All_menu 936 รายการ ครอบคลุม 100%):
+  //   ตัวอักษร≥2 + เลข (PPY001, JP12, AA-123) · ตัวอักษรเดี่ยว-เลข (C-1 หมวดคอนเสิร์ต) · +เลข (Extra เช่น +159)
+  // ⚠️ ของเดิมจับแต่แบบแรก → พลาด 125/936 รายการ (Extra 119 + คอนเสิร์ต 6)
+  //    รหัสที่จับไม่ได้ = แถวนั้นไม่ถูกตัดเป็นรายการใหม่ → ตัวเลขไปรวมกับเมนูก่อนหน้า
+  //    แล้วตัวแกะหยิบ "6 ตัวเลขท้าย" ซึ่งกลายเป็นของแถวที่จับไม่ได้ → เมนูก่อนหน้ายอดบวม + เมนูนั้นหายไป
+  //    (เคสจริง 31/07/26: ผัดผักรวม(เลือก) ควรเป็น 159 แต่ได้ 2,569 · รวมทั้งใบเกินจริง 7,111)
+  var isCode=function(s){return /^([A-Za-z]{2,}-?\d|[A-Za-z]-\d|\+\d)/.test(s);};
   var catHdr=/^\d{1,2}\.[^\d]/;
   var KNOWN=['อาหารญี่ปุ่น','ร้านขนมเส้น','ร้านก๋วยเตี๋ยว'];
   var headers=[]; for(var j=0;j<toks.length;j++) if(catHdr.test(toks[j])||KNOWN.indexOf(toks[j])>=0) headers.push(j);
-  var sumIdx=-1; for(var q=0;q<toks.length;q++) if(toks[q].indexOf('สรุปยอดขาย')>=0){sumIdx=q;break;}
-  var bset=headers.slice(); if(sumIdx>=0) bset.push(sumIdx); bset.sort(function(a,b){return a-b;});
+  var sumIdx=-1, grandIdx=-1;
+  for(var q=0;q<toks.length;q++){
+    if(sumIdx<0 && toks[q].indexOf('สรุปยอดขาย')>=0) sumIdx=q;
+    if(grandIdx<0 && toks[q]==='Grand' && toks[q+1]==='Total') grandIdx=q;   // ขอบเขตท้ายของใบอังกฤษ
+  }
+  var bset=headers.slice(); if(sumIdx>=0) bset.push(sumIdx); if(grandIdx>=0) bset.push(grandIdx);
+  bset.sort(function(a,b){return a-b;});
   var items=[];
   for(var k=0;k<headers.length;k++){
     var start=headers[k], cat=toks[start], end=toks.length;
@@ -203,6 +216,9 @@ function parseSaleItems_(text){
       if(nums.length>=6){
         var inc=nums[nums.length-1].v, qn=nums[nums.length-6];
         var name=span.slice(0,qn.i).join(' ').trim();
+        // รายการ Extra ชื่อเท่ากับรหัสเลย (เช่น '+159 +159 1.00 ครั้ง …') → ช่องชื่อว่าง
+        // ของเดิมทิ้งรายการที่ชื่อว่าง = ยอด Extra หายไปทั้งก้อน ทั้งที่นับอยู่ในยอดรวมหมวด
+        if(!name) name=toks[cp];
         // กันเมนูเพี้ยน: ตัดชื่อที่จริงๆ เป็น "ข้อความหัว/สรุปท้ายรายงาน" (ไม่ใช่ชื่อเมนู) หรือยาวผิดปกติ
         //   เกิดตอนโค้ด+ตัวเลขของส่วนสรุปหลุดมาปนช่วงท้ายหมวดสุดท้าย → ได้ 'เมนู' ยอดมั่วก้อนโต
         var badNm=/Sales Report|Item Code|Item Description|Category|Total Order|Total Customer|Real Sale|Take Home|Point Redeem|Sale by|Count |Transaction|\d{1,2}:\d{2}|รายงานสรุป|ตั้งแต่|หมวดสินค้า/;
