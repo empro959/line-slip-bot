@@ -821,13 +821,51 @@ function _subjDateIso_(subject){
   return y+'-'+('0'+mo).slice(-2)+'-'+('0'+d).slice(-2);
 }
 
+// วันที่จากชื่อไฟล์แนบ (…_260726_1234.pdf) — ใช้ตอนหัวเรื่องไม่มีวันที่/วันที่ไม่ตรง
+// ลอง yymmdd ก่อน แล้วค่อย ddmmyy · ตัวไหนแปลออกมาเป็นวันจริงในช่วงปีที่ใช้งานเท่านั้นจึงรับ
+function _fileDateIso_(name){
+  var m=String(name||'').match(/(\d{6})_\d{4,6}\.pdf$/i);
+  if(!m) return null;
+  var t=m[1], cand=[[t.slice(0,2),t.slice(2,4),t.slice(4,6)],   // yy mm dd
+                    [t.slice(4,6),t.slice(2,4),t.slice(0,2)]];  // (ddmmyy อ่านกลับ) yy mm dd
+  for(var i=0;i<cand.length;i++){
+    var y=2000+parseInt(cand[i][0],10), mo=parseInt(cand[i][1],10), d=parseInt(cand[i][2],10);
+    if(y<2025||y>2030) continue;
+    if(mo<1||mo>12||d<1||d>31) continue;
+    return y+'-'+('0'+mo).slice(-2)+'-'+('0'+d).slice(-2);
+  }
+  return null;
+}
+
+// เมลรายงานของวันนั้น — เงื่อนไขบังคับคือ "ต้องมีไฟล์ SaleReport" ไม่ใช่แค่วันที่ตรง
+// (เคสจริง 19/08/26: 31/07 ไปเจอ 'Grab: Receipt/Tax Invoice … Date 31/07/2026' แล้วหยุดหาเลย)
+var _POS_MSG_CACHE_=null;
+function _findPosMsg_(iso){
+  if(!_POS_MSG_CACHE_){                      // สแกนเมลครั้งเดียว ใช้ได้ทุกวันที่ในรอบเดียวกัน
+    _POS_MSG_CACHE_={};
+    GmailApp.search('has:attachment filename:pdf newer_than:90d',0,150).forEach(function(t){
+      t.getMessages().forEach(function(msg){
+        var hasSale=false, fileIso=null;
+        msg.getAttachments().forEach(function(a){
+          var n=a.getName(); if(!/\.pdf$/i.test(n)) return;
+          if(/SaleReport/i.test(n)) hasSale=true;
+          var fi=_fileDateIso_(n); if(fi&&!fileIso) fileIso=fi;
+        });
+        if(!hasSale) return;                 // ไม่มีใบขาย = ไม่ใช่เมลรายงาน POS
+        var sIso=_subjDateIso_(msg.getSubject());
+        if(sIso && !_POS_MSG_CACHE_[sIso])   _POS_MSG_CACHE_[sIso]={msg:msg, how:'หัวเรื่อง'};
+        if(fileIso && !_POS_MSG_CACHE_[fileIso]) _POS_MSG_CACHE_[fileIso]={msg:msg, how:'ชื่อไฟล์แนบ'};
+      });
+    });
+  }
+  return _POS_MSG_CACHE_[iso]||null;
+}
+
 function _importPosOneDate_(iso){
-  var threads=GmailApp.search('has:attachment filename:pdf newer_than:60d',0,100), hit=null;
-  threads.forEach(function(t){ t.getMessages().forEach(function(msg){
-    if(!hit && _subjDateIso_(msg.getSubject())===iso && msg.getAttachments().length) hit=msg;
-  });});
-  if(!hit){ Logger.log('❌ ไม่พบอีเมลรายงานของ '+iso+' — หัวเรื่องต้องมีวันที่แบบ dd/mm/yyyy (พ.ศ. หรือ ค.ศ. ก็ได้)'); return; }
-  Logger.log('📧 ใช้อีเมล: "'+hit.getSubject()+'"  (เข้ามา '+hit.getDate()+')');
+  var found=_findPosMsg_(iso);
+  if(!found){ Logger.log('❌ ไม่พบเมลรายงาน POS ของ '+iso+' (หาแล้วทั้งหัวเรื่องและชื่อไฟล์แนบ ใน 90 วันล่าสุด)'); return; }
+  var hit=found.msg;
+  Logger.log('📧 ใช้อีเมล: "'+hit.getSubject()+'"  (เข้ามา '+hit.getDate()+' · จับคู่จาก'+found.how+')');
   var att={};
   hit.getAttachments().forEach(function(a){ var n=a.getName();
     if(!/\.pdf$/i.test(n)) return;
@@ -991,13 +1029,27 @@ var DUMP_OCR = false;
 // 👉 ใส่วันที่ที่ต้องการกู้ตรงนี้ — ใส่กี่วันก็ได้ คั่นด้วยจุลภาค แล้วรันฟังก์ชันนี้ครั้งเดียว
 // ใช้ OCR ~4 ครั้ง/วัน · ชนลิมิต (⏳) ให้พัก ~5 นาทีแล้วรันซ้ำได้เลย — วันที่กู้สำเร็จแล้วจะถูกทับด้วยข้อมูลเดิม ไม่เสียหาย
 function importPosByDate(){
-  var DATES = ['2026-08-11'];   // ← เปลี่ยนเป็นวันที่ที่ขาดจริง (ดูจาก debugDaily)
-  DATES.forEach(function(iso, i){
+  var DATES = ['2026-08-11'];   // ← เปลี่ยนเป็นวันที่ที่ขาดจริง (ดูจาก checkSaleTotals/debugDaily)
+  var done=0, left=[];
+  for(var i=0;i<DATES.length;i++){
+    var iso=DATES[i];
+    if(left.length){ left.push(iso); continue; }          // โควตาหมดแล้ว เก็บชื่อวันที่เหลือไว้บอกเจ้าของ
     Logger.log('───── ' + (i + 1) + '/' + DATES.length + '  กู้วันที่ ' + iso + ' ─────');
-    try { _importPosOneDate_(iso); }
-    catch(e){ Logger.log('❌ ' + iso + ' พัง: ' + e); }   // วันหนึ่งพังต้องไม่หยุดวันที่เหลือ
-  });
-  Logger.log('🏁 จบ ' + DATES.length + ' วัน — เลื่อนอ่าน log ข้างบน หา ✅/❌ ของแต่ละวัน');
+    try { _importPosOneDate_(iso); done++; }
+    catch(e){
+      Logger.log('❌ ' + iso + ' พัง: ' + e);
+      // โควตา OCR หมด = วันที่เหลือก็พังเหมือนกันแน่นอน · ไล่บดต่อ = เสียเวลาจนชนลิมิต 6 นาที
+      // แล้ว log ที่สรุปว่า "เหลือวันไหนบ้าง" ก็ไม่ได้พิมพ์ (เคสจริง 19/08/26)
+      if(/rate limit|quota/i.test(String(e))) left.push(iso);
+    }
+  }
+  if(left.length){
+    Logger.log('\n⛔ OCR หมดโควตาช่วงนี้ — หยุดไว้ก่อน ทำสำเร็จ '+done+' วัน · ยังเหลือ '+left.length+' วัน');
+    Logger.log('   👉 พักสัก 1 ชม. (หรือรอข้ามวัน) แล้ววางบรรทัดนี้แทนใน DATES ค่อยรันใหม่:');
+    Logger.log("   var DATES = ['"+left.join("','")+"'];");
+  } else {
+    Logger.log('🏁 จบ ' + DATES.length + ' วัน — เลื่อนอ่าน log ข้างบน หา ✅/❌ ของแต่ละวัน');
+  }
 }
 
 // ===== ดูว่ามีไฟล์รายงาน POS วันไหนในเมลบ้าง (ไม่ OCR เลย = ไม่กินโควตา) =====
