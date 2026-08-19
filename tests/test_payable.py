@@ -620,5 +620,66 @@ class TestWebhookForward(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+class TestModelGoneDetection(unittest.TestCase):
+    """โมเดล AI ถูกปลดระวาง — ต้องรู้ทันที ไม่ใช่เงียบ
+
+    ทำไมต้องมี: 19/08/26 ห้องคอนเทนต์โดน Groq ปลดโมเดลกลางอากาศ ระบบเงียบไป 7 วัน
+    ฝั่งสลิปเป็นเรื่องเงิน จะเงียบแบบนั้นไม่ได้ · โมเดลหาย = ปัญหาถาวร ห้าม retry วนเปล่า"""
+
+    def test_detects_provider_wording(self):
+        for msg in [
+            "404 NOT_FOUND: models/gemini-9.9-flash is not found for API version v1beta",
+            '{"error":{"message":"The model `x` does not exist or you do not have access","code":"model_not_found"}}',
+            "Publisher Model `models/gemini-old` was not found",
+        ]:
+            self.assertTrue(app._is_model_gone(Exception(msg)), f"ต้องจับได้: {msg[:50]}")
+
+    def test_does_not_confuse_with_temporary_errors(self):
+        """503/429/รูปหมดอายุ = ชั่วคราว ต้องไม่ถูกตีเป็น 'โมเดลหาย' (ไม่งั้นเลิก retry ทั้งที่ควร retry)"""
+        for msg in [
+            "503 The model is overloaded. Please try again later",
+            "429 RESOURCE_EXHAUSTED: quota exceeded",
+            "LINE 410 content is gone",
+        ]:
+            self.assertFalse(app._is_model_gone(Exception(msg)), f"ต้องไม่จับ: {msg[:50]}")
+
+    def test_stops_retrying_immediately(self):
+        """ปัญหาถาวร → ต้องยิงครั้งเดียวแล้วเลิก (ของเดิมไล่ 4 รอบ + หน่วง 14 วิ ต่อรูป)"""
+        calls = []
+        class _Boom:
+            def generate_content(self, model=None, contents=None, config=None):
+                calls.append(model)
+                raise Exception("404 NOT_FOUND: models/x is not found for API version v1beta")
+        class _C:
+            models = _Boom()
+        orig = app.gemini_client
+        app.gemini_client = _C()
+        try:
+            with self.assertRaises(Exception):
+                app._gemini_generate("hi", attempts=4)
+        finally:
+            app.gemini_client = orig
+        self.assertEqual(len(calls), 1, "โมเดลหายแล้วยัง retry ซ้ำ = เสียเวลาเปล่า")
+
+    def test_still_retries_temporary_failures(self):
+        """กันแก้เกิน: 503 ต้องยัง retry ครบตามเดิม"""
+        calls = []
+        class _Boom:
+            def generate_content(self, model=None, contents=None, config=None):
+                calls.append(model)
+                raise Exception("503 The model is overloaded")
+        class _C:
+            models = _Boom()
+        orig, orig_sleep = app.gemini_client, app.time.sleep
+        app.gemini_client = _C()
+        app.time.sleep = lambda *_: None      # ไม่ต้องรอจริงตอนเทสต์
+        try:
+            with self.assertRaises(Exception):
+                app._gemini_generate("hi", attempts=3)
+        finally:
+            app.gemini_client, app.time.sleep = orig, orig_sleep
+        self.assertEqual(len(calls), 3)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

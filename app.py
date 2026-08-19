@@ -219,6 +219,11 @@ def _gemini_generate(contents, attempts=4, model=None, json_mode=False):
             return gemini_client.models.generate_content(model=use_model, contents=contents, config=config)
         except Exception as e:
             last = e
+            # โมเดลถูกปลดระวาง = ปัญหาถาวร รอไปก็ไม่หาย → เลิกลองทันที ให้ error เด้งขึ้นไปเตือนคน
+            # (ถ้าปล่อยให้ไล่ retry ครบ จะกิน 14 วิ/รูป แล้วสุดท้ายก็แจ้งว่า 'น่าจะโควตาหมด' ซึ่งวินิจฉัยผิด)
+            if _is_model_gone(e):
+                print(f"[gemini] ⛔ โมเดล '{use_model}' ไม่มีอยู่แล้ว — เลิกลองซ้ำ: {str(e)[:120]}", flush=True)
+                raise
             if i < attempts - 1:
                 print(f"[gemini] retry {i+1}/{attempts}: {str(e)[:100]}", flush=True)
                 time.sleep(2 * (2 ** i))   # 2, 4, 8 วินาที
@@ -2863,6 +2868,16 @@ def _is_gemini_credits_error(e) -> bool:
         k in s for k in ("credit", "depleted", "prepay", "billing", "balance", "insufficient"))
 
 
+def _is_model_gone(e) -> bool:
+    """โมเดลที่ตั้งไว้ 'ไม่มีอยู่แล้ว' — ผู้ให้บริการปลดระวาง หรือพิมพ์ชื่อผิด
+    ต่างจาก 503/429 ตรงที่ **รอไปก็ไม่หาย** ลองซ้ำมีแต่เสียเวลา ต้องมีคนไปเปลี่ยนชื่อโมเดล
+    (เคสจริง 19/08/26: ห้องคอนเทนต์โดน Groq ปลด llama-3.3-70b → ระบบเงียบ 7 วันโดยไม่มีใครรู้)"""
+    s = str(e).lower()
+    return ("model_not_found" in s
+            or ("not found" in s and "model" in s)
+            or ("does not exist" in s and "model" in s))
+
+
 def _is_quota_error(e: Exception) -> bool:
     """push โดนปฏิเสธเพราะเต็มโควต้า push รายเดือน (429 / ข้อความมี monthly/limit/quota)
     ใช้เป็น safety net: ถ้าตัวนับพลาดหรือ OA เต็มก่อนถึง PUSH_FREE_LIMIT → สลับ OA ถัดไปทันที ไม่ให้ตกหล่น"""
@@ -3848,6 +3863,11 @@ def notify_admin_error(group_id, err):
     if _is_content_gone(err):
         tip = ("📎 รูปถูกยกเลิก/หมดอายุก่อนบอทโหลดทัน (LINE 410 'content is gone') — "
                "ไม่เกี่ยวกับ Gemini; ให้ส่งรูปสลิปใหม่ หรือใช้ 'เพิ่มสลิป <ยอด>' ลงมือ")
+    elif _is_model_gone(err):
+        tip = (f"⛔ โมเดล Gemini ที่ตั้งไว้ถูกปลดระวาง/ชื่อผิด — บอทหยุดอ่านสลิปทันที\n"
+               f"แก้ได้ใน 1 นาทีไม่ต้อง deploy: Render → Environment → ตั้ง GEMINI_MODEL "
+               f"(และ GEMINI_MODEL_RETRY ถ้าตัวนั้นก็โดน) เป็นรุ่นที่ยังใช้ได้ → Save\n"
+               f"ตอนนี้ตั้งไว้: {GEMINI_MODEL} / retry={GEMINI_MODEL_RETRY}")
     elif _is_gemini_credits_error(err):
         tip = ("💳 เครดิต Gemini (prepay) หมด! เติมด่วนที่ https://ai.studio/projects — "
                "บอทหยุดอ่านสลิปชั่วคราวกันยิงเปล่า, จะกลับมาอ่านเองใน ~1 นาทีหลังเติม; "
