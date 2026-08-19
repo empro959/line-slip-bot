@@ -1085,30 +1085,36 @@ function checkSaleTotals(){
   var sumObj_=function(o){ var t=0; o=o||{};
     Object.keys(o).forEach(function(k){ if(typeof o[k]==='number') t+=o[k]; }); return t; };
 
-  var bad=[], noRef=[];
+  var bad=[], soft=[], noRef=[];
   Logger.log('🔍 ตรวจ '+daily.length+' วัน (ไม่ใช้ OCR):');
   daily.forEach(function(d){
     var cat=sum_(d.sales), menu=sum_(d.menu), pay=sumObj_(d.payments), zone=sumObj_(d.zones);
-    var ref=Math.max(menu,pay,zone);
-    // ไม่มีตัวเทียบเลย (ไม่มีเมนู/ไม่มีใบ Balance) = ตรวจไม่ได้ ต้องบอก ไม่ใช่เงียบแล้วนับว่าผ่าน
-    if(ref<=0){ noRef.push(d.date); return; }
-    var miss=ref-cat;
-    if(miss>500 && miss>ref*0.03){
-      bad.push({date:d.date, cat:cat, menu:menu, pay:pay, zone:zone, miss:miss});
+    if(menu<=0 && pay<=0 && zone<=0){ noRef.push(d.date); return; }   // ไม่มีตัวเทียบ = ตรวจไม่ได้ ต้องบอก
+    var row={date:d.date, cat:cat, menu:menu, pay:pay, zone:zone};
+    // 🔴 หลักฐานแน่น: 'หมวด' กับ 'เมนู' มาจากใบขายใบเดียวกัน ต้องเท่ากันเสมอ — ไม่เท่า = แกะหมวดตกไปจริง
+    if(menu>0 && menu-cat>500 && menu-cat>menu*0.03){ row.miss=menu-cat; bad.push(row); return; }
+    // 🟡 เงินรับสูงกว่ายอดขาย = คนละใบกัน อธิบายได้หลายทางที่ไม่ใช่บั๊ก
+    //    (ลูกหนี้เก่ามาจ่ายวันนี้ · ใบ Balance ที่ export เป็นช่วงวันที่ · มัดจำ) → ห้ามเหมาว่าพัง
+    if(pay>0 && pay-Math.max(cat,menu)>500 && pay-Math.max(cat,menu)>pay*0.03){
+      row.miss=pay-Math.max(cat,menu); soft.push(row);
     }
   });
 
+  var fmtRow_=function(b){
+    return '   • '+b.date+'  ยอดขายที่บันทึก '+Math.round(b.cat).toLocaleString()+
+           '  | รายเมนู '+Math.round(b.menu).toLocaleString()+
+           '  | เงินรับ '+Math.round(b.pay).toLocaleString()+
+           '  | โซน '+Math.round(b.zone).toLocaleString()+
+           '  → ต่าง '+Math.round(b.miss).toLocaleString()+' บาท';
+  };
+
   if(!bad.length){
-    Logger.log('✅ ทุกวันที่ตรวจได้ ยอดหมวดตรงกับเมนู/เงินรับ/โซน — ไม่มีวันไหนต้องอ่านใหม่');
+    Logger.log('✅ ไม่มีวันไหน "ขาดหมวด" — ยอดหมวดตรงกับรายเมนูทุกวันที่ตรวจได้');
   }else{
-    Logger.log('🔴 พบ '+bad.length+' วันที่ยอดขายน่าจะขาดหมวด (เรียงจากขาดมากสุด):');
-    bad.sort(function(a,b){ return b.miss-a.miss; }).forEach(function(b){
-      Logger.log('   • '+b.date+'  บันทึกไว้ '+Math.round(b.cat).toLocaleString()+
-                 '  | เมนู '+Math.round(b.menu).toLocaleString()+
-                 '  | เงินรับ '+Math.round(b.pay).toLocaleString()+
-                 '  | โซน '+Math.round(b.zone).toLocaleString()+
-                 '  → ขาดราว '+Math.round(b.miss).toLocaleString()+' บาท');
-    });
+    var lost=bad.reduce(function(a,b){return a+b.miss;},0);
+    Logger.log('🔴 ต้องอ่านใหม่ '+bad.length+' วัน — ยอดขายขาดหายรวม ~'+Math.round(lost).toLocaleString()+' บาท');
+    Logger.log('   (หลักฐาน: หมวดกับรายเมนูมาจากใบขายใบเดียวกัน ต้องเท่ากัน — ไม่เท่า = แกะตกไปแน่นอน)');
+    bad.sort(function(a,b){ return b.miss-a.miss; }).forEach(function(b){ Logger.log(fmtRow_(b)); });
     // ให้ก๊อปไปวางใน importPosByDate ได้เลย ไม่ต้องพิมพ์วันที่เองทีละตัว (พิมพ์ผิด = อ่านผิดวัน เสียโควตาฟรี)
     var iso=bad.map(function(b){ return b.date; }).sort();
     Logger.log('\n👉 ก๊อปบรรทัดนี้ไปแทนใน importPosByDate() แล้วรัน:');
@@ -1118,8 +1124,14 @@ function checkSaleTotals(){
     }
     if(iso.length>8) Logger.log('   ⚠️ รันทีละชุด เว้นห่างกันสัก 5 นาที กันชนลิมิต OCR');
   }
+  if(soft.length){
+    Logger.log('\n🟡 '+soft.length+' วัน "เงินรับ > ยอดขาย" — ยังไม่ใช่หลักฐานว่าพัง อย่าเพิ่งเสียโควตาอ่านใหม่:');
+    soft.sort(function(a,b){ return b.miss-a.miss; }).forEach(function(b){ Logger.log(fmtRow_(b)); });
+    Logger.log('   สาเหตุที่ไม่ใช่บั๊ก: ลูกหนี้เก่ามาจ่ายวันนี้ · มัดจำ · ใบ Balance ที่ export เป็นช่วงวันที่ (From..To)');
+    Logger.log('   👉 เช็กก่อนด้วย debugReports() ว่าเมลวันนั้นมาช้าไหม (ใบส่งย้อนหลัง = ฟอร์แมตอังกฤษ ตัวอ่านเคยพัง)');
+  }
   if(noRef.length) Logger.log('⚠️ ตรวจไม่ได้ '+noRef.length+' วัน (ไม่มีเมนู/เงินรับ/โซนให้เทียบ): '+noRef.join(', '));
-  Logger.log('ℹ️ ตัวเลขที่ต่างกันเล็กน้อย (<3%) เป็นเรื่องปกติ — ค่าบริการ/ลูกหนี้/ส่วนลดทำให้ไม่เท่ากันเป๊ะ');
+  Logger.log('ℹ️ ต่างกันเล็กน้อย (<3%) ถือว่าปกติ — ค่าบริการ/ส่วนลด/ปัดเศษทำให้ไม่เท่ากันเป๊ะ');
 }
 
 // ==========================================================================
