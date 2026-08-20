@@ -913,6 +913,24 @@ class TestRecoverMissedSlips(unittest.TestCase):
                           (self.gid, target_date)).fetchone()["c"]
         self.assertEqual(n, 1, "กดกู้ซ้ำแล้วต้องไม่ได้ยอดเบิ้ล")
 
+    def test_saving_slip_clears_its_earlier_miss_row(self):
+        """อ่านรอบแรกไม่ออก → บันทึกว่าพลาด → อ่านซ้ำผ่าน → แถวพลาดต้องหายไป
+        ไม่งั้นลิสต์ 'ใบที่ถูกข้าม' มีของที่บันทึกแล้วค้าง ทำให้ดูเหมือนเงินหาย"""
+        app.record_image_miss(self.gid, "notincome", detail="1,175.00 → ?", message_id="Mretry")
+        app.save_slip(self.gid, {"amount": 1175.0, "sender": "สุจิตรา"}, "PASS", message_id="Mretry")
+        with app._db() as c:
+            n = c.execute("SELECT COUNT(*) c FROM image_misses WHERE group_id=? AND message_id=?",
+                          (self.gid, "Mretry")).fetchone()["c"]
+        self.assertEqual(n, 0, "แถวพลาดของรูปเดียวกันต้องถูกล้างเมื่อบันทึกสำเร็จ")
+
+    def test_other_misses_untouched(self):
+        """ล้างเฉพาะรูปเดียวกัน ห้ามไปลบใบพลาดของรูปอื่น"""
+        app.record_image_miss(self.gid, "notslip", message_id="Mother")
+        app.save_slip(self.gid, {"amount": 100.0}, "PASS", message_id="Mmine")
+        with app._db() as c:
+            n = c.execute("SELECT COUNT(*) c FROM image_misses WHERE group_id=?", (self.gid,)).fetchone()["c"]
+        self.assertEqual(n, 1)
+
     def test_cap_counts_only_ai_reads(self):
         """เพดานต้องนับเฉพาะใบที่ต้องอ่านรูปด้วย AI
         เคสจริง 20/08/26: นับรวมใบที่กู้จากบันทึก (ซึ่งฟรี) → ใบที่ต้องอ่านจริงไม่เคยถูกแตะ

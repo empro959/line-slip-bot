@@ -1183,6 +1183,11 @@ def save_slip(group_id: str, info: dict, verdict_status: str, message_id: str = 
              _slip_account_label(info), message_id)
         )
         conn.execute("INSERT INTO groups (group_id) VALUES (?) ON CONFLICT DO NOTHING", (group_id,))
+        # รูปเดียวกันนี้เคยถูกบันทึกว่า 'พลาด' ไว้ (อ่านรอบแรกไม่ออก แล้วอ่านซ้ำผ่าน) → ล้างแถวพลาดทิ้ง
+        # ไม่งั้นลิสต์ 'ใบที่ถูกข้าม' จะมีของที่บันทึกไปแล้วค้างอยู่ ทำให้ดูเหมือนเงินหาย
+        # (เคสจริง 19/08/26: เจ้าของไล่เช็ค 12 ใบ ปรากฏว่า 4 ใบเป็นแถวค้างแบบนี้)
+        if message_id:
+            conn.execute("DELETE FROM image_misses WHERE group_id=? AND message_id=?", (group_id, message_id))
         conn.commit()
     return rid
 
