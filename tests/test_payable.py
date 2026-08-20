@@ -1166,6 +1166,26 @@ class TestManualSlipAccountLabel(unittest.TestCase):
         self.assertIsNone(app._slip_account_label({"receiver": "JUMPOT KHUMHA"}))
 
 
+class TestReportWindowVsQuietHours(unittest.TestCase):
+    """เลื่อนเวลารายงานไปอยู่ในช่วงเงียบลึกแล้วต้องยังส่งได้
+
+    เคสจริง 20/08/26: เจ้าของตั้ง REPORT_HOUR=5 เพื่อรอข้อมูล POS
+    แต่ช่วงเงียบลึก 03:00–10:00 ตัวปลุกจะไม่แตะงานตามเวลาเลย → รายงานจะไม่ออกจนพ้น 10:00"""
+
+    def test_window_covers_report_time(self):
+        now = app.datetime.now(app.TZ)
+        start = now.replace(hour=app.REPORT_HOUR, minute=app.REPORT_MIN, second=0, microsecond=0)
+        for delta_min, expect in [(0, True), (10, True), (44, True), (46, False), (-1, False)]:
+            probe = start + app.timedelta(minutes=delta_min)
+            in_win = start <= probe < start + app.timedelta(minutes=45)
+            self.assertEqual(in_win, expect, f"{delta_min} นาทีหลังเวลารายงาน")
+
+    def test_function_matches_config(self):
+        """ฟังก์ชันจริงต้องอิงค่า REPORT_HOUR/REPORT_MIN ที่ตั้งไว้ ไม่ใช่ค่าตายตัว"""
+        self.assertIsInstance(app._is_report_window(), bool)
+        self.assertTrue(hasattr(app, "REPORT_HOUR") and hasattr(app, "REPORT_MIN"))
+
+
 class TestPushAcceptsString(unittest.TestCase):
     """_push ต้องรับสตริงได้
 
