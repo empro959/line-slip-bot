@@ -979,5 +979,41 @@ class TestRecoverMissedSlips(unittest.TestCase):
         self.assertEqual(n, 1)
 
 
+class TestPushAcceptsString(unittest.TestCase):
+    """_push ต้องรับสตริงได้
+
+    เคสจริง 20/08/26: คำสั่ง 'กู้สลิป' ส่งข้อความเปล่าเข้า _push → SDK พังเงียบในเธรดเบื้องหลัง
+    ผู้ใช้เห็นแค่ 'กำลังตรวจ...' แล้วรอผลลัพธ์ที่ไม่มีวันมา 10 นาที
+    บั๊กชนิดนี้ต้องกันที่ตัวส่ง ไม่ใช่ไล่แก้ทีละจุดเรียก"""
+
+    def test_string_is_wrapped(self):
+        sent = {}
+        class _Api:
+            def push_message(self, to, messages):
+                sent["to"], sent["msg"] = to, messages
+        orig = app._push_apis[:]
+        app._push_apis[:] = [_Api()]
+        try:
+            app._push("Gtest", "ข้อความเปล่า")
+        finally:
+            app._push_apis[:] = orig
+        self.assertEqual(sent["to"], "Gtest")
+        self.assertIsInstance(sent["msg"], app.TextSendMessage)
+        self.assertEqual(sent["msg"].text, "ข้อความเปล่า")
+
+    def test_message_object_passes_through(self):
+        sent = {}
+        class _Api:
+            def push_message(self, to, messages):
+                sent["msg"] = messages
+        orig = app._push_apis[:]
+        app._push_apis[:] = [_Api()]
+        try:
+            app._push("Gtest", app.TextSendMessage(text="ปกติ"))
+        finally:
+            app._push_apis[:] = orig
+        self.assertEqual(sent["msg"].text, "ปกติ")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

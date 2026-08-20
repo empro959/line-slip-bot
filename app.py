@@ -3134,6 +3134,10 @@ def _push(to, messages):
     #   - ปลายทางที่แมปใน OA_ROUTE → ส่งผ่าน OA ตัวนั้นตัวเดียว
     #   - ปลายทางอื่นทั้งหมด (DM แอดมิน / กลุ่มที่มีแต่เอด เช่นกลุ่มหนี้) → OA1 (เอด) เสมอ ไม่ cascade
     #     ⚠️ เดิม cascade ไป OA ถัดไปเมื่อเอดครบโควต้า — พอเพิ่ม token OA2 แต่มันไม่ได้อยู่ในกลุ่มนั้น → push ล้ม 'not member'
+    # เผลอส่ง str มา (เกิดจริง 20/08/26: คำสั่ง 'กู้สลิป' ส่งข้อความเปล่าเข้ามา → SDK พังเงียบ
+    # ผู้ใช้รอผลลัพธ์ที่ไม่มีวันมา) → ห่อให้เองแทนที่จะระเบิด
+    if isinstance(messages, str):
+        messages = TextSendMessage(text=messages)
     route = _oa_route.get(to) if isinstance(to, str) else None
     candidates = [i for i in route if i < n] if route else [0]   # ลิสต์ OA (หลายตัว = สลับอัตโนมัติเมื่อเต็ม)
     if not candidates:
@@ -5038,9 +5042,16 @@ def handle_text(event):
                 text="🔎 กำลังย้อนอ่านรูปที่พลาด เดี๋ยวสรุปให้ครับ (อาจใช้เวลาสักครู่ถ้ามีหลายใบ)"))
             # ต้องแยกเธรด: การกู้ต้องโหลดรูป+อ่านทีละใบ ถ้าทำในสายนี้จะบล็อก worker
             # (เคสจริง 20/08/26: ค้าง 6 นาที เสี่ยงโดน timeout ตัดกลางคัน)
-            threading.Thread(
-                target=lambda: _push(group_id, recover_missed_slips(group_id, _d, limit=REPORT_RECOVER_MAX)),
-                daemon=True).start()
+            def _run_recover(gid=group_id, dd=_d):
+                try:
+                    _push(gid, TextSendMessage(text=recover_missed_slips(gid, dd, limit=REPORT_RECOVER_MAX)))
+                except Exception as e:      # พังในเธรดเบื้องหลัง = ผู้ใช้รอเก้อ ต้องบอกเสมอ
+                    print(f"[recover] ล้มเหลว group={gid}: {e}", flush=True)
+                    try:
+                        _push(gid, TextSendMessage(text=f"❌ กู้สลิปไม่สำเร็จ: {str(e)[:150]}"))
+                    except Exception:
+                        pass
+            threading.Thread(target=_run_recover, daemon=True).start()
             return
 
         if text.startswith("ดูที่ข้าม ") or text.startswith("รายการข้าม "):
