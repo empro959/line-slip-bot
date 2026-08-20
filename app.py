@@ -1226,6 +1226,15 @@ def record_image_miss(group_id: str, reason: str, detail: str = None, message_id
         print(f"[miss] record failed group={group_id}: {e}", flush=True)
 
 
+def _slip_amount_exists(group_id: str, slip_date: str, amount: float) -> bool:
+    """มีสลิปยอดนี้ของวันนี้อยู่แล้วไหม — ใช้กันบันทึกซ้ำตอนกู้ใบเก่าที่ไม่มีรหัสรูปให้เทียบ"""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM slips WHERE group_id=? AND slip_date=? AND ABS(amount-?)<0.01 LIMIT 1",
+            (group_id, slip_date, float(amount))).fetchone()
+    return row is not None
+
+
 def num_or_zero(s) -> float:
     """'1,017.00' → 1017.0 · อ่านไม่ได้คืน 0 (ใช้กับ detail ที่เราเขียนเอง)"""
     try:
@@ -1245,21 +1254,26 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
     ข้อจำกัดที่ต้องรู้: LINE เก็บไฟล์รูปไว้ไม่นาน (ราวๆ 2 สัปดาห์) เกินนั้นจะได้ 410 กู้ไม่ได้"""
     d = report_date or (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
     with _db() as conn:
+        # เอาทั้งใบที่มีรหัสรูป (กู้ด้วยการอ่านรูปใหม่) และใบ 'ไม่ใช่รายรับ' ที่มีบันทึกยอด/ปลายทาง
+        # (กู้จากบันทึกได้เลย ไม่ต้องใช้รูป — ใบเก่าก่อนระบบเก็บรหัสรูปจึงยังกู้ได้)
         rows = conn.execute(
             "SELECT id, reason, recorded_at, detail, message_id FROM image_misses "
             "WHERE group_id=? AND stat_date=? AND reason IN ('notslip','notincome') "
-            "AND message_id IS NOT NULL AND message_id<>'' ORDER BY id", (group_id, d)).fetchall()
+            "AND ((message_id IS NOT NULL AND message_id<>'') "
+            "     OR (reason='notincome' AND detail IS NOT NULL AND detail<>'')) ORDER BY id",
+            (group_id, d)).fetchall()
     capped = 0
     if limit and len(rows) > limit:
         capped = len(rows) - limit
         rows = rows[:limit]
     if not rows:
-        return f"📭 วันที่ {d} ไม่มีรูปที่พอจะกู้ได้ (ไม่มีใบพลาดที่เก็บรหัสรูปไว้)"
+        return (f"📭 วันที่ {d} ไม่มีใบที่พอจะกู้ได้\n"
+                    "(ใบที่พลาดวันนั้นไม่มีทั้งรหัสรูปและบันทึกยอด — ต้องกรอกมือ)")
 
     added, gone, still, skipped = [], 0, 0, 0
     for r in rows:
         mid = r["message_id"]
-        if _slip_message_seen(group_id, mid):     # กู้ไปแล้ว/บันทึกไปแล้ว — ห้ามนับซ้ำ
+        if mid and _slip_message_seen(group_id, mid):   # กู้ไปแล้ว/บันทึกไปแล้ว — ห้ามนับซ้ำ
             skipped += 1
             continue
 
@@ -1277,6 +1291,9 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
                          "bank": _parts[2] if len(_parts) > 2 else None,
                          "is_slip": True}
                 if _info["amount"] > 0 and _is_income(_info):
+                    if not mid and _slip_amount_exists(group_id, d, _info["amount"]):
+                        skipped += 1      # ไม่มีรหัสรูปให้เทียบ → กันซ้ำด้วยวัน+ยอดแทน
+                        continue
                     save_slip(group_id, _info, "PASS", message_id=mid, slip_date=d)
                     added.append((_info["receiver"] or "?", _info["amount"], r["recorded_at"] or "-"))
                 else:

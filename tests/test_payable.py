@@ -883,11 +883,35 @@ class TestRecoverMissedSlips(unittest.TestCase):
             c.execute("DELETE FROM slips WHERE group_id=?", (self.gid,))
             c.commit()
 
-    def test_no_message_id_means_nothing_to_recover(self):
-        """ใบพลาดเก่าที่ไม่ได้เก็บรหัสรูปไว้ ต้องบอกตรงๆ ว่ากู้ไม่ได้ ไม่ใช่เงียบ"""
-        app.record_image_miss(self.gid, "notslip")
+    def test_nothing_to_work_with_says_so(self):
+        """ใบพลาดที่ไม่มีทั้งรหัสรูปและบันทึกยอด = กู้ไม่ได้จริง ต้องบอกตรงๆ ไม่ใช่เงียบ"""
+        app.record_image_miss(self.gid, "notslip")      # อ่านไม่ออก + ไม่มีรหัสรูป
         out = app.recover_missed_slips(self.gid, _d(0))
-        self.assertIn("ไม่มีรูปที่พอจะกู้ได้", out)
+        self.assertIn("ไม่มีใบที่พอจะกู้ได้", out)
+
+    def test_old_notincome_without_image_id_still_recoverable(self):
+        """ใบเก่าก่อนระบบเก็บรหัสรูป — ถ้ามีบันทึกยอด/ปลายทาง ต้องยังกู้ได้
+        (เคสจริง 19/08: 120 + 897 บันทึกไว้ก่อนมีคอลัมน์ message_id)"""
+        target_date = _d(1)
+        with app._db() as c:
+            c.execute("INSERT INTO image_misses (group_id, stat_date, reason, recorded_at, detail) "
+                      "VALUES (?,?,?,?,?)",
+                      (self.gid, target_date, "notincome", "20:12:54",
+                       "120.00 → บจก. ไส้บ้างซอย4 / 202608193367819 / K PLUS"))
+            c.commit()
+        orig_pa = app.PAYEE_ACCOUNTS[:]
+        app.PAYEE_ACCOUNTS[:] = [("ไส้ย่างซอย4", ["ไส้ย่าง"])]
+        try:
+            out = app.recover_missed_slips(self.gid, target_date)
+            again = app.recover_missed_slips(self.gid, target_date)   # กดซ้ำต้องไม่เบิ้ล
+        finally:
+            app.PAYEE_ACCOUNTS[:] = orig_pa
+        self.assertIn("กู้เข้าระบบแล้ว 1 ใบ", out)
+        self.assertNotIn("กู้เข้าระบบแล้ว 1 ใบ", again)
+        with app._db() as c:
+            n = c.execute("SELECT COUNT(*) c FROM slips WHERE group_id=? AND slip_date=?",
+                          (self.gid, target_date)).fetchone()["c"]
+        self.assertEqual(n, 1, "กดกู้ซ้ำแล้วต้องไม่ได้ยอดเบิ้ล")
 
     def test_records_message_id_when_given(self):
         app.record_image_miss(self.gid, "notslip", message_id="M123")
