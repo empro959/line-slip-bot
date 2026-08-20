@@ -752,6 +752,45 @@ class TestPayeeMatching(unittest.TestCase):
             app.PAYEE_ACCOUNTS[:] = orig
 
 
+class TestResvDraft(unittest.TestCase):
+    """ร่างจองค้าง — บอทถามเฉพาะที่ขาด แล้วเอาคำตอบสั้นๆ มาต่อกับของเดิม
+    (เจ้าของสั่ง 19/08/26: 'ถามเป็นข้อแล้วให้คนจองตอบ แล้วสรุปเลย ถามแบบคนถามกัน')"""
+
+    def setUp(self):
+        app._resv_draft_clear("Gstaff")
+
+    def test_no_draft_by_default(self):
+        self.assertIsNone(app._resv_draft_get("Gstaff"))
+
+    def test_save_and_read_back(self):
+        app._resv_draft_set("Gstaff", "คุณยานา 12 คน โซน A2-3-4", 1)
+        d = app._resv_draft_get("Gstaff")
+        self.assertEqual(d["text"], "คุณยานา 12 คน โซน A2-3-4")
+        self.assertEqual(d["rounds"], 1)
+
+    def test_draft_expires(self):
+        """ร่างต้องหมดอายุเอง ไม่ค้างไปเอาข้อความคนละเรื่องมาต่อทีหลัง"""
+        import json as _json
+        stale = app.time.time() - (app.RESV_FOLLOWUP_MIN * 60 + 60)
+        app._set_meta("resvdraft:Gstaff", _json.dumps({"text": "x", "ts": stale, "rounds": 1}))
+        self.assertIsNone(app._resv_draft_get("Gstaff"))
+
+    def test_corrupt_draft_does_not_crash(self):
+        app._set_meta("resvdraft:Gstaff", "{ไม่ใช่ json")
+        self.assertIsNone(app._resv_draft_get("Gstaff"))
+
+    def test_cleared_after_complete(self):
+        app._resv_draft_set("Gstaff", "x", 1)
+        app._resv_draft_clear("Gstaff")
+        self.assertIsNone(app._resv_draft_get("Gstaff"))
+
+    def test_every_missing_field_has_a_human_question(self):
+        """ทุกช่องที่บอทเช็ค ต้องมีคำถามภาษาคน ไม่งั้นจะ KeyError กลางทางตอนถาม"""
+        for k in ("customer", "people", "date", "time", "table"):
+            self.assertIn(k, app._RESV_ASK)
+            self.assertTrue(app._RESV_ASK[k].endswith("?") or "?" in app._RESV_ASK[k])
+
+
 class TestResvFollowupWindow(unittest.TestCase):
     """พนักงานพิมพ์จองใหม่หลังบอทถามข้อมูลที่ขาด — ต้องไม่หลุด
 
@@ -759,24 +798,14 @@ class TestResvFollowupWindow(unittest.TestCase):
     ตอน 15:19 แต่ไม่มีคำว่า 'จอง' → ด่านคำใบ้ตัดทิ้งเงียบ จองวันที่ 20/8 หายทั้งใบ"""
 
     def setUp(self):
-        app._set_meta("resvwait:Gstaff", "0")
+        app._resv_draft_clear("Gstaff")
 
     def test_window_closed_by_default(self):
         self.assertFalse(app._resv_followup_open("Gstaff"))
 
     def test_window_opens_after_bot_asked(self):
-        app._set_meta("resvwait:Gstaff", str(int(app.time.time())))
+        app._resv_draft_set("Gstaff", "คุณยานา 12 คน", 1)
         self.assertTrue(app._resv_followup_open("Gstaff"))
-
-    def test_window_expires(self):
-        """หน้าต่างต้องปิดเอง ไม่ค้างยิง AI ให้ทุกข้อความที่มีตัวเลขทั้งวัน"""
-        stale = int(app.time.time()) - (app.RESV_FOLLOWUP_MIN * 60 + 60)
-        app._set_meta("resvwait:Gstaff", str(stale))
-        self.assertFalse(app._resv_followup_open("Gstaff"))
-
-    def test_bad_value_does_not_crash(self):
-        app._set_meta("resvwait:Gstaff", "ไม่ใช่ตัวเลข")
-        self.assertFalse(app._resv_followup_open("Gstaff"))
 
     def test_real_message_that_was_dropped_has_no_hint_word(self):
         """ยืนยันสาเหตุ: ข้อความจริงที่หลุด ไม่มีคำใบ้สักคำ แต่มีตัวเลข (เงื่อนไขที่ใช้เปิดทาง)"""

@@ -3262,13 +3262,43 @@ _RESV_HINTS = ("จอง", "โต๊ะ", "table", "reserve", "booking", "ล�
 # บอทถามข้อมูลจองที่ขาดไปแล้วกี่นาที ยังถือว่าข้อความถัดไปในกลุ่มนั้นคือ 'การพิมพ์จองใหม่'
 RESV_FOLLOWUP_MIN = int(os.environ.get("RESV_FOLLOWUP_MIN", "15"))
 
-def _resv_followup_open(group_id: str) -> bool:
-    """อยู่ในช่วง 'เพิ่งถามข้อมูลจองที่ขาด' ไหม (ต่อกลุ่ม)"""
+RESV_FOLLOWUP_MAX_ROUNDS = int(os.environ.get("RESV_FOLLOWUP_MAX_ROUNDS", "3"))
+
+def _resv_draft_get(group_id: str):
+    """ร่างจองที่ค้างอยู่ของกลุ่มนี้ (บอทถามข้อมูลที่ขาดแล้วรอคำตอบ) — คืน None ถ้าไม่มี/หมดอายุ"""
+    raw = _get_meta(f"resvdraft:{group_id}")
+    if not raw:
+        return None
     try:
-        ts = int(_get_meta(f"resvwait:{group_id}") or 0)
-    except (TypeError, ValueError):
-        return False
-    return 0 < time.time() - ts <= RESV_FOLLOWUP_MIN * 60
+        d = json.loads(raw)
+        if time.time() - float(d.get("ts", 0)) > RESV_FOLLOWUP_MIN * 60:
+            return None
+        return d
+    except (ValueError, TypeError):
+        return None
+
+
+def _resv_draft_set(group_id: str, text: str, rounds: int):
+    _set_meta(f"resvdraft:{group_id}", json.dumps({"text": text, "ts": time.time(), "rounds": rounds}))
+
+
+def _resv_draft_clear(group_id: str):
+    _set_meta(f"resvdraft:{group_id}", "")
+
+
+def _resv_followup_open(group_id: str) -> bool:
+    """อยู่ในช่วง 'เพิ่งถามข้อมูลจองที่ขาด แล้วรอคำตอบ' ไหม (ต่อกลุ่ม)"""
+    return _resv_draft_get(group_id) is not None
+
+
+# ถามแบบคนคุยกัน — ถามเฉพาะช่องที่ขาด ไม่ต้องให้พิมพ์ใหม่ทั้งชุด
+_RESV_ASK = {
+    "customer": "จองในชื่อใครครับ?",
+    "people":   "กี่ท่านครับ?",
+    "date":     "วันไหนครับ? (เช่น วันนี้ / พรุ่งนี้ / 25 ส.ค.)",
+    "time":     "กี่โมงครับ?",
+    "table":    "นั่งโซนไหนครับ?",
+}
 # คำที่แปลว่า "ลูกค้าจะมาเดี๋ยวนี้/เร็วๆ นี้" (walk-in) → ไม่มีเวลาชัด แต่ถือว่าจอง 'ตอนนี้' (เวลาปัจจุบัน วันนี้)
 _RESV_NOW_WORDS = ("ซักครู่", "สักครู่", "กำลังมา", "กำลังจะมา", "กำลังไป", "ใกล้ถึง", "จะถึง",
                    "อีกแป๊บ", "อีกประเดี๋ยว", "เดี๋ยวมา", "เดี๋ยวเข้า", "เดี๋ยวถึง", "เดี๋ยวนี้",
@@ -3514,14 +3544,19 @@ def handle_reservation_text(event, text: str, group_id: str):
     #    แล้ว 'ตกคำว่าจอง' ไป → ของเดิมเงียบสนิท จองหลุดทั้งใบโดยไม่มีใครรู้
     #    (เคสจริง 19/08/26 กลุ่ม Staff: บอทถามหาเวลา 15:15 → พนักงานพิมพ์ใหม่ครบทุกอย่างตอน 15:19
     #     แต่ไม่มีคำว่า 'จอง' → บอทไม่รับ จองของวันที่ 20/8 หายเงียบ)
+    _draft = _resv_draft_get(group_id)
     if not any(h in text.lower() for h in _RESV_HINTS):
-        if not (_resv_followup_open(group_id) and any(c.isdigit() for c in text)):
+        if not _draft:
             return False
-        print(f"[resv] ไม่มีคำใบ้ แต่เพิ่งถามข้อมูลจองไป → ลองอ่านต่อ group={group_id}", flush=True)
+        print(f"[resv] ไม่มีคำใบ้ แต่มีร่างจองค้างอยู่ → อ่านต่อ group={group_id}", flush=True)
 
-    print(f"[resv] เช็คจอง group={group_id} text={text}", flush=True)
+    # ต่อคำตอบใหม่เข้ากับสิ่งที่พนักงานพิมพ์ไว้รอบก่อน แล้วอ่านรวมทีเดียว
+    # (พนักงานตอบสั้นๆ ได้เลย เช่น '19.30' หรือ 'โซน A' ไม่ต้องพิมพ์ใหม่ทั้งชุด)
+    eff_text = f"{_draft['text']}\n{text}" if _draft else text
+
+    print(f"[resv] เช็คจอง group={group_id} text={eff_text}", flush=True)
     try:
-        info = extract_reservation(text)
+        info = extract_reservation(eff_text)
     except Exception as e:
         print(f"[resv] extract failed: {e}", flush=True)
         return False
@@ -3530,7 +3565,7 @@ def handle_reservation_text(event, text: str, group_id: str):
         return False
 
     # "ซักครู่/เดี๋ยว/กำลังมา/ตอนนี้/ใกล้ถึง" (walk-in จะมาเลย) = จองตอนนี้ → เวลา=ปัจจุบัน วันนี้ (ไม่ต้องถามเวลา)
-    if not info.get("time_hhmm") and any(w in text for w in _RESV_NOW_WORDS):
+    if not info.get("time_hhmm") and any(w in eff_text for w in _RESV_NOW_WORDS):
         info["time_hhmm"] = datetime.now(TZ).strftime("%H:%M")
         info["is_advance"] = False
         info["date"] = info.get("date") or "วันนี้"
@@ -3546,29 +3581,43 @@ def handle_reservation_text(event, text: str, group_id: str):
 
     requested_by = get_display_name(event.source)
     # จองให้ตัวเอง: ไม่มีชื่อลูกค้า แต่ใช้สรรพนามแทนตัว (กู/ผม/ฉัน/เรา/หนู) → ใช้ชื่อคนแจ้งจองเป็นชื่อลูกค้า
-    if not info.get("customer") and any(w in text for w in ("กู", "ผม", "ฉัน", "เรา", "หนู", "ข้า", "ชั้น", "ตัวเอง")):
+    if not info.get("customer") and any(w in eff_text for w in ("กู", "ผม", "ฉัน", "เรา", "หนู", "ข้า", "ชั้น", "ตัวเอง")):
         info["customer"] = requested_by
 
     # ── เช็คข้อมูลให้ครบ: 1.ชื่อ 2.จำนวนคน 3.เวลา 4.โซน — ถ้าขาดให้ถามกลับ ยังไม่บันทึก ──
     missing = []
-    if not info.get("customer"):  missing.append("1. ชื่อผู้จอง")
-    if not info.get("people"):    missing.append("2. จำนวนคน")
+    if not info.get("customer"):  missing.append("customer")
+    if not info.get("people"):    missing.append("people")
     # วันและเวลา: ต้องได้ 'วันที่จริง' (resv_date) — ถ้า AI แปลงวันไม่ได้/ไม่มั่นใจ ให้ถามวันที่ให้ชัด
-    when_missing = []
-    if not _valid_ymd(info.get("resv_date")): when_missing.append("วันที่ (ระบุให้ชัด เช่น พรุ่งนี้/25 มิ.ย.)")
-    if not info.get("time_hhmm"):             when_missing.append("เวลา")
-    if when_missing:                          missing.append("3. " + " + ".join(when_missing))
-    if not info.get("table"):     missing.append("4. โซน")
+    if not _valid_ymd(info.get("resv_date")): missing.append("date")
+    if not info.get("time_hhmm"):             missing.append("time")
+    if not info.get("table"):     missing.append("table")
     if missing:
-        print(f"[resv] ข้อมูลไม่ครบ ขาด {missing} → ถามกลับ", flush=True)
-        _set_meta(f"resvwait:{group_id}", str(int(time.time())))   # เปิดหน้าต่างรับข้อความถัดไปแม้ไม่มีคำว่า 'จอง' 
-        body = ("📝 ขอข้อมูลจองเพิ่มครับ ยังขาด:\n" + "\n".join(missing) +
-                "\n📖 กรุณาอ่านคู่มือและทำให้ถูกต้องด้วย"
-                "\n─────────────────\n" + _resv_guide())
+        rounds = (_draft or {}).get("rounds", 0) + 1
+        print(f"[resv] ข้อมูลไม่ครบ ขาด {missing} (รอบ {rounds}) → ถามกลับ", flush=True)
+        # ถามวนไม่จบ = กวนกลุ่ม + เปลือง AI → ครบโควตารอบแล้วยอมแพ้ พร้อมบอกวิธีที่ชัวร์
+        if rounds > RESV_FOLLOWUP_MAX_ROUNDS:
+            _resv_draft_clear(group_id)
+            _reply_with_mention(event, "🙏 ขอโทษครับ ผมยังจับข้อมูลไม่ครบ รบกวนพิมพ์ใหม่ทีเดียวแบบนี้ครับ\n"
+                                       "จองโต๊ะ คุณเอ 4 คน วันนี้ 2 ทุ่ม โซน A")
+            return True
+        _resv_draft_set(group_id, eff_text, rounds)
+        # โชว์สิ่งที่จับได้แล้วด้วย จะได้รู้ว่าบอทเข้าใจถูกไหม แล้วถามเฉพาะที่ขาด
+        got = []
+        if info.get("customer"): got.append(f"ชื่อ {info['customer']}")
+        if info.get("people"):   got.append(f"{info['people']} ท่าน")
+        if _valid_ymd(info.get("resv_date")): got.append(_resv_when_label({"resv_date": info["resv_date"]}))
+        if info.get("time_hhmm"): got.append(f"{info['time_hhmm']} น.")
+        if info.get("table"):     got.append(f"โซน {info['table']}")
+        qs = [f"{i+1}) {_RESV_ASK[m]}" for i, m in enumerate(missing)]
+        body = (("รับจองแล้วครับ " + " · ".join(got) + "\n" if got else "") +
+                ("ขอถามเพิ่มอีก " + ("ข้อเดียว" if len(qs) == 1 else f"{len(qs)} ข้อ") + "ครับ\n") +
+                "\n".join(qs) +
+                "\n\n(ตอบสั้นๆ ได้เลยครับ ไม่ต้องพิมพ์ใหม่ทั้งหมด)")
         _reply_with_mention(event, body)
         return True
 
-    _set_meta(f"resvwait:{group_id}", "0")   # ข้อมูลครบแล้ว ปิดหน้าต่าง (กันยิง AI ให้ข้อความอื่นที่มีตัวเลข)
+    _resv_draft_clear(group_id)   # ข้อมูลครบแล้ว ปิดร่าง (กันยิง AI ให้ข้อความอื่นที่ตามมา)
 
     # ── เช็คเวลาจองอยู่ในเวลาเปิดร้าน (11:00–00:00) ไหม — นอกเวลาแค่ 'เตือน' ไม่บล็อก ──
     tmin = _parse_hhmm(info.get("time_hhmm"))
