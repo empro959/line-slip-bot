@@ -913,6 +913,37 @@ class TestRecoverMissedSlips(unittest.TestCase):
                           (self.gid, target_date)).fetchone()["c"]
         self.assertEqual(n, 1, "กดกู้ซ้ำแล้วต้องไม่ได้ยอดเบิ้ล")
 
+    def test_cap_counts_only_ai_reads(self):
+        """เพดานต้องนับเฉพาะใบที่ต้องอ่านรูปด้วย AI
+        เคสจริง 20/08/26: นับรวมใบที่กู้จากบันทึก (ซึ่งฟรี) → ใบที่ต้องอ่านจริงไม่เคยถูกแตะ
+        พิมพ์ซ้ำกี่รอบก็ขึ้น 'ยังเหลืออีก 2 ใบ' เท่าเดิม = วนไม่จบ"""
+        target_date = _d(1)
+        with app._db() as c:
+            for i in range(3):    # ใบที่กู้จากบันทึกได้ (ไม่ใช้ AI)
+                c.execute("INSERT INTO image_misses (group_id, stat_date, reason, recorded_at, detail) "
+                          "VALUES (?,?,?,?,?)",
+                          (self.gid, target_date, "notincome", f"20:0{i}:00",
+                           f"{100+i}.00 → บจก. ไส้บ้างซอย4 / x / K PLUS"))
+            c.execute("INSERT INTO image_misses (group_id, stat_date, reason, recorded_at, message_id) "
+                      "VALUES (?,?,?,?,?)", (self.gid, target_date, "notslip", "21:00:00", "Mneed"))
+            c.commit()
+        reads = []
+        class _Api:
+            def get_message_content(self, mid):
+                reads.append(mid)
+                raise Exception("410 content is gone")
+        orig_api, app.line_bot_api = app.line_bot_api, _Api()
+        orig_pa = app.PAYEE_ACCOUNTS[:]
+        app.PAYEE_ACCOUNTS[:] = [("ไส้ย่างซอย4", ["ไส้ย่าง"])]
+        try:
+            out = app.recover_missed_slips(self.gid, target_date, limit=2)
+        finally:
+            app.line_bot_api = orig_api
+            app.PAYEE_ACCOUNTS[:] = orig_pa
+        self.assertIn("กู้เข้าระบบแล้ว 3 ใบ", out)          # ใบฟรีต้องได้ครบ ไม่โดนเพดานกิน
+        self.assertEqual(reads, ["Mneed"], "ใบที่ต้องอ่านด้วย AI ต้องถูกแตะ")
+        self.assertNotIn("ยังเหลืออีก", out)
+
     def test_recovered_keeps_original_time(self):
         """กู้ย้อนหลังต้องคงเวลาเดิมของใบ ไม่ใช่เวลาที่กดกู้ — ไม่งั้นลำดับในรายงานเพี้ยน"""
         target_date = _d(1)

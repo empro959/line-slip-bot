@@ -1264,10 +1264,10 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
             "AND ((message_id IS NOT NULL AND message_id<>'') "
             "     OR (reason='notincome' AND detail IS NOT NULL AND detail<>'')) ORDER BY id",
             (group_id, d)).fetchall()
-    capped = 0
-    if limit and len(rows) > limit:
-        capped = len(rows) - limit
-        rows = rows[:limit]
+    # เพดานมีไว้คุมค่า 'อ่านรูปด้วย AI' เท่านั้น — ใบที่กู้จากบันทึกไม่เสียค่าอะไร ห้ามเอามานับ
+    # (เคสจริง 20/08/26: นับรวมกันหมด ใบที่ไม่ต้องใช้ AI กินโควตาจนไม่เคยไปถึงใบที่ต้องอ่านจริง
+    #  พิมพ์ซ้ำกี่รอบก็ขึ้น 'ยังเหลืออีก 2 ใบ' เท่าเดิมตลอด = วนไม่จบ)
+    capped, ocr_used = 0, 0
     if not rows:
         return (f"📭 วันที่ {d} ไม่มีใบที่พอจะกู้ได้\n"
                     "(ใบที่พลาดวันนั้นไม่มีทั้งรหัสรูปและบันทึกยอด — ต้องกรอกมือ)")
@@ -1304,6 +1304,10 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
                     notmine += 1        # อ่านออกแล้ว แต่ปลายทางไม่ใช่บัญชีร้านจริงๆ
                 continue
 
+        if limit and ocr_used >= limit:
+            capped += 1
+            continue
+        ocr_used += 1
         try:
             content = line_bot_api.get_message_content(mid)
             image_bytes = b"".join(chunk for chunk in content.iter_content())
@@ -1344,7 +1348,7 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
     if notmine: lines.append(f"↪️ ไม่ใช่เงินเข้าร้าน {notmine} ใบ (โอนเข้าบัญชีอื่น — ถูกต้องแล้วที่ไม่นับ)")
     if gone:    lines.append(f"⏳ รูปหมดอายุใน LINE แล้ว {gone} ใบ — กู้ไม่ได้ ต้องกรอกมือ")
     if skipped: lines.append(f"↩️ ข้าม {skipped} ใบ (บันทึกไปแล้ว)")
-    if capped:  lines.append(f"⚠️ ยังเหลืออีก {capped} ใบที่ยังไม่ได้ลอง (จำกัดรอบละ {limit}) — พิมพ์ 'กู้สลิป {d}' ซ้ำได้")
+    if capped:  lines.append(f"⚠️ ยังเหลืออีก {capped} ใบที่ต้องอ่านรูปด้วย AI (จำกัดรอบละ {limit}) — พิมพ์ 'กู้สลิป {d}' ซ้ำได้")
     lines.append("━━━━━━━━━━━━━")
     if added:
         lines.append(f"👉 พิมพ์ 'สรุป {d}' เพื่อดูยอดหลังกู้")
