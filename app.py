@@ -172,6 +172,14 @@ admin_push_api = LineBotApi(_ADMIN_PUSH_TOKEN) if _ADMIN_PUSH_TOKEN else line_bo
 # ตั้ง env ให้ตรงแพ็กเกจจริงของ OA ที่ใช้อยู่ (เช่นตอนเอดมีแพ็ก 15,000 → PUSH_FREE_LIMIT=15000)
 # ⚠️ LINE นับ 'push เข้ากลุ่ม' = จำนวนสมาชิกกลุ่ม (ไม่ใช่ 1) — ดู _recipient_count
 PUSH_FREE_LIMIT = int(os.environ.get("PUSH_FREE_LIMIT", "300"))
+# เวลาส่ง 'รายงานสลิปของเมื่อวาน' — ดีฟอลต์ 00:30 ตามเดิม
+# เลื่อนให้ช้ากว่าเวลาที่ข้อมูล POS เข้าระบบ (Apps Script ดึงตี 1–5) แล้วรายงานจะได้เทียบยอดโอนได้
+# เช่น ตั้ง REPORT_HOUR=5 REPORT_MIN=30 → รายงานสลิปเป็นตัวสุดท้ายของรอบดึก
+REPORT_HOUR = int(os.environ.get("REPORT_HOUR", "0"))
+REPORT_MIN  = int(os.environ.get("REPORT_MIN", "30"))
+# ก่อนส่งรายงาน ให้ย้อนอ่าน 'รูปที่อ่านไม่ออก' ของเมื่อวานได้สูงสุดกี่ใบ (0 = ปิด)
+# กันค่า OCR บานปลายในวันที่มีคนส่งรูปทั่วไปเข้ากลุ่มเยอะ
+REPORT_RECOVER_MAX = int(os.environ.get("REPORT_RECOVER_MAX", "10"))
 # เตือนเจ้าของครั้งเดียว/เดือน เมื่อ 'OA ตัวสุดท้าย' (ไม่มีตัวสำรองต่อ) push ใกล้เต็ม — ใช้เป็นสัญญาณว่า
 # 'push ไม่พอแล้ว' ถึงเวลาพิจารณาแยกกลุ่มไปอีก OA (แผน B) หรือลด push ก่อนข้อความตกหล่น
 PUSH_WARN_RATIO = float(os.environ.get("PUSH_WARN_RATIO", "0.8"))
@@ -472,17 +480,20 @@ def init_db():
                 stat_date   TEXT,
                 reason      TEXT,
                 recorded_at TEXT,
-                detail      TEXT
+                detail      TEXT,
+                message_id  TEXT
             )
         """)
         # migration: detail = ยอด/ปลายทางของใบที่ถูกข้าม (ไว้ดูว่า 'ข้ามไม่ใช่รายรับ' เข้าบัญชีอะไร) — ทั้ง PG/SQLite
         if USE_PG:
             conn.execute("ALTER TABLE image_misses ADD COLUMN IF NOT EXISTS detail TEXT")
+            conn.execute("ALTER TABLE image_misses ADD COLUMN IF NOT EXISTS message_id TEXT")
         else:
-            try:
-                conn.execute("ALTER TABLE image_misses ADD COLUMN detail TEXT")
-            except Exception:
-                pass
+            for _col in ("detail TEXT", "message_id TEXT"):
+                try:
+                    conn.execute(f"ALTER TABLE image_misses ADD COLUMN {_col}")
+                except Exception:
+                    pass
         conn.execute(f"""
             CREATE TABLE IF NOT EXISTS reservations (
                 id              {_PK},
@@ -1199,19 +1210,93 @@ def _msg_once(message_id: str, kind: str) -> bool:
     return True
 
 
-def record_image_miss(group_id: str, reason: str, detail: str = None):
+def record_image_miss(group_id: str, reason: str, detail: str = None, message_id: str = None):
     """บันทึกรูปที่รับเข้ามาแต่ไม่ได้กลายเป็นสลิป (reason='notslip' อ่านไม่ออก/ไม่ใช่สลิป, 'error' พัง, 'notincome' ข้ามไม่ใช่รายรับ)
-    detail = ยอด/ปลายทาง (ไว้ดูใบที่ถูกข้าม) — ห้าม throw ซ้อน (best-effort)"""
+    detail = ยอด/ปลายทาง (ไว้ดูใบที่ถูกข้าม) · message_id = ไว้ 'ย้อนกลับไปอ่านรูปนั้นใหม่' ตอนยอดไม่ตรง
+    — ห้าม throw ซ้อน (best-effort)"""
     try:
         with _db() as conn:
             conn.execute(
-                "INSERT INTO image_misses (group_id, stat_date, reason, recorded_at, detail) VALUES (?,?,?,?,?)",
+                "INSERT INTO image_misses (group_id, stat_date, reason, recorded_at, detail, message_id) VALUES (?,?,?,?,?,?)",
                 (group_id, datetime.now(TZ).date().isoformat(), reason,
-                 datetime.now(TZ).strftime("%H:%M:%S"), detail)
+                 datetime.now(TZ).strftime("%H:%M:%S"), detail, message_id)
             )
             conn.commit()
     except Exception as e:
         print(f"[miss] record failed group={group_id}: {e}", flush=True)
+
+
+def recover_missed_slips(group_id: str, report_date: str = None, limit: int = None) -> str:
+    """ย้อนกลับไปอ่าน 'รูปที่พลาด' ของวันนั้นใหม่ แล้วบันทึกใบที่อ่านได้ให้อัตโนมัติ
+
+    ทำไมต้องมี: เวลายอดสลิปกับยอดโอนจริงไม่ตรง คนต้องมานั่งไล่หาเองว่าใบไหนหลุด
+    แล้วกรอกมือ — ซึ่งพลาดง่ายและมักลงผิดวัน (คำสั่งเพิ่มมือลงเป็น 'วันนี้' เสมอ)
+    ตัวนี้ใช้ message_id ที่เก็บไว้ตอนพลาด ดึงรูปเดิมจาก LINE มาอ่านใหม่ด้วยโมเดลตัวเก่ง
+    แล้วลงวันให้ตรงกับ 'วันที่รับรูป' ไม่ใช่วันที่กดกู้
+
+    ข้อจำกัดที่ต้องรู้: LINE เก็บไฟล์รูปไว้ไม่นาน (ราวๆ 2 สัปดาห์) เกินนั้นจะได้ 410 กู้ไม่ได้"""
+    d = report_date or (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT id, reason, recorded_at, detail, message_id FROM image_misses "
+            "WHERE group_id=? AND stat_date=? AND reason IN ('notslip','notincome') "
+            "AND message_id IS NOT NULL AND message_id<>'' ORDER BY id", (group_id, d)).fetchall()
+    capped = 0
+    if limit and len(rows) > limit:
+        capped = len(rows) - limit
+        rows = rows[:limit]
+    if not rows:
+        return f"📭 วันที่ {d} ไม่มีรูปที่พอจะกู้ได้ (ไม่มีใบพลาดที่เก็บรหัสรูปไว้)"
+
+    added, gone, still, skipped = [], 0, 0, 0
+    for r in rows:
+        mid = r["message_id"]
+        if _slip_message_seen(group_id, mid):     # กู้ไปแล้ว/บันทึกไปแล้ว — ห้ามนับซ้ำ
+            skipped += 1
+            continue
+        try:
+            content = line_bot_api.get_message_content(mid)
+            image_bytes = b"".join(chunk for chunk in content.iter_content())
+        except Exception as e:
+            if _is_content_gone(e):
+                gone += 1
+            else:
+                print(f"[recover] โหลดรูปไม่ได้ msg={mid}: {str(e)[:100]}", flush=True)
+                gone += 1
+            continue
+        try:
+            info = extract_slip_info(image_bytes, retry=True)   # ใช้โมเดลตัวเก่งเลย รอบนี้มีเวลา
+        except Exception as e:
+            print(f"[recover] อ่านไม่สำเร็จ msg={mid}: {str(e)[:100]}", flush=True)
+            still += 1
+            continue
+        amount = float(info.get("amount") or 0)
+        if not info.get("is_slip", False) or amount <= 0:
+            still += 1
+            continue
+        income_only = INCOME_ONLY or (group_id in INCOME_ONLY_GROUPS)
+        if income_only and PAYEE_ACCOUNTS and _slip_account_label(info) is None:
+            still += 1                                  # ยังตัดสินว่าไม่ใช่เงินร้าน → ไม่ยัดเข้าไปเอง
+            continue
+        save_slip(group_id, info, "PASS", message_id=mid, slip_date=d)   # ← ลงวันเดิม ไม่ใช่วันนี้
+        added.append((info.get("sender") or "?", amount, r["recorded_at"] or "-"))
+
+    if not added and not gone and not still:
+        return f"✅ วันที่ {d} ไม่มีอะไรต้องกู้ (ใบที่พลาดถูกบันทึกไปแล้วทั้งหมด)"
+    lines = [f"🔁 กู้สลิปที่อ่านไม่ออก ({d})", "━━━━━━━━━━━━━"]
+    if added:
+        tot = sum(a[1] for a in added)
+        lines.append(f"✅ กู้เข้าระบบแล้ว {len(added)} ใบ · รวม {tot:,.2f} บาท")
+        for sender, amt, at in added:
+            lines.append(f"   • {sender} | {amt:,.2f} บาท | {at}")
+    if still:   lines.append(f"🟡 อ่านใหม่แล้วยังไม่ผ่าน {still} ใบ (น่าจะเป็นรูปทั่วไป ไม่ใช่สลิป)")
+    if gone:    lines.append(f"⏳ รูปหมดอายุใน LINE แล้ว {gone} ใบ — กู้ไม่ได้ ต้องกรอกมือ")
+    if skipped: lines.append(f"↩️ ข้าม {skipped} ใบ (บันทึกไปแล้ว)")
+    if capped:  lines.append(f"⚠️ ยังเหลืออีก {capped} ใบที่ยังไม่ได้ลอง (จำกัดรอบละ {limit}) — พิมพ์ 'กู้สลิป {d}' ซ้ำได้")
+    lines.append("━━━━━━━━━━━━━")
+    if added:
+        lines.append(f"👉 พิมพ์ 'สรุป {d}' เพื่อดูยอดหลังกู้")
+    return "\n".join(lines)
 
 
 def build_skipped_list(group_id: str, report_date: str = None) -> str:
@@ -3076,7 +3161,7 @@ def maybe_send_daily_report():
     เรียกได้บ่อย (จากทุก /health ping + thread สำรอง) — กันส่งซ้ำด้วย last_report_date + lock จึงทนรีสตาร์ท/หลาย thread
     สำคัญ: มาร์ค last_report_date *หลังส่งสำเร็จ* เท่านั้น ถ้า push พลาด (quota/เน็ต) จะ retry รอบ ping ถัดไปแทนที่จะเงียบทั้งวัน"""
     now = datetime.now(TZ)
-    if (now.hour, now.minute) < (0, 30):
+    if (now.hour, now.minute) < (REPORT_HOUR, REPORT_MIN):
         return
     today = now.date().isoformat()
     # ถือ lock ตลอดการส่ง เพื่อกันสอง thread ผ่านเช็ค "ยังไม่ส่ง" พร้อมกันแล้วส่งซ้ำ (ping ถี่ ๆ)
@@ -3101,6 +3186,15 @@ def maybe_send_daily_report():
             if _group_left(dest) or dest in IGNORE_GROUPS:
                 continue
             try:
+                # ก่อนสรุป: ย้อนอ่าน 'รูปที่พลาด' ของเมื่อวานอีกรอบ จะได้ไม่ต้องมานั่งไล่หาเองว่าใบไหนหาย
+                # (พังตรงนี้ต้องไม่ทำให้รายงานไม่ออก — รายงานสำคัญกว่าการกู้)
+                if REPORT_RECOVER_MAX > 0:
+                    try:
+                        _rc = recover_missed_slips(group_id, yesterday, limit=REPORT_RECOVER_MAX)
+                        if _rc.startswith("🔁") and "กู้เข้าระบบแล้ว" in _rc:
+                            _push(dest, TextSendMessage(text=_rc))
+                    except Exception as _e:
+                        print(f"[recover] ข้ามการกู้ก่อนรายงาน group={group_id}: {str(_e)[:120]}", flush=True)
                 _push(dest, TextSendMessage(text=build_daily_report(group_id, yesterday)))
                 _mark_sent("report", today, group_id)
                 print(f"[report] sent OK → {dest}" + (f" (redirect จาก {group_id})" if dest != group_id else ""), flush=True)
@@ -4205,7 +4299,7 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
     if info.get("is_card_settlement"):
         _amt = f"{float(info.get('amount') or 0):,.2f}"
         print(f"[skip] ใบรูดบัตรเครดิต (ไม่นับยอดโอน) group={group_id} amt={_amt}", flush=True)
-        record_image_miss(group_id, "notincome", detail=f"💳 บัตรเครดิต {_amt} (รูดบัตร EDC)")
+        record_image_miss(group_id, "notincome", detail=f"💳 บัตรเครดิต {_amt} (รูดบัตร EDC)", message_id=msg_id)
         return
 
     # บิลร้านล้วน (ใบแจ้งรายการ) ในกลุ่ม dining → เก็บเข้าคิวรอจับคู่กับสลิป (ไม่ใช่สลิป ไม่นับตกหล่น)
@@ -4229,7 +4323,7 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
         # ยังไม่ใช่สลิปหลังอ่านซ้ำ → นับตกหล่น (เงียบ เว้นแต่เปิด SLIP_WARN_UNREAD) — ไม่เด้ง error กวน
         if not info.get("is_slip", True):
             print(f"[skip] not a slip, group={group_id}", flush=True)
-            record_image_miss(group_id, "notslip")
+            record_image_miss(group_id, "notslip", message_id=msg_id)
             if SLIP_WARN_UNREAD:
                 try:
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(
@@ -4246,7 +4340,7 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
             print(f"[skip] ไม่ใช่รายรับ (ไม่ตรงบัญชีร้านที่ระบุ) group={group_id}", flush=True)
             _amt = f"{float(info.get('amount') or 0):,.2f}"
             _dest = " / ".join(p for p in (info.get("receiver"), info.get("receiver_account"), info.get("bank")) if p) or "?"
-            record_image_miss(group_id, "notincome", detail=f"{_amt} → {_dest}")
+            record_image_miss(group_id, "notincome", detail=f"{_amt} → {_dest}", message_id=msg_id)
             return
 
         # normalize เลขอ้างอิง (ตัวพิมพ์ใหญ่ + ตัดช่องว่าง) กันอ่านเพี้ยนเล็กน้อยแล้วเทียบไม่ตรง
@@ -4845,6 +4939,23 @@ def handle_text(event):
         if text.lower() in ("ดูที่ข้าม", "รายการข้าม", "ใบที่ข้าม", "สรุปข้าม", "ที่ข้าม"):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_skipped_list(group_id)))
             return
+        # กู้รูปที่อ่านไม่ออกของวันนั้น (ดีฟอลต์ = เมื่อวาน) แล้วบันทึกใบที่อ่านได้ให้เอง
+        if text.startswith("กู้สลิป") or text.startswith("กูสลิป"):
+            _arg = text.split(" ", 1)[1].strip() if " " in text else ""
+            _d = None
+            if _arg:
+                try:
+                    datetime.strptime(_arg, "%Y-%m-%d"); _d = _arg
+                except ValueError:
+                    _d = _parse_thai_date(_arg)
+                    if _d is None:
+                        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                            text="❌ ใส่วันที่แบบนี้ครับ: กู้สลิป 2026-08-19 (หรือ กู้สลิป 19/8) · ไม่ใส่ = เมื่อวาน"))
+                        return
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🔎 กำลังย้อนอ่านรูปที่พลาด รอสักครู่..."))
+            _push(group_id, recover_missed_slips(group_id, _d))
+            return
+
         if text.startswith("ดูที่ข้าม ") or text.startswith("รายการข้าม "):
             arg = text.split(" ", 1)[1].strip()
             try:

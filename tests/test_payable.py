@@ -814,5 +814,86 @@ class TestResvFollowupWindow(unittest.TestCase):
         self.assertTrue(any(c.isdigit() for c in real))
 
 
+class TestRecoverMissedSlips(unittest.TestCase):
+    """กู้รูปที่อ่านไม่ออกย้อนหลัง — หัวใจคือ 'ต้องลงวันเดิม ไม่ใช่วันที่กดกู้'
+
+    ทำไมต้องมี: 19/08/26 มีสลิปหลุด 3 ใบ ต้องมานั่งไล่หาเองว่าใบไหน แล้วกรอกมือ
+    ซึ่งคำสั่งกรอกมือลงเป็น 'วันนี้' เสมอ → ถ้าทำข้ามวัน ยอดเพี้ยนสองวันรวด"""
+
+    def setUp(self):
+        self.gid = "Grecover"
+        with app._db() as c:
+            c.execute("DELETE FROM image_misses WHERE group_id=?", (self.gid,))
+            c.execute("DELETE FROM slips WHERE group_id=?", (self.gid,))
+            c.commit()
+
+    def test_no_message_id_means_nothing_to_recover(self):
+        """ใบพลาดเก่าที่ไม่ได้เก็บรหัสรูปไว้ ต้องบอกตรงๆ ว่ากู้ไม่ได้ ไม่ใช่เงียบ"""
+        app.record_image_miss(self.gid, "notslip")
+        out = app.recover_missed_slips(self.gid, _d(0))
+        self.assertIn("ไม่มีรูปที่พอจะกู้ได้", out)
+
+    def test_records_message_id_when_given(self):
+        app.record_image_miss(self.gid, "notslip", message_id="M123")
+        with app._db() as c:
+            row = c.execute("SELECT message_id FROM image_misses WHERE group_id=?", (self.gid,)).fetchone()
+        self.assertEqual(row["message_id"], "M123")
+
+    def test_expired_image_reported_not_crashed(self):
+        """รูปหมดอายุใน LINE (410) = เรื่องปกติ ต้องรายงานว่ากู้ไม่ได้ ไม่ใช่ throw"""
+        app.record_image_miss(self.gid, "notslip", message_id="Mgone")
+        class _Api:
+            def get_message_content(self, mid):
+                raise Exception("410 content is gone")
+        orig, app.line_bot_api = app.line_bot_api, _Api()
+        try:
+            out = app.recover_missed_slips(self.gid, _d(0))
+        finally:
+            app.line_bot_api = orig
+        self.assertIn("หมดอายุ", out)
+
+    def test_recovered_slip_is_filed_under_original_date(self):
+        """ใจความสำคัญ: กู้วันนี้ แต่ต้องลงเป็นวันของรูป"""
+        target_date = _d(1)                      # เมื่อวาน
+        with app._db() as c:                     # จำลองใบพลาดของเมื่อวาน
+            c.execute("INSERT INTO image_misses (group_id, stat_date, reason, recorded_at, detail, message_id) "
+                      "VALUES (?,?,?,?,?,?)", (self.gid, target_date, "notslip", "20:12:00", None, "Mok"))
+            c.commit()
+        class _Content:
+            def iter_content(self): return [b"fake"]
+        class _Api:
+            def get_message_content(self, mid): return _Content()
+        orig_api, app.line_bot_api = app.line_bot_api, _Api()
+        orig_ex, app.extract_slip_info = app.extract_slip_info, (
+            lambda b, retry=False: {"is_slip": True, "amount": 120.0, "sender": "ศักดิ์ชัย"})
+        orig_pa, app.PAYEE_ACCOUNTS[:] = app.PAYEE_ACCOUNTS[:], []
+        try:
+            out = app.recover_missed_slips(self.gid, target_date)
+        finally:
+            app.line_bot_api, app.extract_slip_info = orig_api, orig_ex
+            app.PAYEE_ACCOUNTS[:] = orig_pa
+        self.assertIn("กู้เข้าระบบแล้ว 1 ใบ", out)
+        with app._db() as c:
+            rows = c.execute("SELECT slip_date, amount FROM slips WHERE group_id=?", (self.gid,)).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["slip_date"], target_date, "กู้แล้วต้องลงวันเดิม ไม่ใช่วันที่กดกู้")
+        self.assertEqual(float(rows[0]["amount"]), 120.0)
+
+    def test_does_not_double_add_same_image(self):
+        """กดกู้ซ้ำต้องไม่ได้ยอดเบิ้ล"""
+        target_date = _d(1)
+        with app._db() as c:
+            c.execute("INSERT INTO image_misses (group_id, stat_date, reason, recorded_at, detail, message_id) "
+                      "VALUES (?,?,?,?,?,?)", (self.gid, target_date, "notslip", "20:12:00", None, "Mdup"))
+            c.execute("INSERT INTO slips (group_id, slip_date, sender, amount, verdict, recorded_at, message_id) "
+                      "VALUES (?,?,?,?,?,?,?)", (self.gid, target_date, "ศักดิ์ชัย", 120.0, "PASS", "20:12:00", "Mdup"))
+            c.commit()
+        out = app.recover_missed_slips(self.gid, target_date)
+        self.assertIn("บันทึกไปแล้ว", out)
+        with app._db() as c:
+            n = c.execute("SELECT COUNT(*) c FROM slips WHERE group_id=?", (self.gid,)).fetchone()["c"]
+        self.assertEqual(n, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
