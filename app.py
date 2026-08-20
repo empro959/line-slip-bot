@@ -1169,9 +1169,11 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None, 
 # Storage & Report
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_slip(group_id: str, info: dict, verdict_status: str, message_id: str = None, slip_date: str = None):
+def save_slip(group_id: str, info: dict, verdict_status: str, message_id: str = None, slip_date: str = None,
+              recorded_at: str = None):
     today       = slip_date or datetime.now(TZ).date().isoformat()
-    recorded_at = datetime.now(TZ).strftime("%H:%M:%S")
+    # กู้ย้อนหลังต้องคงเวลาเดิมของใบไว้ ไม่ใช่เวลาที่กดกู้ — ไม่งั้นลำดับในรายงานเพี้ยน
+    recorded_at = recorded_at or datetime.now(TZ).strftime("%H:%M:%S")
     with _db() as conn:
         rid = conn.insert_returning_id(
             "INSERT INTO slips (group_id, slip_date, sender, amount, bank, ref_number, slip_datetime, verdict, recorded_at, account_label, message_id) "
@@ -1294,7 +1296,9 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
                     if not mid and _slip_amount_exists(group_id, d, _info["amount"]):
                         skipped += 1      # ไม่มีรหัสรูปให้เทียบ → กันซ้ำด้วยวัน+ยอดแทน
                         continue
-                    save_slip(group_id, _info, "PASS", message_id=mid, slip_date=d)
+                    _info["sender"] = _info.get("sender") or "(กู้ย้อนหลัง)"
+                    save_slip(group_id, _info, "PASS", message_id=mid, slip_date=d,
+                              recorded_at=r["recorded_at"])
                     added.append((_info["receiver"] or "?", _info["amount"], r["recorded_at"] or "-"))
                 else:
                     notmine += 1        # อ่านออกแล้ว แต่ปลายทางไม่ใช่บัญชีร้านจริงๆ
@@ -1324,7 +1328,8 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
         if income_only and PAYEE_ACCOUNTS and _slip_account_label(info) is None:
             still += 1                                  # ยังตัดสินว่าไม่ใช่เงินร้าน → ไม่ยัดเข้าไปเอง
             continue
-        save_slip(group_id, info, "PASS", message_id=mid, slip_date=d)   # ← ลงวันเดิม ไม่ใช่วันนี้
+        save_slip(group_id, info, "PASS", message_id=mid, slip_date=d,
+                  recorded_at=r["recorded_at"])            # ← ลงวัน+เวลาเดิม ไม่ใช่ตอนกดกู้
         added.append((info.get("sender") or "?", amount, r["recorded_at"] or "-"))
 
     if not added and not gone and not still and not notmine:

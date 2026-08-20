@@ -913,6 +913,26 @@ class TestRecoverMissedSlips(unittest.TestCase):
                           (self.gid, target_date)).fetchone()["c"]
         self.assertEqual(n, 1, "กดกู้ซ้ำแล้วต้องไม่ได้ยอดเบิ้ล")
 
+    def test_recovered_keeps_original_time(self):
+        """กู้ย้อนหลังต้องคงเวลาเดิมของใบ ไม่ใช่เวลาที่กดกู้ — ไม่งั้นลำดับในรายงานเพี้ยน"""
+        target_date = _d(1)
+        with app._db() as c:
+            c.execute("INSERT INTO image_misses (group_id, stat_date, reason, recorded_at, detail) "
+                      "VALUES (?,?,?,?,?)",
+                      (self.gid, target_date, "notincome", "20:12:54",
+                       "120.00 → บจก. ไส้บ้างซอย4 / x / K PLUS"))
+            c.commit()
+        orig_pa = app.PAYEE_ACCOUNTS[:]
+        app.PAYEE_ACCOUNTS[:] = [("ไส้ย่างซอย4", ["ไส้ย่าง"])]
+        try:
+            app.recover_missed_slips(self.gid, target_date)
+        finally:
+            app.PAYEE_ACCOUNTS[:] = orig_pa
+        with app._db() as c:
+            row = c.execute("SELECT recorded_at, sender FROM slips WHERE group_id=?", (self.gid,)).fetchone()
+        self.assertEqual(row["recorded_at"], "20:12:54")
+        self.assertTrue(row["sender"], "ต้องไม่ปล่อยชื่อว่าง (รายงานจะขึ้น None)")
+
     def test_records_message_id_when_given(self):
         app.record_image_miss(self.gid, "notslip", message_id="M123")
         with app._db() as c:
