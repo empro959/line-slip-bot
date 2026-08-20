@@ -1072,6 +1072,29 @@ class TestRecoverMissedSlips(unittest.TestCase):
         self.assertEqual(n, 1)
 
 
+class TestFlipDetection(unittest.TestCase):
+    """ชื่อร้านไปโผล่ฝั่งผู้โอน = สัญญาณว่าอ่านสลับด้าน
+
+    เคสจริง 19/08/26: 3 ใบ (2,486 + 2,195 + 708 = 5,389 บาท) หลุดทั้งหมด
+    เพราะบอทเอาข้อมูลฝั่งผู้โอนมาเป็นผู้รับ แล้วเทียบบัญชีร้านไม่ตรง"""
+
+    def setUp(self):
+        self._orig = app.PAYEE_ACCOUNTS[:]
+        app.PAYEE_ACCOUNTS[:] = [("ร้าน", ["ไส้ย่าง", "99912460", "4612"])]
+
+    def tearDown(self):
+        app.PAYEE_ACCOUNTS[:] = self._orig
+
+    def test_shop_name_on_sender_side_is_detected(self):
+        self.assertTrue(app._kw_hit_any_payee("นาง พิมนภัทร์ สุวภาพ และ นาย สุวัฒน์ บุญ"))
+        self.assertTrue(app._kw_hit_any_payee("004-999-1-2460594-9"))
+
+    def test_stranger_on_sender_side_is_not_flagged(self):
+        """คนอื่นโอนมา = ปกติที่สุด ห้ามติดธงมั่ว ไม่งั้นลิสต์เต็มไปด้วยธงจนไม่มีใครดู"""
+        for t in ["JUMPOT KHUMHA", "SITTHIKORN RI", "นาย สมชาย ใจดี", ""]:
+            self.assertFalse(app._kw_hit_any_payee(t), t)
+
+
 class TestPushAcceptsString(unittest.TestCase):
     """_push ต้องรับสตริงได้
 

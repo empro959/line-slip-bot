@@ -632,6 +632,15 @@ def extract_slip_info(image_bytes: bytes, retry: bool = False, dining: bool = Fa
         "(เช่น SAI YANG SOI 4) — ⚠️ ห้ามเอาชื่อคนฝั่ง 'จาก/ผู้จ่าย' (เช่น นาย...) มาเป็น receiver เด็ดขาด; "
         "receiver_account = 'รหัสร้านค้า' (เช่น KB000001944107) ถ้ามี\n"
         "receiver_account: เลขบัญชีปลายทาง/ผู้รับ (ตามที่เห็น แม้ถูกปิดบางส่วน เช่น xxx-x-x4818-x ก็ใส่)\n"
+        # เคสจริง 19/08/26: อ่านสลับด้าน 3 ใบ (2,486 + 2,195 + 708 = 5,389 บาท) หลุดจากระบบทั้งหมด
+        # เพราะเอาชื่อ/เลขบัญชี 'ฝั่งผู้โอน' มาเป็น receiver → เทียบบัญชีร้านไม่ตรง → ตัดทิ้งว่าไม่ใช่รายรับ
+        "🧭 **วิธีดูว่าฝั่งไหนคือผู้รับ — สำคัญมาก ห้ามสลับ**\n"
+        "  - สลิปไทยเรียง 'บนลงล่าง' เสมอ: บล็อกบน = ผู้โอน · ลูกศร (↓/→) · บล็อกล่าง = **ผู้รับ**\n"
+        "  - ถ้ามีคำว่า 'จาก/From' กับ 'ไปยัง/ไปที่/To' ให้ยึดคำนั้นก่อนเสมอ\n"
+        "  - **รูปอาจถูกถ่ายเอียงหรือหมุน 90 องศา** ให้หมุนกลับในใจก่อนอ่าน แล้วค่อยดูว่าใครอยู่ต้นลูกศร ใครอยู่ปลายลูกศร\n"
+        "  - แถบแจ้งเตือนด้านบน (เช่น 'มีเงินออก xxx-x-x9999-x จำนวน …') เป็นของ **เจ้าของเครื่อง = ผู้โอน** "
+        "ห้ามเอาเลขบัญชีในแถบนั้นมาเป็น receiver_account เด็ดขาด\n"
+        "  - วอลเล็ต/พร้อมเพย์ปลายทางอาจเป็นเลขยาว เช่น 004-999-1-2460594-9 ก็ใส่ตามที่เห็น\n"
         "ref_number: ใช้ 'รหัสอ้างอิง/เลขที่รายการ' ที่ 'ไม่ซ้ำต่อรายการ' (เลขยาวสุ่ม เช่น 202606235fy5l3i8dHouzVOLz หรือ C20260624617516105918)\n"
         "  ⚠️ สลิป 'จ่ายบิล/ชำระร้านค้า' (Krungthai/KBank): 'ห้าม' ใช้ 'รหัสธุรกรรม/รหัสร้านค้า' (เช่น EMPKB000001944107005, KB000001944107) เป็น ref_number เด็ดขาด — "
         "พวกนี้เป็นรหัสของ 'ร้าน' ซ้ำทุกใบทุกคน (ลูกค้าทุกคนได้เลขนี้เหมือนกัน) → ให้ใช้ 'รหัสอ้างอิง' ที่ไม่ซ้ำแทน; ถ้าหาเลขที่ไม่ซ้ำไม่เจอให้ null\n"
@@ -1062,6 +1071,16 @@ def _slip_account_label(info: dict):
         if any(_kw_hit(k, hay) for k in kws):
             return label
     return None
+
+
+def _kw_hit_any_payee(text: str) -> bool:
+    """ข้อความนี้มีคีย์เวิร์ดบัญชีร้านอยู่ไหม (ใช้ตรวจว่าชื่อร้านไปโผล่ผิดฝั่ง)"""
+    hay = _norm_match_text(text)
+    if not hay:
+        return False
+    if any(_kw_hit(k, hay) for k in PAYEE_KEYWORDS):
+        return True
+    return any(_kw_hit(k, hay) for _, kws in PAYEE_ACCOUNTS for k in kws)
 
 
 def _is_income(info: dict) -> bool:
@@ -4458,7 +4477,14 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
             print(f"[skip] ไม่ใช่รายรับ (ไม่ตรงบัญชีร้านที่ระบุ) group={group_id}", flush=True)
             _amt = f"{float(info.get('amount') or 0):,.2f}"
             _dest = " / ".join(p for p in (info.get("receiver"), info.get("receiver_account"), info.get("bank")) if p) or "?"
-            record_image_miss(group_id, "notincome", detail=f"{_amt} → {_dest}", message_id=msg_id)
+            # ชื่อร้านไปโผล่ 'ฝั่งผู้โอน' แทน = สัญญาณว่าอ่านสลับด้าน
+            # ไม่กลับข้างให้เอง เพราะสลิป 'ร้านจ่ายออก' ก็มีหน้าตาแบบนี้เป๊ะ (sender=ร้าน) แยกไม่ได้จากข้อมูลที่มี
+            # แต่ต้องติดป้ายให้เห็นชัดในลิสต์ ไม่ใช่ปนไปกับใบที่ข้ามถูกต้อง
+            _flip = ""
+            if _kw_hit_any_payee(f"{info.get('sender') or ''} {info.get('account') or ''}"):
+                _flip = "  ⚠️ อาจอ่านสลับด้าน (ชื่อร้านอยู่ฝั่งผู้โอน) — ถ้าเป็นเงินเข้าร้านให้กรอกเอง"
+                print(f"[slip] ⚠️ อาจอ่านสลับด้าน group={group_id} amt={_amt}", flush=True)
+            record_image_miss(group_id, "notincome", detail=f"{_amt} → {_dest}{_flip}", message_id=msg_id)
             return
 
         # normalize เลขอ้างอิง (ตัวพิมพ์ใหญ่ + ตัดช่องว่าง) กันอ่านเพี้ยนเล็กน้อยแล้วเทียบไม่ตรง
