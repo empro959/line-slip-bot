@@ -1097,6 +1097,58 @@ class TestFlipDetection(unittest.TestCase):
             self.assertFalse(app._kw_hit_any_payee(t), t)
 
 
+class TestManualSlipParsing(unittest.TestCase):
+    """คำสั่งกรอกสลิปมือ ต้องไม่เรื่องมากเรื่องลำดับคำ
+
+    เคสจริง 20/08/26: พิมพ์ตามตัวอย่างแล้วบอทตอบ 'วิธีใช้' กลับมา
+    คำสั่งนี้ใช้ตอนยอดไม่ตรงซึ่งมักเป็นตอนเร่งรีบ ยิ่งเรื่องมากยิ่งพลาด"""
+
+    @staticmethod
+    def _parse(text, kw="เพิ่มสลิป"):
+        """จำลอง logic เดียวกับใน handler (ส่วนที่แยกวันที่/ยอด/โน๊ต)"""
+        import re
+        rest = text[len(kw):].strip()
+        date = None
+        if "เมื่อวาน" in rest:
+            date = "Y"; rest = rest.replace("เมื่อวาน", " ", 1).strip()
+        else:
+            dm = re.search(r"(?<!\d)(\d{1,2}/\d{1,2}(?:/\d{2,4})?)(?!\d)", rest)
+            if dm:
+                date = dm.group(1); rest = (rest[:dm.start()] + " " + rest[dm.end():]).strip()
+        am = re.search(r"(?<![\d:.])([\d,]+(?:\.\d+)?)(?![\d]*\s*:)(?!\s*[:.]\d)", rest)
+        if not am:
+            return None
+        note = (rest[:am.start()] + " " + rest[am.end():]).strip(" ,")
+        return date, float(am.group(1).replace(",", "")), note
+
+    def test_amount_and_date_in_any_order(self):
+        for t in ["เพิ่มสลิป 19/8 2486 JUMPOT",
+                  "เพิ่มสลิป 2486 JUMPOT 19/8",
+                  "เพิ่มสลิป JUMPOT 2486 19/8"]:
+            got = self._parse(t)
+            self.assertIsNotNone(got, t)
+            self.assertEqual(got[0], "19/8", t)
+            self.assertEqual(got[1], 2486.0, t)
+
+    def test_time_in_note_is_not_taken_as_amount(self):
+        """'23:17' ต้องไม่ถูกอ่านเป็นยอด — ไม่งั้นได้ยอด 23 บาท"""
+        d, amt, note = self._parse("เพิ่มสลิป 19/8 40 ธีรกมล 23:51")
+        self.assertEqual(amt, 40.0)
+        self.assertIn("23:51", note)
+
+    def test_decimal_and_comma(self):
+        _, amt, note = self._parse("เพิ่มสลิป 1,175.50 โต๊ะ 5")
+        self.assertEqual(amt, 1175.5)
+        self.assertIn("โต๊ะ", note)
+
+    def test_yesterday_keyword(self):
+        d, amt, note = self._parse("เพิ่มสลิปเมื่อวาน 708 ประเสริฐ")
+        self.assertEqual((d, amt), ("Y", 708.0))
+
+    def test_plain_amount_still_works(self):
+        self.assertEqual(self._parse("เพิ่มสลิป 114"), (None, 114.0, ""))
+
+
 class TestPushAcceptsString(unittest.TestCase):
     """_push ต้องรับสตริงได้
 

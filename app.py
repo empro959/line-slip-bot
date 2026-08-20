@@ -5158,27 +5158,31 @@ def handle_text(event):
             if text.startswith(_kw):
                 rest = text[len(_kw):].strip()
                 target_date = None   # None = วันนี้ (save_slip ใส่วันนี้ให้เอง)
-                if rest.startswith("เมื่อวาน"):
+                if "เมื่อวาน" in rest:
                     target_date = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
-                    rest = rest[len("เมื่อวาน"):].strip()
+                    rest = rest.replace("เมื่อวาน", " ", 1).strip()
                 else:
-                    dm = re.match(r"^(\d{1,2}/\d{1,2}(?:/\d{2,4})?)\s+(.*)$", rest)
+                    # วันที่อยู่ตรงไหนก็ได้ ไม่ต้องอยู่หน้าสุด — คนพิมพ์เร็วมักสลับลำดับ
+                    dm = re.search(r"(?<!\d)(\d{1,2}/\d{1,2}(?:/\d{2,4})?)(?!\d)", rest)
                     if dm:
                         target_date = _parse_thai_date(dm.group(1))
                         if target_date is None:
                             line_bot_api.reply_message(event.reply_token, TextSendMessage(
                                 text="❌ วันที่ไม่ถูก เช่น: เพิ่มสลิป 6/6 114 (วัน/เดือน ยอด)"))
                             return
-                        rest = dm.group(2).strip()
-                m = re.match(r"^([\d,]+(?:\.\d+)?)\s*(.*)$", rest)
-                if not m:
+                        rest = (rest[:dm.start()] + " " + rest[dm.end():]).strip()
+                # ยอดอยู่ตรงไหนก็ได้เช่นกัน — แต่ต้องไม่ไปหยิบ 'เวลา' (23:17) มาเป็นยอด
+                # เคสจริง 20/08/26: พิมพ์ตามตัวอย่างแล้วบอทตอบวิธีใช้กลับมา เพราะรูปแบบไม่ตรงเป๊ะ
+                am = re.search(r"(?<![\d:.])([\d,]+(?:\.\d+)?)(?![\d]*\s*:)(?!\s*[:.]\d)", rest)
+                if not am:
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=_help_add))
                     return
-                amt = float(m.group(1).replace(",", ""))
+                note = (rest[:am.start()] + " " + rest[am.end():]).strip(" ,")
+                amt = float(am.group(1).replace(",", ""))
                 if amt <= 0:
                     line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ ยอดต้องมากกว่า 0"))
                     return
-                add_manual_slip(event, group_id, amt, (m.group(2).strip() or None), slip_date=target_date)
+                add_manual_slip(event, group_id, amt, (note or None), slip_date=target_date)
                 return
 
         # คำสั่งลบสลิป (กรณีส่งผิด/ซ้ำ)
