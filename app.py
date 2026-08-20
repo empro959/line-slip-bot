@@ -79,7 +79,9 @@ SYNC_URL = os.environ.get("SYNC_URL", "").strip()          # ลิงก์ App
 # แต่บอทร้านจึงไปฝากชีวิตไว้กับสคริปต์ของอีกห้อง (bridge พังทีร้านดับ) · ทางนี้ให้ Render เป็นทางเข้า
 # (อุ่นเครื่องอยู่แล้ว ไม่มี cold start) แล้ว forward ต่อแบบ fire-and-forget ไม่มีทางทำให้บอทช้าหรือพัง
 WEBHOOK_FORWARD_URLS = [u.strip() for u in os.environ.get("WEBHOOK_FORWARD_URLS", "").split(",") if u.strip()]
-WEBHOOK_FORWARD_TIMEOUT = float(os.environ.get("WEBHOOK_FORWARD_TIMEOUT", "5"))
+# ปลายทางอาจเป็น Apps Script ซึ่ง cold start ได้หลายวินาที — ให้เวลาพอสมควร
+# (ยิงใน thread แยกอยู่แล้ว รอนานไม่กระทบการตอบ LINE)
+WEBHOOK_FORWARD_TIMEOUT = float(os.environ.get("WEBHOOK_FORWARD_TIMEOUT", "10"))
 RECON_MIN_DIFF = float(os.environ.get("RECON_MIN_DIFF", "1"))  # ต่างเกินกี่บาทถึงเตือน (กัน rounding)
 RECON_POS_WAIT  = int(os.environ.get("RECON_POS_WAIT", "900"))  # จดมือมาก่อน POS → เว้นกี่วินาทีค่อยลองดึง POS ใหม่ (15 นาที · ไม่กระทบเงิน แค่ยิง GET ถาม Apps Script)
 RECON_MAX_WAIT  = int(os.environ.get("RECON_MAX_WAIT", "10800"))  # รอ POS วันที่ตรงเข้าระบบได้นานสุดกี่วินาที (ดีฟอลต์ 3 ชม. · POS ลงตี1-5) เกินนี้ยังไม่มา = บอก 'ไม่เจอ เทียบไม่ได้' (ไม่เทียบข้ามวัน)
