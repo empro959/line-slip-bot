@@ -4597,6 +4597,13 @@ def add_manual_slip(event, group_id, amount: float, note: str = None, slip_date:
     slip_date=None → ลงวันนี้; ระบุ ISO ได้ (เช่นเคลียร์ยอดหลังเที่ยงคืน ให้ลงเป็นเมื่อวาน)"""
     sender = f"✍️ กรอกมือ{(' ' + note) if note else ''}"
     info = {"sender": sender, "amount": amount}
+    # ถ้าโน๊ตบอกบัญชีปลายทางมาด้วย (เช่น 'พิมนภัทร' / 'ซอย4' / เลขบัญชี) ให้ผูกบัญชีให้เลย
+    # ไม่งั้นยอดกรอกมือจะไปกองใน 'ไม่ระบุบัญชี' ทำให้ยอดแยกบัญชีในรายงานกระทบยาก
+    if note:
+        for _label, _kws in PAYEE_ACCOUNTS:
+            if any(_kw_hit(k, _norm_match_text(note)) for k in _kws):
+                info["receiver"] = note      # ให้ _slip_account_label จับได้ตอนบันทึก
+                break
     save_slip(group_id, info, "PASS", slip_date=slip_date)
     d = slip_date or _today_iso()
     date_note = "" if slip_date is None else f" [ลงวันที่ {slip_date}]"

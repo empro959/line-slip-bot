@@ -1149,6 +1149,26 @@ class TestManualSlipParsing(unittest.TestCase):
         self.assertEqual(self._parse("เพิ่มสลิป 114"), (None, 114.0, ""))
 
 
+class TestManualSlipAccountLabel(unittest.TestCase):
+    """กรอกมือแล้วถ้าโน๊ตบอกบัญชีได้ ควรผูกบัญชีให้ ไม่ใช่กองใน 'ไม่ระบุบัญชี'"""
+
+    def setUp(self):
+        self._orig = app.PAYEE_ACCOUNTS[:]
+        app.PAYEE_ACCOUNTS[:] = [("ไส้ย่างซอย4", ["ไส้ย่าง", "ซอย4"]),
+                                 ("พิมนภัทร์&สุวัฒน์", ["พิมนภัทร", "4612"])]
+
+    def tearDown(self):
+        app.PAYEE_ACCOUNTS[:] = self._orig
+
+    def test_note_with_account_keyword_gets_label(self):
+        self.assertEqual(app._slip_account_label({"receiver": "โอนเข้า ซอย4"}), "ไส้ย่างซอย4")
+        self.assertEqual(app._slip_account_label({"receiver": "เข้าบัญชี พิมนภัทร"}), "พิมนภัทร์&สุวัฒน์")
+
+    def test_note_without_keyword_has_no_label(self):
+        """โน๊ตทั่วไปต้องไม่ถูกเดาว่าเป็นบัญชีไหน"""
+        self.assertIsNone(app._slip_account_label({"receiver": "JUMPOT KHUMHA"}))
+
+
 class TestPushAcceptsString(unittest.TestCase):
     """_push ต้องรับสตริงได้
 
