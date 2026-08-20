@@ -86,6 +86,17 @@ var THAI_MONTHS = ['มกราคม','กุมภาพันธ์','มี
 function num_(s){ s=String(s).replace(/,/g,'').trim(); if(s==='.00'||s==='.'||s==='')return 0; var v=parseFloat(s); return isNaN(v)?null:v; }
 
 // แปลง PDF -> ข้อความ ผ่าน OCR ของ Google
+// Apps Script ตัดจบที่ 6 นาที — การ 'พักรอ rate limit' จึงมีงบจำกัด
+// เคสจริง 20/08/26: พัก 60+120+240 = 420 วิ เกินเพดาน สคริปต์ตายกลางทาง
+// แล้ว log สรุป 'เหลือวันไหนบ้าง' ไม่ได้พิมพ์ = เสียรอบฟรีๆ
+var OCR_WAIT_BUDGET_SEC = 200;      // รวมเวลาพักทั้งรอบ ห้ามเกินนี้
+var _RUN_START_MS = null;           // ตั้งตอนเริ่ม importPosByDate
+
+function _waitBudgetLeft_(){
+  if (!_RUN_START_MS) return OCR_WAIT_BUDGET_SEC;
+  return OCR_WAIT_BUDGET_SEC - (Date.now() - _RUN_START_MS) / 1000;
+}
+
 function pdfToText_(blob){ return _ocrTry_(blob, 3); }  // ลองใหม่ได้ถึง 3 ครั้งถ้าชน rate limit
 function _ocrTry_(blob, retriesLeft){
   try{
@@ -98,6 +109,12 @@ function _ocrTry_(blob, retriesLeft){
       // พัก 60 วิเท่ากันทุกรอบไม่พอ — เคสจริง 19/08/26 พัก 60 วิ 3 รอบติดก็ยังโดน
       // ถอยเป็นเท่าตัว (60 → 120 → 240) ให้โควตาคลายจริง ก่อนยอมแพ้
       var wait=60000*Math.pow(2, 3-retriesLeft);
+      // ถ้าพักแล้วจะเกินงบเวลาของรอบนี้ → เลิกทันที ให้ตัวเรียกสรุปว่าเหลือวันไหน
+      // (ดีกว่าปล่อยให้สคริปต์ถูกตัดจบ แล้วไม่รู้ว่าทำถึงไหน)
+      if (wait/1000 > _waitBudgetLeft_()){
+        Logger.log('   ⏳ โควตา OCR ยังไม่คลาย และเวลาในรอบนี้จะหมดก่อน — หยุดรอ');
+        throw e;
+      }
       Logger.log('   …ชน rate limit พัก '+(wait/1000)+' วิ แล้วลองใหม่ (เหลืออีก '+retriesLeft+' ครั้ง)');
       Utilities.sleep(wait);
       return _ocrTry_(blob, retriesLeft-1);
@@ -1080,7 +1097,8 @@ var DUMP_OCR = false;
 // 👉 ใส่วันที่ที่ต้องการกู้ตรงนี้ — ใส่กี่วันก็ได้ คั่นด้วยจุลภาค แล้วรันฟังก์ชันนี้ครั้งเดียว
 // ใช้ OCR ~4 ครั้ง/วัน · ชนลิมิต (⏳) ให้พัก ~5 นาทีแล้วรันซ้ำได้เลย — วันที่กู้สำเร็จแล้วจะถูกทับด้วยข้อมูลเดิม ไม่เสียหาย
 function importPosByDate(){
-  var DATES = ['2026-07-31','2026-08-12'];   // ← เปลี่ยนเป็นวันที่ที่ขาดจริง (ดูจาก checkSaleTotals/debugDaily)
+  var DATES = ['2026-08-12'];   // ← เปลี่ยนเป็นวันที่ที่ขาดจริง (ดูจาก checkSaleTotals/debugDaily)
+  _RUN_START_MS = Date.now();          // เริ่มจับเวลางบพักรอ rate limit ของรอบนี้
   var done=0, left=[];
   for(var i=0;i<DATES.length;i++){
     var iso=DATES[i];
