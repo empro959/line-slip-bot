@@ -1270,7 +1270,7 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
         return (f"📭 วันที่ {d} ไม่มีใบที่พอจะกู้ได้\n"
                     "(ใบที่พลาดวันนั้นไม่มีทั้งรหัสรูปและบันทึกยอด — ต้องกรอกมือ)")
 
-    added, gone, still, skipped = [], 0, 0, 0
+    added, gone, still, skipped, notmine = [], 0, 0, 0, 0
     for r in rows:
         mid = r["message_id"]
         if mid and _slip_message_seen(group_id, mid):   # กู้ไปแล้ว/บันทึกไปแล้ว — ห้ามนับซ้ำ
@@ -1297,7 +1297,7 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
                     save_slip(group_id, _info, "PASS", message_id=mid, slip_date=d)
                     added.append((_info["receiver"] or "?", _info["amount"], r["recorded_at"] or "-"))
                 else:
-                    still += 1
+                    notmine += 1        # อ่านออกแล้ว แต่ปลายทางไม่ใช่บัญชีร้านจริงๆ
                 continue
 
         try:
@@ -1327,7 +1327,7 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
         save_slip(group_id, info, "PASS", message_id=mid, slip_date=d)   # ← ลงวันเดิม ไม่ใช่วันนี้
         added.append((info.get("sender") or "?", amount, r["recorded_at"] or "-"))
 
-    if not added and not gone and not still:
+    if not added and not gone and not still and not notmine:
         return f"✅ วันที่ {d} ไม่มีอะไรต้องกู้ (ใบที่พลาดถูกบันทึกไปแล้วทั้งหมด)"
     lines = [f"🔁 กู้สลิปที่อ่านไม่ออก ({d})", "━━━━━━━━━━━━━"]
     if added:
@@ -1335,7 +1335,8 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
         lines.append(f"✅ กู้เข้าระบบแล้ว {len(added)} ใบ · รวม {tot:,.2f} บาท")
         for sender, amt, at in added:
             lines.append(f"   • {sender} | {amt:,.2f} บาท | {at}")
-    if still:   lines.append(f"🟡 อ่านใหม่แล้วยังไม่ผ่าน {still} ใบ (น่าจะเป็นรูปทั่วไป ไม่ใช่สลิป)")
+    if still:   lines.append(f"🟡 อ่านใหม่แล้วยังไม่ออก {still} ใบ (น่าจะเป็นรูปทั่วไป ไม่ใช่สลิป)")
+    if notmine: lines.append(f"↪️ ไม่ใช่เงินเข้าร้าน {notmine} ใบ (โอนเข้าบัญชีอื่น — ถูกต้องแล้วที่ไม่นับ)")
     if gone:    lines.append(f"⏳ รูปหมดอายุใน LINE แล้ว {gone} ใบ — กู้ไม่ได้ ต้องกรอกมือ")
     if skipped: lines.append(f"↩️ ข้าม {skipped} ใบ (บันทึกไปแล้ว)")
     if capped:  lines.append(f"⚠️ ยังเหลืออีก {capped} ใบที่ยังไม่ได้ลอง (จำกัดรอบละ {limit}) — พิมพ์ 'กู้สลิป {d}' ซ้ำได้")
