@@ -935,6 +935,34 @@ class TestRecoverMissedSlips(unittest.TestCase):
         self.assertEqual(rows[0]["slip_date"], target_date, "กู้แล้วต้องลงวันเดิม ไม่ใช่วันที่กดกู้")
         self.assertEqual(float(rows[0]["amount"]), 120.0)
 
+    def test_notincome_recovered_without_touching_line_or_ai(self):
+        """ใบที่ 'อ่านออกแล้วแต่ตัดว่าไม่ใช่เงินร้าน' ต้องกู้ได้จากบันทึกเดิม
+        ไม่ต้องโหลดรูป ไม่ต้องยิง AI — เคสจริง 19/08 (120 + 897 ที่ชื่อร้าน OCR เพี้ยน)"""
+        target_date = _d(1)
+        with app._db() as c:
+            for detail, mid in [("120.00 → บจก. ไส้บ้างซอย4 / 202608193367819 / K PLUS", "Mn1"),
+                                ("897.00 → ไส้บ้างซอย 4 / 202608193485741 / กสิกรไทย", "Mn2"),
+                                ("710.00 → บจก. โปร พลัส มัลติเทค / x-9431 / ธนาคาร", "Mn3")]:
+                c.execute("INSERT INTO image_misses (group_id, stat_date, reason, recorded_at, detail, message_id) "
+                          "VALUES (?,?,?,?,?,?)", (self.gid, target_date, "notincome", "20:12:00", detail, mid))
+            c.commit()
+
+        def _boom(*a, **k):
+            raise AssertionError("ต้องไม่โหลดรูปจาก LINE ในทางลัดนี้")
+        orig_api, app.line_bot_api = app.line_bot_api, type("X", (), {"get_message_content": _boom})()
+        orig_pa = app.PAYEE_ACCOUNTS[:]
+        app.PAYEE_ACCOUNTS[:] = [("ไส้ย่างซอย4", ["ไส้ย่าง"])]
+        try:
+            out = app.recover_missed_slips(self.gid, target_date)
+        finally:
+            app.line_bot_api = orig_api
+            app.PAYEE_ACCOUNTS[:] = orig_pa
+        self.assertIn("กู้เข้าระบบแล้ว 2 ใบ", out)
+        with app._db() as c:
+            rows = c.execute("SELECT slip_date, amount FROM slips WHERE group_id=? ORDER BY amount", (self.gid,)).fetchall()
+        self.assertEqual([float(r["amount"]) for r in rows], [120.0, 897.0])
+        self.assertTrue(all(r["slip_date"] == target_date for r in rows), "ต้องลงวันเดิม")
+
     def test_does_not_double_add_same_image(self):
         """กดกู้ซ้ำต้องไม่ได้ยอดเบิ้ล"""
         target_date = _d(1)

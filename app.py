@@ -1226,6 +1226,14 @@ def record_image_miss(group_id: str, reason: str, detail: str = None, message_id
         print(f"[miss] record failed group={group_id}: {e}", flush=True)
 
 
+def num_or_zero(s) -> float:
+    """'1,017.00' → 1017.0 · อ่านไม่ได้คืน 0 (ใช้กับ detail ที่เราเขียนเอง)"""
+    try:
+        return float(str(s).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def recover_missed_slips(group_id: str, report_date: str = None, limit: int = None) -> str:
     """ย้อนกลับไปอ่าน 'รูปที่พลาด' ของวันนั้นใหม่ แล้วบันทึกใบที่อ่านได้ให้อัตโนมัติ
 
@@ -1254,6 +1262,27 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
         if _slip_message_seen(group_id, mid):     # กู้ไปแล้ว/บันทึกไปแล้ว — ห้ามนับซ้ำ
             skipped += 1
             continue
+
+        # ทางลัดสำหรับใบที่ 'อ่านออกแล้ว แต่ตัดสินว่าไม่ใช่เงินร้าน' —
+        # ตอนบันทึกพลาดเราเก็บยอด+ปลายทางไว้ใน detail แล้ว จึงตัดสินใหม่ได้เลย
+        # ไม่ต้องโหลดรูป ไม่ต้องยิง AI ซ้ำ (เร็วกว่าเป็นสิบเท่า และไม่เสียค่าอ่าน)
+        # ใช้ได้ผลจริงหลังแก้ตัวเทียบชื่อร้าน: ใบที่เคยตกเพราะ OCR อ่านชื่อเพี้ยนจะกลับเข้ามาเอง
+        if r["reason"] == "notincome" and r["detail"]:
+            _m = re.match(r"\s*([\d,]+(?:\.\d+)?)\s*→\s*(.+)$", r["detail"])
+            if _m:
+                _parts = [p.strip() for p in _m.group(2).split("/")]
+                _info = {"amount": num_or_zero(_m.group(1)),
+                         "receiver": _parts[0] if _parts else None,
+                         "receiver_account": _parts[1] if len(_parts) > 1 else None,
+                         "bank": _parts[2] if len(_parts) > 2 else None,
+                         "is_slip": True}
+                if _info["amount"] > 0 and _is_income(_info):
+                    save_slip(group_id, _info, "PASS", message_id=mid, slip_date=d)
+                    added.append((_info["receiver"] or "?", _info["amount"], r["recorded_at"] or "-"))
+                else:
+                    still += 1
+                continue
+
         try:
             content = line_bot_api.get_message_content(mid)
             image_bytes = b"".join(chunk for chunk in content.iter_content())
@@ -5005,8 +5034,13 @@ def handle_text(event):
                         line_bot_api.reply_message(event.reply_token, TextSendMessage(
                             text="❌ ใส่วันที่แบบนี้ครับ: กู้สลิป 2026-08-19 (หรือ กู้สลิป 19/8) · ไม่ใส่ = เมื่อวาน"))
                         return
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🔎 กำลังย้อนอ่านรูปที่พลาด รอสักครู่..."))
-            _push(group_id, recover_missed_slips(group_id, _d))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="🔎 กำลังย้อนอ่านรูปที่พลาด เดี๋ยวสรุปให้ครับ (อาจใช้เวลาสักครู่ถ้ามีหลายใบ)"))
+            # ต้องแยกเธรด: การกู้ต้องโหลดรูป+อ่านทีละใบ ถ้าทำในสายนี้จะบล็อก worker
+            # (เคสจริง 20/08/26: ค้าง 6 นาที เสี่ยงโดน timeout ตัดกลางคัน)
+            threading.Thread(
+                target=lambda: _push(group_id, recover_missed_slips(group_id, _d, limit=REPORT_RECOVER_MAX)),
+                daemon=True).start()
             return
 
         if text.startswith("ดูที่ข้าม ") or text.startswith("รายการข้าม "):
