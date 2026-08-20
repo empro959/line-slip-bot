@@ -148,6 +148,18 @@ RESV_LOOP_SEC    = int(os.environ.get("RESV_LOOP_SEC", "120"))  # รอบเ�
 TZ                = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
 
 
+def _is_report_window() -> bool:
+    """อยู่ในกรอบเวลา 'ถึงคิวส่งรายงานสลิป' ไหม (นับจากเวลาที่ตั้ง ไป 45 นาที)
+
+    ทำไมต้องมี: ช่วงเงียบลึกถูกออกแบบให้ 'ไม่แตะงานตามเวลาเลย' (ปล่อย DB หลับ)
+    ถ้าเจ้าของเลื่อนเวลารายงานไปอยู่ในช่วงนั้น (เช่น 05:30 เพื่อรอข้อมูล POS)
+    รายงานจะไม่มีวันออกจนกว่าจะพ้น 10:00 — เงียบหายโดยไม่มีใครรู้
+    จึงเปิดช่องเฉพาะกรอบสั้นๆ นี้ให้ทำงานได้ แม้อยู่ในช่วงเงียบลึก"""
+    now = datetime.now(TZ)
+    start = now.replace(hour=REPORT_HOUR, minute=REPORT_MIN, second=0, microsecond=0)
+    return start <= now < start + timedelta(minutes=45)
+
+
 def _in_deep_quiet() -> bool:
     """อยู่ช่วง 'เงียบลึก' ไหม — ใช้หยุด poll DB ปล่อย Neon หลับ (ประหยัด compute) เมื่อไม่มีงานตามเวลา"""
     h = datetime.now(TZ).hour
@@ -3422,7 +3434,7 @@ def maybe_send_payable_summary():
 def _report_backup_loop():
     """thread สำรอง — เผื่อ UptimeRobot ไม่ ping; เช็คทุก ~5 นาที"""
     while True:
-        if _in_deep_quiet():
+        if _in_deep_quiet() and not _is_report_window():
             time.sleep(1800)   # เงียบลึก → ไม่มีรายงานตามเวลา หยุดเช็ค ปล่อย Neon หลับ
             continue
         time.sleep(300)
@@ -5360,7 +5372,7 @@ def handle_postback(event):
 @app.route("/health", methods=["GET"])
 def health():
     # ช่วงเงียบลึก (ดึก–เช้า) → ตอบเบาๆ ไม่แตะ DB/รายงาน เพื่อปล่อยให้ Neon หลับ ประหยัด compute
-    if _in_deep_quiet():
+    if _in_deep_quiet() and not _is_report_window():
         return {"status": "ok", "quiet": True}
     # ทุกครั้งที่ถูก ping (UptimeRobot ทุก 5 นาที) เช็คว่าถึงเวลาส่งรายงาน/สรุปจองไหม + เฝ้า memory
     try:
