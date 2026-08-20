@@ -3259,6 +3259,16 @@ threading.Thread(target=_report_backup_loop, daemon=True).start()
 
 # คำที่เป็นไปได้ว่าเกี่ยวกับการจอง (เกตเบื้องต้นแบบประหยัด ก่อนส่งให้ AI ตัดสินจริง)
 _RESV_HINTS = ("จอง", "โต๊ะ", "table", "reserve", "booking", "ลูกค้า")
+# บอทถามข้อมูลจองที่ขาดไปแล้วกี่นาที ยังถือว่าข้อความถัดไปในกลุ่มนั้นคือ 'การพิมพ์จองใหม่'
+RESV_FOLLOWUP_MIN = int(os.environ.get("RESV_FOLLOWUP_MIN", "15"))
+
+def _resv_followup_open(group_id: str) -> bool:
+    """อยู่ในช่วง 'เพิ่งถามข้อมูลจองที่ขาด' ไหม (ต่อกลุ่ม)"""
+    try:
+        ts = int(_get_meta(f"resvwait:{group_id}") or 0)
+    except (TypeError, ValueError):
+        return False
+    return 0 < time.time() - ts <= RESV_FOLLOWUP_MIN * 60
 # คำที่แปลว่า "ลูกค้าจะมาเดี๋ยวนี้/เร็วๆ นี้" (walk-in) → ไม่มีเวลาชัด แต่ถือว่าจอง 'ตอนนี้' (เวลาปัจจุบัน วันนี้)
 _RESV_NOW_WORDS = ("ซักครู่", "สักครู่", "กำลังมา", "กำลังจะมา", "กำลังไป", "ใกล้ถึง", "จะถึง",
                    "อีกแป๊บ", "อีกประเดี๋ยว", "เดี๋ยวมา", "เดี๋ยวเข้า", "เดี๋ยวถึง", "เดี๋ยวนี้",
@@ -3499,8 +3509,15 @@ def handle_reservation_text(event, text: str, group_id: str):
     # ทำงานถ้า: เป็นกลุ่มรับจองวันนี้ หรือ ตั้งบาร์น้ำไว้ (เพื่อรับจองล่วงหน้าจากทุกกลุ่ม)
     if not in_resv and not BAR_GROUP_ID:
         return False
+    # ปกติต้องมีคำใบ้ (จอง/โต๊ะ/ลูกค้า) ถึงจะเรียก AI อ่าน — กันยิง AI ทุกข้อความในกลุ่ม
+    # ⚠️ ข้อยกเว้นที่ต้องมี: ถ้าบอทเพิ่ง 'ถามข้อมูลจองที่ขาด' ในกลุ่มนี้ พนักงานมักพิมพ์ใหม่ทั้งชุด
+    #    แล้ว 'ตกคำว่าจอง' ไป → ของเดิมเงียบสนิท จองหลุดทั้งใบโดยไม่มีใครรู้
+    #    (เคสจริง 19/08/26 กลุ่ม Staff: บอทถามหาเวลา 15:15 → พนักงานพิมพ์ใหม่ครบทุกอย่างตอน 15:19
+    #     แต่ไม่มีคำว่า 'จอง' → บอทไม่รับ จองของวันที่ 20/8 หายเงียบ)
     if not any(h in text.lower() for h in _RESV_HINTS):
-        return False
+        if not (_resv_followup_open(group_id) and any(c.isdigit() for c in text)):
+            return False
+        print(f"[resv] ไม่มีคำใบ้ แต่เพิ่งถามข้อมูลจองไป → ลองอ่านต่อ group={group_id}", flush=True)
 
     print(f"[resv] เช็คจอง group={group_id} text={text}", flush=True)
     try:
@@ -3544,11 +3561,14 @@ def handle_reservation_text(event, text: str, group_id: str):
     if not info.get("table"):     missing.append("4. โซน")
     if missing:
         print(f"[resv] ข้อมูลไม่ครบ ขาด {missing} → ถามกลับ", flush=True)
+        _set_meta(f"resvwait:{group_id}", str(int(time.time())))   # เปิดหน้าต่างรับข้อความถัดไปแม้ไม่มีคำว่า 'จอง' 
         body = ("📝 ขอข้อมูลจองเพิ่มครับ ยังขาด:\n" + "\n".join(missing) +
                 "\n📖 กรุณาอ่านคู่มือและทำให้ถูกต้องด้วย"
                 "\n─────────────────\n" + _resv_guide())
         _reply_with_mention(event, body)
         return True
+
+    _set_meta(f"resvwait:{group_id}", "0")   # ข้อมูลครบแล้ว ปิดหน้าต่าง (กันยิง AI ให้ข้อความอื่นที่มีตัวเลข)
 
     # ── เช็คเวลาจองอยู่ในเวลาเปิดร้าน (11:00–00:00) ไหม — นอกเวลาแค่ 'เตือน' ไม่บล็อก ──
     tmin = _parse_hhmm(info.get("time_hhmm"))

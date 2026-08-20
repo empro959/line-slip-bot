@@ -752,5 +752,38 @@ class TestPayeeMatching(unittest.TestCase):
             app.PAYEE_ACCOUNTS[:] = orig
 
 
+class TestResvFollowupWindow(unittest.TestCase):
+    """พนักงานพิมพ์จองใหม่หลังบอทถามข้อมูลที่ขาด — ต้องไม่หลุด
+
+    เคสจริง 19/08/26 กลุ่ม Staff: บอทถามหา 'เวลา' ตอน 15:15 → พนักงานพิมพ์ใหม่ครบทุกอย่าง
+    ตอน 15:19 แต่ไม่มีคำว่า 'จอง' → ด่านคำใบ้ตัดทิ้งเงียบ จองวันที่ 20/8 หายทั้งใบ"""
+
+    def setUp(self):
+        app._set_meta("resvwait:Gstaff", "0")
+
+    def test_window_closed_by_default(self):
+        self.assertFalse(app._resv_followup_open("Gstaff"))
+
+    def test_window_opens_after_bot_asked(self):
+        app._set_meta("resvwait:Gstaff", str(int(app.time.time())))
+        self.assertTrue(app._resv_followup_open("Gstaff"))
+
+    def test_window_expires(self):
+        """หน้าต่างต้องปิดเอง ไม่ค้างยิง AI ให้ทุกข้อความที่มีตัวเลขทั้งวัน"""
+        stale = int(app.time.time()) - (app.RESV_FOLLOWUP_MIN * 60 + 60)
+        app._set_meta("resvwait:Gstaff", str(stale))
+        self.assertFalse(app._resv_followup_open("Gstaff"))
+
+    def test_bad_value_does_not_crash(self):
+        app._set_meta("resvwait:Gstaff", "ไม่ใช่ตัวเลข")
+        self.assertFalse(app._resv_followup_open("Gstaff"))
+
+    def test_real_message_that_was_dropped_has_no_hint_word(self):
+        """ยืนยันสาเหตุ: ข้อความจริงที่หลุด ไม่มีคำใบ้สักคำ แต่มีตัวเลข (เงื่อนไขที่ใช้เปิดทาง)"""
+        real = "คุณยานา จำนวน 12 คน เวลา 19.30 0826062980 โซน A2-3-4 วันที่ 20/8/69 @All"
+        self.assertFalse(any(h in real.lower() for h in app._RESV_HINTS))
+        self.assertTrue(any(c.isdigit() for c in real))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
