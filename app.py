@@ -4591,20 +4591,52 @@ def delete_slip_by_index(event, group_id, n, slip_date: str = None):
              "─────────────────\n" + build_daily_report(group_id, d)))
 
 
+_MANUAL_SLIP_KWS = ("เพิ่มสลิป", "กรอกสลิป", "เติมสลิป", "บวกสลิป")
+
+def _parse_manual_slip_line(line: str):
+    """อ่านบรรทัดคำสั่งกรอกสลิป → (slip_date|None, amount, note) · อ่านไม่ได้คืน None
+    วันที่/ยอดอยู่ตรงไหนก็ได้ · ห้ามหยิบเวลา (23:17) มาเป็นยอด"""
+    rest = line.strip()
+    for kw in _MANUAL_SLIP_KWS:
+        if rest.startswith(kw):
+            rest = rest[len(kw):].strip()
+            break
+    if not rest:
+        return None
+    slip_date = None
+    if "เมื่อวาน" in rest:
+        slip_date = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+        rest = rest.replace("เมื่อวาน", " ", 1).strip()
+    else:
+        dm = re.search(r"(?<!\d)(\d{1,2}/\d{1,2}(?:/\d{2,4})?)(?!\d)", rest)
+        if dm:
+            slip_date = _parse_thai_date(dm.group(1))
+            if slip_date is None:
+                return "BADDATE"
+            rest = (rest[:dm.start()] + " " + rest[dm.end():]).strip()
+    am = re.search(r"(?<![\d:.])([\d,]+(?:\.\d+)?)(?![\d]*\s*:)(?!\s*[:.]\d)", rest)
+    if not am:
+        return None
+    note = (rest[:am.start()] + " " + rest[am.end():]).strip(" ,")
+    return slip_date, float(am.group(1).replace(",", "")), (note or None)
+
+
+def _save_manual_slip(group_id, amount: float, note: str = None, slip_date: str = None):
+    """บันทึกสลิปกรอกมือ (ไม่ตอบกลับ) — ใช้ทั้งแบบใบเดียวและแบบวางทีเดียวหลายใบ"""
+    info = {"sender": f"✍️ กรอกมือ{(' ' + note) if note else ''}", "amount": amount}
+    if note:
+        for _label, _kws in PAYEE_ACCOUNTS:
+            if any(_kw_hit(k, _norm_match_text(note)) for k in _kws):
+                info["receiver"] = note
+                break
+    save_slip(group_id, info, "PASS", slip_date=slip_date)
+
+
 def add_manual_slip(event, group_id, amount: float, note: str = None, slip_date: str = None):
     """กรอกสลิปด้วยมือ (เมื่อบอทอ่านรูปไม่ออก เช่น ถ่ายจอเบลอ/มืด/มี noise) เพื่อให้ยอดตรง
     บันทึกเป็นสลิป PASS ป้ายชื่อ '✍️ กรอกมือ' ให้เห็นชัดว่าเป็นการเติมเอง ไม่ใช่ AI อ่าน
     slip_date=None → ลงวันนี้; ระบุ ISO ได้ (เช่นเคลียร์ยอดหลังเที่ยงคืน ให้ลงเป็นเมื่อวาน)"""
-    sender = f"✍️ กรอกมือ{(' ' + note) if note else ''}"
-    info = {"sender": sender, "amount": amount}
-    # ถ้าโน๊ตบอกบัญชีปลายทางมาด้วย (เช่น 'พิมนภัทร' / 'ซอย4' / เลขบัญชี) ให้ผูกบัญชีให้เลย
-    # ไม่งั้นยอดกรอกมือจะไปกองใน 'ไม่ระบุบัญชี' ทำให้ยอดแยกบัญชีในรายงานกระทบยาก
-    if note:
-        for _label, _kws in PAYEE_ACCOUNTS:
-            if any(_kw_hit(k, _norm_match_text(note)) for k in _kws):
-                info["receiver"] = note      # ให้ _slip_account_label จับได้ตอนบันทึก
-                break
-    save_slip(group_id, info, "PASS", slip_date=slip_date)
+    _save_manual_slip(group_id, amount, note, slip_date)
     d = slip_date or _today_iso()
     date_note = "" if slip_date is None else f" [ลงวันที่ {slip_date}]"
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
@@ -5161,36 +5193,42 @@ def handle_text(event):
         _help_add = ("✍️ พิมพ์: เพิ่มสลิป <ยอด> [โน๊ต]\n"
                      "เช่น  เพิ่มสลิป 114  |  เพิ่มสลิป 114 โต๊ะ5\n"
                      "ย้อนวัน:  เพิ่มสลิปเมื่อวาน 114  |  เพิ่มสลิป 6/6 114")
-        for _kw in ("เพิ่มสลิป", "กรอกสลิป", "เติมสลิป", "บวกสลิป"):
-            if text.startswith(_kw):
-                rest = text[len(_kw):].strip()
-                target_date = None   # None = วันนี้ (save_slip ใส่วันนี้ให้เอง)
-                if "เมื่อวาน" in rest:
-                    target_date = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
-                    rest = rest.replace("เมื่อวาน", " ", 1).strip()
+        if any(text.startswith(_kw) for _kw in _MANUAL_SLIP_KWS):
+            _lines = [ln for ln in text.split("\n") if ln.strip()]
+            _parsed, _bad = [], []
+            for ln in _lines:
+                r = _parse_manual_slip_line(ln)
+                if r == "BADDATE":
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                        text="❌ วันที่ไม่ถูก เช่น: เพิ่มสลิป 6/6 114 (วัน/เดือน ยอด)"))
+                    return
+                if r is None or r[1] <= 0:
+                    _bad.append(ln.strip())
                 else:
-                    # วันที่อยู่ตรงไหนก็ได้ ไม่ต้องอยู่หน้าสุด — คนพิมพ์เร็วมักสลับลำดับ
-                    dm = re.search(r"(?<!\d)(\d{1,2}/\d{1,2}(?:/\d{2,4})?)(?!\d)", rest)
-                    if dm:
-                        target_date = _parse_thai_date(dm.group(1))
-                        if target_date is None:
-                            line_bot_api.reply_message(event.reply_token, TextSendMessage(
-                                text="❌ วันที่ไม่ถูก เช่น: เพิ่มสลิป 6/6 114 (วัน/เดือน ยอด)"))
-                            return
-                        rest = (rest[:dm.start()] + " " + rest[dm.end():]).strip()
-                # ยอดอยู่ตรงไหนก็ได้เช่นกัน — แต่ต้องไม่ไปหยิบ 'เวลา' (23:17) มาเป็นยอด
-                # เคสจริง 20/08/26: พิมพ์ตามตัวอย่างแล้วบอทตอบวิธีใช้กลับมา เพราะรูปแบบไม่ตรงเป๊ะ
-                am = re.search(r"(?<![\d:.])([\d,]+(?:\.\d+)?)(?![\d]*\s*:)(?!\s*[:.]\d)", rest)
-                if not am:
-                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=_help_add))
-                    return
-                note = (rest[:am.start()] + " " + rest[am.end():]).strip(" ,")
-                amt = float(am.group(1).replace(",", ""))
-                if amt <= 0:
-                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text="❌ ยอดต้องมากกว่า 0"))
-                    return
-                add_manual_slip(event, group_id, amt, (note or None), slip_date=target_date)
+                    _parsed.append(r)
+            if not _parsed:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=_help_add))
                 return
+            # ใบเดียว = ตอบแบบเดิม (มีรายงานท้ายข้อความ)
+            if len(_parsed) == 1 and not _bad:
+                _d0, _amt0, _note0 = _parsed[0]
+                add_manual_slip(event, group_id, _amt0, _note0, slip_date=_d0)
+                return
+            # วางทีเดียวหลายใบ — บันทึกให้ครบแล้วสรุปทีเดียว ไม่เด้งรายงานทุกบรรทัด
+            for _d1, _amt1, _note1 in _parsed:
+                _save_manual_slip(group_id, _amt1, _note1, slip_date=_d1)
+            _tot = sum(p[1] for p in _parsed)
+            _dates = {p[0] or _today_iso() for p in _parsed}
+            _body = [f"✍️ เพิ่มสลิปด้วยมือ {len(_parsed)} ใบ · รวม {_tot:,.2f} บาท"]
+            for _d2, _amt2, _note2 in _parsed:
+                _body.append(f"   • {_amt2:,.2f} บาท [{_d2 or _today_iso()}]" + (f" ({_note2})" if _note2 else ""))
+            if _bad:
+                _body.append(f"⚠️ อ่านไม่ออก {len(_bad)} บรรทัด — ยังไม่บันทึก:")
+                _body += [f"   ✗ {b[:60]}" for b in _bad]
+            _rep = build_daily_report(group_id, sorted(_dates)[-1]) if len(_dates) == 1 else ""
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="\n".join(_body) + (("\n─────────────────\n" + _rep) if _rep else "")))
+            return
 
         # คำสั่งลบสลิป (กรณีส่งผิด/ซ้ำ)
         if text in ("ล้างวันนี้", "รีเซ็ตวันนี้", "ล้างสลิปวันนี้", "รีเซ็ต"):
