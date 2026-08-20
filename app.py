@@ -3360,6 +3360,24 @@ RESV_FOLLOWUP_MIN = int(os.environ.get("RESV_FOLLOWUP_MIN", "15"))
 
 RESV_FOLLOWUP_MAX_ROUNDS = int(os.environ.get("RESV_FOLLOWUP_MAX_ROUNDS", "3"))
 
+# สัญญาณว่า "ข้อความนี้หน้าตาเป็นการจอง" แม้ไม่มีคำว่าจอง
+# เคสจริง 20/08/26: 'คุณยานา จำนวน 12 คน เวลา 08xxxxxxxx โซน A2-3-4 วันที่ 20/8/69' → บอทเงียบสนิท
+#   เพราะด่านคำใบ้ต้องมีคำว่า จอง/โต๊ะ/ลูกค้า · พนักงานต้องพิมพ์ใหม่ใส่คำว่า 'จองให้' ถึงจะติด
+# ใช้ 'นับสัญญาณ' แทนการเพิ่มคำใบ้เดี่ยวๆ เพราะคำอย่าง 'คน' โผล่ในแชททั่วไปตลอด
+#   → เจอ 2 สัญญาณขึ้นไปค่อยเรียก AI (คุมค่าใช้จ่าย + ไม่ตอบมั่วในบทสนทนาปกติ)
+_RESV_SIGNALS = (
+    r"\d+\s*(?:คน|ท่าน|ที่)\b",                       # จำนวนคน
+    r"โซน\s*\S+|โต๊ะ\s*\S+",                          # โซน/โต๊ะ
+    r"\d{1,2}[:.]\d{2}|\d+\s*(?:ทุ่ม|โมง)|เที่ยง",     # เวลา
+    r"วันที่\s*\d|\d{1,2}/\d{1,2}",                    # วันที่แบบตัวเลข
+    r"วันนี้|พรุ่งนี้|มะรืน|คืนนี้|เสาร์|อาทิตย์|จันทร์|อังคาร|พุธ|พฤหัส|ศุกร์",   # วันแบบคำ
+)
+
+def _looks_like_resv(text: str) -> bool:
+    """หน้าตาเข้าข่ายการจองไหม (ใช้ตอนไม่มีคำใบ้) — ต้องเจออย่างน้อย 2 สัญญาณ"""
+    hits = sum(1 for pat in _RESV_SIGNALS if re.search(pat, text))
+    return hits >= 2
+
 def _resv_draft_get(group_id: str):
     """ร่างจองที่ค้างอยู่ของกลุ่มนี้ (บอทถามข้อมูลที่ขาดแล้วรอคำตอบ) — คืน None ถ้าไม่มี/หมดอายุ"""
     raw = _get_meta(f"resvdraft:{group_id}")
@@ -3374,8 +3392,9 @@ def _resv_draft_get(group_id: str):
         return None
 
 
-def _resv_draft_set(group_id: str, text: str, rounds: int):
-    _set_meta(f"resvdraft:{group_id}", json.dumps({"text": text, "ts": time.time(), "rounds": rounds}))
+def _resv_draft_set(group_id: str, text: str, rounds: int, asked=None):
+    _set_meta(f"resvdraft:{group_id}",
+              json.dumps({"text": text, "ts": time.time(), "rounds": rounds, "asked": asked or []}))
 
 
 def _resv_draft_clear(group_id: str):
@@ -3385,6 +3404,35 @@ def _resv_draft_clear(group_id: str):
 def _resv_followup_open(group_id: str) -> bool:
     """อยู่ในช่วง 'เพิ่งถามข้อมูลจองที่ขาด แล้วรอคำตอบ' ไหม (ต่อกลุ่ม)"""
     return _resv_draft_get(group_id) is not None
+
+
+def _resv_label_answer(draft: dict, reply: str) -> str:
+    """ติดป้ายให้คำตอบสั้นๆ ว่าเป็นค่าของช่องไหน ก่อนเอาไปต่อกับข้อความเดิม
+
+    เคสจริง 20/08/26: บอทถาม 'กี่ท่านครับ?' พนักงานตอบ '12' → AI อ่านไม่ออกว่า 12 คืออะไร
+    ต้องพิมพ์ '12 ท่าน' ถึงจะติด · ถ้าเราถามข้อเดียวเราก็รู้อยู่แล้วว่าคำตอบคือค่าของช่องนั้น"""
+    asked = (draft or {}).get("asked") or []
+    r = (reply or "").strip()
+    if len(asked) != 1 or not r or len(r) > 40:
+        return r                       # ถามหลายข้อ/ตอบยาว → ปล่อยให้ AI อ่านเอง
+    field = asked[0]
+    tag = {"customer": "ชื่อลูกค้า", "people": "จำนวน", "date": "วันที่",
+           "time": "เวลา", "table": "โซน"}.get(field)
+    if not tag:
+        return r
+    # ตอบมาพร้อมหน่วย/คำบอกชนิดอยู่แล้ว ('12 ท่าน', 'โซน B', '2 ทุ่ม') → ปล่อยไว้ ไม่ต้องเติมป้ายซ้อน
+    already = {
+        "people":   r"คน|ท่าน|ที่นั่ง|จำนวน",
+        "time":     r"ทุ่ม|โมง|เที่ยง|เวลา",     # '19.30' เปล่าๆ ยังควรติดป้าย 'เวลา' ให้ชัด
+        "table":    r"โซน|โต๊ะ",
+        "date":     r"วันที่|วันนี้|พรุ่งนี้|มะรืน|คืนนี้|จันทร์|อังคาร|พุธ|พฤหัส|ศุกร์|เสาร์|อาทิตย์|/",
+        "customer": r"ชื่อ|คุณ",
+    }.get(field)
+    if already and re.search(already, r):
+        return r
+    if field == "people" and re.fullmatch(r"\d+(?:[-–]\d+)?", r):
+        return f"จำนวน {r} คน"
+    return f"{tag} {r}"
 
 
 # ถามแบบคนคุยกัน — ถามเฉพาะช่องที่ขาด ไม่ต้องให้พิมพ์ใหม่ทั้งชุด
@@ -3647,13 +3695,13 @@ def handle_reservation_text(event, text: str, group_id: str):
     #     แต่ไม่มีคำว่า 'จอง' → บอทไม่รับ จองของวันที่ 20/8 หายเงียบ)
     _draft = _resv_draft_get(group_id)
     if not any(h in text.lower() for h in _RESV_HINTS):
-        if not _draft:
+        if not _draft and not _looks_like_resv(text):
             return False
-        print(f"[resv] ไม่มีคำใบ้ แต่มีร่างจองค้างอยู่ → อ่านต่อ group={group_id}", flush=True)
+        print(f"[resv] ไม่มีคำใบ้ แต่{'มีร่างค้าง' if _draft else 'รูปแบบเข้าข่ายจอง'} → อ่านต่อ group={group_id}", flush=True)
 
     # ต่อคำตอบใหม่เข้ากับสิ่งที่พนักงานพิมพ์ไว้รอบก่อน แล้วอ่านรวมทีเดียว
     # (พนักงานตอบสั้นๆ ได้เลย เช่น '19.30' หรือ 'โซน A' ไม่ต้องพิมพ์ใหม่ทั้งชุด)
-    eff_text = f"{_draft['text']}\n{text}" if _draft else text
+    eff_text = f"{_draft['text']}\n{_resv_label_answer(_draft, text)}" if _draft else text
 
     print(f"[resv] เช็คจอง group={group_id} text={eff_text}", flush=True)
     try:
@@ -3702,7 +3750,7 @@ def handle_reservation_text(event, text: str, group_id: str):
             _reply_with_mention(event, "🙏 ขอโทษครับ ผมยังจับข้อมูลไม่ครบ รบกวนพิมพ์ใหม่ทีเดียวแบบนี้ครับ\n"
                                        "จองโต๊ะ คุณเอ 4 คน วันนี้ 2 ทุ่ม โซน A")
             return True
-        _resv_draft_set(group_id, eff_text, rounds)
+        _resv_draft_set(group_id, eff_text, rounds, asked=missing)
         # โชว์สิ่งที่จับได้แล้วด้วย จะได้รู้ว่าบอทเข้าใจถูกไหม แล้วถามเฉพาะที่ขาด
         got = []
         if info.get("customer"): got.append(f"ชื่อ {info['customer']}")

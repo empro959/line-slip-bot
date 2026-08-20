@@ -791,6 +791,62 @@ class TestResvDraft(unittest.TestCase):
             self.assertTrue(app._RESV_ASK[k].endswith("?") or "?" in app._RESV_ASK[k])
 
 
+class TestResvLooksLike(unittest.TestCase):
+    """จับข้อความที่ 'หน้าตาเป็นการจอง' แม้ไม่มีคำว่าจอง
+
+    เคสจริง 20/08/26: ข้อความแรกของพนักงานเงียบสนิท ต้องพิมพ์ใหม่ใส่คำว่า 'จองให้' ถึงจะติด"""
+
+    def test_real_dropped_message_now_detected(self):
+        self.assertTrue(app._looks_like_resv(
+            "คุณยานา จำนวน 12 คน เวลา 0826062980 โซน A2-3-4 วันที่ 20/8/69"))
+
+    def test_common_booking_shapes(self):
+        for t in ["คุณเอ 4 คน 2 ทุ่ม โซน A", "6 ท่าน พรุ่งนี้ 19:00", "คุณบี 5 คน เสาร์นี้ 1 ทุ่ม"]:
+            self.assertTrue(app._looks_like_resv(t), t)
+
+    def test_casual_chat_must_not_trigger(self):
+        """สัญญาณเดียวไม่พอ — ไม่งั้นยิง AI ทุกข้อความในกลุ่ม เปลืองและตอบมั่ว"""
+        for t in ["ไปกินข้าวกัน 3 คน", "วันนี้เหนื่อยจัง", "พรุ่งนี้เจอกัน",
+                  "ส่งของแล้วนะ", "โอนไป 500 แล้ว"]:
+            self.assertFalse(app._looks_like_resv(t), t)
+
+
+class TestResvLabelAnswer(unittest.TestCase):
+    """คำตอบสั้นๆ ต้องรู้ว่าตอบข้อไหน
+
+    เคสจริง 20/08/26: บอทถาม 'กี่ท่านครับ?' ตอบ '12' → ไม่รู้จัก ต้องพิมพ์ '12 ท่าน' ถึงติด"""
+
+    def test_bare_number_becomes_people(self):
+        d = {"asked": ["people"]}
+        self.assertEqual(app._resv_label_answer(d, "12"), "จำนวน 12 คน")
+
+    def test_range_number(self):
+        self.assertEqual(app._resv_label_answer({"asked": ["people"]}, "5-6"), "จำนวน 5-6 คน")
+
+    def test_other_fields_get_their_tag(self):
+        self.assertEqual(app._resv_label_answer({"asked": ["time"]}, "19.30"), "เวลา 19.30")
+        self.assertEqual(app._resv_label_answer({"asked": ["table"]}, "A2"), "โซน A2")
+        self.assertEqual(app._resv_label_answer({"asked": ["date"]}, "25"), "วันที่ 25")
+
+    def test_self_explanatory_answers_left_alone(self):
+        """คำที่บอกชนิดในตัวอยู่แล้ว ไม่ต้องเติมป้าย (อ่านออกอยู่แล้ว เติมไปก็รกเปล่าๆ)"""
+        self.assertEqual(app._resv_label_answer({"asked": ["date"]}, "พรุ่งนี้"), "พรุ่งนี้")
+        self.assertEqual(app._resv_label_answer({"asked": ["date"]}, "20/8"), "20/8")
+        self.assertEqual(app._resv_label_answer({"asked": ["time"]}, "2 ทุ่ม"), "2 ทุ่ม")
+
+    def test_answer_that_already_has_tag_is_untouched(self):
+        self.assertEqual(app._resv_label_answer({"asked": ["people"]}, "12 ท่าน"), "12 ท่าน")
+        self.assertEqual(app._resv_label_answer({"asked": ["table"]}, "โซน B"), "โซน B")
+
+    def test_multiple_questions_left_raw(self):
+        """ถามหลายข้อ = ไม่รู้ว่าคำตอบตรงกับข้อไหน ต้องปล่อยให้ AI อ่านเอง ห้ามเดา"""
+        self.assertEqual(app._resv_label_answer({"asked": ["people", "time"]}, "12 สองทุ่ม"), "12 สองทุ่ม")
+
+    def test_long_answer_left_raw(self):
+        long = "ลูกค้าบอกว่ามาประมาณ 12 คนแต่อาจจะเพิ่มอีกสองสามคนนะครับไม่แน่ใจ"
+        self.assertEqual(app._resv_label_answer({"asked": ["people"]}, long), long)
+
+
 class TestResvFollowupWindow(unittest.TestCase):
     """พนักงานพิมพ์จองใหม่หลังบอทถามข้อมูลที่ขาด — ต้องไม่หลุด
 
