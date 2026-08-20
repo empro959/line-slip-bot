@@ -1080,7 +1080,9 @@ class TestFlipDetection(unittest.TestCase):
 
     def setUp(self):
         self._orig = app.PAYEE_ACCOUNTS[:]
-        app.PAYEE_ACCOUNTS[:] = [("ร้าน", ["ไส้ย่าง", "99912460", "4612"])]
+        # เลียนแบบของจริง: บัญชีร้านมี 2 ชุด (ชื่อร้าน + บัญชีร่วมเจ้าของ)
+        app.PAYEE_ACCOUNTS[:] = [("ไส้ย่างซอย4", ["ไส้ย่าง", "SAI YANG"]),
+                                 ("พิมนภัทร์&สุวัฒน์", ["พิมนภัทร", "สุวภาพ", "4612", "99912460"])]
 
     def tearDown(self):
         app.PAYEE_ACCOUNTS[:] = self._orig
