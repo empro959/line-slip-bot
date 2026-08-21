@@ -9,6 +9,7 @@
 วิธีรัน:  python3 -m unittest discover -s tests -v
 ไม่ต้องมี DB จริง/คีย์จริง — ใช้ SQLite ไฟล์ชั่วคราว และคีย์ปลอม (ไม่ยิงเน็ตออก)
 """
+import json
 import os
 import sys
 import tempfile
@@ -272,8 +273,11 @@ class TestPayableReconcile(PayableTestCase):
 
 
 class TestPayablePushSummary(PayableTestCase):
-    """_payable_push_summary — reply token หมดอายุ (Gemini อ่านรูปนาน) ต้อง fallback push
-    ไม่งั้นสรุปหนี้หายเงียบ (เคสจริง: ส่งบิลแล้วสรุปไม่เด้ง)"""
+    """_payable_send_summary — reply token หมดอายุ (Gemini อ่านรูปนาน) ต้อง fallback push
+    ไม่งั้นสรุปหนี้หายเงียบ (เคสจริง: ส่งบิลแล้วสรุปไม่เด้ง)
+
+    หมายเหตุ 22/08/26: ตัวส่งจริงถูกแยกออกจาก _payable_push_summary (ซึ่งตอนนี้ทำหน้าที่ 'เข้าคิว')
+    เทสต์ชุดนี้จึงยิงที่ตัวส่งตรงๆ — เรื่องคิว/รวบใบเดียวดูที่ TestPayableSummaryDebounce"""
 
     def setUp(self):
         super().setUp()
@@ -295,7 +299,7 @@ class TestPayablePushSummary(PayableTestCase):
         app.line_bot_api.reply_message = self._fail_reply
         app.save_payable_bill(ACCT, 100.0, note="รูป", doc_date=_d(0))
 
-        app._payable_push_summary(self._Event(), ACCT, ACCT)
+        app._payable_send_summary(ACCT, ACCT, self._Event.reply_token)
 
         self.assertIn(ACCT, self.pushed, "reply พังแล้วต้อง push กลุ่มต้นทางแทน")
         self.assertIn(MIRROR, self.pushed, "กลุ่ม mirror ต้องได้สรุปด้วย")
@@ -305,7 +309,7 @@ class TestPayablePushSummary(PayableTestCase):
         app.line_bot_api.reply_message = self._ok_reply
         app.save_payable_bill(ACCT, 100.0, note="รูป", doc_date=_d(0))
 
-        app._payable_push_summary(self._Event(), ACCT, ACCT)
+        app._payable_send_summary(ACCT, ACCT, self._Event.reply_token)
 
         self.assertEqual(len(self.replied), 1, "กลุ่มต้นทางต้องใช้ reply")
         self.assertNotIn(ACCT, self.pushed, "กลุ่มต้นทางไม่ควรกินโควตา push")
@@ -1448,3 +1452,92 @@ class TestResvNoRepeatQuestion(unittest.TestCase):
     def test_name_answer_is_never_skipped(self):
         """ตอนถามชื่อลูกค้า คำตอบเป็นชื่อคนซึ่งไม่มีสัญญาณใดๆ — ห้ามข้าม"""
         self.assertFalse(app._resv_not_an_answer({"asked": ["customer"]}, "คุณสมชาย"))
+
+
+class TestPayableSummaryDebounce(unittest.TestCase):
+    """ส่งรูปหลายใบรวดเดียว ต้องได้สรุป 'ใบเดียว'
+
+    เคสจริง 22/08/26: ส่งสลิป 2 ใบพร้อมกัน → การ์ดสรุปยาวๆ เด้ง 2 ใบติด เนื้อหาเกือบเหมือนกัน
+    กลุ่มต้นทางเป็น reply (ฟรี) แต่กลุ่มคู่เป็น push ซึ่ง LINE คิดโควตาเป็น 'จำนวนสมาชิก' ต่อครั้ง"""
+
+    ACCT = "Gpaydeb"
+
+    class _Ev:
+        def __init__(self, token): self.reply_token = token
+
+    def setUp(self):
+        self.sent, self.cleaned = [], []
+        self._real_send = app._payable_send_summary
+        self._real_clean = app._payable_cleanup_paid
+        self._real_deb = app.PAYABLE_SUMMARY_DEBOUNCE
+        app._payable_send_summary = lambda g, a, t=None: self.sent.append((g, a, t))
+        app._payable_cleanup_paid = lambda a: self.cleaned.append(a)
+        app._set_meta(app._payable_pend_key(self.ACCT), "")
+
+    def tearDown(self):
+        app._payable_send_summary = self._real_send
+        app._payable_cleanup_paid = self._real_clean
+        app.PAYABLE_SUMMARY_DEBOUNCE = self._real_deb
+        app._set_meta(app._payable_pend_key(self.ACCT), "")
+
+    def test_debounce_zero_sends_immediately(self):
+        """ตั้ง 0 = พฤติกรรมเดิม ส่งทันที (ทางถอยถ้าไม่ชอบให้รอ)"""
+        app.PAYABLE_SUMMARY_DEBOUNCE = 0
+        app._payable_push_summary(self._Ev("tok1"), "G1", self.ACCT)
+        self.assertEqual(self.sent, [("G1", self.ACCT, "tok1")])
+
+    def test_two_images_produce_one_summary(self):
+        app.PAYABLE_SUMMARY_DEBOUNCE = 999          # กันเธรดจริงยิงระหว่างเทสต์
+        app._payable_push_summary(self._Ev("tok1"), "G1", self.ACCT)
+        stamp1 = json.loads(app._get_meta(app._payable_pend_key(self.ACCT)))["stamp"]
+        app._payable_push_summary(self._Ev("tok2"), "G1", self.ACCT)
+        # เธรดของรูปใบแรกตื่นมาแล้วเห็นว่าไม่ใช่คิวของตัวเอง → ไม่ส่ง
+        self.assertFalse(app._payable_flush_pending(self.ACCT, only_stamp=stamp1))
+        self.assertEqual(self.sent, [])
+        # เธรดของใบล่าสุดส่ง 1 ครั้ง ด้วย token ที่สดที่สุด
+        stamp2 = json.loads(app._get_meta(app._payable_pend_key(self.ACCT)))["stamp"]
+        self.assertTrue(app._payable_flush_pending(self.ACCT, only_stamp=stamp2))
+        self.assertEqual(self.sent, [("G1", self.ACCT, "tok2")])
+
+    def test_flush_twice_does_not_double_send(self):
+        app.PAYABLE_SUMMARY_DEBOUNCE = 999
+        app._payable_push_summary(self._Ev("tok1"), "G1", self.ACCT)
+        self.assertTrue(app._payable_flush_pending(self.ACCT))
+        self.assertFalse(app._payable_flush_pending(self.ACCT))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_cleanup_runs_after_summary_and_is_sticky(self):
+        """บรรทัดที่จ่ายครบต้องลบ 'หลัง' สรุปออก (ใบนี้ยังโชว์ ✅ จ่ายครบ)
+        และถ้ารอบก่อนขอ cleanup ไว้ รอบหลังไม่ได้ขอ ก็ยังต้องทำ (จ่ายครบไปแล้วจริง)"""
+        app.PAYABLE_SUMMARY_DEBOUNCE = 999
+        app._payable_push_summary(self._Ev("tok1"), "G1", self.ACCT, cleanup=True)
+        app._payable_push_summary(self._Ev("tok2"), "G1", self.ACCT)          # บิลซื้อ ไม่ขอ cleanup
+        self.assertTrue(app._payable_flush_pending(self.ACCT))
+        self.assertEqual(self.cleaned, [self.ACCT])
+
+    def test_no_cleanup_when_never_requested(self):
+        app.PAYABLE_SUMMARY_DEBOUNCE = 999
+        app._payable_push_summary(self._Ev("tok1"), "G1", self.ACCT)
+        app._payable_flush_pending(self.ACCT)
+        self.assertEqual(self.cleaned, [])
+
+    def test_min_age_holds_fresh_queue(self):
+        """ตาข่ายเก็บคิวค้างต้องไม่ไปแย่งส่งคิวที่เพิ่งเข้ามา (เธรดของมันยังรออยู่)"""
+        app.PAYABLE_SUMMARY_DEBOUNCE = 999
+        app._payable_push_summary(self._Ev("tok1"), "G1", self.ACCT)
+        self.assertFalse(app._payable_flush_pending(self.ACCT, min_age=600))
+        self.assertEqual(self.sent, [])
+
+    def test_stale_queue_is_rescued(self):
+        """worker ตายกลางทาง → คิวค้าง ตัวเดินตรวจต้องมาเก็บ ไม่ให้สรุปหายเงียบ"""
+        app.PAYABLE_SUMMARY_DEBOUNCE = 999
+        app._payable_push_summary(self._Ev("tok1"), "G1", self.ACCT)
+        key = app._payable_pend_key(self.ACCT)
+        d = json.loads(app._get_meta(key)); d["ts"] = d["ts"] - 3600
+        app._set_meta(key, json.dumps(d))
+        self.assertTrue(app._payable_flush_pending(self.ACCT, min_age=60))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_empty_queue_is_a_noop(self):
+        self.assertFalse(app._payable_flush_pending(self.ACCT))
+        self.assertEqual(self.sent, [])

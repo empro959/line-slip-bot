@@ -2337,19 +2337,94 @@ def _payable_report_recipients(acct: str):
     return [(acct, True)]
 
 
-def _payable_push_summary(event, source_group: str, acct: str):
-    """เด้ง 'สรุปหนี้รายวัน' ให้กลุ่มผู้รับ (กลุ่ม 1 ไม่มียอดรวม / กลุ่ม 2 มียอดรวม)
-    กลุ่มต้นทาง = reply (ฟรี), กลุ่มอื่น = push — ใช้ทั้งตอน 'บันทึกบิลซื้อ' และ 'มีการจ่าย'
-    reply พลาด (token หมดอายุเพราะ Gemini อ่านรูปนาน) → fallback เป็น push ไม่ให้สรุปหาย"""
+# ส่งรูปรวดเดียวหลายใบ = สรุปเด้งหลายใบติดกัน (ยาว เนื้อหาเกือบเหมือนกัน อ่านยาก)
+# → รอให้เงียบก่อนกี่วินาทีค่อยส่ง 'ใบเดียว' ที่รวมครบ · ตั้ง 0 = ส่งทันทีแบบเดิม
+PAYABLE_SUMMARY_DEBOUNCE = int(os.environ.get("PAYABLE_SUMMARY_DEBOUNCE", "25"))
+
+
+def _payable_pend_key(acct: str) -> str:
+    return f"payablepend:{acct}"
+
+
+def _payable_flush_pending(acct: str, only_stamp: str = None, min_age: float = 0) -> bool:
+    """ส่งสรุปที่ค้างคิวอยู่ของบัญชีนี้ (ถ้ามี) — คืน True ถ้าส่งจริง
+
+    only_stamp = ส่งเฉพาะเมื่อคิวยังเป็นของรอบเรา (มีรูปใหม่มาทีหลัง = ปล่อยให้ตัวหลังส่ง)
+    min_age    = ตาข่ายกันคิวค้าง (worker ตายกลางทางระหว่างรอ) ให้ตัวเดินตรวจมาเก็บทีหลัง"""
+    key = _payable_pend_key(acct)
+    try:
+        d = json.loads(_get_meta(key) or "{}")
+    except (ValueError, TypeError):
+        d = {}
+    if not d.get("stamp"):
+        return False
+    if only_stamp and d.get("stamp") != only_stamp:
+        return False
+    if min_age and time.time() - float(d.get("ts") or 0) < min_age:
+        return False
+    _set_meta(key, "")                      # เคลียร์ก่อนส่ง กัน worker อื่นส่งซ้ำ
+    _payable_send_summary(d.get("group") or "", acct, d.get("token") or None)
+    if d.get("cleanup"):
+        _payable_cleanup_paid(acct)         # ลบบรรทัดจ่ายครบ 'หลัง' สรุปออก (ใบนี้ยังโชว์ ✅ จ่ายครบ)
+    return True
+
+
+def _payable_flush_all_pending():
+    """ตาข่ายกันสรุปหาย — ตัวเดินตรวจทุก ~5 นาทีมาเก็บคิวที่ค้างนานผิดปกติ"""
+    for acct in PAYABLE_GROUPS:
+        try:
+            _payable_flush_pending(acct, min_age=max(60, PAYABLE_SUMMARY_DEBOUNCE * 2))
+        except Exception as e:
+            print(f"[payable] เก็บคิวสรุปค้างไม่สำเร็จ acct={acct}: {e}", flush=True)
+
+
+def _payable_push_summary(event, source_group: str, acct: str, cleanup: bool = False):
+    """เข้าคิวส่งสรุป — ส่งรูปติดกันหลายใบจะได้สรุป 'ใบเดียว' ที่รวมครบ
+
+    เคสจริง 22/08/26: ส่งสลิป 2 ใบพร้อมกัน → การ์ดสรุปยาวๆ เด้ง 2 ใบติด เนื้อหาเกือบเหมือนกัน
+    (กลุ่มต้นทางเป็น reply ฟรี แต่กลุ่มคู่เป็น push ซึ่ง LINE คิดโควตาเป็น 'จำนวนสมาชิก' ต่อครั้ง)
+
+    ใช้ token ของรูป 'ใบล่าสุด' เพราะสดที่สุด (reply token อายุราว 1 นาที) หมดอายุก็ fallback เป็น push
+    คิวเก็บใน meta ไม่ใช่ตัวแปรในหน่วยความจำ — gunicorn หลาย worker รูปคนละใบอาจตกคนละตัว"""
+    token = getattr(event, "reply_token", None)
+    if PAYABLE_SUMMARY_DEBOUNCE <= 0:
+        _payable_send_summary(source_group, acct, token)
+        if cleanup:
+            _payable_cleanup_paid(acct)
+        return
+    stamp = f"{time.time():.6f}"
+    # cleanup ต้องติดค้างไว้: รอบก่อนขอไว้แล้วรอบนี้ไม่ขอ ก็ยังต้องทำ (จ่ายครบไปแล้วจริง)
+    try:
+        prev = json.loads(_get_meta(_payable_pend_key(acct)) or "{}")
+    except (ValueError, TypeError):
+        prev = {}
+    _set_meta(_payable_pend_key(acct), json.dumps(
+        {"stamp": stamp, "group": source_group, "token": token or "",
+         "cleanup": bool(cleanup or prev.get("cleanup")), "ts": time.time()}))
+
+    def _later():
+        time.sleep(PAYABLE_SUMMARY_DEBOUNCE)
+        try:
+            _payable_flush_pending(acct, only_stamp=stamp)
+        except Exception as e:
+            print(f"[payable] รวบสรุปไม่สำเร็จ acct={acct}: {e}", flush=True)
+
+    threading.Thread(target=_later, daemon=True).start()
+
+
+def _payable_send_summary(source_group: str, acct: str, reply_token: str = None):
+    """ส่ง 'สรุปหนี้รายวัน' จริง (กลุ่ม 1 ไม่มียอดรวม / กลุ่ม 2 มียอดรวม)
+    กลุ่มต้นทาง = reply (ฟรี), กลุ่มอื่น = push
+    reply พลาด (token หมดอายุเพราะ Gemini อ่านรูปนาน/รอรวบสรุป) → fallback เป็น push ไม่ให้สรุปหาย"""
     replied = False
     for grp, with_total in _payable_report_recipients(acct):
         if _group_left(grp) or grp in IGNORE_GROUPS:
             continue
         text = build_payable_ledger(acct, with_total)
         try:
-            if grp == source_group and not replied and getattr(event, "reply_token", None):
+            if grp == source_group and not replied and reply_token:
                 try:
-                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=text))
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text=text))
                 except Exception as e_reply:
                     print(f"[payable] reply หมดอายุ grp={grp} → fallback push: {e_reply}", flush=True)
                     _push(grp, TextSendMessage(text=text))
@@ -2611,8 +2686,7 @@ def _process_payable_image(event, group_id: str):
                              ref_number=ref, slip_dt=info.get("datetime"),
                              doc_date=doc_date, allocated=allocated, settle_note=settle_note)
         # มีการจ่าย → เด้ง 'สรุปหนี้' ทุกครั้ง (กลุ่ม 1 ไม่มียอดรวม / กลุ่ม 2 มียอดรวม) แล้วลบบรรทัดที่จ่ายครบ (รอบหน้าหาย)
-        _payable_push_summary(event, group_id, acct)
-        _payable_cleanup_paid(acct)
+        _payable_push_summary(event, group_id, acct, cleanup=True)
         return
 
     # other → อ่านไม่ออกว่าเป็นบิล/สลิป — ห้ามทิ้งเงียบ (กันบัญชีคลาดเคลื่อน) ตอบเตือน + นับไว้ให้เห็นในสรุป
@@ -2871,8 +2945,7 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         allocated, settled, settle_note = _payable_settle(acct, doc_date, val)
         save_payable_payment(acct, val, sender="พิมพ์", ref_number=None, slip_dt=None,
                              doc_date=doc_date, allocated=allocated, settle_note=settle_note)
-        _payable_push_summary(event, group_id, acct)
-        _payable_cleanup_paid(acct)
+        _payable_push_summary(event, group_id, acct, cleanup=True)
         return True
 
     # สรุปหนี้ (วันนี้ / ตามวันที่)
@@ -3485,6 +3558,7 @@ def _report_backup_loop():
             maybe_send_resv_summary()
             maybe_send_daily_report()
             maybe_send_payable_summary()
+            _payable_flush_all_pending()
         except Exception as e:
             print(f"[report] backup loop error: {e}", flush=True)
 
@@ -5542,6 +5616,7 @@ def health():
         maybe_send_resv_summary()
         maybe_send_daily_report()
         maybe_send_payable_summary()
+        _payable_flush_all_pending()
     except Exception as e:
         print(f"[report] health-trigger error: {e}", flush=True)
     try:
