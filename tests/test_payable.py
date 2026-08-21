@@ -1380,3 +1380,71 @@ class TestResvMergeFragments(unittest.TestCase):
         app._resv_merge_text(self.GID, self.U1, "@All b10")
         app._resv_buf_clear(self.GID, self.U1)
         self.assertEqual(app._resv_merge_text(self.GID, self.U1, "คุนนาต"), "คุนนาต")
+
+
+class TestResvFalsePositiveGuards(unittest.TestCase):
+    """กันบอทตีข้อความ 'เรื่องขายของ/จ่ายเงิน' เป็นการจอง
+
+    เคสจริง 22/08/26 กลุ่ม Staff 00:03 (43 คน):
+      'น้องขายให้แล้วค่ะ อันนี้'
+      'ลูกค้าบอกให้มาด้วยจ่ายให้ลูกค้า 2 คน น้องกับพี่แตงโม2คน เป็น4'
+    คำใบ้ติดที่คำว่า 'ลูกค้า' (คำใบ้อ่อน) + เห็น '2 คน' → AI ตีเป็นจอง 4 ท่านของ 'พี่แตงโม'
+    แล้วเด้งการ์ดถามเวลา/โซน · พอพนักงานคุยต่อก็เด้งการ์ดเดิมซ้ำอีกใบ"""
+
+    def _blocked(self, text: str) -> bool:
+        return app._resv_is_money_talk(text)
+
+    def test_real_false_positive_is_blocked(self):
+        for t in ["น้องขายให้แล้วค่ะ อันนี้",
+                  "ลูกค้าบอกให้มาด้วยจ่ายให้ลูกค้า 2 คน น้องกับพี่แตงโม2คน เป็น4",
+                  "ขายให้ลุงเกาหลีด้วยค่ะ"]:
+            self.assertTrue(self._blocked(t), t)
+
+    def test_real_booking_with_money_words_still_passes(self):
+        """มีคำว่า 'จอง/โต๊ะ' อยู่ด้วย = จองจริง ห้ามตัดทิ้ง"""
+        for t in ["จองโต๊ะ 4 คน ลูกค้าจ่ายให้แล้ว",
+                  "โต๊ะ A5 6 ท่าน 2 ทุ่ม เดี๋ยวเก็บเงินหน้าร้าน"]:
+            self.assertFalse(self._blocked(t), t)
+
+    def test_plain_booking_still_passes(self):
+        for t in ["คุณเอ 4 คน 2 ทุ่ม โซน A", "@All b10 คุนนาต มาทุ่ม"]:
+            self.assertFalse(self._blocked(t), t)
+
+    def test_weak_hint_is_a_subset_of_hints(self):
+        for w in app._RESV_WEAK_HINTS:
+            self.assertIn(w, app._RESV_HINTS)
+
+
+class TestResvNoRepeatQuestion(unittest.TestCase):
+    """ถามคำถามเดิมเป๊ะๆ ซ้ำ = กวนกลุ่มเปล่าๆ (กลุ่ม Staff มี 43 คน)"""
+
+    GID = "Gask"
+
+    def setUp(self):
+        app._resv_draft_clear(self.GID)
+
+    def test_draft_remembers_last_question(self):
+        body = "รับจองแล้วครับ ชื่อ พี่แตงโม\nขอถามเพิ่มอีก 2 ข้อครับ\n1) กี่โมงครับ?\n2) นั่งโซนไหนครับ?"
+        app._resv_draft_set(self.GID, "ข้อความเดิม", 1, asked=["time", "table"], last_ask=body)
+        d = app._resv_draft_get(self.GID)
+        self.assertEqual(d["last_ask"], body)
+        self.assertEqual(d["asked"], ["time", "table"])
+
+    def test_old_draft_without_last_ask_does_not_crash(self):
+        """ร่างที่เขียนไว้ก่อน deploy นี้ยังไม่มีช่อง last_ask — ต้องอ่านได้ ไม่ระเบิด"""
+        import json as _json
+        app._set_meta(f"resvdraft:{self.GID}",
+                      _json.dumps({"text": "x", "ts": app.time.time(), "rounds": 1, "asked": ["time"]}))
+        d = app._resv_draft_get(self.GID)
+        self.assertEqual((d or {}).get("last_ask") or "", "")
+
+    def test_non_answer_while_draft_open_is_skipped(self):
+        """ข้อความที่ไม่มีสัญญาณจองเลย + ไม่ได้กำลังถามชื่อ → ไม่ต้องยิง AI ซ้ำ"""
+        draft = {"asked": ["time", "table"]}
+        for t in ["แต่หยุดไม่ได้บอกลูกค้าแล้วค่ะ", "ขายให้ลุงเกาหลีด้วยค่ะ"]:
+            self.assertTrue(app._resv_not_an_answer(draft, t), t)
+        self.assertFalse(app._resv_not_an_answer(None, "อะไรก็ได้"))
+
+    def test_name_answer_is_never_skipped(self):
+        """ตอนถามชื่อลูกค้า คำตอบเป็นชื่อคนซึ่งไม่มีสัญญาณใดๆ — ห้ามข้าม"""
+        self.assertFalse(app._resv_not_an_answer({"asked": ["customer"]}, "คุณสมชาย"))

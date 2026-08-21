@@ -3498,6 +3498,12 @@ threading.Thread(target=_report_backup_loop, daemon=True).start()
 
 # คำที่เป็นไปได้ว่าเกี่ยวกับการจอง (เกตเบื้องต้นแบบประหยัด ก่อนส่งให้ AI ตัดสินจริง)
 _RESV_HINTS = ("จอง", "โต๊ะ", "table", "reserve", "booking", "ลูกค้า")
+# 'ลูกค้า' เป็นคำใบ้ที่อ่อนมาก — ในกลุ่มพนักงานพูดถึงลูกค้าทั้งวันโดยไม่เกี่ยวกับการจอง
+_RESV_WEAK_HINTS = ("ลูกค้า",)
+# เรื่องเงิน/ขายของ ไม่ใช่การจองโต๊ะ — ใช้ตัดเฉพาะข้อความที่ 'ไม่มีคำว่าจอง/โต๊ะ' เท่านั้น
+# เคสจริง 22/08/26 กลุ่ม Staff 00:03: 'ลูกค้าบอกให้มาด้วยจ่ายให้ลูกค้า 2 คน น้องกับพี่แตงโม2คน เป็น4'
+#   → คำใบ้ติดที่ 'ลูกค้า' + เห็น '2 คน' → AI ตีเป็นจอง 4 ท่านของ 'พี่แตงโม' แล้วถามหาเวลา/โซน
+_RESV_NOT_BOOKING = ("ขาย", "จ่ายให้", "โอนให้", "ค่าเช่า", "เก็บเงิน", "ค้างชำระ", "ทอนเงิน")
 # บอทถามข้อมูลจองที่ขาดไปแล้วกี่นาที ยังถือว่าข้อความถัดไปในกลุ่มนั้นคือ 'การพิมพ์จองใหม่'
 RESV_FOLLOWUP_MIN = int(os.environ.get("RESV_FOLLOWUP_MIN", "15"))
 
@@ -3529,6 +3535,24 @@ def _resv_signal_hits(text: str) -> int:
 def _looks_like_resv(text: str) -> bool:
     """หน้าตาเข้าข่ายการจองไหม (ใช้ตอนไม่มีคำใบ้) — ต้องเจออย่างน้อย 2 สัญญาณ"""
     return _resv_signal_hits(text) >= 2
+
+
+def _resv_is_money_talk(text: str) -> bool:
+    """คุยเรื่องขายของ/จ่ายเงิน โดยไม่มีคำว่า 'จอง/โต๊ะ' = ไม่ใช่การจอง
+
+    ถ้ามีคำว่าจอง/โต๊ะอยู่ด้วย ต้องปล่อยผ่าน — 'จองโต๊ะ 4 คน ลูกค้าจ่ายมาแล้ว' เป็นจองจริง"""
+    if any(h in text.lower() for h in _RESV_HINTS if h not in _RESV_WEAK_HINTS):
+        return False
+    return any(w in text for w in _RESV_NOT_BOOKING)
+
+
+def _resv_not_an_answer(draft, text: str) -> bool:
+    """มีร่างค้างอยู่ แต่ข้อความใหม่ไม่มีข้อมูลจองเลย = พนักงานคุยเรื่องอื่นต่อ ไม่ใช่คำตอบ
+
+    ยกเว้นตอนกำลังถาม 'ชื่อลูกค้า' — ชื่อคนไม่มีสัญญาณใดๆ ให้จับ ข้ามไม่ได้"""
+    if not draft or "customer" in (draft.get("asked") or []):
+        return False
+    return _resv_signal_hits(text) == 0
 
 
 # ต่อข้อความสั้นๆ ที่คนเดียวกันพิมพ์ติดกัน — พนักงานพิมพ์จองทีละท่อน
@@ -3589,9 +3613,11 @@ def _resv_draft_get(group_id: str):
         return None
 
 
-def _resv_draft_set(group_id: str, text: str, rounds: int, asked=None):
+def _resv_draft_set(group_id: str, text: str, rounds: int, asked=None, last_ask=""):
+    """last_ask = ข้อความคำถามที่เพิ่งถามไป — ไว้เทียบกันถามซ้ำคำถามเดิมเป๊ะๆ"""
     _set_meta(f"resvdraft:{group_id}",
-              json.dumps({"text": text, "ts": time.time(), "rounds": rounds, "asked": asked or []}))
+              json.dumps({"text": text, "ts": time.time(), "rounds": rounds,
+                          "asked": asked or [], "last_ask": last_ask or ""}))
 
 
 def _resv_draft_clear(group_id: str):
@@ -3892,7 +3918,17 @@ def handle_reservation_text(event, text: str, group_id: str):
     #     แต่ไม่มีคำว่า 'จอง' → บอทไม่รับ จองของวันที่ 20/8 หายเงียบ)
     _uid = getattr(getattr(event, "source", None), "user_id", None) or ""
     _draft = _resv_draft_get(group_id)
-    if not any(h in text.lower() for h in _RESV_HINTS):
+    _low = text.lower()
+    # คุยเรื่องขายของ/จ่ายเงิน โดยไม่มีคำว่า 'จอง/โต๊ะ' = ไม่ใช่การจอง — ตัดก่อนเปลือง AI
+    # (ถ้ามีคำว่าจอง/โต๊ะ อยู่ด้วย ปล่อยผ่าน เพราะ 'จองโต๊ะ 4 คน ลูกค้าจ่ายมาแล้ว' เป็นจองจริง)
+    if _resv_is_money_talk(text):
+        print(f"[resv] ข้อความเรื่องขาย/จ่ายเงิน ไม่มีคำว่าจอง → ไม่ใช่การจอง group={group_id}", flush=True)
+        return False
+    # มีร่างค้าง แต่ข้อความใหม่ไม่ใช่คำตอบ → ไม่ต้องยิง AI ซ้ำ
+    if _resv_not_an_answer(_draft, text):
+        print(f"[resv] ร่างค้างอยู่ แต่ข้อความนี้ไม่ใช่คำตอบ → ข้าม group={group_id}", flush=True)
+        return False
+    if not any(h in _low for h in _RESV_HINTS):
         if _draft:
             pass                                     # บอทเพิ่งถามข้อมูลที่ขาด → รับคำตอบต่อได้เลย
         elif _looks_like_resv(text):
@@ -3951,6 +3987,7 @@ def handle_reservation_text(event, text: str, group_id: str):
     if not info.get("table"):     missing.append("table")
     if missing:
         rounds = (_draft or {}).get("rounds", 0) + 1
+        _prev_ask = (_draft or {}).get("last_ask") or ""
         print(f"[resv] ข้อมูลไม่ครบ ขาด {missing} (รอบ {rounds}) → ถามกลับ", flush=True)
         # ถามวนไม่จบ = กวนกลุ่ม + เปลือง AI → ครบโควตารอบแล้วยอมแพ้ พร้อมบอกวิธีที่ชัวร์
         if rounds > RESV_FOLLOWUP_MAX_ROUNDS:
@@ -3958,7 +3995,7 @@ def handle_reservation_text(event, text: str, group_id: str):
             _reply_with_mention(event, "🙏 ขอโทษครับ ผมยังจับข้อมูลไม่ครบ รบกวนพิมพ์ใหม่ทีเดียวแบบนี้ครับ\n"
                                        "จองโต๊ะ คุณเอ 4 คน วันนี้ 2 ทุ่ม โซน A")
             return True
-        _resv_draft_set(group_id, eff_text, rounds, asked=missing)
+        _resv_draft_set(group_id, eff_text, rounds, asked=missing, last_ask=_prev_ask)
         # โชว์สิ่งที่จับได้แล้วด้วย จะได้รู้ว่าบอทเข้าใจถูกไหม แล้วถามเฉพาะที่ขาด
         got = []
         if info.get("customer"): got.append(f"ชื่อ {info['customer']}")
@@ -3971,6 +4008,13 @@ def handle_reservation_text(event, text: str, group_id: str):
                 ("ขอถามเพิ่มอีก " + ("ข้อเดียว" if len(qs) == 1 else f"{len(qs)} ข้อ") + "ครับ\n") +
                 "\n".join(qs) +
                 "\n\n(ตอบสั้นๆ ได้เลยครับ ไม่ต้องพิมพ์ใหม่ทั้งหมด)")
+        # ถามคำถามเดิมเป๊ะๆ ซ้ำ = ไม่มีข้อมูลใหม่เข้ามา ถามไปก็ได้คำตอบเดิม
+        # เคสจริง 22/08/26 กลุ่ม Staff 00:04: การ์ดคำถามชุดเดียวกันเด้ง 2 รอบติด (กลุ่ม 43 คน)
+        # → เงียบไว้ แต่ยังนับรอบ พอครบโควตาค่อยบอกวิธีพิมพ์ใหม่ทีเดียว (เตือนครั้งเดียว ไม่ใช่ทุกข้อความ)
+        if body == _prev_ask:
+            print(f"[resv] คำถามเดิมเป๊ะ ไม่มีข้อมูลใหม่ → ไม่ถามซ้ำ (รอบ {rounds}) group={group_id}", flush=True)
+            return True
+        _resv_draft_set(group_id, eff_text, rounds, asked=missing, last_ask=body)
         _reply_with_mention(event, body)
         return True
 
