@@ -3508,18 +3508,72 @@ RESV_FOLLOWUP_MAX_ROUNDS = int(os.environ.get("RESV_FOLLOWUP_MAX_ROUNDS", "3"))
 #   เพราะด่านคำใบ้ต้องมีคำว่า จอง/โต๊ะ/ลูกค้า · พนักงานต้องพิมพ์ใหม่ใส่คำว่า 'จองให้' ถึงจะติด
 # ใช้ 'นับสัญญาณ' แทนการเพิ่มคำใบ้เดี่ยวๆ เพราะคำอย่าง 'คน' โผล่ในแชททั่วไปตลอด
 #   → เจอ 2 สัญญาณขึ้นไปค่อยเรียก AI (คุมค่าใช้จ่าย + ไม่ตอบมั่วในบทสนทนาปกติ)
+# หมายเหตุ: 1 บรรทัด = 1 "เรื่อง" (จำนวนคน / โซน / เวลา / วันที่) — ห้ามแยกบรรทัดใหม่ให้เรื่องเดิม
+# ไม่งั้นข้อความที่พูดเรื่องเดียวจะนับได้ 2 สัญญาณ แล้วผ่านด่านไปเรียก AI ทั้งที่ไม่ใช่การจอง
 _RESV_SIGNALS = (
     r"\d+\s*(?:คน|ท่าน|ที่)\b",                       # จำนวนคน
-    r"โซน\s*\S+|โต๊ะ\s*\S+",                          # โซน/โต๊ะ
-    r"\d{1,2}[:.]\d{2}|\d+\s*(?:ทุ่ม|โมง)|เที่ยง",     # เวลา
+    # โซน/โต๊ะ — รวม "รหัสโต๊ะลอยๆ" (b10 / A11 / A2) เพราะพนักงานร้านนี้ไม่เคยพิมพ์คำว่าโต๊ะ
+    # lookbehind กันไปจับคำอังกฤษที่ลงท้ายด้วยเลข (COVID19) และเลขที่ตามด้วยตัวอักษร
+    r"โซน\s*\S+|โต๊ะ\s*\S+|(?<![A-Za-z\u0E00-\u0E7F\d])[A-Za-z]\s?\d{1,2}(?![\d.])",
+    # เวลา — รวมแบบพูดที่ไม่มีเลขนำหน้า ("มาทุ่ม" = 1 ทุ่ม) · กัน "ทุ่มเท"
+    r"\d{1,2}[:.]\d{2}|\d+\s*(?:ทุ่ม|โมง)|ทุ่ม(?!เท)|โมง|เที่ยง",
     r"วันที่\s*\d|\d{1,2}/\d{1,2}",                    # วันที่แบบตัวเลข
     r"วันนี้|พรุ่งนี้|มะรืน|คืนนี้|เสาร์|อาทิตย์|จันทร์|อังคาร|พุธ|พฤหัส|ศุกร์",   # วันแบบคำ
 )
 
+def _resv_signal_hits(text: str) -> int:
+    """นับว่าข้อความนี้พูดถึง 'เรื่องของการจอง' กี่เรื่อง (จำนวนคน/โซน/เวลา/วันที่)"""
+    return sum(1 for pat in _RESV_SIGNALS if re.search(pat, text))
+
+
 def _looks_like_resv(text: str) -> bool:
     """หน้าตาเข้าข่ายการจองไหม (ใช้ตอนไม่มีคำใบ้) — ต้องเจออย่างน้อย 2 สัญญาณ"""
-    hits = sum(1 for pat in _RESV_SIGNALS if re.search(pat, text))
-    return hits >= 2
+    return _resv_signal_hits(text) >= 2
+
+
+# ต่อข้อความสั้นๆ ที่คนเดียวกันพิมพ์ติดกัน — พนักงานพิมพ์จองทีละท่อน
+# เคสจริง 21/08/26 กลุ่ม Staff 17:30: "@All b10" / "คุนนาต" / "มาทุ่ม" (3 ข้อความ ห่างกันไม่ถึงนาที)
+#   แต่ละท่อนมีสัญญาณไม่ถึง 2 → เงียบทั้งชุด จองหลุดโดยไม่มีใครรู้
+RESV_MERGE_SEC    = int(os.environ.get("RESV_MERGE_SEC", "120"))   # ต่อกันได้ภายในกี่วินาที
+RESV_MERGE_MAX    = int(os.environ.get("RESV_MERGE_MAX", "5"))     # เก็บย้อนหลังกี่ข้อความ
+RESV_MERGE_MAXLEN = int(os.environ.get("RESV_MERGE_MAXLEN", "40")) # ยาวเกินนี้ = พิมพ์มาเป็นชุดแล้ว ไม่ต้องต่อ
+
+
+def _resv_buf_key(group_id: str, user_id: str) -> str:
+    return f"resvbuf:{group_id}:{user_id}"
+
+
+def _resv_buf_clear(group_id: str, user_id: str):
+    if user_id:
+        _set_meta(_resv_buf_key(group_id, user_id), "")
+
+
+def _resv_merge_text(group_id: str, user_id: str, text: str) -> str:
+    """คืน 'ข้อความรวม' ของคนคนนี้ในกลุ่มนี้ (ท่อนเก่าที่ยังไม่หมดอายุ + ท่อนใหม่)
+
+    กติกาที่ตั้งใจให้แคบ กันเรียก AI มั่ว:
+      • เฉพาะ user เดียวกัน — คนอื่นพิมพ์แทรก (เช่น 'เจ้า') ไม่ถูกดึงเข้ามา
+      • เฉพาะข้อความสั้น และอยู่ในกรอบเวลา
+      • ท่อนแรกต้องมีสัญญาณจองอย่างน้อย 1 อย่าง ไม่งั้นไม่เริ่มเก็บ (ไม่เขียน DB ให้แชททั่วไป)
+      • ยังต้องครบ 2 สัญญาณเหมือนเดิมถึงจะเรียก AI — ตัวนี้แค่เปลี่ยนจาก 'นับในข้อความเดียว'
+        เป็น 'นับในชุดที่ต่อกัน' ไม่ได้ลดมาตรฐาน
+
+    เก็บใน meta (ไม่ใช่ตัวแปรในหน่วยความจำ) เพราะ gunicorn มีหลาย worker
+    ข้อความ 3 ท่อนอาจตกคนละ worker กัน ตัวแปรในเครื่องจะไม่เห็นกัน"""
+    if not user_id or len(text) > RESV_MERGE_MAXLEN:
+        return text
+    key, now, buf = _resv_buf_key(group_id, user_id), time.time(), []
+    try:
+        d = json.loads(_get_meta(key) or "{}")
+        if now - float(d.get("ts", 0)) <= RESV_MERGE_SEC:
+            buf = [m for m in (d.get("msgs") or []) if isinstance(m, str)]
+    except (ValueError, TypeError):
+        buf = []
+    if not buf and _resv_signal_hits(text) < 1:
+        return text                      # ไม่มีอะไรให้เกาะ — อย่าเขียน DB ทิ้งๆ ขว้างๆ
+    buf = (buf + [text])[-RESV_MERGE_MAX:]
+    _set_meta(key, json.dumps({"ts": now, "msgs": buf}))
+    return " ".join(buf)
 
 def _resv_draft_get(group_id: str):
     """ร่างจองที่ค้างอยู่ของกลุ่มนี้ (บอทถามข้อมูลที่ขาดแล้วรอคำตอบ) — คืน None ถ้าไม่มี/หมดอายุ"""
@@ -3836,10 +3890,21 @@ def handle_reservation_text(event, text: str, group_id: str):
     #    แล้ว 'ตกคำว่าจอง' ไป → ของเดิมเงียบสนิท จองหลุดทั้งใบโดยไม่มีใครรู้
     #    (เคสจริง 19/08/26 กลุ่ม Staff: บอทถามหาเวลา 15:15 → พนักงานพิมพ์ใหม่ครบทุกอย่างตอน 15:19
     #     แต่ไม่มีคำว่า 'จอง' → บอทไม่รับ จองของวันที่ 20/8 หายเงียบ)
+    _uid = getattr(getattr(event, "source", None), "user_id", None) or ""
     _draft = _resv_draft_get(group_id)
     if not any(h in text.lower() for h in _RESV_HINTS):
-        if not _draft and not _looks_like_resv(text):
-            return False
+        if _draft:
+            pass                                     # บอทเพิ่งถามข้อมูลที่ขาด → รับคำตอบต่อได้เลย
+        elif _looks_like_resv(text):
+            _resv_buf_clear(group_id, _uid)          # ข้อความเดียวครบแล้ว ท่อนเก่าไม่ต้องใช้
+        else:
+            # ไม่ครบในข้อความเดียว → ลองต่อกับท่อนสั้นๆ ที่คนเดียวกันเพิ่งพิมพ์
+            _merged = _resv_merge_text(group_id, _uid, text)
+            if not _looks_like_resv(_merged):
+                return False
+            print(f"[resv] ต่อข้อความของคนเดียวกันแล้วเข้าข่ายจอง group={group_id} → '{_merged}'", flush=True)
+            _resv_buf_clear(group_id, _uid)          # ใช้แล้วล้าง กันท่อนถัดไปยิง AI ซ้ำไม่จบ
+            text = _merged
         print(f"[resv] ไม่มีคำใบ้ แต่{'มีร่างค้าง' if _draft else 'รูปแบบเข้าข่ายจอง'} → อ่านต่อ group={group_id}", flush=True)
 
     # ต่อคำตอบใหม่เข้ากับสิ่งที่พนักงานพิมพ์ไว้รอบก่อน แล้วอ่านรวมทีเดียว

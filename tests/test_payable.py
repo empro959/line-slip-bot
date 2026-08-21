@@ -1289,3 +1289,94 @@ class TestInternalTransferNotIncome(unittest.TestCase):
         self.assertTrue(detail.startswith(app._INTERNAL_MARK))
         # รูปแบบ 'ยอด → ปลายทาง' ของใบข้ามปกติต้องแกะไม่ติด (ไม่งั้นจะถูกกู้กลับ)
         self.assertIsNone(app.re.match(r"\s*([\d,]+(?:\.\d+)?)\s*→\s*(.+)$", detail))
+
+
+class TestResvSignalsNewShapes(unittest.TestCase):
+    """รหัสโต๊ะลอยๆ กับเวลาแบบพูด ต้องนับเป็นสัญญาณ
+
+    เคสจริง 21/08/26 กลุ่ม Staff 17:30 — พนักงานพิมพ์ 3 ท่อน:
+      '@All b10' / 'คุนนาต' / 'มาทุ่ม'
+    ทุกท่อนได้ 0 สัญญาณ (แพตเทิร์นโซนบังคับคำว่า 'โต๊ะ' · แพตเทิร์นเวลาบังคับตัวเลขนำหน้า)
+    → เงียบทั้งชุด จองหลุด"""
+
+    def test_bare_table_code_counts(self):
+        for t in ["b10", "@All b10", "A11", "โซน A2"]:
+            self.assertGreaterEqual(app._resv_signal_hits(t), 1, t)
+
+    def test_spoken_time_counts(self):
+        for t in ["มาทุ่ม", "มา 2 ทุ่ม", "บ่ายโมง", "เที่ยง"]:
+            self.assertGreaterEqual(app._resv_signal_hits(t), 1, t)
+
+    def test_one_topic_must_count_once(self):
+        """เรื่องเดียวห้ามนับ 2 — ไม่งั้น 'โต๊ะ b10' เฉยๆ จะผ่านด่านไปเรียก AI"""
+        for t in ["โต๊ะ b10", "โซน A2", "2 ทุ่ม", "19:30", "บ่ายโมง"]:
+            self.assertEqual(app._resv_signal_hits(t), 1, t)
+            self.assertFalse(app._looks_like_resv(t), t)
+
+    def test_thumthe_is_not_time(self):
+        self.assertEqual(app._resv_signal_hits("ทุ่มเทมากเลย"), 0)
+
+    def test_english_word_ending_with_digits_is_not_a_table(self):
+        for t in ["COVID19 ยังมีอยู่", "ราคา 500"]:
+            self.assertEqual(app._resv_signal_hits(t), 0, t)
+
+    def test_real_dropped_fragments_joined_is_detected(self):
+        self.assertTrue(app._looks_like_resv("@All b10 คุนนาต มาทุ่ม"))
+
+    def test_casual_chat_with_one_new_signal_still_silent(self):
+        for t in ["เดี๋ยว b10 ว่างแล้วบอก", "ส่ง A4 ให้หน่อย", "ทุ่มเทหน่อยนะ"]:
+            self.assertFalse(app._looks_like_resv(t), t)
+
+
+class TestResvMergeFragments(unittest.TestCase):
+    """ต่อข้อความสั้นๆ ที่คนเดียวกันพิมพ์ติดกัน (เคส 21/08/26 ข้างบน)"""
+
+    GID, U1, U2 = "Gresv", "Uthanant", "Unattha"
+
+    def setUp(self):
+        app._resv_buf_clear(self.GID, self.U1)
+        app._resv_buf_clear(self.GID, self.U2)
+
+    def test_three_fragments_become_a_booking(self):
+        self.assertFalse(app._looks_like_resv(app._resv_merge_text(self.GID, self.U1, "@All b10")))
+        self.assertFalse(app._looks_like_resv(app._resv_merge_text(self.GID, self.U1, "คุนนาต")))
+        merged = app._resv_merge_text(self.GID, self.U1, "มาทุ่ม")
+        self.assertTrue(app._looks_like_resv(merged), merged)
+        self.assertIn("b10", merged)
+        self.assertIn("คุนนาต", merged)
+
+    def test_other_person_is_not_mixed_in(self):
+        """คนอื่นพิมพ์แทรก ('เจ้า' ของ Natthakan43) ต้องไม่ถูกดึงเข้าชุดของอีกคน"""
+        app._resv_merge_text(self.GID, self.U1, "@All b10")
+        self.assertNotIn("b10", app._resv_merge_text(self.GID, self.U2, "เจ้า"))
+
+    def test_chat_without_any_signal_does_not_start_a_buffer(self):
+        """ไม่มีสัญญาณเลย = ไม่เริ่มเก็บ (ไม่เขียน DB ให้แชททั่วไปทุกข้อความ)"""
+        self.assertEqual(app._resv_merge_text(self.GID, self.U1, "เจ้า"), "เจ้า")
+        self.assertEqual(app._get_meta(app._resv_buf_key(self.GID, self.U1)) or "", "")
+
+    def test_long_message_is_not_merged(self):
+        long_text = "x" * (app.RESV_MERGE_MAXLEN + 1)
+        self.assertEqual(app._resv_merge_text(self.GID, self.U1, long_text), long_text)
+
+    def test_buffer_expires(self):
+        import json as _json
+        app._resv_merge_text(self.GID, self.U1, "@All b10")
+        raw = _json.loads(app._get_meta(app._resv_buf_key(self.GID, self.U1)))
+        raw["ts"] = raw["ts"] - app.RESV_MERGE_SEC - 5           # ทำให้หมดอายุ
+        app._set_meta(app._resv_buf_key(self.GID, self.U1), _json.dumps(raw))
+        self.assertEqual(app._resv_merge_text(self.GID, self.U1, "มาทุ่ม"), "มาทุ่ม")
+
+    def test_buffer_keeps_only_recent_messages(self):
+        for i in range(app.RESV_MERGE_MAX + 3):
+            out = app._resv_merge_text(self.GID, self.U1, f"A{i % 9}")
+        self.assertLessEqual(len(out.split()), app.RESV_MERGE_MAX)
+
+    def test_no_user_id_means_no_merging(self):
+        """ไม่มี user_id (เช่น event แปลกๆ) → ห้ามเอาไปปนกับของคนอื่น"""
+        self.assertEqual(app._resv_merge_text(self.GID, "", "@All b10"), "@All b10")
+
+    def test_clear_after_use(self):
+        app._resv_merge_text(self.GID, self.U1, "@All b10")
+        app._resv_buf_clear(self.GID, self.U1)
+        self.assertEqual(app._resv_merge_text(self.GID, self.U1, "คุนนาต"), "คุนนาต")
