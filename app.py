@@ -1090,6 +1090,34 @@ def _slip_account_label(info: dict):
     return None
 
 
+# ป้ายกำกับใบที่เป็น "ย้ายเงินระหว่างบัญชีร้านเอง" — ต้องหน้าตาต่างจากใบข้ามปกติ
+# เพราะตัวกู้สลิปต้องรู้ว่า "ห้ามดึงกลับเข้าเป็นรายรับ" (ปลายทางเป็นบัญชีร้านจริง แต่ไม่ใช่เงินใหม่)
+_INTERNAL_MARK = "🔁 โอนระหว่างบัญชีร้านเอง"
+
+
+def _internal_transfer_label(info: dict):
+    """โอนจาก 'บัญชีร้าน' ไป 'บัญชีร้าน' ด้วยกันเอง → ย้ายกระเป๋า ไม่ใช่รายได้ใหม่ (คืน label ต้นทาง)
+
+    เคสจริง 20/08/26: ใบ 873 บาท (บจก.ไส้ย่างซอย4 xxx-x-x2481-x → พิมนภัทร์&สุวัฒน์ xxx-x-x4612-x)
+    ถูกนับเป็นรายรับ เพราะกติกาเดิมดูแค่ "ปลายทางตรงบัญชีร้านไหม" ไม่เคยดูฝั่งต้นทาง
+    → เงินก้อนนี้เป็นรายรับตั้งแต่ลูกค้าโอนเข้าบัญชีแรกแล้ว นับอีกรอบ = ยอดวันนั้นเกินจริง
+
+    ยืนยันด้วย 'เลขบัญชี' ฝั่งผู้โอนเท่านั้น ห้ามใช้ชื่อ —
+    คีย์เวิร์ดชื่อมีคำอย่าง 'สุวัฒน'/'บุญเรือง' ซึ่งเป็นชื่อคนไทยทั่วไป
+    ลูกค้าจริงที่บังเอิญชื่อซ้ำจะโดนตัดรายรับทิ้งเงียบๆ (พลาดแบบนี้แพงกว่านับเกิน)"""
+    if not PAYEE_ACCOUNTS or _slip_account_label(info) is None:
+        return None                      # ปลายทางไม่ใช่บัญชีร้าน → คนละเรื่อง (ร้านจ่ายออก) ปล่อยทางเดิมจัดการ
+    hay = _norm_match_text(f"{info.get('sender') or ''} {info.get('account') or ''}")
+    if not hay:
+        return None
+    for label, kws in PAYEE_ACCOUNTS:
+        for k in kws:
+            k = k.strip()
+            if k.isdigit() and len(k) >= 4 and k in hay:
+                return label
+    return None
+
+
 def _kw_hit_any_payee(text: str) -> bool:
     """ข้อความนี้มีคีย์เวิร์ดบัญชีร้านอยู่ไหม (ใช้ตรวจว่าชื่อร้านไปโผล่ผิดฝั่ง)"""
     hay = _norm_match_text(text)
@@ -1299,16 +1327,17 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
     with _db() as conn:
         # เอาทั้งใบที่มีรหัสรูป (กู้ด้วยการอ่านรูปใหม่) และใบ 'ไม่ใช่รายรับ' ที่มีบันทึกยอด/ปลายทาง
         # (กู้จากบันทึกได้เลย ไม่ต้องใช้รูป — ใบเก่าก่อนระบบเก็บรหัสรูปจึงยังกู้ได้)
+        # ดึงมาทั้งหมด แล้วค่อยคัดในลูป — เดิมกรอง "ไม่มีรหัสรูป" ทิ้งใน SQL เลย
+        # ผลคือใบพวกนั้นหายไปจากผลลัพธ์เงียบๆ (เคสจริง 21/08/26: ตกหล่น 17 ใบ แต่ผลกู้ไม่พูดถึงสักคำ
+        # เจ้าของอ่านแล้วนึกว่าตรวจครบแล้ว) → ต้องนับและบอกว่ากู้ไม่ได้เพราะอะไร
         rows = conn.execute(
             "SELECT id, reason, recorded_at, detail, message_id FROM image_misses "
-            "WHERE group_id=? AND stat_date=? AND reason IN ('notslip','notincome') "
-            "AND ((message_id IS NOT NULL AND message_id<>'') "
-            "     OR (reason='notincome' AND detail IS NOT NULL AND detail<>'')) ORDER BY id",
+            "WHERE group_id=? AND stat_date=? AND reason IN ('notslip','notincome') ORDER BY id",
             (group_id, d)).fetchall()
     # เพดานมีไว้คุมค่า 'อ่านรูปด้วย AI' เท่านั้น — ใบที่กู้จากบันทึกไม่เสียค่าอะไร ห้ามเอามานับ
     # (เคสจริง 20/08/26: นับรวมกันหมด ใบที่ไม่ต้องใช้ AI กินโควตาจนไม่เคยไปถึงใบที่ต้องอ่านจริง
     #  พิมพ์ซ้ำกี่รอบก็ขึ้น 'ยังเหลืออีก 2 ใบ' เท่าเดิมตลอด = วนไม่จบ)
-    capped, ocr_used = 0, 0
+    capped, ocr_used, noimg = 0, 0, 0
     if not rows:
         return (f"📭 วันที่ {d} ไม่มีใบที่พอจะกู้ได้\n"
                     "(ใบที่พลาดวันนั้นไม่มีทั้งรหัสรูปและบันทึกยอด — ต้องกรอกมือ)")
@@ -1316,6 +1345,14 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
     added, gone, still, skipped, notmine = [], 0, 0, 0, 0
     for r in rows:
         mid = r["message_id"]
+        # ใบที่เคยตัดสินว่า "ย้ายเงินระหว่างบัญชีร้านเอง" — ห้ามดึงกลับเข้าเป็นรายรับ
+        # (ปลายทางเป็นบัญชีร้านจริง ตัวเช็ครายรับจะบอกว่า "ใช่" ทุกครั้ง ถ้าไม่ดักตรงนี้จะวนกลับมานับซ้ำ)
+        if (r["detail"] or "").startswith(_INTERNAL_MARK):
+            notmine += 1
+            continue
+        if not mid and not (r["reason"] == "notincome" and r["detail"]):
+            noimg += 1          # ไม่มีทั้งรหัสรูปและบันทึกยอด → กู้ไม่ได้จริงๆ ต้องกรอกมือ
+            continue
         if mid and _slip_message_seen(group_id, mid):   # กู้ไปแล้ว/บันทึกไปแล้ว — ห้ามนับซ้ำ
             skipped += 1
             continue
@@ -1373,11 +1410,14 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
         if income_only and PAYEE_ACCOUNTS and _slip_account_label(info) is None:
             still += 1                                  # ยังตัดสินว่าไม่ใช่เงินร้าน → ไม่ยัดเข้าไปเอง
             continue
+        if _internal_transfer_label(info):
+            notmine += 1                                # ย้ายเงินระหว่างบัญชีร้านเอง — ไม่ใช่เงินใหม่
+            continue
         save_slip(group_id, info, "PASS", message_id=mid, slip_date=d,
                   recorded_at=r["recorded_at"])            # ← ลงวัน+เวลาเดิม ไม่ใช่ตอนกดกู้
         added.append((info.get("sender") or "?", amount, r["recorded_at"] or "-"))
 
-    if not added and not gone and not still and not notmine:
+    if not added and not gone and not still and not notmine and not noimg:
         return f"✅ วันที่ {d} ไม่มีอะไรต้องกู้ (ใบที่พลาดถูกบันทึกไปแล้วทั้งหมด)"
     lines = [f"🔁 กู้สลิปที่อ่านไม่ออก ({d})", "━━━━━━━━━━━━━"]
     if added:
@@ -1389,6 +1429,8 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
     if notmine: lines.append(f"↪️ ไม่ใช่เงินเข้าร้าน {notmine} ใบ (โอนเข้าบัญชีอื่น — ถูกต้องแล้วที่ไม่นับ)")
     if gone:    lines.append(f"⏳ รูปหมดอายุใน LINE แล้ว {gone} ใบ — กู้ไม่ได้ ต้องกรอกมือ")
     if skipped: lines.append(f"↩️ ข้าม {skipped} ใบ (บันทึกไปแล้ว)")
+    if noimg:   lines.append(f"🗒️ กู้อัตโนมัติไม่ได้ {noimg} ใบ (ไม่มีรหัสรูปเก็บไว้ — รูปเข้ามาก่อนระบบเริ่มเก็บรหัส)\n"
+                             f"   ถ้าในนั้นมีสลิปจริง ต้องเปิดดูรูปในกลุ่มแล้ว 'เพิ่มสลิป <ยอด>' เอง")
     if capped:  lines.append(f"⚠️ ยังเหลืออีก {capped} ใบที่ต้องอ่านรูปด้วย AI (จำกัดรอบละ {limit}) — พิมพ์ 'กู้สลิป {d}' ซ้ำได้")
     lines.append("━━━━━━━━━━━━━")
     if added:
@@ -4502,6 +4544,17 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
                 _flip = "  ⚠️ อาจอ่านสลับด้าน (ชื่อร้านอยู่ฝั่งผู้โอน) — ถ้าเป็นเงินเข้าร้านให้กรอกเอง"
                 print(f"[slip] ⚠️ อาจอ่านสลับด้าน group={group_id} amt={_amt}", flush=True)
             record_image_miss(group_id, "notincome", detail=f"{_amt} → {_dest}{_flip}", message_id=msg_id)
+            return
+
+        # ย้ายเงินระหว่างบัญชีร้านเอง → ไม่ใช่รายรับ (กันนับซ้ำ) · ดูหัวข้อ _internal_transfer_label
+        _int_from = _internal_transfer_label(info)
+        if _int_from:
+            _amt = f"{float(info.get('amount') or 0):,.2f}"
+            _to = _slip_account_label(info)
+            print(f"[skip] โอนระหว่างบัญชีร้านเอง {_int_from}→{_to} group={group_id} amt={_amt}", flush=True)
+            record_image_miss(group_id, "notincome",
+                              detail=f"{_INTERNAL_MARK} {_amt} · {_int_from} → {_to} (ย้ายกระเป๋า ไม่ใช่เงินใหม่)",
+                              message_id=msg_id)
             return
 
         # normalize เลขอ้างอิง (ตัวพิมพ์ใหญ่ + ตัดช่องว่าง) กันอ่านเพี้ยนเล็กน้อยแล้วเทียบไม่ตรง

@@ -884,10 +884,14 @@ class TestRecoverMissedSlips(unittest.TestCase):
             c.commit()
 
     def test_nothing_to_work_with_says_so(self):
-        """ใบพลาดที่ไม่มีทั้งรหัสรูปและบันทึกยอด = กู้ไม่ได้จริง ต้องบอกตรงๆ ไม่ใช่เงียบ"""
+        """ใบพลาดที่ไม่มีทั้งรหัสรูปและบันทึกยอด = กู้ไม่ได้จริง ต้องบอกตรงๆ ไม่ใช่เงียบ
+
+        เดิม SQL กรองใบพวกนี้ทิ้งตั้งแต่ต้น ผลลัพธ์เลยไม่พูดถึงมันเลย —
+        เคสจริง 21/08/26: รายงานบอก 'ตกหล่น 17 ใบ' แต่ผลกู้เงียบสนิท เจ้าของนึกว่าตรวจครบแล้ว"""
         app.record_image_miss(self.gid, "notslip")      # อ่านไม่ออก + ไม่มีรหัสรูป
         out = app.recover_missed_slips(self.gid, _d(0))
-        self.assertIn("ไม่มีใบที่พอจะกู้ได้", out)
+        self.assertIn("กู้อัตโนมัติไม่ได้ 1 ใบ", out)
+        self.assertIn("ไม่มีรหัสรูป", out)
 
     def test_old_notincome_without_image_id_still_recoverable(self):
         """ใบเก่าก่อนระบบเก็บรหัสรูป — ถ้ามีบันทึกยอด/ปลายทาง ต้องยังกู้ได้
@@ -1224,3 +1228,64 @@ class TestPushAcceptsString(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestInternalTransferNotIncome(unittest.TestCase):
+    """โอนระหว่างบัญชีร้านด้วยกันเอง ต้องไม่ถูกนับเป็นรายรับ
+
+    เคสจริง 20/08/26: สลิป KBIZ 873 บาท
+      จาก 'บจก. ไส้ย่างซอย4  xxx-x-x2481-x'  →  'พิมนภัทร์ สุวภาพ และ สุวัฒน์ บุญเรือง  xxx-x-x4612-x'
+    ทั้งสองฝั่งเป็นบัญชีร้าน แต่กติกาเดิมดูแค่ปลายทาง → นับเป็นรายรับ = นับซ้ำ
+    (เงินก้อนนี้เป็นรายรับตั้งแต่ลูกค้าโอนเข้าบัญชีแรกแล้ว)"""
+
+    def setUp(self):
+        self._orig = app.PAYEE_ACCOUNTS[:]
+        app.PAYEE_ACCOUNTS[:] = [
+            ("ไส้ย่างซอย4",       ["4818", "2481", "ไส้ย่าง", "SAI YANG"]),
+            ("พิมนภัทร์&สุวัฒน์", ["6120", "4612", "พิมนภัทร", "สุวัฒน", "สุวภาพ", "บุญเรือง"]),
+        ]
+
+    def tearDown(self):
+        app.PAYEE_ACCOUNTS[:] = self._orig
+
+    def test_real_case_873_is_internal(self):
+        info = {"sender": "บจก. ไส้ย่างซอย4", "account": "xxx-x-x2481-x",
+                "receiver": "นาง พิมนภัทร์ สุวภาพ และ นาย สุวัฒน์ บุญเรือง",
+                "receiver_account": "xxx-x-x4612-x", "amount": 873.0}
+        self.assertEqual(app._internal_transfer_label(info), "ไส้ย่างซอย4")
+
+    def test_customer_paying_in_is_still_income(self):
+        """ลูกค้าโอนเข้าร้าน — ต้นทางไม่ใช่บัญชีร้าน → ยังเป็นรายรับ"""
+        info = {"sender": "น.ส. กานต์พัชรา ด.", "account": "xxx-x-x1947-x",
+                "receiver": "นาง พิมนภัทร์ สุวภาพ และ นาย สุวัฒน์ บุญเรือง",
+                "receiver_account": "xxx-x-x4612-x", "amount": 40.0}
+        self.assertIsNone(app._internal_transfer_label(info))
+
+    def test_customer_with_same_name_is_not_mistaken_for_shop(self):
+        """ลูกค้าชื่อซ้ำคีย์เวิร์ดร้าน ('สุวัฒน์'/'บุญเรือง' เป็นชื่อคนไทยทั่วไป)
+        ต้องไม่ถูกตัดทิ้งว่าเป็นการย้ายกระเป๋า — ยืนยันด้วยเลขบัญชีเท่านั้น"""
+        info = {"sender": "นาย สุวัฒน์ บุญเรือง", "account": "xxx-x-x7788-x",
+                "receiver": "บจก. ไส้ย่างซอย4", "receiver_account": "xxx-x-x2481-x",
+                "amount": 500.0}
+        self.assertIsNone(app._internal_transfer_label(info))
+
+    def test_shop_paying_out_is_not_internal(self):
+        """ร้านจ่ายออกให้บริษัทอื่น (SCB 1,100 → บจก. โปร พลัส มัลติเทค)
+        ปลายทางไม่ใช่บัญชีร้าน → ไม่เข้าเคสนี้ (ทางเดิมข้ามให้อยู่แล้ว)"""
+        info = {"sender": "นาง พิมนภัทร์ ส.", "account": "xxx-xxx905-1",
+                "receiver": "บจก. โปร พลัส มัลติเทค", "receiver_account": "x-9431",
+                "amount": 1100.0}
+        self.assertIsNone(app._internal_transfer_label(info))
+
+    def test_no_payee_config_means_no_guessing(self):
+        app.PAYEE_ACCOUNTS[:] = []
+        info = {"sender": "บจก. ไส้ย่างซอย4", "account": "xxx-x-x2481-x",
+                "receiver": "พิมนภัทร", "receiver_account": "xxx-x-x4612-x", "amount": 873.0}
+        self.assertIsNone(app._internal_transfer_label(info))
+
+    def test_marked_detail_is_not_recovered_back_as_income(self):
+        """ป้ายกำกับต้องเห็นได้จาก detail — ตัวกู้สลิปใช้ป้ายนี้กันดึงกลับเข้าเป็นรายรับ"""
+        detail = f"{app._INTERNAL_MARK} 873.00 · ไส้ย่างซอย4 → พิมนภัทร์&สุวัฒน์ (ย้ายกระเป๋า ไม่ใช่เงินใหม่)"
+        self.assertTrue(detail.startswith(app._INTERNAL_MARK))
+        # รูปแบบ 'ยอด → ปลายทาง' ของใบข้ามปกติต้องแกะไม่ติด (ไม่งั้นจะถูกกู้กลับ)
+        self.assertIsNone(app.re.match(r"\s*([\d,]+(?:\.\d+)?)\s*→\s*(.+)$", detail))
