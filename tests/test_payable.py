@@ -1698,3 +1698,45 @@ class TestPastedLedgerFeedback(PayableTestCase):
         self.assertTrue(handled)
         self.assertEqual(len(self.bills()), 3)
         self.assertNotIn("อ่านบล็อกค้างไม่ได้", "\n".join(self.sent))
+
+
+class TestResvSummaryShowsWholeShop(unittest.TestCase):
+    """'สรุปจอง' ต้องเห็นจองทั้งร้าน ไม่ใช่เฉพาะจองที่เกิดในกลุ่มที่พิมพ์
+
+    เคสจริง 22/08/26: จอง #54 (ออม 3 ท่าน 30 ส.ค. โซน A โต๊ะ 12) เข้าที่กลุ่มบาร์น้ำ
+    เจ้าของพิมพ์ 'สรุปจอง' ในกลุ่ม Sound & Pro → ตอบ 'ไม่มีการจอง' ทั้งที่มีอยู่"""
+
+    GBAR, GOTHER = "Gbar", "Gsound"
+
+    def setUp(self):
+        with app._db() as conn:
+            conn.execute("DELETE FROM reservations WHERE origin_group_id IN (?,?)", (self.GBAR, self.GOTHER))
+            conn.commit()
+        info = {"customer": "ออม", "people": "3 ท่าน", "table": "A โต๊ะ 12",
+                "time_hhmm": "19:30", "resv_date": _d(-2), "is_advance": True}
+        app.save_reservation(self.GBAR, "Doi", info, "จองโต๊ะ", self.GBAR)
+
+    def tearDown(self):
+        with app._db() as conn:
+            conn.execute("DELETE FROM reservations WHERE origin_group_id IN (?,?)", (self.GBAR, self.GOTHER))
+            conn.commit()
+
+    def test_other_group_used_to_see_nothing(self):
+        """ยืนยันพฤติกรรมเดิมที่เป็นปัญหา — กรองตามกลุ่มแล้วกลุ่มอื่นมองไม่เห็น"""
+        out = app.build_resv_summary(self.GOTHER, "x", upcoming=True, match_origin=True)
+        self.assertIn("ไม่มีการจอง", out)
+
+    def test_whole_shop_view_sees_it(self):
+        out = app.build_resv_summary(None, "📋 สรุปการจองทั้งร้าน", upcoming=True)
+        self.assertNotIn("ไม่มีการจอง", out)
+        self.assertIn("ออม", out)
+
+    def test_origin_group_still_sees_it(self):
+        out = app.build_resv_summary(None, "x", upcoming=True)
+        self.assertIn("ออม", out)
+
+    def test_cancelled_is_excluded_from_whole_shop_view(self):
+        with app._db() as conn:
+            conn.execute("UPDATE reservations SET status='CANCELLED' WHERE origin_group_id=?", (self.GBAR,))
+            conn.commit()
+        self.assertIn("ไม่มีการจอง", app.build_resv_summary(None, "x", upcoming=True))
