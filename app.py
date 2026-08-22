@@ -2783,6 +2783,7 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     if len(lines) > 1:
         entries, errors, stated_total = [], [], None
         bill_rows, pay_lines = [], 0
+        ledger_rows = 0        # บรรทัดที่ก๊อปมาจากสรุปของบอทเอง (มี 📥) — แชททั่วไปไม่มีทางมี
         for ln in lines:
             ln = ln.strip()
             if not ln:
@@ -2801,6 +2802,8 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                     raw_b = m_left_b.group(1) if m_left_b else m_bill.group(2)
                     try:
                         bill_rows.append((diso_b, float(raw_b.replace(",", ""))))
+                        if "📥" in ln:
+                            ledger_rows += 1
                         continue
                     except ValueError:
                         pass
@@ -2868,13 +2871,27 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         # เข้าเงื่อนไข '≥2 บรรทัด' พอดี → บอทลบยอดค้างยกมาทั้งชุด (169,427) ทิ้ง เหลือ 2,050
         # เงื่อนไขนับบรรทัดอย่างเดียวหลวมเกินไปสำหรับงานที่ 'ลบของเดิม' — ต้องมีเจตนาชัด
         has_carry_word = bool(re.search(r"ค้าง|ยกมา|สรุปหนี้", re.sub(r"[^\wก-๙]+", "", text)))
-        if hdr_carry and not entries:   # สั่งมาชัดว่าจะวางยอดค้าง แต่อ่านไม่ได้เลย → ต้องบอก ห้ามเงียบ
-            _payable_send(event, group_id, out,
-                          "❌ อ่านบล็อกค้างไม่ได้ — รูปแบบควรเป็น  วัน/เดือน=ยอด (ค้าง xxxx)")
-            return True
         _rows = len(entries) + len(bill_rows)
+        # หัวบล็อกสั่งชัดว่าจะวางยอด แต่อ่านไม่ได้สักบรรทัด → ต้องบอก ห้ามเงียบ
+        # (เดิมเช็คแค่ entries → พาดหัว 'ค้าง' แล้ววางบรรทัดแบบบิล ('15/8 บิล 22449' / '15/08/26 📥+22,449')
+        #  จะขึ้น 'อ่านบล็อกค้างไม่ได้' ทั้งที่อ่านได้ครบทุกบรรทัด)
+        if hdr_carry and _rows == 0:
+            _payable_send(event, group_id, out,
+                          "❌ อ่านบล็อกค้างไม่ได้ — รูปแบบควรเป็น  วัน/เดือน=ยอด (ค้าง xxxx)\n"
+                          "หรือแบบบิล:  วัน/เดือน บิล ยอด")
+            return True
         if not ((entries or bill_rows) and has_carry_word
                 and (hdr_carry or (_rows >= 2 and _rows >= len(errors)))):
+            # อ่านบรรทัดยอดได้หลายบรรทัดแต่ยังไม่รับ = คนตั้งใจวางยอดแน่ๆ แค่ขาดคำสั่งหัวบล็อก
+            # ห้ามเงียบ — เคสจริง 22/08/26: ล้างบัญชีแล้ววางสรุปกลับ บอทไม่ตอบอะไรเลย
+            # เจ้าของไม่รู้ว่าพลาดตรงไหน นึกว่าระบบพัง
+            # เตือนเฉพาะกรณี 'ก๊อปสรุปของบอทมาวาง' (มี 📥 ตั้งแต่ 2 บรรทัด) — ชัดว่าตั้งใจวางยอด
+            # ห้ามเตือนแชททั่วไปที่บังเอิญมี 'วันที่=ยอด' หลายบรรทัด (เคส 'ยอดเนื้อกาดสามแยก' 18/08/26)
+            if ledger_rows >= 2 and not has_carry_word:
+                _payable_send(event, group_id, out,
+                              f"🟡 เห็นยอดจากสรุป {ledger_rows} บรรทัด แต่ยังไม่บันทึกให้ครับ\n"
+                              "การวางยอดทับของเดิมต้องสั่งให้ชัด → พิมพ์คำว่า  ค้าง  ไว้บรรทัดแรก แล้ววางใหม่")
+                return True
             return False   # ไม่ใช่บล็อกค้าง → ปล่อยให้คำสั่งอื่นจัดการต่อ
         if errors:
             print(f"[payable-import] ข้าม {len(errors)} บรรทัด: {errors[:5]}", flush=True)
@@ -2928,9 +2945,17 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                 f"⚠️ บันทึกยอดค้างยกมา {len(entries)} บรรทัด รวม {total:,.2f} บาท{chk}\n"
                 f"❌ อ่านไม่ได้ {len(errors)} บรรทัด — ยังไม่ได้บันทึก โปรดแก้แล้ววางใหม่ทั้งบล็อก:\n{skipped}{more}")
         else:
-            _payable_send(event, group_id, out,
-                f"✅ บันทึกยอดค้างยกมา {len(entries)} บรรทัด รวม {total:,.2f} บาท "
-                f"({entries[0][0]} → {entries[-1][0]}){chk}")
+            # 🔴 เคสจริง 22/08/26: ก๊อป 'สรุปหนี้' ของบอทมาวางกลับหลังล้างบัญชี
+            # ทุกบรรทัดเป็น 'บิล' (📥) ไม่มีบรรทัด 'ยกมา' เลย → entries ว่าง
+            # แต่ข้อความตอบไปหยิบ entries[0] → IndexError → ระเบิดกลางทาง
+            # บิลถูกบันทึกไปแล้ว (save วิ่งก่อนหน้า) แต่คำตอบไม่เคยถูกส่ง = เจ้าของเห็นบอทเงียบสนิท
+            # นึกว่า 'ไม่รับยอด' ทั้งที่ข้อมูลเข้าไปแล้ว — ความเงียบอันตรายกว่า error เสมอ
+            if entries:
+                head = (f"✅ บันทึกยอดค้างยกมา {len(entries)} บรรทัด รวม {total:,.2f} บาท "
+                        f"({entries[0][0]} → {entries[-1][0]})")
+            else:
+                head = f"✅ บันทึกจากบล็อกเรียบร้อย {len(bill_rows)} บรรทัด"
+            _payable_send(event, group_id, out, head + chk)
         _payable_push_summary(event, group_id, acct)
         return True
 

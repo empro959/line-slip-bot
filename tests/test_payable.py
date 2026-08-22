@@ -1648,3 +1648,53 @@ class TestSettleAcrossNotedDates(PayableTestCase):
         allocated, _, _ = app._payable_settle(ACCT, [_d(3), _d(1)], 9027.0)
         self.assertLessEqual(allocated, 9027.0 + 0.01)
         self.assertAlmostEqual(sum(b["paid"] for b in self.bills()), 9027.0, places=2)
+
+
+class TestPastedLedgerFeedback(PayableTestCase):
+    """ก๊อป 'สรุปหนี้' ของบอทมาวางกลับ — ต้องไม่เงียบไม่ว่าผลจะเป็นยังไง
+
+    เคสจริง 22/08/26: ล้างบัญชีแล้ววางสรุปกลับ บอทไม่ตอบอะไรเลย
+    เจ้าของไม่รู้ว่าพลาดตรงไหน นึกว่าระบบพัง"""
+
+    class _Ev:
+        reply_token = "tok"
+
+    def setUp(self):
+        super().setUp()
+        self.sent = []
+        self._orig = app._payable_send
+        app._payable_send = lambda ev, src, dst, txt: self.sent.append(txt)
+
+    def tearDown(self):
+        app._payable_send = self._orig
+
+    def _ledger(self, header: str) -> str:
+        rows = "\n".join(f"{_dmy(_d(i))} 📥+{1000 + i:,}.00" for i in (5, 4, 3))
+        return f"{header}\n━━━━━━━━━━━━━\n{rows}"
+
+    def test_pasted_ledger_with_header_is_accepted(self):
+        handled = app.handle_payable_text(self._Ev(), self._ledger("📋 สรุปหนี้  — รายวัน"), ACCT)
+        self.assertTrue(handled)
+        self.assertEqual(len(self.bills()), 3, "ต้องลงบิลครบ 3 ใบ")
+
+    def test_pasted_ledger_without_header_says_why(self):
+        """ก๊อปเฉพาะบรรทัดยอด (ไม่ติดหัว) → ต้องบอกวิธี ไม่ใช่เงียบ"""
+        handled = app.handle_payable_text(self._Ev(), self._ledger("รายการ"), ACCT)
+        self.assertTrue(handled, "ต้องตอบ ไม่ปล่อยเงียบ")
+        self.assertEqual(self.bills(), [], "ยังไม่บันทึกจนกว่าจะสั่งให้ชัด")
+        self.assertIn("ค้าง", self.sent[-1])
+
+    def test_ordinary_chat_with_date_equals_amount_stays_silent(self):
+        """🔴 เคส 18/08/26 ที่เคยทำหนี้หาย — แชททั่วไปต้องไม่ถูกแตะและไม่ถูกเตือน"""
+        self.sent.clear()
+        chat = f"ยอดเนื้อกาดสามแยก\n{_dm(_d(2))}=430\n{_dm(_d(1))}=520"
+        handled = app.handle_payable_text(self._Ev(), chat, ACCT)
+        self.assertFalse(handled)
+        self.assertEqual(self.sent, [], "ห้ามเตือนแชททั่วไป")
+
+    def test_carry_header_with_bill_rows_is_not_reported_as_unreadable(self):
+        """พาดหัว 'ค้าง' แล้ววางบรรทัดแบบบิล — เดิมตอบ 'อ่านบล็อกค้างไม่ได้' ทั้งที่อ่านได้ครบ"""
+        handled = app.handle_payable_text(self._Ev(), self._ledger("ค้าง"), ACCT)
+        self.assertTrue(handled)
+        self.assertEqual(len(self.bills()), 3)
+        self.assertNotIn("อ่านบล็อกค้างไม่ได้", "\n".join(self.sent))
