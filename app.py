@@ -4,6 +4,7 @@ import json
 import hmac
 import hashlib
 import difflib
+import itertools
 import base64
 import uuid
 import requests
@@ -2163,7 +2164,34 @@ def save_payable_payment(group_id: str, amount: float, sender=None, ref_number=N
     return rid
 
 
-def _payable_settle(group_id: str, pay_for_date: str, amount: float):
+_COMBO_MAX_LINES = int(os.environ.get("PAYABLE_COMBO_MAX_LINES", "14"))
+
+
+def _exact_combo(lines, target: float):
+    """หา 'ชุดบิล' ที่ยอดค้างบวกกันได้เท่ายอดจ่ายพอดี — คืนชุดนั้น หรือ None
+
+    lines = [(id, doc_date, remaining), ...] · เทียบเป็นสตางค์ (int) กันปัญหาทศนิยมลอย
+    ⚠️ เจอมากกว่า 1 ชุดที่บวกได้เท่ากัน = **เดาไม่ได้ ต้องคืน None**
+       เรื่องเงินห้ามเดา — ตัดผิดใบแล้วหนี้เพี้ยนสองทาง (ใบที่ควรจ่ายยังค้าง ใบที่ไม่ควรกลับหาย)
+    จำกัดจำนวนบรรทัดที่เอามาจับคู่ กันคำนวณบานปลาย (2^14 = 16,384 ชุด ยังเร็วมาก)"""
+    lines = list(lines)[:_COMBO_MAX_LINES]
+    if not lines:
+        return None
+    cents = [int(round(float(r[2]) * 100)) for r in lines]
+    goal = int(round(float(target) * 100))
+    if goal <= 0:
+        return None
+    hit = None
+    for k in range(2, len(lines) + 1):          # k=1 (ใบเดียวตรงเป๊ะ) มีขั้นตอนก่อนหน้าจัดการแล้ว
+        for combo in itertools.combinations(range(len(lines)), k):
+            if sum(cents[i] for i in combo) == goal:
+                if hit is not None:
+                    return None                 # ชุดที่สอง = กำกวม ไม่ตัดให้
+                hit = combo
+    return [lines[i] for i in hit] if hit else None
+
+
+def _payable_settle(group_id: str, pay_for_date, amount: float):
     """ตัดยอดจ่ายเข้ากับ 'บรรทัดบิล/ค้าง' โดยตรง — ลำดับการเลือกใบ (เจ้าของตกลง 2026-08-13):
       (1) ยอดค้างตรงเป๊ะ 'ในวันที่ที่โน้ตบนสลิป'  (2) ยอดค้างตรงเป๊ะ 'ทั้งบัญชี' เก่าสุดก่อน
       (3) ไม่มีใบยอดตรง → FIFO บิลของวันที่ที่โน้ตไว้ (ตัดบางส่วนได้)
@@ -2171,6 +2199,11 @@ def _payable_settle(group_id: str, pay_for_date: str, amount: float):
     จ่ายครบ = ลบบรรทัดนั้น, จ่ายบางส่วน = ลดยอดบรรทัดเหลือเท่าที่ค้าง (เรียงค้างยกมาก่อน แล้ว FIFO)
     คืน (allocated_total, [ข้อความสรุปบรรทัดที่ตัด], settle_note) — ส่วนที่ตัดได้จะถูกหักจาก amount ที่ลดยอดรวม กันนับซ้ำ
     settle_note = วันที่ของบรรทัดที่ถูกตัด (แบบสั้น คั่นด้วย ,) ไว้โชว์ในรายงานว่า 'จ่ายตัดของวันไหน'"""
+    # รับได้ทั้ง 'วันเดียว' (แบบเดิม) และ 'หลายวัน' (โน้ตระบุหลายบิล)
+    pay_dates = [pay_for_date] if isinstance(pay_for_date, str) else list(pay_for_date or [])
+    pay_dates = [d for d in pay_dates if d]
+    pay_for_date = pay_dates[0] if pay_dates else None
+
     remaining = float(amount)
     allocated_total = 0.0
     settled = []
@@ -2196,22 +2229,40 @@ def _payable_settle(group_id: str, pay_for_date: str, amount: float):
 
     with _db() as conn:
         rows = []
-        if pay_for_date:   # (1) วันที่ที่โน้ตไว้ + ยอดตรงเป๊ะ = ชัวร์สุด
-            rows = conn.execute(_EXACT + "AND doc_date=? " + _EXACT_ORDER,
-                                (group_id, float(amount), pay_for_date, _PAYABLE_CARRY_NOTE)).fetchall()
+        if pay_dates:      # (1) วันที่ที่โน้ตไว้ (ทุกวัน) + ยอดตรงเป๊ะทั้งใบ = ชัวร์สุด
+            _ph = ",".join("?" * len(pay_dates))
+            rows = conn.execute(_EXACT + f"AND doc_date IN ({_ph}) " + _EXACT_ORDER,
+                                (group_id, float(amount), *pay_dates, _PAYABLE_CARRY_NOTE)).fetchall()
+        if not rows and len(pay_dates) >= 2:
+            # (1b) โน้ตระบุหลายบิล → หาชุดที่ 'ยอดค้างรวมกันเท่ายอดโอนพอดี' ในวันที่ที่โน้ตไว้
+            # เคสจริง 22/08/26: โอน 9,027 โน้ต '(19/8 และ 21/8) 2 บิล' = 5,939 + 3,088 พอดี
+            _ph = ",".join("?" * len(pay_dates))
+            cand = conn.execute(
+                "SELECT id, doc_date, amount, COALESCE(paid,0) paid FROM payable_bills "
+                f"WHERE group_id=? AND doc_date IN ({_ph}) AND (amount - COALESCE(paid,0))>0.01 "
+                "ORDER BY doc_date, id", (group_id, *pay_dates)).fetchall()
+            picked = _exact_combo(
+                [(r["id"], r["doc_date"], float(r["amount"] or 0) - float(r["paid"] or 0)) for r in cand],
+                float(amount))
+            if picked:
+                _ids = {p[0] for p in picked}
+                rows = [r for r in cand if r["id"] in _ids]
+                print(f"[payable] จับคู่ชุดบิลตรงยอดพอดี {len(rows)} ใบ "
+                      f"({', '.join(str(p[1]) for p in picked)}) = {amount:,.2f}", flush=True)
         if not rows:
             # (2) ยอดตรงเป๊ะ 'ทั้งบัญชี' (เก่าสุดก่อน) — ชนะการตัดบางส่วนตามวันที่ที่โน้ตไว้
             # เคสจริง 12/08/26: จ่าย 2,867 = ค่าบิล 03/08 เป๊ะ แต่สลิปให้วันที่ 12/08 มา
             # ของเดิมจำกัดเฉพาะวันที่โน้ต → ไปตัดบางส่วนบิล 12/08 (15,091) ผิดใบ บิล 03/08 ค้างค้างอยู่
             rows = conn.execute(_EXACT + _EXACT_ORDER,
                                 (group_id, float(amount), _PAYABLE_CARRY_NOTE)).fetchall()
-        if not rows and pay_for_date:
-            # (3) ไม่มีใบยอดตรงเลย → ตัดบิลของวันที่ที่โน้ตไว้แบบ FIFO (ตัดบางส่วนได้) เหมือนเดิม
+        if not rows and pay_dates:
+            # (3) ไม่มีใบ/ชุดยอดตรงเลย → ตัดบิลของ 'ทุกวันที่ที่โน้ตไว้' แบบ FIFO (ตัดบางส่วนได้)
+            _ph = ",".join("?" * len(pay_dates))
             rows = conn.execute(
                 "SELECT id, doc_date, amount, COALESCE(paid,0) paid FROM payable_bills "
-                "WHERE group_id=? AND doc_date=? AND (amount - COALESCE(paid,0))>0.01 "
-                "ORDER BY CASE WHEN note=? THEN 0 ELSE 1 END, id",
-                (group_id, pay_for_date, _PAYABLE_CARRY_NOTE)).fetchall()
+                f"WHERE group_id=? AND doc_date IN ({_ph}) AND (amount - COALESCE(paid,0))>0.01 "
+                "ORDER BY CASE WHEN note=? THEN 0 ELSE 1 END, doc_date, id",
+                (group_id, *pay_dates, _PAYABLE_CARRY_NOTE)).fetchall()
         for r in rows:
             if remaining <= 0.01:
                 break
@@ -2559,14 +2610,28 @@ def _payable_reconcile(acct: str):
     return total_before, total_after
 
 
-def _date_from_memo(memo) -> str:
-    """แกะ 'วัน/เดือน' จากบันทึกช่วยจำบนสลิป (เช่น 'ไส้ (23/7) ค้าง 7,993' → 2026-07-23)
-    ใช้เป็น fallback เมื่อ AI ไม่ได้ให้ pay_for_date — regex ในโค้ดชัวร์กว่าให้ AI เดา
-    รับ D/M หรือ D/M/Y (จะในวงเล็บหรือไม่ก็ได้); คืน YYYY-MM-DD หรือ None"""
+def _dates_from_memo(memo) -> list:
+    """แกะ 'วัน/เดือน' **ทุกตัว** จากบันทึกช่วยจำบนสลิป — จ่ายทีเดียวหลายบิลได้
+
+    เคสจริง 22/08/26: โอน 9,027 โน้ตว่า '(19/8 และ 21/8) 2 บิล'
+      = บิล 19/8 ยอด 5,939 + บิล 21/8 ยอด 3,088 พอดีเป๊ะ
+      แต่ของเดิมใช้ re.search เอา 'วันแรกวันเดียว' → เห็นแค่ 19/8
+      หายอดตรงในวันนั้นไม่เจอ เลยตัด FIFO บิลแรกของ 19/8 (21,408) ผิดใบทั้งก้อน
+    รับ D/M หรือ D/M/Y (จะในวงเล็บหรือไม่ก็ได้) · คืนลิสต์ YYYY-MM-DD เรียงตามที่เจอ ไม่ซ้ำ"""
     if not memo or not isinstance(memo, str):
-        return None
-    m = re.search(r"(\d{1,2}/\d{1,2}(?:/\d{2,4})?)", memo)
-    return _sane_doc_date(_parse_thai_date(m.group(1))) if m else None
+        return []
+    out = []
+    for raw in re.findall(r"(\d{1,2}/\d{1,2}(?:/\d{2,4})?)", memo):
+        d = _sane_doc_date(_parse_thai_date(raw))
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def _date_from_memo(memo) -> str:
+    """วันแรกที่เจอในโน้ต (คงไว้ให้ที่เดิมเรียกได้) — คืน YYYY-MM-DD หรือ None"""
+    ds = _dates_from_memo(memo)
+    return ds[0] if ds else None
 
 
 _PAYABLE_SRC = {"block": "บล็อกค้าง", "พิมพ์": "พิมพ์เอง", "รูป": "รูปบิล"}
@@ -2680,7 +2745,10 @@ def _process_payable_image(event, group_id: str):
             notify(f"🔁 สลิปนี้ (อ้างอิง {ref}) เคยบันทึกแล้ว — ไม่นับซ้ำ", force=True)
             return
         # ตัดยอดเข้ากับบรรทัดค้าง: ดูวันที่ที่โน้ตบนสลิป → ถ้าไม่มี ลองจับยอดที่ตรงกับบรรทัดเดียว
-        pay_for = _sane_doc_date(info.get("pay_for_date")) or _date_from_memo(info.get("memo"))
+        # โน้ตที่คนเขียนเองชัวร์กว่า AI เดา — ถ้าโน้ตระบุหลายบิล ใช้ทั้งชุด
+        _memo_dates = _dates_from_memo(info.get("memo"))
+        _ai_date = _sane_doc_date(info.get("pay_for_date"))
+        pay_for = _memo_dates if len(_memo_dates) >= 2 else (_ai_date or (_memo_dates[0] if _memo_dates else None))
         allocated, settled, settle_note = _payable_settle(acct, pay_for, amount)
         save_payable_payment(acct, amount, sender=info.get("sender"),
                              ref_number=ref, slip_dt=info.get("datetime"),

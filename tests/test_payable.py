@@ -1541,3 +1541,110 @@ class TestPayableSummaryDebounce(unittest.TestCase):
     def test_empty_queue_is_a_noop(self):
         self.assertFalse(app._payable_flush_pending(self.ACCT))
         self.assertEqual(self.sent, [])
+
+
+class TestMemoMultipleDates(unittest.TestCase):
+    """โน้ตบนสลิประบุหลายบิล ต้องอ่านครบทุกวัน
+
+    เคสจริง 22/08/26: โอน 9,027 โน้ต '(19/8 และ 21/8) 2 บิล'
+    ของเดิมใช้ re.search เอาวันแรกวันเดียว → เห็นแค่ 19/8"""
+
+    def test_reads_every_date(self):
+        got = app._dates_from_memo(f"จ่าย ({_dm(_d(3))} และ {_dm(_d(1))}) 2 บิล")
+        self.assertEqual(got, [_d(3), _d(1)])
+
+    def test_single_date_still_works(self):
+        self.assertEqual(app._dates_from_memo(f"ไส้ ({_dm(_d(2))}) ค้าง 7,993"), [_d(2)])
+        self.assertEqual(app._date_from_memo(f"ไส้ ({_dm(_d(2))}) ค้าง 7,993"), _d(2))
+
+    def test_duplicate_dates_collapse(self):
+        self.assertEqual(app._dates_from_memo(f"{_dm(_d(1))} กับ {_dm(_d(1))}"), [_d(1)])
+
+    def test_no_date_returns_empty(self):
+        self.assertEqual(app._dates_from_memo("จ่ายค่าน้ำแข็ง"), [])
+        self.assertEqual(app._dates_from_memo(None), [])
+        self.assertIsNone(app._date_from_memo(""))
+
+
+class TestExactCombo(unittest.TestCase):
+    """จับคู่ 'ชุดบิล' ที่บวกกันได้เท่ายอดโอนพอดี"""
+
+    def test_real_case_two_bills(self):
+        lines = [(1, "d1", 21408.0), (2, "d1", 5939.0), (3, "d2", 25957.0), (4, "d2", 3088.0)]
+        got = app._exact_combo(lines, 9027.0)
+        self.assertEqual(sorted(r[0] for r in got), [2, 4])
+
+    def test_ambiguous_returns_none(self):
+        """สองชุดบวกได้เท่ากัน = เดาไม่ได้ ห้ามตัดมั่ว (ตัดผิดใบ หนี้เพี้ยนสองทาง)"""
+        lines = [(1, "d1", 100.0), (2, "d1", 200.0), (3, "d2", 300.0), (4, "d2", 100.0)]
+        self.assertIsNone(app._exact_combo(lines, 300.0))   # 100+200 หรือ 300 (แต่ 300 เป็นใบเดียว)
+        lines2 = [(1, "d1", 100.0), (2, "d1", 200.0), (3, "d2", 200.0), (4, "d2", 100.0)]
+        self.assertIsNone(app._exact_combo(lines2, 300.0))  # (1,2) และ (1,3) และ (2,4) และ (3,4)
+
+    def test_no_combination_returns_none(self):
+        self.assertIsNone(app._exact_combo([(1, "d", 500.0), (2, "d", 700.0)], 999.0))
+
+    def test_single_line_is_not_a_combo(self):
+        """ใบเดียวตรงเป๊ะเป็นหน้าที่ของขั้นตอนก่อนหน้า ตัวนี้ต้องไม่ไปแย่งทำ"""
+        self.assertIsNone(app._exact_combo([(1, "d", 900.0), (2, "d", 5.0)], 900.0))
+
+    def test_satang_precision(self):
+        lines = [(1, "d", 0.1), (2, "d", 0.2)]
+        self.assertIsNotNone(app._exact_combo(lines, 0.3))   # 0.1+0.2 ทศนิยมลอย ต้องยังจับได้
+
+    def test_empty_or_zero(self):
+        self.assertIsNone(app._exact_combo([], 100.0))
+        self.assertIsNone(app._exact_combo([(1, "d", 100.0)], 0))
+
+
+class TestSettleAcrossNotedDates(PayableTestCase):
+    """ตัดยอดจ่ายข้ามวันตามที่โน้ตระบุ — เคสจริง 22/08/26 (9,027 = 5,939 + 3,088)"""
+
+    def _setup_real_bills(self):
+        app.save_payable_bill(ACCT, 21408.0, note="รูป", doc_date=_d(3))
+        app.save_payable_bill(ACCT,  5939.0, note="รูป", doc_date=_d(3))
+        app.save_payable_bill(ACCT, 25957.0, note="รูป", doc_date=_d(1))
+        app.save_payable_bill(ACCT,  3088.0, note="รูป", doc_date=_d(1))
+
+    def _paid(self):
+        return {round(b["amount"], 2): round(b["paid"], 2) for b in self.bills()}
+
+    def test_pays_the_two_noted_bills_exactly(self):
+        self._setup_real_bills()
+        allocated, settled, note = app._payable_settle(ACCT, [_d(3), _d(1)], 9027.0)
+        self.assertAlmostEqual(allocated, 9027.0, places=2)
+        paid = self._paid()
+        self.assertAlmostEqual(paid[5939.0], 5939.0, places=2, msg="บิล 5,939 ต้องจ่ายครบ")
+        self.assertAlmostEqual(paid[3088.0], 3088.0, places=2, msg="บิล 3,088 ต้องจ่ายครบ")
+        self.assertAlmostEqual(paid[21408.0], 0.0, places=2, msg="ห้ามไปแตะใบใหญ่")
+        self.assertAlmostEqual(paid[25957.0], 0.0, places=2)
+
+    def test_old_behaviour_before_fix_would_hit_the_big_bill(self):
+        """ยืนยันว่าถ้าได้วันเดียว (พฤติกรรมเดิม) จะไปตัดใบใหญ่จริง — นี่คือบั๊กที่แก้"""
+        self._setup_real_bills()
+        app._payable_settle(ACCT, _d(3), 9027.0)
+        self.assertAlmostEqual(self._paid()[21408.0], 9027.0, places=2)
+
+    def test_single_exact_bill_still_wins_over_combo(self):
+        """ใบเดียวยอดตรงเป๊ะต้องมาก่อนการจับคู่ชุด (ชัวร์กว่า)"""
+        app.save_payable_bill(ACCT, 9027.0, note="รูป", doc_date=_d(1))
+        app.save_payable_bill(ACCT, 5939.0, note="รูป", doc_date=_d(3))
+        app.save_payable_bill(ACCT, 3088.0, note="รูป", doc_date=_d(1))
+        app._payable_settle(ACCT, [_d(3), _d(1)], 9027.0)
+        paid = self._paid()
+        self.assertAlmostEqual(paid[9027.0], 9027.0, places=2)
+        self.assertAlmostEqual(paid[5939.0], 0.0, places=2)
+        self.assertAlmostEqual(paid[3088.0], 0.0, places=2)
+
+    def test_falls_back_to_fifo_across_all_noted_dates(self):
+        """ไม่มีชุดไหนบวกได้พอดี → ตัด FIFO ข้ามวันที่โน้ตไว้ทั้งหมด (เดิมตัดได้แค่วันแรก)"""
+        app.save_payable_bill(ACCT, 1000.0, note="รูป", doc_date=_d(3))
+        app.save_payable_bill(ACCT, 1000.0, note="รูป", doc_date=_d(1))
+        allocated, _, _ = app._payable_settle(ACCT, [_d(3), _d(1)], 1500.0)
+        self.assertAlmostEqual(allocated, 1500.0, places=2, msg="ต้องไหลข้ามวันได้ ไม่ติดอยู่วันเดียว")
+
+    def test_never_allocates_more_than_paid(self):
+        self._setup_real_bills()
+        allocated, _, _ = app._payable_settle(ACCT, [_d(3), _d(1)], 9027.0)
+        self.assertLessEqual(allocated, 9027.0 + 0.01)
+        self.assertAlmostEqual(sum(b["paid"] for b in self.bills()), 9027.0, places=2)
