@@ -3195,17 +3195,54 @@ def _payable_unlink(conn, group_id: str, table: str, row) -> float:
     return left
 
 
-def _delete_last_payable(event, group_id: str, table: str, label: str):
+# กดลบซ้ำติดๆ กัน = อุบัติเหตุบ่อยที่สุดของคำสั่งที่แตะเงิน
+# เคสจริง 23/08/26: สั่ง 'ลบจ่ายล่าสุด' สองรอบติด → ลบทั้งก้อน 20,297 และก้อน 10,000
+#   ยอดหนี้เกินจริง 10,000 โดยไม่มีใครทันสังเกต (ต้องไล่ย้อนกว่าจะเจอ)
+# ครั้งแรกยังลบทันทีเหมือนเดิม (ตอนฉุกเฉินต้องเร็ว) — ครั้งที่สองในกรอบเวลานี้ค่อยขอยืนยัน
+PAYABLE_DEL_CONFIRM_SEC = int(os.environ.get("PAYABLE_DEL_CONFIRM_SEC", "120"))
+_PAYABLE_DEL_TABLES = {"payable_payments": "เงินจ่าย", "payable_bills": "บิลซื้อ"}
+
+
+def _payable_del_key(group_id: str, table: str) -> str:
+    return f"paydel:{group_id}:{table}"
+
+
+def _payable_del_recent(group_id: str, table: str) -> bool:
+    """เพิ่งลบรายการชนิดนี้ไปในกรอบเวลาไหม (ต่อบัญชี+ต่อชนิด)"""
+    try:
+        ts = float(_get_meta(_payable_del_key(group_id, table)) or 0)
+    except (TypeError, ValueError):
+        return False
+    return 0 < time.time() - ts < PAYABLE_DEL_CONFIRM_SEC
+
+
+def _delete_last_payable(event, group_id: str, table: str, label: str, confirmed: bool = False):
+    if table not in _PAYABLE_DEL_TABLES:      # ชื่อตารางถูกต่อเข้า SQL ตรงๆ — ต้องมาจากลิสต์ที่รู้จักเท่านั้น
+        return
     with _db() as conn:
         row = conn.execute(f"SELECT * FROM {table} WHERE group_id=? ORDER BY id DESC LIMIT 1",
                            (group_id,)).fetchone()
         if not row:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"📭 ไม่มี{label}ให้ลบ"))
             return
+        if not confirmed and _payable_del_recent(group_id, table):
+            # โชว์ว่ากำลังจะลบ 'ใบไหน' ให้เห็นก่อน — จุดที่พลาดคือคนไม่รู้ว่าลบตัวที่สองไปด้วย
+            line_bot_api.reply_message(event.reply_token, TemplateSendMessage(
+                alt_text=f"ยืนยันลบ{label}ล่าสุดซ้ำอีกใบ",
+                template=ButtonsTemplate(
+                    title=f"⚠️ ลบ{label}ซ้ำอีกใบ?",
+                    text=(f"เพิ่งลบไปเมื่อครู่ · ใบถัดไปคือ #{row['id']} "
+                          f"{float(row['amount'] or 0):,.2f} บาท (กู้คืนไม่ได้)")[:60],
+                    actions=[PostbackAction(label=f"🗑️ ยืนยันลบ #{row['id']}",
+                                            data=f"paydel:{table}:{row['id']}")],
+                ),
+            ))
+            return
         # คืนยอดที่จับคู่ไว้ก่อนลบ (ของเดิมลบแถวเดียวโดยไม่คืน → ยอดค้างเพี้ยน)
         stuck = _payable_unlink(conn, group_id, table, row)
         conn.execute(f"DELETE FROM {table} WHERE id=?", (row["id"],))
         conn.commit()
+    _set_meta(_payable_del_key(group_id, table), str(time.time()))
     warn = (f"\n⚠️ คืนยอดที่จับคู่ไว้ไม่ครบ {stuck:,.2f} บาท (บรรทัดคู่ถูกลบไปแล้ว) "
             "— ถ้ายอดดูไม่ถูก สั่ง 'จัดยอดใหม่'" if stuck > 0.01 else "")
     line_bot_api.reply_message(event.reply_token, TextSendMessage(
@@ -5683,6 +5720,17 @@ def handle_postback(event):
             do_reset_all(event)
         except Exception as e:
             print(f"[reset] reset_all error: {e}", flush=True)
+    elif action == "paydel":
+        _tbl = parts[1] if len(parts) > 1 else ""
+        if _tbl not in _PAYABLE_DEL_TABLES:
+            return
+        if not _postback_once(f"pb:{data}"):
+            _already(); return
+        try:
+            _acct = _payable_account_key(getattr(event.source, "group_id", event.source.user_id))
+            _delete_last_payable(event, _acct, _tbl, _PAYABLE_DEL_TABLES[_tbl], confirmed=True)
+        except Exception as e:
+            print(f"[payable] ยืนยันลบไม่สำเร็จ: {e}", flush=True)
     elif action == "reset_payable":
         if not _postback_once(f"pb:{data}"):
             _already(); return

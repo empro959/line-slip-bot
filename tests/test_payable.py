@@ -1811,3 +1811,74 @@ class TestMemoSharedMonthDayList(unittest.TestCase):
         self.assertEqual(app._dates_from_memo("ไส้ (23/7) ค้าง 7,993"), ["2026-07-23"])
         self.assertEqual(app._dates_from_memo("จ่าย (19/8 และ 21/8) 2 บิล"),
                          ["2026-08-19", "2026-08-21"])
+
+
+class TestDeleteLastNeedsConfirmOnRepeat(PayableTestCase):
+    """กด 'ลบจ่ายล่าสุด' ซ้ำติดๆ กัน ต้องขอยืนยันก่อน
+
+    เคสจริง 23/08/26: สั่งสองรอบติด → ลบทั้งก้อน 20,297 และก้อน 10,000
+    ยอดหนี้เกินจริง 10,000 โดยไม่มีใครทันสังเกต"""
+
+    class _Ev:
+        reply_token = "tok"
+        class source:
+            group_id = ACCT
+            user_id = ACCT
+
+    def setUp(self):
+        super().setUp()
+        self.replies = []
+        self._orig = app.line_bot_api.reply_message
+        app.line_bot_api.reply_message = lambda tok, msg: self.replies.append(msg)
+        app._set_meta(app._payable_del_key(ACCT, "payable_payments"), "")
+        app.save_payable_bill(ACCT, 5000.0, note="รูป", doc_date=_d(1))
+        app.save_payable_payment(ACCT, 1000.0, sender="พิมพ์")
+        app.save_payable_payment(ACCT, 2000.0, sender="พิมพ์")
+
+    def tearDown(self):
+        app.line_bot_api.reply_message = self._orig
+        app._set_meta(app._payable_del_key(ACCT, "payable_payments"), "")
+
+    def _pays(self):
+        with app._db() as conn:
+            return conn.execute("SELECT COUNT(*) c FROM payable_payments WHERE group_id=?",
+                                (ACCT,)).fetchone()["c"]
+
+    def test_first_delete_is_immediate(self):
+        """ตอนฉุกเฉินต้องเร็ว — ครั้งแรกยังลบทันทีเหมือนเดิม"""
+        app._delete_last_payable(self._Ev(), ACCT, "payable_payments", "เงินจ่าย")
+        self.assertEqual(self._pays(), 1)
+
+    def test_second_delete_asks_first(self):
+        app._delete_last_payable(self._Ev(), ACCT, "payable_payments", "เงินจ่าย")
+        app._delete_last_payable(self._Ev(), ACCT, "payable_payments", "เงินจ่าย")
+        self.assertEqual(self._pays(), 1, "ครั้งที่สองต้องยังไม่ลบ")
+        self.assertIn("ยืนยัน", getattr(self.replies[-1], "alt_text", ""))
+
+    def test_confirmed_delete_goes_through(self):
+        app._delete_last_payable(self._Ev(), ACCT, "payable_payments", "เงินจ่าย")
+        app._delete_last_payable(self._Ev(), ACCT, "payable_payments", "เงินจ่าย")
+        app._delete_last_payable(self._Ev(), ACCT, "payable_payments", "เงินจ่าย", confirmed=True)
+        self.assertEqual(self._pays(), 0)
+
+    def test_window_expires(self):
+        """พ้นกรอบเวลาแล้วกลับมาลบทันทีเหมือนเดิม (ไม่กวนตอนใช้งานปกติ)"""
+        app._delete_last_payable(self._Ev(), ACCT, "payable_payments", "เงินจ่าย")
+        app._set_meta(app._payable_del_key(ACCT, "payable_payments"),
+                      str(app.time.time() - app.PAYABLE_DEL_CONFIRM_SEC - 5))
+        app._delete_last_payable(self._Ev(), ACCT, "payable_payments", "เงินจ่าย")
+        self.assertEqual(self._pays(), 0)
+
+    def test_unknown_table_is_refused(self):
+        """ชื่อตารางถูกต่อเข้า SQL ตรงๆ — ค่าที่มาจากปุ่มต้องอยู่ในลิสต์ที่รู้จักเท่านั้น"""
+        app._delete_last_payable(self._Ev(), ACCT, "slips; DROP TABLE x", "มั่ว")
+        self.assertEqual(self._pays(), 2, "ห้ามแตะข้อมูล")
+        self.assertEqual(self.replies, [])
+
+    def test_bills_and_payments_have_separate_windows(self):
+        """ลบจ่ายแล้วสั่งลบบิลทันที ต้องไม่ถูกขอยืนยัน (คนละชนิดกัน)"""
+        app._delete_last_payable(self._Ev(), ACCT, "payable_payments", "เงินจ่าย")
+        app._delete_last_payable(self._Ev(), ACCT, "payable_bills", "บิลซื้อ")
+        with app._db() as conn:
+            n = conn.execute("SELECT COUNT(*) c FROM payable_bills WHERE group_id=?", (ACCT,)).fetchone()["c"]
+        self.assertEqual(n, 0, "บิลต้องถูกลบทันที")
