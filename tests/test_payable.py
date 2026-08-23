@@ -1933,3 +1933,47 @@ class TestResvDraftLivesLongEnough(unittest.TestCase):
             fresh = (any(h in text.lower() for h in app._RESV_HINTS if h not in app._RESV_WEAK_HINTS)
                      or app._resv_signal_hits(text) >= 3)
             self.assertTrue(fresh, text)
+
+
+class TestTableCodeFallback(unittest.TestCase):
+    """พนักงานพิมพ์รหัสโต๊ะมาแล้ว บอทต้องไม่ถามซ้ำ
+
+    เคสจริง 23/08/26: ข้อความมี 'A4' อยู่แล้ว แต่บอทยังถาม 'นั่งโซนไหนครับ?'
+    คำสั่งแปลงรหัสอยู่ใน prompt แล้ว แต่ AI ไม่ได้ทำทุกครั้ง
+    → เรื่องที่กติกาตายตัวอยู่แล้ว ไม่ควรฝากไว้กับความแน่นอนของ AI"""
+
+    def test_reads_the_real_case(self):
+        self.assertEqual(app._table_from_text("เวลา 19.00 โซน A4"), "โซน A โต๊ะ 4")
+        self.assertEqual(app._table_from_text("แม่เล็ก ลาบต้นยาง 2 ท่าน 30/8 A4"), "โซน A โต๊ะ 4")
+
+    def test_lowercase_and_two_digits(self):
+        self.assertEqual(app._table_from_text("จอง b10 คุนนาต มาทุ่ม"), "โซน B โต๊ะ 10")
+
+    def test_multi_table_range(self):
+        self.assertEqual(app._table_from_text("A2-3-4"), "โซน A โต๊ะ 2-3-4")
+
+    def test_no_code_returns_none(self):
+        for t in ("ลูกค้า 4 คน 19:30", "ปิดร้าน 2 ทุ่ม", "คุณเอ 6 ท่าน พรุ่งนี้"):
+            self.assertIsNone(app._table_from_text(t), t)
+
+    def test_time_is_not_a_table_code(self):
+        """'19.00' / '19:30' ขึ้นต้นด้วยเลข ไม่ใช่รหัสโต๊ะ"""
+        self.assertIsNone(app._table_from_text("มา 19.00 นะ"))
+
+    def test_english_word_ending_with_digits_is_not_a_table(self):
+        self.assertIsNone(app._table_from_text("COVID19 ยังมีอยู่"))
+
+
+class TestPeopleLabelNotDoubled(unittest.TestCase):
+    """'2 ท่าน ท่าน' — AI คืนหน่วยมาแล้ว โค้ดต่อหน่วยซ้ำอีก"""
+
+    def _label(self, people: str) -> str:
+        p = str(people).strip()
+        return p if app.re.search(r"ท่าน|คน|ที่นั่ง", p) else f"{p} ท่าน"
+
+    def test_value_with_unit_is_not_doubled(self):
+        self.assertEqual(self._label("2 ท่าน"), "2 ท่าน")
+        self.assertEqual(self._label("4 คน"), "4 คน")
+
+    def test_bare_number_gets_a_unit(self):
+        self.assertEqual(self._label("6"), "6 ท่าน")

@@ -3763,6 +3763,24 @@ _RESV_SIGNALS = (
     r"วันนี้|พรุ่งนี้|มะรืน|คืนนี้|เสาร์|อาทิตย์|จันทร์|อังคาร|พุธ|พฤหัส|ศุกร์",   # วันแบบคำ
 )
 
+# รหัสโต๊ะที่พนักงานพิมพ์ลอยๆ — 'A4' · 'B10' · 'A2-3-4'
+_TABLE_CODE = re.compile(
+    r"(?<![A-Za-z\u0E00-\u0E7F\d])([A-Za-z])\s?(\d{1,2}(?:\s*[-–]\s*\d{1,2})*)(?![\d.])")
+
+
+def _table_from_text(text: str):
+    """แปลงรหัสโต๊ะลอยๆ ในข้อความเป็น 'โซน A โต๊ะ 4' — ใช้เป็นตัวสำรองเมื่อ AI ไม่ได้ดึงช่องโต๊ะมา
+
+    เคสจริง 23/08/26: พนักงานพิมพ์โซนมาแล้วแต่บอทยังถาม 'นั่งโซนไหนครับ?'
+    คำสั่งใน prompt มีอยู่แล้ว แต่ AI ไม่ได้ทำทุกครั้ง — เรื่องที่กติกาตายตัวอยู่แล้ว
+    ไม่ควรฝากไว้กับความแน่นอนของ AI"""
+    m = _TABLE_CODE.search(text or "")
+    if not m:
+        return None
+    nums = re.sub(r"\s+", "", m.group(2))
+    return f"โซน {m.group(1).upper()} โต๊ะ {nums}"
+
+
 def _resv_signal_hits(text: str) -> int:
     """นับว่าข้อความนี้พูดถึง 'เรื่องของการจอง' กี่เรื่อง (จำนวนคน/โซน/เวลา/วันที่)"""
     return sum(1 for pat in _RESV_SIGNALS if re.search(pat, text))
@@ -4222,6 +4240,14 @@ def handle_reservation_text(event, text: str, group_id: str):
     if not info.get("customer") and any(w in eff_text for w in ("กู", "ผม", "ฉัน", "เรา", "หนู", "ข้า", "ชั้น", "ตัวเอง")):
         info["customer"] = requested_by
 
+    # AI ไม่ได้ดึงช่องโต๊ะมา แต่ในข้อความมีรหัสโต๊ะชัดๆ → เติมให้เอง อย่าไปถามซ้ำ
+    # (ถามสิ่งที่เขาพิมพ์มาแล้ว = พนักงานเสียความเชื่อมั่นในบอทเร็วที่สุด)
+    if not info.get("table"):
+        _t = _table_from_text(eff_text)
+        if _t:
+            info["table"] = _t
+            print(f"[resv] เติมโซนจากรหัสในข้อความ → {_t} group={group_id}", flush=True)
+
     # ── เช็คข้อมูลให้ครบ: 1.ชื่อ 2.จำนวนคน 3.เวลา 4.โซน — ถ้าขาดให้ถามกลับ ยังไม่บันทึก ──
     missing = []
     if not info.get("customer"):  missing.append("customer")
@@ -4244,7 +4270,9 @@ def handle_reservation_text(event, text: str, group_id: str):
         # โชว์สิ่งที่จับได้แล้วด้วย จะได้รู้ว่าบอทเข้าใจถูกไหม แล้วถามเฉพาะที่ขาด
         got = []
         if info.get("customer"): got.append(f"ชื่อ {info['customer']}")
-        if info.get("people"):   got.append(f"{info['people']} ท่าน")
+        if info.get("people"):
+            _p = str(info["people"]).strip()          # AI คืนมาพร้อมหน่วยแล้วบ้าง ('2 ท่าน') → อย่าต่อซ้ำ
+            got.append(_p if re.search(r"ท่าน|คน|ที่นั่ง", _p) else f"{_p} ท่าน")
         if _valid_ymd(info.get("resv_date")): got.append(_resv_when_label({"resv_date": info["resv_date"]}))
         if info.get("time_hhmm"): got.append(f"{info['time_hhmm']} น.")
         if info.get("table"):     got.append(f"โซน {info['table']}")
