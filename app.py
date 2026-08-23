@@ -2615,6 +2615,18 @@ def _payable_reconcile(acct: str):
     return total_before, total_after
 
 
+# '22,23/8' · '22 และ 23/8' · '22-23/8' → วันหลายวันที่ใช้เดือนเดียวกัน
+# จำกัดวันละ 1-2 หลัก จึงไม่ไปจับเลขเงินอย่าง '1,200/8'
+_MEMO_DAYLIST = re.compile(
+    r"(\d{1,2}(?:\s*(?:,|และ|กับ|-|–)\s*\d{1,2})+)\s*/\s*(\d{1,2})((?:/\d{2,4})?)")
+
+
+def _expand_daylist(m) -> str:
+    days = re.findall(r"\d{1,2}", m.group(1))
+    mon, yr = m.group(2), m.group(3) or ""
+    return ",".join(f"{d}/{mon}{yr}" for d in days)
+
+
 def _dates_from_memo(memo) -> list:
     """แกะ 'วัน/เดือน' **ทุกตัว** จากบันทึกช่วยจำบนสลิป — จ่ายทีเดียวหลายบิลได้
 
@@ -2625,6 +2637,11 @@ def _dates_from_memo(memo) -> list:
     รับ D/M หรือ D/M/Y (จะในวงเล็บหรือไม่ก็ได้) · คืนลิสต์ YYYY-MM-DD เรียงตามที่เจอ ไม่ซ้ำ"""
     if not memo or not isinstance(memo, str):
         return []
+    # กางรายการวันที่ที่ 'ใช้เดือนร่วมกัน' ก่อน: '22,23/8' → '22/8,23/8'
+    # เคสจริง 23/08/26: โอน 20,297 โน้ต 'ไส้ (12/8 จ่ายที่ค้าง(22,23/8) รวม 3 บิล'
+    #   เลข 22 ไม่มี '/เดือน' ของตัวเอง → ตัวอ่านมองไม่เห็น เหลือแค่ 12/8 กับ 23/8
+    #   → ไปตัดบิล 23/8 หมดทั้งใบแทนที่จะกระจายตามที่โน้ตสั่ง
+    memo = _MEMO_DAYLIST.sub(_expand_daylist, memo)
     out = []
     for raw in re.findall(r"(\d{1,2}/\d{1,2}(?:/\d{2,4})?)", memo):
         d = _sane_doc_date(_parse_thai_date(raw))

@@ -1783,3 +1783,31 @@ class TestCarryHeaderIsCommandOnly(PayableTestCase):
         """สั่งชัดว่าจะวางยอด แต่อ่านไม่ได้เลย → ยังต้องบอก ห้ามเงียบ"""
         app.handle_payable_text(self._Ev(), "ค้าง\nอะไรก็ไม่รู้\nมั่วๆ", ACCT)
         self.assertIn("อ่านบล็อกค้างไม่ได้", "\n".join(self.sent))
+
+
+class TestMemoSharedMonthDayList(unittest.TestCase):
+    """วันหลายวันที่ 'ใช้เดือนร่วมกัน' ต้องอ่านครบ
+
+    เคสจริง 23/08/26: โอน 20,297 โน้ต 'ไส้ (12/8 จ่ายที่ค้าง(22,23/8) รวม 3 บิล'
+    เลข 22 ไม่มี '/เดือน' ของตัวเอง → ตัวอ่านมองไม่เห็น เหลือแค่ 12/8 กับ 23/8"""
+
+    def test_real_memo_reads_all_three_dates(self):
+        got = app._dates_from_memo("ไส้ (12/8 จ่ายที่ค้าง(22,23/8) รวม 3 บิล")
+        self.assertEqual(got, ["2026-08-12", "2026-08-22", "2026-08-23"])
+
+    def test_various_separators(self):
+        for memo in ("22,23/8", "22 และ 23/8", "22-23/8", "22 กับ 23/8"):
+            self.assertEqual(app._dates_from_memo(memo), ["2026-08-22", "2026-08-23"], memo)
+
+    def test_three_days_sharing_a_month(self):
+        self.assertEqual(app._dates_from_memo("จ่าย 1,2,3/8"),
+                         ["2026-08-01", "2026-08-02", "2026-08-03"])
+
+    def test_money_amount_is_not_mistaken_for_dates(self):
+        """'1,200/8' เป็นตัวเลขเงิน ไม่ใช่รายการวันที่ — ห้ามกางเป็นวัน"""
+        self.assertEqual(app._dates_from_memo("ค่าของ 1,200/8"), [])
+
+    def test_plain_formats_unchanged(self):
+        self.assertEqual(app._dates_from_memo("ไส้ (23/7) ค้าง 7,993"), ["2026-07-23"])
+        self.assertEqual(app._dates_from_memo("จ่าย (19/8 และ 21/8) 2 บิล"),
+                         ["2026-08-19", "2026-08-21"])
