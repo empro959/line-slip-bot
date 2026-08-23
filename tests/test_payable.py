@@ -1882,3 +1882,54 @@ class TestDeleteLastNeedsConfirmOnRepeat(PayableTestCase):
         with app._db() as conn:
             n = conn.execute("SELECT COUNT(*) c FROM payable_bills WHERE group_id=?", (ACCT,)).fetchone()["c"]
         self.assertEqual(n, 0, "บิลต้องถูกลบทันที")
+
+
+class TestResvDraftLivesLongEnough(unittest.TestCase):
+    """ร่างจองต้องอยู่นานพอให้หน้าร้านตอบตอนว่าง
+
+    เคสจริง 23/08/26 กลุ่ม Sound & Pro:
+      19:22 บอทถาม 'กี่โมง? / โซนไหน?' (แม่เล็ก ลาบต้นยาง · 2 ท่าน · 30 ส.ค.)
+      21:12 พนักงานตอบ 'เวลา 19.00 โซน A4'  ← ห่าง 1 ชม. 50 นาที
+    ร่างหมดอายุไปแล้ว คำตอบเลยลอยเดี่ยวๆ ไม่มีชื่อ/จำนวน/วัน → จองหลุด"""
+
+    GID = "Gdraft"
+
+    def setUp(self):
+        app._resv_draft_clear(self.GID)
+
+    def tearDown(self):
+        app._resv_draft_clear(self.GID)
+
+    def test_default_window_covers_a_two_hour_gap(self):
+        self.assertGreaterEqual(app.RESV_FOLLOWUP_MIN, 120,
+                                "หน้าร้านตอบช้ากว่า 2 ชม. ได้เป็นเรื่องปกติ")
+
+    def test_draft_survives_the_real_gap(self):
+        app._resv_draft_set(self.GID, "แม่เล็ก ลาบต้นยาง 2 ท่าน 30 ส.ค.", 1, asked=["time", "table"])
+        raw = json.loads(app._get_meta(f"resvdraft:{self.GID}"))
+        raw["ts"] = raw["ts"] - 110 * 60          # ย้อนไป 1 ชม. 50 นาที
+        app._set_meta(f"resvdraft:{self.GID}", json.dumps(raw))
+        self.assertIsNotNone(app._resv_draft_get(self.GID), "ร่างต้องยังอยู่")
+
+    def test_draft_still_expires_eventually(self):
+        app._resv_draft_set(self.GID, "x", 1, asked=["time"])
+        raw = json.loads(app._get_meta(f"resvdraft:{self.GID}"))
+        raw["ts"] = raw["ts"] - (app.RESV_FOLLOWUP_MIN + 5) * 60
+        app._set_meta(f"resvdraft:{self.GID}", json.dumps(raw))
+        self.assertIsNone(app._resv_draft_get(self.GID))
+
+    def test_short_answer_is_treated_as_an_answer_not_a_new_booking(self):
+        """'เวลา 19.00 โซน A4' = 2 สัญญาณ ไม่มีคำว่าจอง → ต้องต่อกับร่างเก่า"""
+        text = "เวลา 19.00 โซน A4"
+        self.assertEqual(app._resv_signal_hits(text), 2)
+        fresh = (any(h in text.lower() for h in app._RESV_HINTS if h not in app._RESV_WEAK_HINTS)
+                 or app._resv_signal_hits(text) >= 3)
+        self.assertFalse(fresh, "ห้ามตีเป็นจองใบใหม่")
+
+    def test_full_new_booking_does_not_merge_with_an_old_draft(self):
+        """จองใบใหม่เต็มใบ ต้องเริ่มใบใหม่ ไม่เอาไปต่อกับร่างของลูกค้าคนก่อน"""
+        for text in ("จองโต๊ะ คุณบี 5 คน พรุ่งนี้ 2 ทุ่ม โซน B",
+                     "คุณซี 6 ท่าน เสาร์นี้ 19:30 โซน A"):
+            fresh = (any(h in text.lower() for h in app._RESV_HINTS if h not in app._RESV_WEAK_HINTS)
+                     or app._resv_signal_hits(text) >= 3)
+            self.assertTrue(fresh, text)
