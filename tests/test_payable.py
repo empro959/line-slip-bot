@@ -1740,3 +1740,46 @@ class TestResvSummaryShowsWholeShop(unittest.TestCase):
             conn.execute("UPDATE reservations SET status='CANCELLED' WHERE origin_group_id=?", (self.GBAR,))
             conn.commit()
         self.assertIn("ไม่มีการจอง", app.build_resv_summary(None, "x", upcoming=True))
+
+
+class TestCarryHeaderIsCommandOnly(PayableTestCase):
+    """หัวบล็อก 'ค้าง' ต้องเป็นคำสั่ง ไม่ใช่ประโยคที่บังเอิญมีคำนั้น
+
+    เคสจริง 23/08/26 กลุ่ม Management (6 คน):
+      'พี่ผมขอเคลียร์ยอดค้างเพิ่มให้หน่อยครับ\\n\\nขอเครดิตอยู่ที่ 80000 ถึง 100000 นะครับ'
+    → บอทตอบ '❌ อ่านบล็อกค้างไม่ได้' ใส่หน้าคนที่แค่คุยกันธรรมดา"""
+
+    class _Ev:
+        reply_token = "tok"
+
+    def setUp(self):
+        super().setUp()
+        self.sent = []
+        self._orig = app._payable_send
+        app._payable_send = lambda ev, src, dst, txt: self.sent.append(txt)
+
+    def tearDown(self):
+        app._payable_send = self._orig
+
+    def test_real_chat_message_stays_silent(self):
+        chat = ("พี่ผมขอเคลียร์ยอดค้างเพิ่มให้หน่อยครับ\n\n"
+                "ขอเครดิตอยู่ที่ 80000 ถึง 100000 นะครับ")
+        handled = app.handle_payable_text(self._Ev(), chat, ACCT)
+        self.assertFalse(handled, "ประโยคคุยกันธรรมดา ไม่ใช่คำสั่งวางบล็อก")
+        self.assertEqual(self.sent, [], "ห้ามตอบอะไรกลับไป")
+
+    def test_real_command_header_still_works(self):
+        block = f"ค้าง\n{_dm(_d(2))}=24153\n{_dm(_d(1))}=18504"
+        handled = app.handle_payable_text(self._Ev(), block, ACCT)
+        self.assertTrue(handled)
+        self.assertEqual(len(self.bills()), 2)
+
+    def test_header_with_emoji_and_colon_still_works(self):
+        block = f"📌 ค้าง:\n{_dm(_d(2))}=24153\n{_dm(_d(1))}=18504"
+        self.assertTrue(app.handle_payable_text(self._Ev(), block, ACCT))
+        self.assertEqual(len(self.bills()), 2)
+
+    def test_command_header_with_unreadable_rows_still_warns(self):
+        """สั่งชัดว่าจะวางยอด แต่อ่านไม่ได้เลย → ยังต้องบอก ห้ามเงียบ"""
+        app.handle_payable_text(self._Ev(), "ค้าง\nอะไรก็ไม่รู้\nมั่วๆ", ACCT)
+        self.assertIn("อ่านบล็อกค้างไม่ได้", "\n".join(self.sent))
