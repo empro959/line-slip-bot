@@ -2300,6 +2300,7 @@ def _clean_ref_number(info: dict):
     ผลเสียของการทิ้ง = เสียตัวกันสลิปซ้ำของใบนั้นใบเดียว · ผลเสียของการเก็บไว้ = ปฏิเสธเงินลูกค้าจริง"""
     ref = str(info.get("ref_number") or "").strip()
     if not ref:
+        info["ref_number"] = None      # ช่องว่าง/ช่องว่างล้วน → ให้เป็น None ไปเลย กันไปเทียบซ้ำกับค่าว่าง
         return
     if _MASKED_REF.search(ref):
         print(f"[slip] เลขอ้างอิงถูกปิดบัง ('{ref}') = เลขบัญชี ไม่ใช่เลขรายการ → ทิ้ง", flush=True)
