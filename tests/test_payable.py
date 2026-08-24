@@ -1977,3 +1977,47 @@ class TestPeopleLabelNotDoubled(unittest.TestCase):
 
     def test_bare_number_gets_a_unit(self):
         self.assertEqual(self._label("6"), "6 ท่าน")
+
+
+class TestMaskedRefIsNotAReference(unittest.TestCase):
+    """เลขบัญชี/พร้อมเพย์ที่ถูกปิดบัง ต้องไม่ถูกใช้เป็น 'เลขอ้างอิงรายการ'
+
+    เคสจริง 24/08/26: AI หยิบเลขพร้อมเพย์ปลายทาง 'XXXXXXXXXXXXX5949' มาใส่ช่องอ้างอิง
+      15/08 น.ส.นลินทิพย์ 1,289  ·  24/08 น.ส.สหราช 2,075
+      → ได้เลขอ้างอิงเดียวกัน → ระบบฟันธง '🚨 สลิปถูกตัดต่อ' ทั้งที่คนละรายการคนละคน
+    เลขอ้างอิงจริงไม่มีการปิดบัง"""
+
+    def test_real_case_masked_promptpay_is_dropped(self):
+        info = {"ref_number": "XXXXXXXXXXXXX5949", "receiver_account": "XXX-XXXXXXXX-5949"}
+        app._clean_ref_number(info)
+        self.assertIsNone(info["ref_number"])
+
+    def test_masked_account_with_dashes_is_dropped(self):
+        info = {"ref_number": "XXX-X-XX474-0"}
+        app._clean_ref_number(info)
+        self.assertIsNone(info["ref_number"])
+
+    def test_star_masking_is_dropped(self):
+        info = {"ref_number": "123***4567"}
+        app._clean_ref_number(info)
+        self.assertIsNone(info["ref_number"])
+
+    def test_ref_equal_to_receiver_account_is_dropped(self):
+        info = {"ref_number": "0123456789", "receiver_account": "012-345-6789"}
+        app._clean_ref_number(info)
+        self.assertIsNone(info["ref_number"])
+
+    def test_real_reference_numbers_survive(self):
+        """เลขอ้างอิงจริงจากสลิปที่เคยเจอ ต้องไม่ถูกทิ้ง — ไม่งั้นเสียตัวกันสลิปซ้ำทั้งระบบ"""
+        for ref in ("202608204TZLHECIKEO1L1QAW", "TRBS260822583060771",
+                    "016231235052BTF02583", "C20260624617516105918",
+                    "202606235FY5L3I8DHOUZVOLZ"):
+            info = {"ref_number": ref, "receiver_account": "xxx-x-x4612-x"}
+            app._clean_ref_number(info)
+            self.assertEqual(info["ref_number"], ref, ref)
+
+    def test_empty_ref_is_left_alone(self):
+        for val in (None, "", "   "):
+            info = {"ref_number": val}
+            app._clean_ref_number(info)
+            self.assertFalse(info["ref_number"])
