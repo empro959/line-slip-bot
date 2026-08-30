@@ -2082,3 +2082,34 @@ class TestResvLabelShowsRealDate(unittest.TestCase):
         lbl = self._label(5)
         d = datetime.now(app.TZ).date() + timedelta(days=5)
         self.assertIn(str(d.day), lbl)
+
+
+class TestTableNumbersAreNotPeople(unittest.TestCase):
+    """เลขโต๊ะต้องไม่ถูกอ่านเป็นจำนวนคน
+
+    เคสจริง 24/08/26 จอง #61: '@All 29/8 จองโต๊ะ L 1 2 3 12 คุณแอน มา 1 ทุ่ม'
+    → การ์ดขึ้น 'จำนวน: 3' ทั้งที่ข้อความไม่ได้บอกจำนวนคนเลย (หยิบเลข 3 จากรายการเลขโต๊ะ)
+    จำนวนคนผิด = เตรียมโต๊ะผิด/ของไม่พอ · ถามเพิ่มหนึ่งคำถามถูกกว่ามาก"""
+
+    def test_real_case_has_no_people_unit(self):
+        self.assertFalse(app._people_is_trustworthy(
+            "@All 29/8 จองโต๊ะ L 1 2 3 12 คุณแอน มา 1 ทุ่ม"))
+
+    def test_table_code_only_is_not_people(self):
+        for t in ("โต๊ะ B10 คุณนาต มาทุ่ม", "A2-3-4 คุณเอ 2 ทุ่ม", "b10 คุนนาต มาทุ่ม"):
+            self.assertFalse(app._people_is_trustworthy(t), t)
+
+    def test_real_people_counts_are_kept(self):
+        for t in ("จองโต๊ะ คุณเอ 4 คน 2 ทุ่ม", "คุณบี 6 ท่าน พรุ่งนี้",
+                  "จำนวน 12 คน โซน A2-3-4", "จอง 5 ที่นั่ง", "จอง 4 pax"):
+            self.assertTrue(app._people_is_trustworthy(t), t)
+
+    def test_labelled_followup_answer_is_trusted(self):
+        """คำตอบสั้นๆ ที่ระบบติดป้ายให้แล้ว ('12' → 'จำนวน 12 คน') ต้องผ่าน"""
+        draft = {"asked": ["people"]}
+        labelled = app._resv_label_answer(draft, "12")
+        self.assertTrue(app._people_is_trustworthy(labelled), labelled)
+
+    def test_empty_text(self):
+        self.assertFalse(app._people_is_trustworthy(""))
+        self.assertFalse(app._people_is_trustworthy(None))
