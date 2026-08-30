@@ -590,17 +590,18 @@ def extract_slip_info(image_bytes: bytes, retry: bool = False, dining: bool = Fa
         "โปรดเพ่งดูให้ละเอียดที่สุด ถ้าพอเห็นจำนวนเงิน + ร่องรอยการโอน/จ่ายสำเร็จ ให้ is_slip=true ไว้ก่อน "
         "(แต่ถ้าเป็น 'กระดาษเขียนด้วยลายมือ-ปากกา' ยังคง is_slip=false, amount=0 — ลายมือไม่ใช่สลิป)\n\n"
     ) if retry else ""
-    # คำสั่ง 'อ่านบิลร้าน' ใส่เฉพาะกลุ่มที่เปิดระบบกระทบบิล-สลิป (DINING_GROUPS) เท่านั้น
-    # → กลุ่มสลิปอื่นได้ prompt เดิมเป๊ะ ไม่กระทบการอ่านสลิปปกติ
-    _bill_json = ',"is_bill":false,"bill_total":0.00,"bill_table":null' if dining else ''
+    # ⚠️ ถาม 'ทุกกลุ่ม' ไม่ใช่เฉพาะ DINING_GROUPS — ตัวจับบิลคือด่านกันนับรายรับซ้ำ ไม่ใช่ฟีเจอร์ของการจับคู่
+    # (เคสจริง: 3 ใน 4 กลุ่มรับสลิปไม่ได้เปิด dining → ไม่เคยถามว่าเป็นบิลไหม → บิลถูกนับเป็นรายรับ)
+    # bill_table ใช้เฉพาะตอนจับคู่ (dining) เท่านั้น กลุ่มอื่นไม่ต้องถาม
+    _bill_json = ',"is_bill":false,"bill_total":0.00' + (',"bill_table":null' if dining else '')
     _bill_instr = (
         "📋 บิลร้านอาหาร (ใบแจ้งรายการ): ถ้าในรูปมี 'บิลร้าน' (มีเลขโต๊ะ + รายการอาหาร + ยอดรวม/สุทธิ) ให้ดึงเพิ่ม:\n"
         "  - bill_total: ยอด 'สุทธิ' หรือ 'ยอดรวมที่ต้องจ่าย' บนบิลร้าน (เลขรวมสุดท้ายที่ลูกค้าต้องจ่าย — ไม่ใช่ยอดก่อน VAT/ยอดย่อยรายหมวด)\n"
-        "  - bill_table: เลขโต๊ะบนบิล (เช่น B16, A3) ถ้ามี ไม่งั้น null\n"
+        + ("  - bill_table: เลขโต๊ะบนบิล (เช่น B16, A3) ถ้ามี ไม่งั้น null\n" if dining else "") +
         "  - is_bill: true 'เฉพาะ' เมื่อรูปนี้เป็นบิลร้านล้วนๆ ไม่มีสลิปโอน/หลักฐานจ่ายเงินในรูป "
         "(กรณีนี้ is_slip=false); ถ้ามีสลิปโอนในรูปด้วย (เดี่ยวหรือคู่กับบิล) → is_slip=true, is_bill=false ตามเดิม "
         "แต่ยังคงดึง bill_total/bill_table จากบิลที่เห็นในรูปมาด้วย\n"
-    ) if dining else ''
+    )
     prompt = (
         retry_note +
         "ดูรูปนี้ว่าเป็นสลิป/หลักฐานการชำระเงินให้ร้านหรือไม่ "
@@ -1095,6 +1096,28 @@ def _slip_account_label(info: dict):
     return None
 
 
+# ป้ายกำกับ "ใบแจ้งรายการ (บิลร้าน)" — บิลกระดาษของร้านเอง ไม่ใช่หลักฐานว่ามีเงินเข้า
+# เคสจริง 30/08/26: บิลมีชื่อร้านอยู่บนหัวใบ → AI ใส่มาเป็น receiver → ตรง PAYEE_ACCOUNTS
+#   → ถูกนับเป็นรายรับ 'ซ้ำ' กับสลิปที่ลูกค้าโอนจริงของโต๊ะเดียวกัน
+# ทำไมไม่มีใครเห็น: find_duplicate ต้องมีทั้ง amount และ datetime ตรงกัน — บิลไม่มีเวลาโอน
+#   จึงไม่เข้าเงื่อนไขจับซ้ำเลยสักทาง ยอดวันนั้นเกินจริงแบบเงียบสนิท
+# เหมือน _INTERNAL_MARK: ต้องหน้าตาต่างจากใบข้ามปกติ เพราะตัวกู้สลิป 'ห้ามดึงกลับเข้าเป็นรายรับ'
+_BILL_MARK = "📋 ใบแจ้งรายการ (บิลร้าน)"
+
+
+def _is_store_bill(info: dict) -> bool:
+    """รูปนี้เป็น 'บิลร้านล้วน' (ไม่มีสลิปโอนอยู่ในรูป) ไหม — ถ้าใช่ ห้ามนับเป็นรายรับทุกกลุ่ม
+
+    ต้นฉบับเดียวของกติกานี้ — ใช้ทั้งตอนรับรูป (_process_image_event) และตอนกู้สลิป (recover)
+    สองเส้นที่ต้องให้ผลเหมือนกันแต่คนละโค้ด จะแยกจากกันวันใดวันหนึ่ง
+
+    เงื่อนไขแคบไว้ก่อน: AI ต้องชี้ว่าเป็นบิล 'และ' ชี้ว่าไม่ใช่สลิป —
+    รูปที่มีสลิปโอนอยู่ด้วย (ถ่ายคู่บิล) AI ตอบ is_slip=true อยู่แล้ว จึงไม่โดนด่านนี้
+    ห้ามเดาจาก 'ไม่มีเลขอ้างอิง' หรือ 'ไม่มีชื่อผู้โอน' — สลิปจริงที่อ่านได้ไม่ครบก็หน้าตาแบบนั้น
+    แล้วจะกลายเป็นตัดเงินลูกค้าทิ้ง ซึ่งแพงกว่านับเกิน (บทเรียน 19/08: ตัดทิ้ง 1,017 บาท)"""
+    return bool(info.get("is_bill")) and not info.get("is_slip", False)
+
+
 # ป้ายกำกับใบที่เป็น "ย้ายเงินระหว่างบัญชีร้านเอง" — ต้องหน้าตาต่างจากใบข้ามปกติ
 # เพราะตัวกู้สลิปต้องรู้ว่า "ห้ามดึงกลับเข้าเป็นรายรับ" (ปลายทางเป็นบัญชีร้านจริง แต่ไม่ใช่เงินใหม่)
 _INTERNAL_MARK = "🔁 โอนระหว่างบัญชีร้านเอง"
@@ -1355,6 +1378,12 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
         if (r["detail"] or "").startswith(_INTERNAL_MARK):
             notmine += 1
             continue
+        # ใบที่เคยตัดสินว่าเป็น "ใบแจ้งรายการ (บิลร้าน)" — ห้ามดึงกลับเข้าเป็นรายรับ
+        # เหตุผลเดียวกับ _INTERNAL_MARK: ชื่อร้านอยู่บนหัวบิล ตัวเช็ครายรับจะบอกว่า "ใช่" ทุกครั้ง
+        # และทางลัด 'ตัดสินใหม่จาก detail' ข้างล่างก็ยัด is_slip=True ให้เองด้วย
+        if (r["detail"] or "").startswith(_BILL_MARK):
+            notmine += 1
+            continue
         if not mid and not (r["reason"] == "notincome" and r["detail"]):
             noimg += 1          # ไม่มีทั้งรหัสรูปและบันทึกยอด → กู้ไม่ได้จริงๆ ต้องกรอกมือ
             continue
@@ -1406,6 +1435,11 @@ def recover_missed_slips(group_id: str, report_date: str = None, limit: int = No
         except Exception as e:
             print(f"[recover] อ่านไม่สำเร็จ msg={mid}: {str(e)[:100]}", flush=True)
             still += 1
+            continue
+        # อ่านซ้ำแล้วได้ความว่าเป็นบิลร้าน → ไม่ใช่เงินเข้า (prompt รอบสองเอนไปทาง is_slip=true
+        # จึงต้องมีด่านนี้ ไม่งั้นบิลที่เคยข้ามถูกแล้วจะถูกกู้กลับมาเป็นรายรับ)
+        if _is_store_bill(info):
+            notmine += 1
             continue
         amount = float(info.get("amount") or 0)
         if not info.get("is_slip", False) or amount <= 0:
@@ -4969,16 +5003,28 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
         record_image_miss(group_id, "notincome", detail=f"💳 บัตรเครดิต {_amt} (รูดบัตร EDC)", message_id=msg_id)
         return
 
-    # บิลร้านล้วน (ใบแจ้งรายการ) ในกลุ่ม dining → เก็บเข้าคิวรอจับคู่กับสลิป (ไม่ใช่สลิป ไม่นับตกหล่น)
+    # บิลร้านล้วน (ใบแจ้งรายการ) — ห้ามนับเป็นรายรับ 'ทุกกลุ่ม' ไม่ใช่เฉพาะ dining
+    # ต้องอยู่ 'ก่อน' กฎ 'มียอด = ถือเป็นสลิป' ข้างล่าง ไม่งั้นกฎนั้นจะทับคำตอบที่ถูกของ AI ทิ้ง
     # ประเมินซ้ำจาก info สุดท้าย (เผื่อ pro รอบสองเพิ่งอ่านออกว่าเป็นบิล)
-    if (_dining_enabled(group_id) and info.get("is_bill") and not info.get("is_slip", False)
-            and float(info.get("bill_total") or 0) > 0):
-        try:
-            if not _dining_bill_seen(group_id, msg_id):
-                _dining_save_bill(group_id, info["bill_total"], info.get("bill_table"), msg_id)
-                print(f"[dining] รับบิลโต๊ะ {info.get('bill_table')} = {info.get('bill_total')} group={group_id}", flush=True)
-        except Exception as e:
-            print(f"[dining] save bill error group={group_id}: {e}", flush=True)
+    if _is_store_bill(info):
+        _bt = float(info.get("bill_total") or info.get("amount") or 0)
+        # กลุ่ม dining: เข้าคิวรอจับคู่กับสลิปตามเดิม (ไม่ใช่สลิป ไม่นับตกหล่น)
+        if _dining_enabled(group_id) and _bt > 0:
+            try:
+                if not _dining_bill_seen(group_id, msg_id):
+                    _dining_save_bill(group_id, _bt, info.get("bill_table"), msg_id)
+                    print(f"[dining] รับบิลโต๊ะ {info.get('bill_table')} = {_bt} group={group_id}", flush=True)
+            except Exception as e:
+                print(f"[dining] save bill error group={group_id}: {e}", flush=True)
+            return
+        # กลุ่มอื่น: ไม่มีระบบจับคู่ → บันทึกว่า 'ข้ามเพราะเป็นบิล' ให้เห็นในลิสต์ 'ดูที่ข้าม'
+        # (ต้องมีร่องรอย ไม่ใช่เงียบหาย — คนตรวจยอดต้องรู้ว่าบอทเห็นรูปนี้แล้วตัดสินว่าอะไร)
+        _tbl = info.get("bill_table")
+        print(f"[skip] ใบแจ้งรายการ (บิลร้าน ไม่ใช่เงินโอน) group={group_id} amt={_bt:,.2f}", flush=True)
+        record_image_miss(group_id, "notincome",
+                          detail=f"{_BILL_MARK} {_bt:,.2f}" + (f" · โต๊ะ {_tbl}" if _tbl else "")
+                                 + " (บิลของร้าน ไม่ใช่หลักฐานว่ามีเงินเข้า)",
+                          message_id=msg_id)
         return
 
     try:
