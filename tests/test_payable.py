@@ -2021,3 +2021,64 @@ class TestMaskedRefIsNotAReference(unittest.TestCase):
             info = {"ref_number": val}
             app._clean_ref_number(info)
             self.assertFalse(info["ref_number"])
+
+
+class TestResvExplicitDateWins(unittest.TestCase):
+    """วันที่ที่พนักงานเขียนมาตรงๆ ต้องชนะการคำนวณของ AI
+
+    เคสจริง 24/08/26: '@All 29/8 จองโต๊ะ L 1 2 3 12 คุณแอน มา 1 ทุ่ม'
+    เขียน 29/8 มาชัดเจน แต่การ์ดขึ้นวันผิด — วันที่ที่คนเขียนเองไม่ควรผ่านการบวกวันของ AI"""
+
+    def _iso(self, days_ahead: int) -> str:
+        return (datetime.now(app.TZ).date() + timedelta(days=days_ahead)).isoformat()
+
+    def _dm(self, days_ahead: int) -> str:
+        d = datetime.now(app.TZ).date() + timedelta(days=days_ahead)
+        return f"{d.day}/{d.month}"
+
+    def test_explicit_future_date_is_read(self):
+        for ahead in (1, 2, 5, 20):
+            txt = f"@All {self._dm(ahead)} จองโต๊ะ L 1 2 3 12 คุณแอน มา 1 ทุ่ม"
+            self.assertEqual(app._resv_date_from_text(txt), self._iso(ahead), txt)
+
+    def test_yesterday_is_not_pushed_to_next_year(self):
+        """พิมพ์ '29/8' ตอนดึกของวันที่ 30/8 → ต้องได้ปีนี้ ไม่ใช่ปีหน้า"""
+        self.assertEqual(app._resv_date_from_text(f"จอง {self._dm(-1)} คุณเอ"), self._iso(-1))
+
+    def test_year_rollover_picks_next_year(self):
+        """วันที่ห่างจากวันนี้มากในปีนี้ แต่ใกล้ในปีหน้า → ต้องได้ปีหน้า"""
+        today = datetime.now(app.TZ).date()
+        far = today.replace(month=1, day=2) if today.month > 6 else today.replace(month=12, day=28)
+        got = app._resv_date_from_text(f"จอง {far.day}/{far.month}")
+        want_year = today.year + 1 if today.month > 6 else today.year
+        self.assertEqual(got[:4], str(want_year), got)
+
+    def test_explicit_date_with_year_is_respected(self):
+        d = datetime.now(app.TZ).date() + timedelta(days=3)
+        txt = f"จองโต๊ะ {d.day}/{d.month}/{(d.year + 543) % 100} 6 ท่าน"
+        self.assertEqual(app._resv_date_from_text(txt), d.isoformat())
+
+    def test_no_date_returns_none(self):
+        for t in ("คุณบี 4 คน 2 ทุ่ม", "โต๊ะ L 1 2 3 12", "เวลา 19.00 โซน A4"):
+            self.assertIsNone(app._resv_date_from_text(t), t)
+
+
+class TestResvLabelShowsRealDate(unittest.TestCase):
+    """คำว่าพรุ่งนี้/มะรืน อ่านตอนไหนก็เปลี่ยนความหมาย — ต้องมีวันที่จริงกำกับเสมอ"""
+
+    def _label(self, days_ahead: int) -> str:
+        d = datetime.now(app.TZ).date() + timedelta(days=days_ahead)
+        return app._resv_when_label({"resv_date": d.isoformat(), "resv_datetime": "19:00"})
+
+    def test_relative_words_carry_the_date(self):
+        for ahead, word in ((0, "วันนี้"), (1, "พรุ่งนี้"), (2, "มะรืน")):
+            lbl = self._label(ahead)
+            d = datetime.now(app.TZ).date() + timedelta(days=ahead)
+            self.assertIn(word, lbl)
+            self.assertIn(f"{d.day}/{d.month}", lbl, lbl)
+            self.assertIn("19:00", lbl)
+
+    def test_far_dates_show_weekday_and_date(self):
+        lbl = self._label(5)
+        d = datetime.now(app.TZ).date() + timedelta(days=5)
+        self.assertIn(str(d.day), lbl)

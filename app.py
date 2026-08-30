@@ -1905,6 +1905,37 @@ def _dining_reset(event, group_id: str):
               f"เริ่มนับทริปใหม่จาก 0 บาท")))
 
 
+def _resv_date_from_text(text: str):
+    """แกะวันที่แบบ 'd/m' ที่พนักงานเขียนมาตรงๆ ในข้อความจอง → YYYY-MM-DD (เอียงไปวันข้างหน้า)
+
+    เคสจริง 24/08/26: ข้อความ '@All 29/8 จองโต๊ะ L 1 2 3 12 คุณแอน มา 1 ทุ่ม'
+    เขียนวันมาชัดเจน แต่ AI คำนวณ resv_date เพี้ยนไปหนึ่งวัน → การ์ดขึ้นวันผิด
+    วันที่ที่คนเขียนมาเองตรงๆ ไม่ควรผ่านการคำนวณของ AI เลย — แกะเองด้วย regex ชัวร์กว่า
+    (ต่างจาก _parse_thai_date ที่เอียงไป 'อดีต' เพราะใช้กับบิล/สลิปที่เป็นเรื่องที่เกิดไปแล้ว)"""
+    if not text:
+        return None
+    m = re.search(r"(?<!\d)(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?(?!\d)", text)
+    if not m:
+        return None
+    day, mon = int(m.group(1)), int(m.group(2))
+    today = datetime.now(TZ).date()
+    if m.group(3):
+        iso = _parse_thai_date(m.group(0))
+        return iso if _valid_ymd(iso or "") else None
+    # ไม่ระบุปี → เลือกปีที่ 'ใกล้วันนี้ที่สุด' (ไม่ใช่ 'ต้องเป็นอนาคตเท่านั้น')
+    # เคสจริง: พิมพ์ '29/8' ตอนดึกของวันที่ 30/8 (คุยกันถึงคืนที่แล้ว) — ถ้าบังคับอนาคต
+    # จะกลายเป็น 29/8 ปีหน้า ซึ่งผิดยิ่งกว่าเดิม · ข้ามปี ('1/1' ตอนสิ้นเดือน 12) ยังได้ปีหน้าถูก
+    cands = []
+    for yr in (today.year, today.year + 1):
+        try:
+            cands.append(date(yr, mon, day))
+        except ValueError:
+            continue
+    if not cands:
+        return None
+    return min(cands, key=lambda d: (abs((d - today).days), d < today)).isoformat()
+
+
 def _resv_when_label(r: dict) -> str:
     """คำบอกวันเวลาที่คำนวณจาก resv_date เทียบ 'วันนี้' ปัจจุบัน (กันคำว่า 'พรุ่งนี้' ค้างจากวันที่จอง)
     + เวลา HH:MM ที่ดึงจากสตริงเดิม. ถ้าไม่มี resv_date ชัด → คืนสตริงเดิม (resv_datetime/datetime)"""
@@ -1919,9 +1950,11 @@ def _resv_when_label(r: dict) -> str:
     except ValueError:
         return raw
     delta = (d - datetime.now(TZ).date()).days
-    if   delta == 0: day = "วันนี้"
-    elif delta == 1: day = "พรุ่งนี้"
-    elif delta == 2: day = "มะรืน"
+    # ⚠️ ต้องมี 'วันที่จริง' กำกับเสมอ — คำว่าพรุ่งนี้/มะรืน อ่านตอนไหนก็เปลี่ยนความหมาย
+    # และถ้าระบบคิดวันพลาด คนอ่านต้องเห็นได้ทันทีจากตัวเลข ไม่ใช่มารู้ตอนลูกค้ามาผิดวัน
+    if   delta == 0: day = f"วันนี้ ({d.day}/{d.month})"
+    elif delta == 1: day = f"พรุ่งนี้ ({d.day}/{d.month})"
+    elif delta == 2: day = f"มะรืน ({d.day}/{d.month})"
     else:            day = f"วัน{_TH_WD[d.weekday()]} {d.day} {_TH_MON[d.month - 1]}"
     return f"{day} {tm}" if tm else day
 
@@ -4268,6 +4301,13 @@ def handle_reservation_text(event, text: str, group_id: str):
     # จองให้ตัวเอง: ไม่มีชื่อลูกค้า แต่ใช้สรรพนามแทนตัว (กู/ผม/ฉัน/เรา/หนู) → ใช้ชื่อคนแจ้งจองเป็นชื่อลูกค้า
     if not info.get("customer") and any(w in eff_text for w in ("กู", "ผม", "ฉัน", "เรา", "หนู", "ข้า", "ชั้น", "ตัวเอง")):
         info["customer"] = requested_by
+
+    # พนักงานเขียนวันที่มาตรงๆ (29/8) → ใช้ค่านั้น ไม่ต้องพึ่งการบวกวันของ AI
+    _td = _resv_date_from_text(eff_text)
+    if _td and _td != info.get("resv_date"):
+        print(f"[resv] ใช้วันที่ที่เขียนมาในข้อความ {_td} (AI ให้ {info.get('resv_date')}) group={group_id}", flush=True)
+        info["resv_date"] = _td
+        info["is_advance"] = _td != datetime.now(TZ).date().isoformat()
 
     # AI ไม่ได้ดึงช่องโต๊ะมา แต่ในข้อความมีรหัสโต๊ะชัดๆ → เติมให้เอง อย่าไปถามซ้ำ
     # (ถามสิ่งที่เขาพิมพ์มาแล้ว = พนักงานเสียความเชื่อมั่นในบอทเร็วที่สุด)
