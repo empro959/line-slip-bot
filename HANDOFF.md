@@ -112,7 +112,7 @@
 | บริการ | สถานะ |
 |---|---|
 | Render `Line-Slip-Bot` (s772) | Suspended · ต่อ empro959 @`785bbb7` — ลบ/เปลี่ยนชื่อ `DO-NOT-USE` เมื่อย้ายเสร็จ |
-| Render `65gt` (E&M เก่า) | Suspended |
+| Render `65gt` | Suspended · ⚠️ **ป้ายเดิมเขียนว่า "E&M เก่า" — ผิด** · เป็น **เซอร์วิสเก่าของบอทร้านเอง** (`line-slip-bot-65gt.onrender.com` · `TEAM.md:123`) ป้ายผิดนี้ทำให้กล่องกลางเถียงกันว่าใครเป็นเจ้าของ (30 ส.ค.) |
 | Supabase `empro959` | จะโดน pause — **export เก็บครบแล้ว 18 ส.ค.** ✅ |
 | Gemini E&M | เลิกใช้ |
 
@@ -190,7 +190,7 @@ GitHub Actions ─ push main ยิง Deploy Hook → Render iq8e (secret RENDE
 | ของ | เงื่อนไขก่อนลบ |
 |---|---|
 | Render `DO-NOT-USE-old` (s772) | **ถ่ายภาพหน้า Environment เก็บก่อนเสมอ** (env คือของที่กู้คืนยากที่สุด) + ยืนยันว่า iq8e ยังรันปกติมาตลอดเดือน |
-| Render `65gt` (E&M เก่า) | ไม่มีอะไรชี้มา ลบได้พร้อมกัน |
+| Render `65gt` (**ของบอทร้าน ไม่ใช่ E&M**) | ไม่มีอะไรชี้มา ลบได้พร้อมกัน |
 | Supabase project ของ `empro959` (pause อยู่) | export เก็บไฟล์แล้ว 18 ส.ค. — เก็บต่ออีกเดือนแล้วค่อยลบ (ฟรี ไม่รีบ) |
 | GitHub `saiyangsoi-sketch/Line-Slip-Bot` | **ลบ/archive ไม่ได้ — ล็อกอินหาย** · ปล่อยไว้เฉยๆ ไม่มีอะไรดึงจากมันแล้ว |
 
