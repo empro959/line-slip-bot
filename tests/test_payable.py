@@ -2113,3 +2113,162 @@ class TestTableNumbersAreNotPeople(unittest.TestCase):
     def test_empty_text(self):
         self.assertFalse(app._people_is_trustworthy(""))
         self.assertFalse(app._people_is_trustworthy(None))
+
+
+class TestDeleteBillByDateAmount(PayableTestCase):
+    """'ลบบิล <วัน> <ยอด>' — ลบเจาะจงรายการเดียว ไม่ใช่ 'ล่าสุดของทั้งระบบ'
+
+    เคสจริง 30/08/26: วันเดียวมี 3 ใบ (18795 · 5445 · 19236) พิมพ์ 'ลบบิล 2/9 18795'
+    (ไม่มีช่องว่างหลัง 'ลบบิล' ตามที่เจ้าของพิมพ์จริง) แล้วบอทเงียบสนิท เพราะคำสั่งนี้
+    ไม่เคยมีอยู่จริง ('ลบบิลล่าสุด' จะลบผิดใบ — ไปโดนใบสุดท้ายของทั้งระบบ ไม่ใช่ใบที่ต้องการ)"""
+
+    class _Ev:
+        reply_token = "tok"
+        class source:
+            group_id = ACCT
+            user_id = ACCT
+
+    def setUp(self):
+        super().setUp()
+        self.replies = []
+        self._orig = app.line_bot_api.reply_message
+        app.line_bot_api.reply_message = lambda tok, msg: self.replies.append(msg)
+
+    def tearDown(self):
+        app.line_bot_api.reply_message = self._orig
+
+    def _seed_real_case(self):
+        d = _d(0)
+        app.save_payable_bill(ACCT, 18795.0, note="พิมพ์", doc_date=d)
+        app.save_payable_bill(ACCT, 5445.0, note="พิมพ์", doc_date=d)
+        app.save_payable_bill(ACCT, 19236.0, note="พิมพ์", doc_date=d)
+        return d
+
+    def test_no_space_after_command_still_parses(self):
+        """เจ้าของพิมพ์ไม่มีช่องว่างจริง ('ลบบิล2/9 18795') — ต้องยังใช้ได้"""
+        d = self._seed_real_case()
+        mm, dd = d.split("-")[1], d.split("-")[2]
+        handled = app.handle_payable_text(self._Ev(), f"ลบบิล{int(dd)}/{int(mm)} 18795", ACCT)
+        self.assertTrue(handled)
+        remaining = sorted(b["amount"] for b in self.bills())
+        self.assertEqual(remaining, [5445.0, 19236.0], "ต้องลบแค่ใบ 18795 ใบเดียว")
+
+    def test_deletes_exact_match_not_the_globally_latest_one(self):
+        """หัวใจของบั๊ก: ต้องลบใบที่ระบุจริง ไม่ใช่ใบที่มี id สูงสุดของทั้งระบบ"""
+        d = self._seed_real_case()
+        # ใบ 19236 ถูกบันทึกทีหลังสุด (id สูงสุด) — ถ้าไปเรียก _delete_last_payable จะโดนใบนี้แทน
+        mm, dd = d.split("-")[1], d.split("-")[2]
+        app.handle_payable_text(self._Ev(), f"ลบบิล {int(dd)}/{int(mm)} 18795", ACCT)
+        remaining = sorted(b["amount"] for b in self.bills())
+        self.assertEqual(remaining, [5445.0, 19236.0])
+        self.assertIn("18,795", self.replies[-1].text)
+        self.assertIn("🗑️", self.replies[-1].text)
+
+    def test_outstanding_drops_by_exactly_the_deleted_amount(self):
+        d = self._seed_real_case()
+        before = app._payable_outstanding(ACCT)
+        mm, dd = d.split("-")[1], d.split("-")[2]
+        app.handle_payable_text(self._Ev(), f"ลบบิล {int(dd)}/{int(mm)} 18795", ACCT)
+        after = app._payable_outstanding(ACCT)
+        self.assertAlmostEqual(before - after, 18795.0, places=2)
+
+    def test_no_match_reports_and_deletes_nothing(self):
+        d = self._seed_real_case()
+        mm, dd = d.split("-")[1], d.split("-")[2]
+        app.handle_payable_text(self._Ev(), f"ลบบิล {int(dd)}/{int(mm)} 999999", ACCT)
+        self.assertEqual(len(self.bills()), 3, "ไม่พบ = ห้ามแตะข้อมูล")
+        self.assertIn("ไม่พบ", self.replies[-1].text)
+
+    def test_ambiguous_match_refuses_instead_of_guessing(self):
+        """วันที่+ยอดตรงกันมากกว่า 1 ใบ — ห้ามเดาว่าใบไหน (กติกาเดียวกับ find_duplicate)"""
+        d = _d(0)
+        app.save_payable_bill(ACCT, 5000.0, note="พิมพ์", doc_date=d)
+        app.save_payable_bill(ACCT, 5000.0, note="พิมพ์", doc_date=d)
+        mm, dd = d.split("-")[1], d.split("-")[2]
+        app.handle_payable_text(self._Ev(), f"ลบบิล {int(dd)}/{int(mm)} 5000", ACCT)
+        self.assertEqual(len(self.bills()), 2, "กำกวม = ห้ามลบ")
+        self.assertIn("พบ", self.replies[-1].text)
+        self.assertIn("2", self.replies[-1].text)
+
+    def test_bad_date_gives_usage_hint_not_silence(self):
+        """toks[0] มี '/' แต่ parse ไม่ออก (99/99) — ต้องได้คำเตือนเรื่อง 'วันที่' โดยเฉพาะ"""
+        app.handle_payable_text(self._Ev(), "ลบบิล 99/99 18795", ACCT)
+        self.assertTrue(self.replies, "ต้องตอบ ห้ามเงียบ")
+        self.assertIn("วันที่", self.replies[-1].text)
+
+    def test_missing_slash_gives_generic_usage_hint(self):
+        """ไม่มี '/' เลย (พิมพ์เดือนเป็นคำ) — ยังต้องตอบ ห้ามเงียบ แค่คนละข้อความ"""
+        app.handle_payable_text(self._Ev(), "ลบบิล กุมภา 18795", ACCT)
+        self.assertTrue(self.replies, "ต้องตอบ ห้ามเงียบ")
+        self.assertIn("รูปแบบไม่ถูก", self.replies[-1].text)
+
+    def test_bad_amount_gives_usage_hint_not_silence(self):
+        app.handle_payable_text(self._Ev(), "ลบบิล 2/9 เยอะๆ", ACCT)
+        self.assertTrue(self.replies)
+        self.assertIn("ยอด", self.replies[-1].text)
+
+    def test_restores_paired_payment_allocation_before_delete(self):
+        """ลบบิลที่ถูกจ่ายไปแล้วบางส่วน — ต้องคืนยอดที่จับคู่ไว้ให้ฝั่งจ่ายก่อนลบ (เหมือน _delete_last_payable)"""
+        d = _d(0)
+        app.save_payable_bill(ACCT, 18795.0, note="พิมพ์", doc_date=d)
+        allocated, settled, note = app._payable_settle(ACCT, d, 18795.0)
+        app.save_payable_payment(ACCT, 18795.0, doc_date=d, allocated=allocated, settle_note=note)
+        with app._db() as conn:
+            pay_before = conn.execute(
+                "SELECT COALESCE(allocated,0) a FROM payable_payments WHERE group_id=?", (ACCT,)
+            ).fetchone()["a"]
+        self.assertGreater(pay_before, 0, "ต้องถูกจับคู่ไว้ก่อน ไม่งั้นเทสต์นี้ไม่ได้พิสูจน์อะไร")
+        mm, dd = d.split("-")[1], d.split("-")[2]
+        app.handle_payable_text(self._Ev(), f"ลบบิล {int(dd)}/{int(mm)} 18795", ACCT)
+        with app._db() as conn:
+            pay_after = conn.execute(
+                "SELECT COALESCE(allocated,0) a FROM payable_payments WHERE group_id=?", (ACCT,)
+            ).fetchone()["a"]
+        self.assertEqual(pay_after, 0, "allocated ต้องถูกคืนเป็น 0 ไม่งั้นยอดค้างจะเพี้ยน")
+
+
+class TestUnknownDeleteCommandNeverSilent(PayableTestCase):
+    """คำสั่งขึ้นต้นด้วย 'ลบ' ที่ไม่ตรงแพทเทิร์นไหนเลย ต้องตอบกลับเสมอ ห้ามเงียบ
+
+    เคสจริง 30/08/26: พิมพ์ 'ลบบิล 2/9 18795' (ก่อนแก้) ไม่ตรงคำสั่งไหนเลย —
+    handle_payable_text คืน False แล้วตัวเรียกทิ้งไปเฉยๆ ไม่มี reply สักตัว"""
+
+    class _Ev:
+        reply_token = "tok"
+        class source:
+            group_id = ACCT
+            user_id = ACCT
+
+    def setUp(self):
+        super().setUp()
+        self.replies = []
+        self._orig = app.line_bot_api.reply_message
+        app.line_bot_api.reply_message = lambda tok, msg: self.replies.append(msg)
+        # กันรอยจากคลาสอื่นที่ทดสอบ 'ลบบิลล่าสุด' ก่อนหน้าในไฟล์เดียวกัน (ตัวกันสั่งซ้ำ
+        # อยู่ที่ meta คนละตารางกับ payable_bills/payable_payments ที่ PayableTestCase.setUp
+        # ล้างอยู่แล้ว จึงไม่ถูกล้างไปด้วย) — ไม่งั้นเทสต์ที่นี่จะเจอการ์ด 'ยืนยันซ้ำ' แทนการลบจริง
+        app._set_meta(app._payable_del_key(ACCT, "payable_bills"), "")
+
+    def tearDown(self):
+        app.line_bot_api.reply_message = self._orig
+
+    def test_garbled_delete_command_gets_a_reply(self):
+        handled = app.handle_payable_text(self._Ev(), "ลบอะไรก็ไม่รู้", ACCT)
+        self.assertTrue(handled, "ต้องคืน True (จัดการแล้ว คือตอบกลับแล้ว) ไม่ใช่เงียบแล้วปล่อยผ่าน")
+        self.assertTrue(self.replies, "ต้องมี reply เสมอ")
+        self.assertIn("ไม่รู้จักคำสั่ง", self.replies[-1].text)
+
+    def test_known_commands_are_not_caught_by_the_fallback(self):
+        """กันไม่ให้ fallback ใหม่ไปแย่งคำสั่งเดิมที่ยังใช้ได้อยู่"""
+        app.save_payable_bill(ACCT, 1000.0, note="พิมพ์", doc_date=_d(0))
+        handled = app.handle_payable_text(self._Ev(), "ลบบิลล่าสุด", ACCT)
+        self.assertTrue(handled)
+        self.assertEqual(len(self.bills()), 0)
+        self.assertNotIn("ไม่รู้จักคำสั่ง", self.replies[-1].text)
+
+    def test_casual_chat_without_lop_prefix_stays_silent(self):
+        """ข้อความคุยทั่วไปที่ไม่ได้ขึ้นต้นด้วย 'ลบ' ต้องไม่โดนตอบแทรก (เหตุผลเดียวกับบทเรียน
+        'พี่ผมขอเคลียร์ยอดค้างเพิ่มให้หน่อยครับ' ที่เคยโดนตีความเป็นคำสั่งผิดๆ มาแล้ว — ห้ามซ้ำรอย"""
+        handled = app.handle_payable_text(self._Ev(), "วันนี้ลูกค้าเยอะมากเลย", ACCT)
+        self.assertFalse(handled)
+        self.assertEqual(self.replies, [])

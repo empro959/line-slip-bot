@@ -3258,9 +3258,68 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
         _delete_last_payable(event, acct, "payable_payments", "เงินจ่าย")
         return True
 
+    # ลบบิลเจาะจงด้วย 'วันที่ + ยอด' — 'ลบบิลล่าสุด' ลบผิดใบได้ถ้าวันเดียวกันมีหลายใบ
+    # (ลบใบล่าสุด "ของทั้งระบบ" ไม่ใช่ใบที่ต้องการของวันนั้น)
+    # เคสจริง 30/08/26: วันเดียวมี 3 ใบ พิมพ์ 'ลบบิล 2/9 18795' แล้วบอทเงียบสนิท
+    # เพราะคำสั่งรูปแบบนี้ไม่เคยมีอยู่จริง (มีแต่ 'ลบบิลล่าสุด' ตรงตัว กับ 'ลบวันที่' ที่ลบทั้งวัน)
+    if low.startswith("ลบบิล"):
+        rest = text[len("ลบบิล"):].strip()
+        toks = rest.split()
+        if len(toks) < 2 or "/" not in toks[0]:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="❌ รูปแบบไม่ถูก เช่น: ลบบิล 2/9 18795 (วัน/เดือน ยอด)"))
+            return True
+        doc_date = _parse_thai_date(toks[0])
+        if doc_date is None:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="❌ วันที่ไม่ถูก เช่น: ลบบิล 2/9 18795"))
+            return True
+        amount_str = " ".join(toks[1:]).replace(",", "").replace("บาท", "").strip()
+        try:
+            amt = float(amount_str)
+        except ValueError:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="❌ ยอดไม่ถูก เช่น: ลบบิล 2/9 18795"))
+            return True
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM payable_bills WHERE group_id=? AND doc_date=? AND ABS(amount-?)<0.01 ORDER BY id",
+                (acct, doc_date, amt)).fetchall()
+            if not rows:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text=f"📭 ไม่พบบิลวันที่ {doc_date} ยอด {amt:,.2f} บาท — เช็คด้วย 'รายการบิล' หรือ 'สรุปหนี้'"))
+                return True
+            if len(rows) > 1:
+                # วันที่+ยอดตรงกันมากกว่า 1 ใบ — ลบเจาะจงไม่ได้ปลอดภัย (กติกาเดียวกับ find_duplicate:
+                # เจอมากกว่า 1 ความเป็นไปได้ = ไม่ทำ ให้คนตัดสิน)
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text=(f"⚠️ พบ {len(rows)} ใบที่วันที่+ยอดตรงกันพอดี ({doc_date} · {amt:,.2f} บาท) "
+                          "— ลบเจาะจงไม่ได้ปลอดภัย ใช้ 'ลบวันที่' แล้วพิมพ์ 'บิล' ใส่ใบที่เหลือกลับเข้าไปแทน")))
+                return True
+            row = rows[0]
+            # คืนยอดที่จับคู่ไว้ก่อนลบ (เหตุผลเดียวกับ _delete_last_payable/ลบวันที่)
+            stuck = _payable_unlink(conn, acct, "payable_bills", row)
+            conn.execute("DELETE FROM payable_bills WHERE id=?", (row["id"],))
+            conn.commit()
+        warn = (f"\n⚠️ คืนยอดที่จับคู่ไว้ไม่ครบ {stuck:,.2f} บาท (บรรทัดคู่ถูกลบไปแล้ว) — ถ้ายอดดูไม่ถูก สั่ง 'จัดยอดใหม่'"
+                if stuck > 0.01 else "")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"🗑️ ลบบิลซื้อ #{row['id']} ({float(row['amount']):,.2f} บาท · {doc_date}) แล้ว\n─────────────────\n"
+                 f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท{warn}"))
+        return True
+
     # ล้างบัญชีหนี้ทั้งหมด (รีเซ็ตเริ่มนับใหม่) — มีปุ่มยืนยัน
     if low in ("ล้างบัญชีหนี้", "ล้างหนี้", "ล้างบัญชี", "รีเซ็ตหนี้", "ล้างทั้งหมด"):
         send_reset_payable_confirm(event, acct)
+        return True
+
+    # คำสั่งที่ขึ้นต้นด้วย 'ลบ' แต่ไม่ตรงแพทเทิร์นไหนเลย — ต้องบอก ห้ามเงียบ
+    # (เคสจริง 30/08/26: พิมพ์ 'ลบบิล 2/9 18795' ก่อนแก้ไข แล้วบอทเงียบสนิททั้งสองครั้ง)
+    # แคบเฉพาะคำขึ้นต้น 'ลบ' เท่านั้น — ไม่ตอบข้อความคุยทั่วไปที่ไม่ได้สั่งอะไร (เหตุผลเดียวกับ
+    # หัวบล็อก 'ค้าง' ที่ห้ามจับแค่คำในบรรทัด ต้องมั่นใจว่าเป็นคำสั่งจริง ไม่ใช่คำที่บังเอิญมี)
+    if low.startswith("ลบ"):
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text="❌ ไม่รู้จักคำสั่งนี้\nลบที่ใช้ได้: 'ลบบิลล่าสุด' · 'ลบจ่ายล่าสุด' · 'ลบบิล <วัน> <ยอด>' · 'ลบวันที่ <วัน>'"))
         return True
     return False
 
