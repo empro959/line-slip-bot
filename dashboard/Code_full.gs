@@ -434,16 +434,18 @@ function rebuildMonths_(daily, slipMap){
       s.amount+=c.amount||0; s.exc+=c.exc||0; s.vat+=c.vat||0;
       byP[d.period].sales[c.category]=s;
     });
-    (d.expenses||[]).forEach(function(r){byP[d.period].records.push(r);});
+    (d.expenses||[]).forEach(function(r){byP[d.period].records.push(r);});   // d.expenses=null → [] เฉยๆ (เดี๋ยว expKnown_ จัดการต่อ)
     var pm=d.payments||{};
     Object.keys(pm).forEach(function(k){ byP[d.period].pay[k]=(byP[d.period].pay[k]||0)+(pm[k]||0); });
+    var expKnown_=Array.isArray(d.expenses);   // false = ใบ Payout ครอบหลายวัน ใช้ไม่ได้ตอน import (ดู importPosReports())
     var dS_=(d.sales||[]).reduce(function(a,c){return a+(c.amount||0);},0);      // ยอดขายรวมวันนั้น (Inc.VAT)
-    var dE_=(d.expenses||[]).reduce(function(a,c){return a+(c.amount||0);},0);   // ค่าใช้จ่ายรวมวันนั้น
+    // ⛔ ไม่ทราบค่าใช้จ่าย → null ไม่ใช่ 0 (0 อ่านว่า 'ตรวจแล้วไม่มีรายจ่ายเลย' ซึ่งไม่จริง — โผล่เป็นกำไรเต็มยอดขายบนกราฟ)
+    var dE_=expKnown_?(d.expenses||[]).reduce(function(a,c){return a+(c.amount||0);},0):null;   // ค่าใช้จ่ายรวมวันนั้น
     var dFood_=(d.sales||[]).filter(function(c){return !/เครื่องดื่ม|อาหารญี่ปุ่น/.test(c.category);}).reduce(function(a,c){return a+(c.amount||0);},0); // ยอดขายอาหาร (ไม่รวมญี่ปุ่น/เครื่องดื่ม)
-    var dRaw_=(d.expenses||[]).filter(function(r){return /วัตถุดิบ/.test(r.category);}).reduce(function(a,r){return a+(r.amount||0);},0); // ต้นทุนวัตถุดิบวันนั้น
+    var dRaw_=expKnown_?(d.expenses||[]).filter(function(r){return /วัตถุดิบ/.test(r.category);}).reduce(function(a,r){return a+(r.amount||0);},0):null; // ต้นทุนวัตถุดิบวันนั้น
     var dBev_=(d.sales||[]).filter(function(c){return /เครื่องดื่ม/.test(c.category);}).reduce(function(a,c){return a+(c.amount||0);},0);   // ยอดขายเครื่องดื่มวันนั้น
-    var dBevC_=(d.expenses||[]).filter(function(r){return /เครื่องดื่ม/.test(r.category);}).reduce(function(a,r){return a+(r.amount||0);},0); // ต้นทุนเครื่องดื่มวันนั้น
-    byP[d.period].days.push({date:d.date,payments:pm,sales:dS_,exp:dE_,food:dFood_,raw:dRaw_,bev:dBev_,bevc:dBevC_,bills:d.bills||0});  // + อาหาร/วัตถุดิบ + เครื่องดื่ม/ต้นทุน + จำนวนบิล
+    var dBevC_=expKnown_?(d.expenses||[]).filter(function(r){return /เครื่องดื่ม/.test(r.category);}).reduce(function(a,r){return a+(r.amount||0);},0):null; // ต้นทุนเครื่องดื่มวันนั้น
+    byP[d.period].days.push({date:d.date,payments:pm,sales:dS_,exp:dE_,expKnown:expKnown_,food:dFood_,raw:dRaw_,bev:dBev_,bevc:dBevC_,bills:d.bills||0});  // + อาหาร/วัตถุดิบ + เครื่องดื่ม/ต้นทุน + จำนวนบิล
     (d.menu||[]).forEach(function(it){ var e=byP[d.period].menu[it.name]||{category:it.category,qty:0,amount:0};
       e.qty+=it.qty||0; e.amount+=it.amount||0; byP[d.period].menu[it.name]=e; });
     var zn=d.zones||{}; Object.keys(zn).forEach(function(z){ byP[d.period].zone[z]=(byP[d.period].zone[z]||0)+(zn[z]||0); });
@@ -472,8 +474,17 @@ function rebuildMonths_(daily, slipMap){
       return {date:dy.date,payments:dy.payments||{},slip_amount:r2_(sv.amount||0),slip_count:sv.count||0,diff:r2_(t-(sv.amount||0))};
     }).sort(function(a,b){return a.date<b.date?1:-1;}); // วันล่าสุดก่อน
     // ยอดรับ/จ่าย/กำไร รายวัน (เรียงวันน้อย→มาก 1→31 สำหรับกราฟ)
+    // dy.expKnown=false → ไม่ทราบค่าใช้จ่าย (ใบ Payout ครอบหลายวัน) → expenses/profit/raw/bevc เป็น null
+    // ไม่ใช่ 0 ห้ามเดา · null ให้กราฟอ่านเป็น 'ไม่มีจุดข้อมูล' ไม่ใช่ 'จุดข้อมูลคือศูนย์'
     var dailyTotals=b.days.map(function(dy){
-      return {date:dy.date,sales:r2_(dy.sales||0),expenses:r2_(dy.exp||0),profit:r2_((dy.sales||0)-(dy.exp||0)),food:r2_(dy.food||0),raw:r2_(dy.raw||0),bev:r2_(dy.bev||0),bevc:r2_(dy.bevc||0),bills:dy.bills||0};
+      return {date:dy.date,sales:r2_(dy.sales||0),
+        expenses:dy.expKnown?r2_(dy.exp||0):null,
+        profit:dy.expKnown?r2_((dy.sales||0)-(dy.exp||0)):null,
+        food:r2_(dy.food||0),
+        raw:dy.expKnown?r2_(dy.raw||0):null,
+        bev:r2_(dy.bev||0),
+        bevc:dy.expKnown?r2_(dy.bevc||0):null,
+        bills:dy.bills||0};
     }).sort(function(a,b){return a.date<b.date?-1:1;});
     var menuItems=Object.keys(b.menu).map(function(nm){var e=b.menu[nm];return {name:nm,category:e.category,qty:r2_(e.qty),amount:r2_(e.amount)};})
                                      .sort(function(a,b){return b.amount-a.amount;});
@@ -481,7 +492,11 @@ function rebuildMonths_(daily, slipMap){
     var creditCust=Object.keys(b.credit).map(function(nm){var e=b.credit[nm];
       return {name:nm,id:e.id,amount:r2_(e.amount),days:e.days.sort(function(a,b){return a.date<b.date?-1:1;})};})
       .sort(function(a,b){return b.amount-a.amount;});
+    // ทั้งเดือนมีวันไหนไม่ทราบค่าใช้จ่ายบ้าง → total_expenses/net_profit ของทั้งเดือนเป็น 'ยอดต่ำสุดเท่าที่รู้'
+    // ไม่ใช่ยอดจริง ต้องมีธงบอกไว้ในข้อมูล ไม่ใช่แค่ปล่อยให้ตัวเลขดูปกติทั้งที่ไม่ครบ
+    var expIncompleteDays=b.days.filter(function(dy){return !dy.expKnown;}).length;
     months.push({period:p,total_sales:r2_(totS),total_expenses:r2_(totE),net_profit:r2_(totS-totE),
+      expenses_incomplete_days:expIncompleteDays,   // >0 = total_expenses/net_profit เป็นยอดขั้นต่ำ ไม่ใช่ยอดจริง
       expense_categories:eCats,sales_categories:sCats,expense_records:b.records,
       payment_methods:payCats,payment_days:payDays,daily_totals:dailyTotals,menu_items:menuItems,zone_sales:zoneSales,credit_customers:creditCust,
       voids:{cancelled:r2_(b.voids.cancelled),deleted:r2_(b.voids.deleted),returns:r2_(b.voids.returns),discount:r2_(b.voids.discount)},
@@ -564,14 +579,25 @@ function importPosReports(){
   var pay=balText?parseBalance_(balText):{}, zones=balText?parseBalanceZones_(balText):{};
   var c=findLatestPdf_('SalesSummaryReportByCustomer'); var bills=0, credit=[];
   try{ if(c){ var ct=pdfToText_(c.blob); bills=parseBills_(ct); credit=parseCustomerCredit_(ct); } }catch(e){}
-  var day={date:dd.key,period:dd.period,sales:parseSale_(st).cats,expenses:parsePayout_(pt).records,payments:pay,menu:parseSaleItems_(st),zones:zones,voids:parseVoids_(st),bills:bills,credit:credit};
+  // ⛔ ใบ PayoutReport ที่ครอบมากกว่า 1 วัน (เช่นใบสัปดาห์) ห้ามลงเป็น 'ค่าใช้จ่ายของวันเดียว'
+  // เดิมไม่เช็คเลย → ใบเดิมถูกใช้ซ้ำทุกคืนจนกว่าจะมีใบใหม่เข้ามา (เคสจริง 30/08/26 ยันจนถึง 02/09:
+  // ใบสัปดาห์ 72,998 ถูกนับซ้ำ 7 รอบ = 510,988 ในสรุปรายสัปดาห์ — ยอดขายถูก แต่ค่าใช้จ่าย/กำไรผิดทั้งคู่)
+  // ใบใช้ไม่ได้ → expenses=null ('ไม่ทราบ' ไม่ใช่ 'ศูนย์' — 0 อ่านว่าวันนั้นไม่มีรายจ่ายเลยซึ่งไม่จริง)
+  // ต้นฉบับเดียวกับ _importPosOneDate_ (เส้นกู้ย้อนหลัง) — สองเส้นนำเข้าต้องกันคนละใบแบบเดียวกัน
+  // ไม่งั้นจะเกิดซ้ำแบบที่เจอ: เส้นกู้ย้อนหลังคำนวณ rangeWarn ไว้แล้วแต่เอาไปต่อท้าย log เฉยๆ
+  // ไม่เคยใช้กันข้อมูลจริง ทั้งสองเส้นจึงลงค่าใช้จ่ายผิดได้เหมือนกัน
+  var payoutRangeIssue = _rangeWarn_(pt);
+  var day={date:dd.key,period:dd.period,sales:parseSale_(st).cats,
+    expenses: payoutRangeIssue ? null : parsePayout_(pt).records,
+    payments:pay,menu:parseSaleItems_(st),zones:zones,voids:parseVoids_(st),bills:bills,credit:credit};
   var daily=loadDaily_().filter(function(x){return x.date!==dd.key;}); // กันซ้ำ
   daily.push(day); saveDaily_(daily);
   writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));
   props.setProperty('LAST_IMPORTED_EMAIL_MS', String(s.time||0));   // จำว่าอีเมลฉบับนี้ import แล้ว (กัน trigger สำรองทำ OCR ซ้ำคืนเดียวกัน)
   var dayS=day.sales.reduce(function(a,c){return a+c.amount;},0);
   Logger.log('✅ เก็บวันที่ '+dd.key+' ('+dd.period+') ยอดขายวันนั้น '+dayS.toLocaleString()+' | สะสม '+daily.length+' วัน'+
-             _saleWarn_(st, dayS)+_rangeWarn_(st));
+             _saleWarn_(st, dayS)+_rangeWarn_(st)+
+             (payoutRangeIssue?('\n   ⛔ ค่าใช้จ่ายวันนี้ = "ไม่ทราบ" (ไม่ใช่ 0) เพราะใบ PayoutReport ใช้ไม่ได้: '+payoutRangeIssue):''));
   // ส่งแจ้งเตือนเฉพาะถ้า "วันนี้ยังไม่เคยแจ้ง" — จำวันที่แจ้งล่าสุดใน Script Properties
   // (ใช้ค่านี้ ไม่ใช่ "มีใน pos_daily" เพราะ backfill ก็เก็บวันโดยไม่แจ้ง → จะพลาดการส่ง)
   if(props.getProperty('LAST_ALERT_DATE')===dd.key){ Logger.log('⏸️ แจ้งเตือน '+dd.key+' ส่งไปแล้ว — ไม่ส่งซ้ำ'); return; }
@@ -794,19 +820,28 @@ function profitByWeekday(){
   daily.forEach(function(d){
     var p=(d.date||'').split('-'); if(p.length<3) return;
     var w=new Date(+p[0],+p[1]-1,+p[2]).getDay(), sm=daySum_(d);
-    var a=agg[w]||(agg[w]={s:0,e:0,cnt:0,bills:0,bcnt:0});
-    a.s+=sm.sales; a.e+=sm.exp; a.cnt++; if(d.bills){ a.bills+=d.bills; a.bcnt++; }
+    var a=agg[w]||(agg[w]={s:0,e:0,cnt:0,ecnt:0,bills:0,bcnt:0});
+    a.s+=sm.sales; a.cnt++;
+    if(sm.expKnown){ a.e+=sm.exp; a.ecnt++; }   // ไม่ทราบค่าใช้จ่าย → ไม่เอาเข้าเฉลี่ย (กันกำไรดูดีเกินจริง)
+    if(d.bills){ a.bills+=d.bills; a.bcnt++; }
   });
   var rows=[];
   for(var w=0;w<7;w++){ var a=agg[w]; if(!a) continue;
-    rows.push({name:WD[w], sales:a.s/a.cnt, exp:a.e/a.cnt, prof:(a.s-a.e)/a.cnt, cnt:a.cnt,
+    var hasExp=a.ecnt>0;
+    rows.push({name:WD[w], sales:a.s/a.cnt,
+      exp: hasExp?a.e/a.ecnt:null, prof: hasExp?((a.s/a.cnt)-(a.e/a.ecnt)):null,
+      cnt:a.cnt, ecnt:a.ecnt,
       tik:a.bcnt?(a.s/a.cnt)/(a.bills/a.bcnt):0}); }
-  rows.sort(function(x,y){return x.prof-y.prof;});   // ขาดทุนสุดขึ้นก่อน
+  rows.sort(function(x,y){return (x.prof===null?0:x.prof)-(y.prof===null?0:y.prof);});   // ขาดทุนสุดขึ้นก่อน
   Logger.log('📅 กำไร/ขาดทุน เฉลี่ยต่อวัน แยกวันในสัปดาห์ (จาก '+daily.length+' วัน):');
   rows.forEach(function(r){
-    Logger.log('  '+(r.prof>=0?'✅':'🔴')+' '+r.name+' → '+(r.prof>=0?'กำไร +':'ขาดทุน -')+'฿'+fmtT_(Math.abs(r.prof))+'/วัน  (ขาย ฿'+fmtT_(r.sales)+' · จ่าย ฿'+fmtT_(r.exp)+' · '+r.cnt+' วัน'+(r.tik?' · ยอด/บิล ฿'+fmtT_(r.tik):'')+')');
+    if(r.prof===null){
+      Logger.log('  ⚪ '+r.name+' → กำไรคำนวณไม่ได้ (ไม่ทราบค่าใช้จ่ายทุกวันของวันนี้ในสัปดาห์ต่างๆ · '+r.cnt+' วัน)');
+      return;
+    }
+    Logger.log('  '+(r.prof>=0?'✅':'🔴')+' '+r.name+' → '+(r.prof>=0?'กำไร +':'ขาดทุน -')+'฿'+fmtT_(Math.abs(r.prof))+'/วัน  (ขาย ฿'+fmtT_(r.sales)+' · จ่าย ฿'+fmtT_(r.exp)+(r.ecnt<r.cnt?' [เฉลี่ยจาก '+r.ecnt+'/'+r.cnt+' วันที่ทราบ]':'')+' · '+r.cnt+' วัน'+(r.tik?' · ยอด/บิล ฿'+fmtT_(r.tik):'')+')');
   });
-  var loss=rows.filter(function(r){return r.prof<0;});
+  var loss=rows.filter(function(r){return r.prof!==null && r.prof<0;});
   Logger.log(loss.length?('💡 วันขาดทุน: '+loss.map(function(r){return r.name;}).join(', ')+' → ลดต้นทุน/พิจารณาปิดคืนเหล่านี้'):'✅ ทุกวันกำไรเฉลี่ยเป็นบวก');
 }
 
@@ -958,7 +993,11 @@ function _importPosOneDate_(iso){
   if(DUMP_OCR){ _dumpOcr_('SaleReport', st); _dumpOcr_('BalanceCashDrawer', bt); }
   // รายงานที่ส่งย้อนหลังมัก export เป็น 'ช่วงวันที่' (From 11 To 12) แต่โค้ดนี้ลงเป็นวันเดียว
   // → ยอดวิธีชำระ/โซน/ค่าใช้จ่าย ของทุกวันในช่วงจะถูกยัดรวมเข้าวันเดียว = ตัวเลขเกินจริง
-  var rangeWarn = _rangeWarn_(bt) || _rangeWarn_(pt);
+  // ⚠️ เดิม rangeWarn ต่อท้าย log เฉยๆ ไม่เคยกันข้อมูลจริง — ใบ Payout ที่ครอบหลายวันเลยยังถูก
+  // ลงเป็นค่าใช้จ่ายของวันเดียวได้ตามปกติ (เคสจริง 30/08–02/09: ใบสัปดาห์ 72,998 ถูกนับซ้ำ 7 วัน)
+  // แยก payoutRangeIssue ออกมาเพื่อ 'กัน' ค่าใช้จ่ายจริงๆ ไม่ใช่แค่พิมพ์เตือน — ต้นฉบับเดียวกับ importPosReports()
+  var payoutRangeIssue = pt ? _rangeWarn_(pt) : '';
+  var rangeWarn = _rangeWarn_(bt) || payoutRangeIssue;
   // บิล/ลูกหนี้ มาจากไฟล์ 'แยกตามลูกค้า' — ของเดิมเป็น catch(e){} เปล่าๆ + ไม่เตือนตอนไฟล์หาย
   // ทำให้ 'บิล 0' แยกไม่ออกว่า (ก) ไม่มีบิลจริง (ข) ไม่มีไฟล์ในเมล (ค) OCR พัง → ต้องบอกให้รู้
   var bills=0, credit=[], custWarn='';
@@ -974,12 +1013,15 @@ function _importPosOneDate_(iso){
   var keepE = (pr.err && prev) ? prev.expenses : [];
   var keepP = (br.err && prev) ? prev.payments : {};
   var keepZ = (br.err && prev) ? prev.zones : {};
+  // pt มีไฟล์ แต่ครอบมากกว่า 1 วัน → ห้ามใช้ (expenses=null, 'ไม่ทราบ' ไม่ใช่ 'ศูนย์')
+  // pt ไม่มีไฟล์เลย → คงของเดิมไว้ (keepE) เหมือนเดิม — คนละสถานการณ์กัน ห้ามปนกัน
   var day={date:dd.key, period:dd.period,
-    sales:parseSale_(st).cats, expenses:pt?parsePayout_(pt).records:keepE,
+    sales:parseSale_(st).cats, expenses: pt ? (payoutRangeIssue ? null : parsePayout_(pt).records) : keepE,
     payments:bt?parseBalance_(bt):keepP, menu:parseSaleItems_(st),
     zones:bt?parseBalanceZones_(bt):keepZ, voids:parseVoids_(st), bills:bills, credit:credit};
   var keptWarn=((pr.err&&prev?'\n   ♻️ ใบ Payout อ่านไม่ได้ → คงค่าใช้จ่ายเดิมไว้ (ไม่ทับด้วยศูนย์)':'')+
-                (br.err&&prev?'\n   ♻️ ใบ Balance อ่านไม่ได้ → คงวิธีชำระ/โซนเดิมไว้':''));
+                (br.err&&prev?'\n   ♻️ ใบ Balance อ่านไม่ได้ → คงวิธีชำระ/โซนเดิมไว้':'')+
+                (payoutRangeIssue?'\n   ⛔ ค่าใช้จ่ายถูกตั้งเป็น "ไม่ทราบ" (ไม่ใช่ 0) — ดูเหตุผลที่ท้าย log':''));
   var totCheck=day.sales.reduce(function(a,c){return a+(c.amount||0);},0);
   // ⛔ อ่านยอดขายไม่ออกเลย (0) แต่ของเดิมมีตัวเลขอยู่ = ทับแล้วข้อมูลหาย ต้องไม่บันทึก
   if(totCheck<=0 && prev && (prev.sales||[]).length){
@@ -991,9 +1033,10 @@ function _importPosOneDate_(iso){
   daily.push(day); saveDaily_(daily);
   writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));                  // rebuild ให้ dashboard เลย
   var totS=day.sales.reduce(function(a,c){return a+c.amount;},0);
-  var totE=day.expenses.reduce(function(a,c){return a+c.amount;},0);
+  // day.expenses เป็น null ได้แล้ว (ใบ Payout ครอบหลายวัน) — .reduce บน null พังทันที ต้องเช็คก่อน
+  var totE=Array.isArray(day.expenses)?day.expenses.reduce(function(a,c){return a+c.amount;},0):null;
   Logger.log('✅ กู้วันที่ '+dd.key+' ('+dd.period+') สำเร็จ — ยอดขาย '+totS.toLocaleString()+
-             ' · ค่าใช้จ่าย '+totE.toLocaleString()+' · เมนู '+day.menu.length+' รายการ · บิล '+bills+
+             ' · ค่าใช้จ่าย '+(totE===null?'ไม่ทราบ':totE.toLocaleString())+' · เมนู '+day.menu.length+' รายการ · บิล '+bills+
              (pt?'':'  ⚠️ ไม่มี PayoutReport ในอีเมลนี้ → ค่าใช้จ่าย = 0')+
              (bt?'':'  ⚠️ ไม่มี BalanceCashDrawer → ไม่มีวิธีชำระ/โซน')+custWarn+_saleWarn_(st, totS)+
              // อ่านไฟล์ได้แต่แกะตัวเลขไม่ออก = เงียบที่สุด ต้องบอก ไม่งั้น dashboard โชว์ว่างโดยไม่มีใครรู้
@@ -1381,9 +1424,14 @@ function pushOwner_(msg){
   }catch(e){ var e3=String(e); Logger.log('push error: '+e3+'  ↳ host เข้าไม่ได้? รัน showSlipUrl()'); return e3; }
 }
 
-function daySum_(d){ return {
-  sales:(d.sales||[]).reduce(function(a,c){return a+c.amount;},0),
-  exp:(d.expenses||[]).reduce(function(a,c){return a+c.amount;},0) }; }
+// expKnown=false เมื่อ d.expenses เป็น null (ใบ Payout ใช้ไม่ได้ตอน import — ดู importPosReports())
+// exp คืน 0 เผื่อโค้ดเก่าที่ยังไม่เช็ค expKnown ไม่พัง แต่ตัวเรียกใหม่ทุกตัวต้องเช็ค expKnown ก่อนเชื่อเลขนี้
+function daySum_(d){
+  var expKnown=Array.isArray(d.expenses);
+  return {
+    sales:(d.sales||[]).reduce(function(a,c){return a+c.amount;},0),
+    exp:expKnown?d.expenses.reduce(function(a,c){return a+c.amount;},0):0,
+    expKnown:expKnown }; }
 
 function _avg_(arr){ return arr.length? arr.reduce(function(a,b){return a+b;},0)/arr.length : 0; }
 function _leakOf_(x){ var v=x.voids||{}; return (v.deleted||0)+(v.cancelled||0)+(v.returns||0)+(v.discount||0); }
@@ -1393,10 +1441,15 @@ function buildDailyMsg_(){
   var daily=loadDaily_(); if(!daily.length) return null;
   var d=daily.reduce(function(a,b){return b.date>a.date?b:a;});
   var hist=daily.filter(function(x){return x.date!==d.date;});   // ค่าฐานจากวันก่อนๆ
-  var s=daySum_(d), pm=d.payments||{}, v=d.voids||{}, prof=s.sales-s.exp, leak=_leakOf_(d);
+  var s=daySum_(d), pm=d.payments||{}, v=d.voids||{}, leak=_leakOf_(d);
+  // ค่าใช้จ่ายไม่ทราบ (ใบ Payout ใช้ไม่ได้) → กำไรคำนวณไม่ได้เช่นกัน ห้ามเดาว่า 0
+  var prof = s.expKnown ? (s.sales-s.exp) : null;
   var lines=['📊 สรุปยอดขาย '+d.date,'─────────────',
-    '💰 ยอดขาย: ฿'+fmtT_(s.sales),'💸 ค่าใช้จ่าย: ฿'+fmtT_(s.exp),
-    (prof>=0?'✅ กำไร: +฿':'🔻 ขาดทุน: -฿')+fmtT_(Math.abs(prof)),
+    '💰 ยอดขาย: ฿'+fmtT_(s.sales),
+    s.expKnown ? ('💸 ค่าใช้จ่าย: ฿'+fmtT_(s.exp))
+               : '💸 ค่าใช้จ่าย: — (ใบจ่ายเงินอ่านเป็นวันเดียวไม่ได้ ไม่ใช่ 0)',
+    prof===null ? '⚠️ กำไร: — (คำนวณไม่ได้จนกว่าจะรู้ค่าใช้จ่ายจริง)'
+                : (prof>=0?'✅ กำไร: +฿':'🔻 ขาดทุน: -฿')+fmtT_(Math.abs(prof)),
     '💳 โอน '+fmtT_(pm['เงินโอน']||0)+' · สด '+fmtT_(pm['เงินสด']||0)+' · บัตร '+fmtT_(pm['บัตรเครดิต']||0)];
   if((d.bills||0)>0) lines.push('🧾 ยอดต่อบิล: ฿'+fmtT_(s.sales/d.bills)+' ('+d.bills+' บิล)');
   var smart=hist.length>=3;   // มีข้อมูลพอค่อยเทียบค่าเฉลี่ย (กันเตือนมั่วช่วงข้อมูลน้อย)
@@ -1411,9 +1464,10 @@ function buildDailyMsg_(){
     al.push('❌ ยกเลิกสูงผิดปกติ ฿'+fmtT_(v.cancelled)+' (~'+((v.cancelled||0)/avgCan).toFixed(1)+'× ค่าเฉลี่ย)');
   else if((v.cancelled||0)>3000) al.push('❌ ยกเลิกสูง ฿'+fmtT_(v.cancelled));
   if(smart && avgS>0 && s.sales<avgS*0.65) al.push('📉 ยอดขายต่ำกว่าปกติมาก (ต่ำกว่าเฉลี่ย '+(100-s.sales/avgS*100).toFixed(0)+'%)');
-  if(prof<0) al.push('🔻 วันนี้ขาดทุน ฿'+fmtT_(Math.abs(prof)));
+  if(prof!==null && prof<0) al.push('🔻 วันนี้ขาดทุน ฿'+fmtT_(Math.abs(prof)));
   if(smart && avgLeak>500 && leak>avgLeak*2 && leak>2000)
     al.push('💧 เงินรั่วรวม (ยกเลิก+ลบบิล+ส่วนลด) สูงผิดปกติ ฿'+fmtT_(leak)+' ('+(s.sales>0?(leak/s.sales*100).toFixed(1):0)+'% ของยอดขาย)');
+  if(!s.expKnown) al.push('⛔ ค่าใช้จ่ายวันนี้ยังไม่ทราบ — เปิด Execution log ของ importPosReports() ดูเหตุผล (ใบจ่ายเงินน่าจะครอบหลายวัน)');
   if(al.length){ lines.push('─────────────','⚠️ ข้อควรระวัง:'); al.forEach(function(a){lines.push('  '+a);}); }
   else { lines.push('─────────────','✅ ทุกอย่างอยู่ในเกณฑ์ปกติ'); }
   return lines.join('\n');
@@ -1424,14 +1478,23 @@ function buildWeeklyMsg_(){
   var daily=loadDaily_(); if(!daily.length) return null;
   var keep={}; daily.map(function(d){return d.date;}).sort().reverse().slice(0,7).forEach(function(x){keep[x]=true;});
   var wk=daily.filter(function(d){return keep[d.date];});
-  var sales=0,exp=0,del=0,best=null;
-  wk.forEach(function(d){ var s=daySum_(d); sales+=s.sales; exp+=s.exp; del+=(d.voids||{}).deleted||0;
+  var sales=0,exp=0,del=0,best=null,unknownDays=0;
+  wk.forEach(function(d){ var s=daySum_(d); sales+=s.sales;
+    if(s.expKnown) exp+=s.exp; else unknownDays++;   // วันที่ไม่ทราบค่าใช้จ่าย ห้ามนับเป็น 0 (จะรวมยอดต่ำกว่าจริงเงียบๆ)
+    del+=(d.voids||{}).deleted||0;
     if(!best||s.sales>best.s) best={date:d.date,s:s.sales}; });
-  var prof=sales-exp;
   var lines=['📅 สรุปรายสัปดาห์ ('+wk.length+' วันล่าสุด)','─────────────',
-    '💰 ยอดขายรวม: ฿'+fmtT_(sales),'💸 ค่าใช้จ่ายรวม: ฿'+fmtT_(exp),
-    (prof>=0?'✅ กำไร: +฿':'🔻 ขาดทุน: -฿')+fmtT_(Math.abs(prof)),
-    '📈 เฉลี่ย/วัน: ฿'+fmtT_(sales/(wk.length||1))];
+    '💰 ยอดขายรวม: ฿'+fmtT_(sales)];
+  // มีวันไหนไม่ทราบค่าใช้จ่ายในสัปดาห์นี้ → รวมยอด/กำไรทั้งสัปดาห์เชื่อไม่ได้ ต้องบอกตรงๆ ไม่ใช่โชว์ยอดที่ขาดวันนั้นไปเงียบๆ
+  if(unknownDays>0){
+    lines.push('💸 ค่าใช้จ่ายรวม: — (ไม่ทราบ '+unknownDays+'/'+wk.length+' วัน — ดูเหตุผลที่สรุปรายวันของวันนั้น)');
+    lines.push('⚠️ กำไร: — (คำนวณไม่ได้จนกว่าจะรู้ค่าใช้จ่ายครบทุกวัน)');
+  } else {
+    var prof=sales-exp;
+    lines.push('💸 ค่าใช้จ่ายรวม: ฿'+fmtT_(exp));
+    lines.push((prof>=0?'✅ กำไร: +฿':'🔻 ขาดทุน: -฿')+fmtT_(Math.abs(prof)));
+  }
+  lines.push('📈 เฉลี่ย/วัน: ฿'+fmtT_(sales/(wk.length||1)));
   if(best) lines.push('🏆 วันขายดีสุด: '+best.date+' (฿'+fmtT_(best.s)+')');
   if(del>0) lines.push('🗑️ ลบบิลรวมสัปดาห์: ฿'+fmtT_(del)+' — ตรวจสอบ');
   return lines.join('\n');

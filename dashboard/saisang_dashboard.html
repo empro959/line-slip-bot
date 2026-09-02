@@ -994,18 +994,22 @@ function buildWeekdayProfit(m){
   dc('wdprofit'); var cv=el('ch-wdprofit'); if(!cv) return;
   var dt=(m.daily_totals||[]).slice(); if(!dt.length){ _svcNoData(cv); return; } _svcShow(cv);
   var WD=['จันทร์','อังคาร','พุธ','พฤหัส','ศุกร์','เสาร์','อาทิตย์'], agg={};
+  // d.expenses เป็น null ได้ (ใบ Payout ครอบหลายวัน ไม่ทราบค่าใช้จ่ายวันนั้น) — ห้ามเอาเข้าเฉลี่ยเป็น 0
+  // ไม่งั้นวันที่ไม่ทราบต้นทุนจะโชว์กำไรเกินจริงบนกราฟนี้ (บทเรียนเดียวกับ profitByWeekday() ฝั่ง Apps Script)
   dt.forEach(function(d){ var p=(d.date||'').split('-'); if(p.length<3) return;
     var dow=(new Date(+p[0],+p[1]-1,+p[2]).getDay()+6)%7;   // จันทร์=0 ... อาทิตย์=6
-    var a=agg[dow]||(agg[dow]={s:0,e:0,cnt:0}); a.s+=(d.sales||0); a.e+=(d.expenses||0); a.cnt++; });
+    var a=agg[dow]||(agg[dow]={s:0,e:0,cnt:0,ecnt:0});
+    a.s+=(d.sales||0); a.cnt++;
+    if(d.expenses!=null){ a.e+=d.expenses; a.ecnt++; } });
   var data=[],colors=[],meta=[];
-  for(var i=0;i<7;i++){ var a=agg[i]; if(a){var avg=(a.s-a.e)/a.cnt; data.push(avg); colors.push(avg>=0?'rgba(105,255,71,.8)':'rgba(255,82,82,.82)'); meta.push({s:a.s/a.cnt,e:a.e/a.cnt,n:a.cnt});}
+  for(var i=0;i<7;i++){ var a=agg[i]; if(a && a.ecnt>0){var avg=(a.s/a.cnt)-(a.e/a.ecnt); data.push(avg); colors.push(avg>=0?'rgba(105,255,71,.8)':'rgba(255,82,82,.82)'); meta.push({s:a.s/a.cnt,e:a.e/a.ecnt,n:a.cnt,ecnt:a.ecnt});}
     else {data.push(null);colors.push('rgba(0,0,0,0)');meta.push(null);} }
   charts['wdprofit']=new Chart(cv,{type:'bar',
     data:{labels:WD,datasets:[{label:'กำไร/ขาดทุน เฉลี่ย/วัน',data:data,backgroundColor:colors,borderRadius:6,borderSkipped:false}]},
     options:{responsive:true,maintainAspectRatio:false,
       plugins:{legend:{display:false},
         tooltip:{callbacks:{label:function(c){var v=c.parsed.y,mt=meta[c.dataIndex];return (v>=0?'กำไร +':'ขาดทุน -')+'฿'+fmt(Math.abs(v))+'/วัน';},
-          afterLabel:function(c){var mt=meta[c.dataIndex];return mt?('ขาย ฿'+fmt(mt.s)+' · จ่าย ฿'+fmt(mt.e)+' · '+mt.n+' วัน'):'';}}},
+          afterLabel:function(c){var mt=meta[c.dataIndex];return mt?('ขาย ฿'+fmt(mt.s)+' · จ่าย ฿'+fmt(mt.e)+(mt.ecnt<mt.n?' [เฉลี่ยจาก '+mt.ecnt+'/'+mt.n+' วันที่ทราบ]':'')+' · '+mt.n+' วัน'):'';}}},
         datalabels:{color:function(ctx){var v=ctx.dataset.data[ctx.dataIndex];return v>=0?'#69ff47':'#ff5252';},
           anchor:function(ctx){return ctx.dataset.data[ctx.dataIndex]>=0?'end':'start';},align:'top',
           font:{size:10,weight:'bold'},formatter:function(v){return v==null?'':(v>=0?'+':'')+fmt(v);}}},
