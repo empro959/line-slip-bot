@@ -93,8 +93,11 @@ LINE bot สำหรับร้าน **ไส้ย่างซอย๔ (E&M
 
 ## เทสต์ (`tests/`)
 ```bash
-python3 -m unittest discover -s tests -v     # ~0.1 วิ ไม่ต้องมี DB จริง/คีย์จริง/เน็ต
+pip install -r requirements.txt            # เครื่อง/คอนเทนเนอร์ใหม่ต้องลงก่อน
+                                            # (blinker ของ Debian ถอนไม่ได้ → เติม --ignore-installed blinker)
+python3 -m unittest discover -s tests -v     # ~0.5 วิ ไม่ต้องมี DB จริง/คีย์จริง/เน็ต
 ```
+- `test_store_bill.py` — **'ใบแจ้งรายการ' (บิลกระดาษ) ห้ามถูกนับเป็นรายรับ** (คุมสองทิศ: บิลต้องไม่เข้า · สลิปจริงต้องไม่ถูกตัดทิ้ง)
 - ครอบ **ตัวเลขเงิน** ที่เคยพังจริง: `_payable_settle` (ตัดผิดใบ) · `_payable_reconcile` (ยอดติดลบเพราะทิ้ง orphan, สั่งซ้ำ 2 ครั้งแล้วพัง) · `_payable_unlink` (ลบแล้วไม่คืนยอด) · `_Conn._pg_sql` (บั๊ก `%` ของ Postgres) · fallback push ตอน reply token หมดอายุ
 - ใช้ SQLite ไฟล์ชั่วคราว + คีย์ปลอม; ย้าย cwd ก่อน `import app` เพราะ background thread ของ app แตะ DB ตั้งแต่ตอน import → ไม่ทิ้ง `slips.db` ไว้ในโฟลเดอร์ repo
 - วันที่ในเทสต์ผูกแบบ **สัมพัทธ์กับวันนี้** (`_d(days_ago)`) เพราะ `_sane_doc_date` ปัดวันอนาคต/เก่าเกิน `PAYABLE_DATE_MAX_DAYS` ทิ้ง — ถ้า hard-code วันที่ เทสต์จะเน่าเองเมื่อเวลาผ่านไป
