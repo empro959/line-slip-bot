@@ -19,11 +19,15 @@
 > **แต่ยังไม่ deploy จริง** — `dashboard/Code_full.gs` ไม่มี clasp/CI ผูกกับ Apps Script เลย
 > merge PR ไม่ทำให้โค้ดที่รันจริงเปลี่ยน **ต้องมีคนก๊อปวางมือเข้า Apps Script editor** (ดูขั้นตอนที่ §3.12)
 > 📋 **2 ก.ย. — เขียนขั้นตอนคลิกต่อคลิกให้ Cowork/เจ้าของทำจริงแล้ว:** `dashboard/DEPLOY_STEPS_2026-09-02.md`
-> (ยังไม่มีใครทำตามขั้นตอนนี้จริง — ห้องนี้แตะ Apps Script editor/Netlify จากในนี้ไม่ได้เลย)
+> (ยังไม่มีใครทำตามขั้นตอนนี้จริง — ห้องนี้แตะ Apps Script editor/Netlify จากในนี้ไม่ได้เลย · แจ้ง Cowork
+> ผ่านกล่องกลาง Drive (`ERP-handoff`) แล้วด้วย 2 ก.ย. 23:37 น. ไทย — ไฟล์ `saiyang-to-cowork-02-09-...md`)
 > จนกว่าจะ deploy มือเสร็จ **อย่าเชื่อบรรทัด "ค่าใช้จ่าย"/"กำไร" ในสรุปรายวัน/รายสัปดาห์** (ยอดขายใช้ได้ปกติ)
 > 🔴 **กติกาเดิมยังใช้เสมอ: ห้าม push `main` ตอนร้านเปิด** — `.github/workflows/render-deploy.yml`
-> ไม่มี path filter push อะไรก็ตาม = ยิง Deploy Hook = worker restart ~1 นาที · รอบนี้ deploy ตอนที่
-> เจ้าของสั่งเองแล้วว่า "Deploy หมดเลย" (2 ก.ย. 18:55) — ไม่ใช่ข้อยกเว้นถาวร รอบหน้ายังต้องรอปิดร้านก่อน
+> ไม่มี path filter push อะไรก็ตาม = ยิง Deploy Hook = worker restart ~1 นาที
+> ✅ **commit `2398c5b` (เอกสารล้วน — DEPLOY_STEPS + อัปเดต HANDOFF) push แล้ว 02:20 น. ไทย (คืน 2→3 ก.ย.)**
+> ตามที่เจ้าของอนุมัติล่วงหน้าไว้แล้วว่า "ร้านตีสอง merge เอง" (คำตอบ 30 ส.ค. ผ่านห้อง Cowork) —
+> GitHub Actions run **#68 `success`** · เทสต์ **220/220 เขียว** ก่อน push (รันจริงหลังติดตั้ง
+> dependency ใหม่ในคอนเทนเนอร์นี้ — `pip install -r requirements.txt --ignore-installed blinker`)
 
 ### 🔴 ค้างที่เจ้าของ — มีกำหนดวัน (เลยกำหนดแล้ว — ยังไม่มีการยืนยัน)
 | เมื่อไหร่ | งาน | ที่ไหน |
