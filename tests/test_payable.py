@@ -83,6 +83,12 @@ class PayableTestCase(unittest.TestCase):
                 "SELECT id, doc_date, amount, COALESCE(paid,0) paid FROM payable_bills "
                 "WHERE group_id=? ORDER BY id", (ACCT,)).fetchall()]
 
+    def payments(self):
+        with app._db() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT id, doc_date, amount, COALESCE(allocated,0) allocated FROM payable_payments "
+                "WHERE group_id=? ORDER BY id", (ACCT,)).fetchall()]
+
     def paid_on(self, doc_date):
         """ยอดที่ถูกตัดของบิลวันนั้น (ไม่มีบรรทัด = None แปลว่าโดน cleanup ลบเพราะจ่ายครบ)"""
         for b in self.bills():
@@ -2225,6 +2231,124 @@ class TestDeleteBillByDateAmount(PayableTestCase):
                 "SELECT COALESCE(allocated,0) a FROM payable_payments WHERE group_id=?", (ACCT,)
             ).fetchone()["a"]
         self.assertEqual(pay_after, 0, "allocated ต้องถูกคืนเป็น 0 ไม่งั้นยอดค้างจะเพี้ยน")
+
+
+class TestDeletePaymentByDateAmount(PayableTestCase):
+    """'ลบจ่าย <วัน> <ยอด>' — มิเรอร์ 'ลบบิล <วัน> <ยอด>' ฝั่งเงินจ่าย
+
+    เคสจริง 2-3 ก.ย. 26 (§3.14): สลิปจ่ายดวงใจเคยถูก reject ผิด (PAYABLE_PAYEE_KEYWORDS
+    เป็นชื่อ ไม่ใช่เลขบัญชี) พอแก้ env แล้วบอทนับสลิปเข้าไปเองทีหลัง แต่มีคนพิมพ์ 'จ่าย <ยอด>'
+    ซ้ำก่อนรู้ว่านับไปแล้ว → 'ลบจ่ายล่าสุด' ใช้ไม่ได้ทันที เพราะมีเงินจ่ายรายการใหม่ (วันอื่น)
+    โผล่มาแทรกจนของที่อยากลบไม่ใช่ 'ล่าสุดของทั้งระบบ' อีกแล้ว"""
+
+    class _Ev:
+        reply_token = "tok"
+        class source:
+            group_id = ACCT
+            user_id = ACCT
+
+    def setUp(self):
+        super().setUp()
+        self.replies = []
+        self._orig = app.line_bot_api.reply_message
+        app.line_bot_api.reply_message = lambda tok, msg: self.replies.append(msg)
+
+    def tearDown(self):
+        app.line_bot_api.reply_message = self._orig
+
+    def _seed_real_case(self):
+        """วันเดียวกัน 2 รายการ ยอดไม่ซ้ำ (10329 · 1740) — ใช้ทดสอบว่าลบเจาะจงได้ถูกใบ
+        (เคสซ้ำยอดเป๊ะทดสอบแยกไว้ต่างหากใน test_ambiguous_duplicate_refuses_instead_of_guessing)"""
+        d = _d(0)
+        app.save_payable_payment(ACCT, 10329.0, doc_date=d)
+        app.save_payable_payment(ACCT, 1740.0, doc_date=d)
+        return d
+
+    def test_no_space_after_command_still_parses(self):
+        """เจ้าของพิมพ์ไม่มีช่องว่างจริง ('ลบจ่าย2/9 10329') — ต้องยังใช้ได้"""
+        d = _d(0)
+        app.save_payable_payment(ACCT, 10329.0, doc_date=d)
+        mm, dd = d.split("-")[1], d.split("-")[2]
+        handled = app.handle_payable_text(self._Ev(), f"ลบจ่าย{int(dd)}/{int(mm)} 10329", ACCT)
+        self.assertTrue(handled)
+        self.assertEqual(len(self.payments()), 0)
+
+    def test_deletes_exact_match_not_the_globally_latest_one(self):
+        """หัวใจของบั๊ก (เคสจริงของเจ้าของ): มีเงินจ่ายรายการใหม่ (คนละยอด) โผล่มาแทรก
+        ทีหลังจนมี id สูงกว่า — 'ลบจ่ายล่าสุด' จะโดนใบใหม่นี้แทน แต่ 'ลบจ่าย <วัน> <ยอด>'
+        ต้องยังหาใบ 10329 เจอถูกต้องไม่ว่าจะมีอะไรบันทึกทีหลังก็ตาม"""
+        d = self._seed_real_case()
+        app.save_payable_payment(ACCT, 999.0, doc_date=_d(1))   # รายการใหม่ที่แทรกเข้ามาทีหลัง (id สูงสุด)
+        mm, dd = d.split("-")[1], d.split("-")[2]
+        app.handle_payable_text(self._Ev(), f"ลบจ่าย {int(dd)}/{int(mm)} 10329", ACCT)
+        remaining = sorted(p["amount"] for p in self.payments())
+        self.assertEqual(remaining, [999.0, 1740.0], "ต้องลบ 10329 แค่ใบเดียว เหลืออีก 2 ใบไว้")
+        self.assertIn("10,329", self.replies[-1].text)
+        self.assertIn("🗑️", self.replies[-1].text)
+
+    def test_ambiguous_duplicate_refuses_instead_of_guessing(self):
+        """มี 10329 ซ้ำกัน 2 ใบวันเดียวกัน (เช่นสลิปจริง + พิมพ์ 'จ่าย' ซ้ำด้วยยอดเป๊ะเดียวกัน)
+        — ห้ามเดาว่าใบไหนคือของซ้ำ ต้องปฏิเสธแล้วให้คนตัดสินเอง"""
+        d = _d(0)
+        app.save_payable_payment(ACCT, 10329.0, doc_date=d)
+        app.save_payable_payment(ACCT, 10329.0, doc_date=d)
+        mm, dd = d.split("-")[1], d.split("-")[2]
+        app.handle_payable_text(self._Ev(), f"ลบจ่าย {int(dd)}/{int(mm)} 10329", ACCT)
+        self.assertEqual(len(self.payments()), 2, "กำกวม = ห้ามลบ")
+        self.assertIn("พบ", self.replies[-1].text)
+        self.assertIn("2", self.replies[-1].text)
+
+    def test_outstanding_rises_by_exactly_the_deleted_payment(self):
+        d = _d(0)
+        app.save_payable_payment(ACCT, 10329.0, doc_date=d)
+        before = app._payable_outstanding(ACCT)
+        mm, dd = d.split("-")[1], d.split("-")[2]
+        app.handle_payable_text(self._Ev(), f"ลบจ่าย {int(dd)}/{int(mm)} 10329", ACCT)
+        after = app._payable_outstanding(ACCT)
+        self.assertAlmostEqual(after - before, 10329.0, places=2,
+                               msg="ลบเงินจ่ายทิ้ง = ยอดค้างต้องเด้งกลับขึ้นเท่ากับที่ลบ")
+
+    def test_no_match_reports_and_deletes_nothing(self):
+        d = _d(0)
+        app.save_payable_payment(ACCT, 10329.0, doc_date=d)
+        mm, dd = d.split("-")[1], d.split("-")[2]
+        app.handle_payable_text(self._Ev(), f"ลบจ่าย {int(dd)}/{int(mm)} 999999", ACCT)
+        self.assertEqual(len(self.payments()), 1, "ไม่พบ = ห้ามแตะข้อมูล")
+        self.assertIn("ไม่พบ", self.replies[-1].text)
+
+    def test_bad_date_gives_usage_hint_not_silence(self):
+        app.handle_payable_text(self._Ev(), "ลบจ่าย 99/99 10329", ACCT)
+        self.assertTrue(self.replies, "ต้องตอบ ห้ามเงียบ")
+        self.assertIn("วันที่", self.replies[-1].text)
+
+    def test_missing_slash_gives_generic_usage_hint(self):
+        app.handle_payable_text(self._Ev(), "ลบจ่าย กันยา 10329", ACCT)
+        self.assertTrue(self.replies, "ต้องตอบ ห้ามเงียบ")
+        self.assertIn("รูปแบบไม่ถูก", self.replies[-1].text)
+
+    def test_bad_amount_gives_usage_hint_not_silence(self):
+        app.handle_payable_text(self._Ev(), "ลบจ่าย 2/9 เยอะๆ", ACCT)
+        self.assertTrue(self.replies)
+        self.assertIn("ยอด", self.replies[-1].text)
+
+    def test_restores_paired_bill_allocation_before_delete(self):
+        """ลบเงินจ่ายที่ถูกจับคู่ตัดบิลไปแล้ว — ต้องคืน paid ให้ฝั่งบิลก่อนลบ (เหมือน _delete_last_payable)"""
+        d = _d(0)
+        app.save_payable_bill(ACCT, 18795.0, note="พิมพ์", doc_date=d)
+        allocated, settled, note = app._payable_settle(ACCT, d, 18795.0)
+        app.save_payable_payment(ACCT, 18795.0, doc_date=d, allocated=allocated, settle_note=note)
+        self.assertGreater(self.paid_on(d) or 0, 0, "ต้องถูกจับคู่ไว้ก่อน ไม่งั้นเทสต์นี้ไม่ได้พิสูจน์อะไร")
+        mm, dd = d.split("-")[1], d.split("-")[2]
+        app.handle_payable_text(self._Ev(), f"ลบจ่าย {int(dd)}/{int(mm)} 18795", ACCT)
+        self.assertEqual(self.paid_on(d) or 0, 0, "paid ต้องถูกคืนเป็น 0 ไม่งั้นยอดค้างจะเพี้ยน")
+
+    def test_known_last_payment_command_not_caught_by_new_pattern(self):
+        """กันไม่ให้คำสั่ง 'ลบจ่ายล่าสุด'/'ลบจ่าย' เดิม ถูกแย่งไปโดยแพทเทิร์นใหม่"""
+        app.save_payable_payment(ACCT, 1000.0, doc_date=_d(0))
+        handled = app.handle_payable_text(self._Ev(), "ลบจ่ายล่าสุด", ACCT)
+        self.assertTrue(handled)
+        self.assertEqual(len(self.payments()), 0)
+        self.assertNotIn("รูปแบบไม่ถูก", self.replies[-1].text)
 
 
 class TestUnknownDeleteCommandNeverSilent(PayableTestCase):

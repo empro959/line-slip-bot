@@ -3308,6 +3308,57 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                  f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท{warn}"))
         return True
 
+    # ลบเงินจ่ายเจาะจงด้วย 'วันที่ + ยอด' — มิเรอร์ 'ลบบิล <วัน> <ยอด>' ข้างบน (ตั้งใจเว้นไว้ตอน §3.13
+    # เพราะตอนนั้นเจอปัญหาแค่ฝั่งบิล — เคสจริง 2-3 ก.ย. 26 (§3.14): สลิปที่เคยถูก reject ผิด
+    # (PAYABLE_PAYEE_KEYWORDS เป็นชื่อ ไม่ใช่เลขบัญชี) พอแก้ env แล้วบอทนับเข้าไปเองทีหลัง
+    # แต่มีคนพิมพ์ 'จ่าย <ยอด>' ซ้ำก่อนรู้ว่านับไปแล้ว → 'ลบจ่ายล่าสุด' ใช้ไม่ได้ทันที เพราะมีเงินจ่าย
+    # รายการใหม่โผล่มาแทรกจนของที่อยากลบไม่ใช่ 'ล่าสุดของทั้งระบบ' อีกแล้ว
+    if low.startswith("ลบจ่าย"):
+        rest = text[len("ลบจ่าย"):].strip()
+        toks = rest.split()
+        if len(toks) < 2 or "/" not in toks[0]:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="❌ รูปแบบไม่ถูก เช่น: ลบจ่าย 2/9 10329 (วัน/เดือน ยอด)"))
+            return True
+        doc_date = _parse_thai_date(toks[0])
+        if doc_date is None:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="❌ วันที่ไม่ถูก เช่น: ลบจ่าย 2/9 10329"))
+            return True
+        amount_str = " ".join(toks[1:]).replace(",", "").replace("บาท", "").strip()
+        try:
+            amt = float(amount_str)
+        except ValueError:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="❌ ยอดไม่ถูก เช่น: ลบจ่าย 2/9 10329"))
+            return True
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM payable_payments WHERE group_id=? AND doc_date=? AND ABS(amount-?)<0.01 ORDER BY id",
+                (acct, doc_date, amt)).fetchall()
+            if not rows:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text=f"📭 ไม่พบเงินจ่ายวันที่ {doc_date} ยอด {amt:,.2f} บาท — เช็คด้วย 'สรุปหนี้'"))
+                return True
+            if len(rows) > 1:
+                # วันที่+ยอดตรงกันมากกว่า 1 ใบ — ลบเจาะจงไม่ได้ปลอดภัย (กติกาเดียวกับฝั่งบิล/find_duplicate:
+                # เจอมากกว่า 1 ความเป็นไปได้ = ไม่ทำ ให้คนตัดสิน)
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                    text=(f"⚠️ พบ {len(rows)} รายการที่วันที่+ยอดตรงกันพอดี ({doc_date} · {amt:,.2f} บาท) "
+                          "— ลบเจาะจงไม่ได้ปลอดภัย แจ้งแอดมินให้ช่วยดู")))
+                return True
+            row = rows[0]
+            # คืนยอดที่จับคู่ไว้ก่อนลบ (เหตุผลเดียวกับ _delete_last_payable/ลบบิล <วัน> <ยอด>)
+            stuck = _payable_unlink(conn, acct, "payable_payments", row)
+            conn.execute("DELETE FROM payable_payments WHERE id=?", (row["id"],))
+            conn.commit()
+        warn = (f"\n⚠️ คืนยอดที่จับคู่ไว้ไม่ครบ {stuck:,.2f} บาท (บรรทัดคู่ถูกลบไปแล้ว) — ถ้ายอดดูไม่ถูก สั่ง 'จัดยอดใหม่'"
+                if stuck > 0.01 else "")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(
+            text=f"🗑️ ลบเงินจ่าย #{row['id']} ({float(row['amount']):,.2f} บาท · {doc_date}) แล้ว\n─────────────────\n"
+                 f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท{warn}"))
+        return True
+
     # ล้างบัญชีหนี้ทั้งหมด (รีเซ็ตเริ่มนับใหม่) — มีปุ่มยืนยัน
     if low in ("ล้างบัญชีหนี้", "ล้างหนี้", "ล้างบัญชี", "รีเซ็ตหนี้", "ล้างทั้งหมด"):
         send_reset_payable_confirm(event, acct)
@@ -3319,7 +3370,7 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     # หัวบล็อก 'ค้าง' ที่ห้ามจับแค่คำในบรรทัด ต้องมั่นใจว่าเป็นคำสั่งจริง ไม่ใช่คำที่บังเอิญมี)
     if low.startswith("ลบ"):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
-            text="❌ ไม่รู้จักคำสั่งนี้\nลบที่ใช้ได้: 'ลบบิลล่าสุด' · 'ลบจ่ายล่าสุด' · 'ลบบิล <วัน> <ยอด>' · 'ลบวันที่ <วัน>'"))
+            text="❌ ไม่รู้จักคำสั่งนี้\nลบที่ใช้ได้: 'ลบบิลล่าสุด' · 'ลบจ่ายล่าสุด' · 'ลบบิล <วัน> <ยอด>' · 'ลบจ่าย <วัน> <ยอด>' · 'ลบวันที่ <วัน>'"))
         return True
     return False
 
