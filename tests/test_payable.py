@@ -2396,3 +2396,137 @@ class TestUnknownDeleteCommandNeverSilent(PayableTestCase):
         handled = app.handle_payable_text(self._Ev(), "วันนี้ลูกค้าเยอะมากเลย", ACCT)
         self.assertFalse(handled)
         self.assertEqual(self.replies, [])
+
+
+class TestContentHeartbeatInDailyReport(unittest.TestCase):
+    """สัญญาณชีพคอนเทนต์ต่อท้ายรายงาน 00:30 (ตกลงกับห้องคอนเทนต์ 19 ส.ค. · ทำจริง 7 ก.ย.)
+
+    กติกาที่แพงที่สุดของฟีเจอร์นี้: **ดึงตัวเลขคอนเทนต์ไม่ได้ ต้องไม่ทำให้รายงานสลิปหายทั้งฉบับ**
+    (เครื่องมือที่ทำไว้กันเงียบ ห้ามกลายเป็นจุดพังใหม่เสียเอง)
+    และห้ามโผล่ในกลุ่มอื่นที่ไม่เกี่ยว — ตั้งกลุ่มไว้กลุ่มเดียวเท่านั้น"""
+
+    HB_GROUP = "Ghb"
+
+    def setUp(self):
+        self._orig = (app.CONTENT_HEARTBEAT_URL, app.CONTENT_HEARTBEAT_GROUP, app.requests.get)
+        app.CONTENT_HEARTBEAT_URL = "https://script.example/exec?key=x"
+        app.CONTENT_HEARTBEAT_GROUP = self.HB_GROUP
+        with app._db() as conn:
+            conn.execute("DELETE FROM slips WHERE group_id IN (?,?)", (self.HB_GROUP, "Gother"))
+            conn.execute("DELETE FROM image_misses WHERE group_id IN (?,?)", (self.HB_GROUP, "Gother"))
+            conn.commit()
+
+    def tearDown(self):
+        app.CONTENT_HEARTBEAT_URL, app.CONTENT_HEARTBEAT_GROUP, app.requests.get = self._orig
+
+    def _fake_get(self, payload=None, status=200, raise_exc=None):
+        class _R:
+            status_code = status
+            def json(self_inner):
+                if isinstance(payload, Exception):
+                    raise payload
+                return payload
+        def _get(url, timeout=None):
+            if raise_exc:
+                raise raise_exc
+            return _R()
+        app.requests.get = _get
+
+    def _seed_slip(self, group_id, day):
+        with app._db() as conn:
+            conn.execute("INSERT INTO slips (group_id, slip_date, amount, sender, verdict, recorded_at) "
+                         "VALUES (?,?,?,?,?,?)", (group_id, day, 500.0, "ลูกค้า", "PASS", "00:10"))
+            conn.commit()
+
+    def test_off_when_no_url_configured(self):
+        """ไม่ตั้ง URL = ปิดสนิท รายงานต้องเหมือนเดิมเป๊ะ ไม่มีบรรทัดแปลกปลอม"""
+        app.CONTENT_HEARTBEAT_URL = ""
+        day = _d(1)
+        self._seed_slip(self.HB_GROUP, day)
+        txt = app.build_daily_report(self.HB_GROUP, day)
+        self.assertNotIn("สัญญาณชีพ", txt)
+
+    def test_not_shown_in_other_groups(self):
+        """กลุ่มอื่นต้องไม่เห็นตัวเลขคอนเทนต์ (ไม่เกี่ยวกับเขา)"""
+        self._fake_get({"date": _d(1), "planned": 2, "posted": 2})
+        day = _d(1)
+        self._seed_slip("Gother", day)
+        txt = app.build_daily_report("Gother", day)
+        self.assertNotIn("สัญญาณชีพ", txt)
+
+    def test_success_renders_numbers(self):
+        day = _d(1)
+        self._fake_get({"date": day, "planned": 2, "posted": 2, "failed": 0,
+                        "images": 8, "model": "openai/gpt-oss-120b", "version": "v24"})
+        self._seed_slip(self.HB_GROUP, day)
+        txt = app.build_daily_report(self.HB_GROUP, day)
+        self.assertIn("สัญญาณชีพคอนเทนต์", txt)
+        self.assertIn("ยิงคอนเทนต์ 2/2 ชิ้น", txt)
+        self.assertIn("รูปเข้า Drive 8 รูป", txt)
+        self.assertIn("openai/gpt-oss-120b", txt)
+        self.assertIn("500.00", txt, "ตัวรายงานสลิปเดิมต้องยังอยู่ครบ")
+
+    def test_failed_calls_are_shouted(self):
+        """failed คือช่องที่จับเคส 'เงียบ 7 วัน' — ต้องเด่น ไม่ใช่ซ่อนในบรรทัดรวม"""
+        day = _d(1)
+        self._fake_get({"date": day, "planned": 2, "posted": 0, "failed": 2})
+        self._seed_slip(self.HB_GROUP, day)
+        txt = app.build_daily_report(self.HB_GROUP, day)
+        self.assertIn("🚨 เรียก AI ไม่สำเร็จ 2 ชิ้น", txt)
+
+    def test_stale_date_is_flagged(self):
+        """ตัวเลขเป็นของวันเก่า = bridge ค้าง — ต้องฟ้อง ไม่ใช่โชว์เลขเก่าเหมือนปกติ"""
+        day = _d(1)
+        self._fake_get({"date": _d(5), "planned": 2, "posted": 2})
+        self._seed_slip(self.HB_GROUP, day)
+        txt = app.build_daily_report(self.HB_GROUP, day)
+        self.assertIn("bridge อาจค้าง", txt)
+
+    def test_network_error_keeps_report_intact(self):
+        """หัวใจของฟีเจอร์: ดึงไม่ได้ = รายงานสลิปต้องยังครบ + มีธงบอกว่าดึงไม่ได้"""
+        day = _d(1)
+        self._fake_get(raise_exc=RuntimeError("timeout"))
+        self._seed_slip(self.HB_GROUP, day)
+        txt = app.build_daily_report(self.HB_GROUP, day)
+        self.assertIn("500.00", txt, "รายงานสลิปห้ามหาย")
+        self.assertIn("⚠️ ดึงตัวเลขไม่ได้", txt)
+
+    def test_http_error_keeps_report_intact(self):
+        day = _d(1)
+        self._fake_get({}, status=500)
+        self._seed_slip(self.HB_GROUP, day)
+        txt = app.build_daily_report(self.HB_GROUP, day)
+        self.assertIn("500.00", txt)
+        self.assertIn("HTTP 500", txt)
+
+    def test_bad_json_keeps_report_intact(self):
+        day = _d(1)
+        self._fake_get(payload=ValueError("not json"))
+        self._seed_slip(self.HB_GROUP, day)
+        txt = app.build_daily_report(self.HB_GROUP, day)
+        self.assertIn("500.00", txt)
+        self.assertIn("⚠️ ดึงตัวเลขไม่ได้", txt)
+
+    def test_non_dict_json_keeps_report_intact(self):
+        day = _d(1)
+        self._fake_get(payload=["not", "a", "dict"])
+        self._seed_slip(self.HB_GROUP, day)
+        txt = app.build_daily_report(self.HB_GROUP, day)
+        self.assertIn("500.00", txt)
+        self.assertIn("⚠️ ดึงตัวเลขไม่ได้", txt)
+
+    def test_shown_even_when_no_slips_that_day(self):
+        """วันที่ไม่มีสลิปเลย ก็ยังต้องเห็นสัญญาณชีพ — ไม่งั้นวันที่เงียบสองฝั่งพร้อมกันจะไม่มีใครรู้"""
+        day = _d(1)
+        self._fake_get({"date": day, "planned": 2, "posted": 2})
+        txt = app.build_daily_report(self.HB_GROUP, day)
+        self.assertIn("ไม่มีสลิป", txt)
+        self.assertIn("ยิงคอนเทนต์ 2/2 ชิ้น", txt)
+
+    def test_holiday_is_shown_so_zero_is_not_alarming(self):
+        """วันร้านหยุด planned=0 เป็นเรื่องปกติ ต้องบอกเหตุผลไว้ ไม่ให้คนอ่านตกใจผิด"""
+        day = _d(1)
+        self._fake_get({"date": day, "planned": 0, "posted": 0, "holiday": "ปีใหม่"})
+        self._seed_slip(self.HB_GROUP, day)
+        txt = app.build_daily_report(self.HB_GROUP, day)
+        self.assertIn("วันหยุดร้าน (ปีใหม่)", txt)
