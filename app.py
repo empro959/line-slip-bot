@@ -193,6 +193,16 @@ REPORT_MIN  = int(os.environ.get("REPORT_MIN", "30"))
 # ก่อนส่งรายงาน ให้ย้อนอ่าน 'รูปที่อ่านไม่ออก' ของเมื่อวานได้สูงสุดกี่ใบ (0 = ปิด)
 # กันค่า OCR บานปลายในวันที่มีคนส่งรูปทั่วไปเข้ากลุ่มเยอะ
 REPORT_RECOVER_MAX = int(os.environ.get("REPORT_RECOVER_MAX", "10"))
+# ── สัญญาณชีพฝั่งคอนเทนต์ (ตกลงกับห้องคอนเทนต์ 19 ส.ค. · ทำจริง 7 ก.ย.) ──────────────
+# ทำไมบอทเป็นคนส่ง ไม่ใช่ bridge: bridge คือตัวที่มีโอกาสพังที่สุด ถ้าให้ตัวที่พังเป็นคนรายงาน
+# วันที่พังจริงจะ 'ไม่มีข้อความออกมาเลย' ซึ่งหน้าตาเหมือน 'วันนี้ไม่มีอะไรเกิดขึ้น' เป๊ะ (เคยเงียบ 7 วันมาแล้ว)
+# บอทอยู่บน Render อุ่นเครื่องตลอด + มีรายงาน 00:30 ที่ยิงจริงทุกคืนอยู่แล้ว จึงเหมาะเป็นคนส่ง
+CONTENT_HEARTBEAT_URL = os.environ.get("CONTENT_HEARTBEAT_URL", "").strip()
+# ต่อท้ายรายงานของ 'กลุ่มเดียว' เท่านั้น (ไม่งั้นทุกกลุ่มรับสลิปจะเห็นตัวเลขคอนเทนต์ที่ไม่เกี่ยวกับตัวเอง)
+# ไม่ตั้ง = ปิดฟีเจอร์ทั้งหมด (เงียบสนิท ไม่กระทบรายงานเดิมสักกลุ่ม)
+CONTENT_HEARTBEAT_GROUP = os.environ.get("CONTENT_HEARTBEAT_GROUP", "").strip()
+# ปลายทางเป็น Apps Script ซึ่ง cold start ได้หลายวินาที แต่ต้องไม่หน่วงรายงานนานเกินไป
+CONTENT_HEARTBEAT_TIMEOUT = float(os.environ.get("CONTENT_HEARTBEAT_TIMEOUT", "8"))
 # เตือนเจ้าของครั้งเดียว/เดือน เมื่อ 'OA ตัวสุดท้าย' (ไม่มีตัวสำรองต่อ) push ใกล้เต็ม — ใช้เป็นสัญญาณว่า
 # 'push ไม่พอแล้ว' ถึงเวลาพิจารณาแยกกลุ่มไปอีก OA (แผน B) หรือลด push ก่อนข้อความตกหล่น
 PUSH_WARN_RATIO = float(os.environ.get("PUSH_WARN_RATIO", "0.8"))
@@ -1494,6 +1504,59 @@ def build_skipped_list(group_id: str, report_date: str = None) -> str:
     return "\n".join(lines)
 
 
+def _content_heartbeat_lines(report_date: str) -> list:
+    """บรรทัด 'สัญญาณชีพ' ของฝั่งคอนเทนต์ ต่อท้ายรายงาน 00:30 (คืน [] = ไม่ต้องต่อท้าย)
+
+    กติกาที่ห้ามพัง: **ดึงตัวเลขไม่ได้ ต้องไม่ทำให้รายงานทั้งฉบับหาย** — รายงานสลิปสำคัญกว่า
+    ตัวเลขคอนเทนต์เสมอ จึงกลืน error ทุกชนิดแล้วขึ้น ⚠️ แทน (ความเงียบคือศัตรูตัวจริง:
+    ไม่มีบรรทัดนี้เลย = แยกไม่ออกว่า 'ปิดฟีเจอร์' หรือ 'ดึงไม่ได้')"""
+    if not CONTENT_HEARTBEAT_URL:
+        return []
+    head = ["", "━━━━━━━━━━━━━", "🫀 สัญญาณชีพคอนเทนต์เมื่อวาน"]
+    try:
+        r = requests.get(CONTENT_HEARTBEAT_URL, timeout=CONTENT_HEARTBEAT_TIMEOUT)
+        if r.status_code >= 400:
+            return head + [f"⚠️ ดึงตัวเลขไม่ได้ (HTTP {r.status_code})"]
+        hb = r.json()
+        if not isinstance(hb, dict):
+            return head + ["⚠️ ดึงตัวเลขไม่ได้ (รูปแบบข้อมูลไม่ใช่ JSON object)"]
+    except Exception as e:
+        print(f"[heartbeat] ดึงไม่สำเร็จ: {str(e)[:120]}", flush=True)
+        return head + [f"⚠️ ดึงตัวเลขไม่ได้ ({str(e)[:60]})"]
+
+    def _num(key):
+        try:
+            return int(float(hb.get(key)))
+        except (TypeError, ValueError):
+            return None
+
+    planned, posted = _num("planned"), _num("posted")
+    failed, images  = _num("failed"), _num("images")
+    out = list(head)
+    # วันที่ของตัวเลขต้องตรงกับวันที่รายงาน — ไม่ตรง = bridge ค้างวันเก่า (เงียบแบบที่เคยโดนมาแล้ว)
+    hb_date = str(hb.get("date") or "").strip()
+    if hb_date and hb_date != report_date:
+        out.append(f"⚠️ ตัวเลขเป็นของวันที่ {hb_date} ไม่ใช่ {report_date} — bridge อาจค้าง")
+    if planned is None and posted is None:
+        out.append("⚠️ ไม่มีตัวเลขยิงคอนเทนต์ในคำตอบ")
+    else:
+        line = f"ยิงคอนเทนต์ {posted if posted is not None else '?'}/{planned if planned is not None else '?'} ชิ้น"
+        if hb.get("holiday"):
+            line += f" · วันหยุดร้าน ({hb['holiday']})"
+        out.append(line)
+    # failed คือช่องที่จับ 'เรียก AI ไม่สำเร็จ' — เคสเงียบ 7 วันรอบก่อนโผล่ตรงนี้
+    if failed:
+        out.append(f"🚨 เรียก AI ไม่สำเร็จ {failed} ชิ้น")
+    if images is not None:
+        out.append(f"รูปเข้า Drive {images} รูป")
+    # โมเดลเปลี่ยนเองโดยไม่มีใครสั่ง = ผู้ให้บริการปลดโมเดลเก่า — ต้องเห็นก่อนระบบพัง ไม่ใช่หลังพัง 7 วัน
+    if hb.get("model"):
+        out.append(f"โมเดล: {hb['model']}")
+    if hb.get("version"):
+        out.append(f"bridge: {hb['version']}")
+    return out
+
+
 def build_daily_report(group_id: str, report_date: str = None) -> str:
     report_date = report_date or datetime.now(TZ).date().isoformat()
     with _db() as conn:
@@ -1527,12 +1590,16 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
             out.append("   ตกหล่น: " + ", ".join(detail) + " — ตามดูใบที่บอทไม่ตอบ")
         return out
 
+    # สัญญาณชีพคอนเทนต์ — ต่อท้ายเฉพาะกลุ่มที่ตั้งไว้ (กลุ่มอื่นไม่เกี่ยว ไม่ต้องเห็น)
+    hb_lines = _content_heartbeat_lines(report_date) if group_id == CONTENT_HEARTBEAT_GROUP else []
+
     if not slips:
         if misses:
             return ("\n".join([f"📊 รายงานสรุปประจำวัน {report_date}",
                                "─────────────────",
-                               "ไม่มีสลิปที่อ่านได้"] + _recon_lines()))
-        return f"📊 ไม่มีสลิปวันที่ {report_date}"
+                               "ไม่มีสลิปที่อ่านได้"] + _recon_lines() + hb_lines))
+        # วันที่ไม่มีสลิปเลย ก็ยังต้องเห็นสัญญาณชีพ (ไม่งั้นวันที่เงียบสองฝั่งพร้อมกันจะไม่มีใครรู้)
+        return "\n".join([f"📊 ไม่มีสลิปวันที่ {report_date}"] + hb_lines)
 
     total  = sum(float(s.get("amount") or 0) for s in slips)
     passed = sum(1 for s in slips if s.get("verdict") == "PASS")
@@ -1570,6 +1637,7 @@ def build_daily_report(group_id: str, report_date: str = None) -> str:
         lines.append(f"{i}. {icon} {s.get('sender','?')} | {amt} บาท | {s.get('recorded_at','')}")
     lines += _recon_lines()
     lines += _dining_report_lines(group_id, report_date)
+    lines += hb_lines
     return "\n".join(lines)
 
 
