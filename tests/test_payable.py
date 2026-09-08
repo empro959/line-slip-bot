@@ -2530,3 +2530,69 @@ class TestContentHeartbeatInDailyReport(unittest.TestCase):
         self._seed_slip(self.HB_GROUP, day)
         txt = app.build_daily_report(self.HB_GROUP, day)
         self.assertIn("วันหยุดร้าน (ปีใหม่)", txt)
+
+
+class TestTruncatedGeminiJson(unittest.TestCase):
+    """JSON ที่โมเดลตอบไม่จบ ต้องกู้ให้ได้ ไม่ใช่ทิ้งทั้งใบ
+
+    เคสจริง 8 ก.ย. 26 (log Render): 'รับจองคุณโอม 5 ท่านโต๊ะ B10  1 ทุ่ม ครับ @All'
+      [gemini] parse JSON ไม่ได้ → ใช้ fallback:
+        '{"is_reservation":true,"is_advance":false,"customer":"คุณโอม","people":"5 ท่าน",...
+      [resv] AI ว่าไม่ใช่การจอง → ข้าม        ← เงียบ ทั้งที่ AI ตอบ is_reservation:true มาแล้ว
+    AI อ่านถูกทุกช่อง แต่ JSON ขาด } ปิด → regex `\\{.*\\}` หาไม่เจอ → ตกไป fallback = 'ไม่ใช่จอง'"""
+
+    class _Resp:
+        def __init__(self, text): self.text = text
+
+    # ข้อความจริงจาก log (ตัดตรงที่ขาดจริงๆ)
+    REAL = ('{"is_reservation":true,"is_advance":false,"customer":"คุณโอม",'
+            '"people":"5 ท่าน","date":"วันนี้","resv_date":"2026-09-08"')
+
+    def test_real_truncated_case_is_recovered(self):
+        out = app._parse_gemini_json(self._Resp(self.REAL), {"is_reservation": False, "_unreadable": True})
+        self.assertTrue(out.get("is_reservation"), "ต้องกู้ได้ว่าเป็นการจอง ไม่ใช่ตกไป fallback")
+        self.assertEqual(out.get("customer"), "คุณโอม")
+        self.assertEqual(out.get("people"), "5 ท่าน")
+        self.assertNotIn("_unreadable", out, "กู้ได้แล้วต้องไม่ติดธง 'อ่านไม่ออก'")
+        self.assertEqual(out.get("resv_date"), "2026-09-08",
+                         "คู่สุดท้ายที่สมบูรณ์อยู่แล้วต้องไม่ถูกตัดทิ้งฟรีๆ — วันจองคือข้อมูลสำคัญ")
+
+    def test_cut_in_the_middle_of_a_value(self):
+        """ตัดกลางค่า (ไม่ใช่ตรงรอยต่อพอดี) — ต้องตัดคู่ที่ไม่สมบูรณ์ทิ้งแล้วเก็บที่เหลือ"""
+        raw = '{"is_reservation":true,"customer":"คุณโอม","people":"5 ท'
+        out = app._parse_gemini_json(self._Resp(raw), {"is_reservation": False})
+        self.assertTrue(out.get("is_reservation"))
+        self.assertEqual(out.get("customer"), "คุณโอม")
+        self.assertIsNone(out.get("people"), "ช่องที่ขาดต้องไม่มีค่ามั่ว")
+
+    def test_complete_json_still_parsed_normally(self):
+        raw = '{"is_reservation":true,"customer":"เอ","people":"4 คน"}'
+        out = app._parse_gemini_json(self._Resp(raw), {"is_reservation": False})
+        self.assertEqual(out.get("customer"), "เอ")
+
+    def test_json_inside_markdown_fence_still_works(self):
+        raw = '```json\n{"is_reservation":true,"customer":"บี"}\n```'
+        out = app._parse_gemini_json(self._Resp(raw), {"is_reservation": False})
+        self.assertEqual(out.get("customer"), "บี")
+
+    def test_real_garbage_still_falls_back(self):
+        """ข้อความบรรยายที่ไม่ใช่ JSON เลย ต้องยังตกไป fallback ตามเดิม (ไม่ใช่กู้มั่ว)"""
+        out = app._parse_gemini_json(self._Resp("ขอโทษครับ ผมไม่เข้าใจรูปนี้"),
+                                     {"is_reservation": False, "_unreadable": True})
+        self.assertFalse(out.get("is_reservation"))
+        self.assertTrue(out.get("_unreadable"), "อ่านไม่ออกจริงต้องติดธงไว้ให้ปลายทางรู้")
+
+    def test_empty_response_falls_back(self):
+        out = app._parse_gemini_json(self._Resp(""), {"is_slip": False})
+        self.assertEqual(out, {"is_slip": False})
+
+    def test_only_opening_brace_falls_back(self):
+        out = app._parse_gemini_json(self._Resp("{"), {"is_reservation": False})
+        self.assertFalse(out.get("is_reservation"))
+
+    def test_repair_never_invents_values(self):
+        """กติกาเหล็กของโปรเจกต์: ไม่รู้ = ไม่มีฟิลด์ ห้ามเดาค่าใส่แทน"""
+        raw = '{"is_reservation":true,"customer":"ซี","table":'
+        out = app._parse_gemini_json(self._Resp(raw), {"is_reservation": False})
+        self.assertEqual(out.get("customer"), "ซี")
+        self.assertIsNone(out.get("table"))

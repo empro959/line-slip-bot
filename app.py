@@ -279,8 +279,46 @@ def _parse_gemini_json(response, fallback: dict) -> dict:
                     return _coerce_gemini_fields(json.loads(m.group(0)))
                 except (json.JSONDecodeError, ValueError):
                     pass
+            # คำตอบ 'ถูกตัดกลางคัน' (ไม่มี } ปิด) — regex ข้างบนหาไม่เจอเพราะไม่มีวงเล็บปิดให้จับ
+            # เคสจริง 8 ก.ย. 26: จองคุณโอม 5 ท่าน โต๊ะ B10 — AI ตอบ is_reservation:true พร้อมข้อมูลครบ
+            #   แต่ JSON ขาดตรงกลาง → parse ไม่ผ่าน → ตกไป fallback ที่แปลว่า 'ไม่ใช่การจอง' → จองหายเงียบ
+            # ข้อมูลที่อ่านได้แล้วมีค่าเกินกว่าจะทิ้ง: ซ่อมด้วยการตัดคู่ที่ไม่สมบูรณ์ทิ้งแล้วปิดวงเล็บ
+            repaired = _repair_truncated_json(raw)
+            if repaired is not None:
+                print(f"[gemini] JSON ถูกตัดกลางคัน → ซ่อมแล้วใช้ต่อได้ ({len(raw)} ตัวอักษร)", flush=True)
+                return _coerce_gemini_fields(repaired)
     print(f"[gemini] parse JSON ไม่ได้ → ใช้ fallback: {raw[:120]!r}", flush=True)
     return dict(fallback)
+
+
+def _repair_truncated_json(raw: str):
+    """กู้ JSON ที่ถูกตัดกลางคัน (โมเดลตอบไม่จบ/ชนลิมิต) — คืน dict ถ้าซ่อมได้ · None ถ้าไม่ไหว
+
+    วิธี: ตัดจากท้ายทีละคู่ 'key:value' จนกว่าจะเหลือส่วนที่ปิดวงเล็บแล้ว parse ผ่าน
+    เก็บเฉพาะฟิลด์ที่โมเดลตอบมาครบจริงๆ — ฟิลด์ที่ขาดจะไม่มีในผลลัพธ์ (ปลายทางเช็ค .get() อยู่แล้ว)
+    ⚠️ ตั้งใจไม่เดาค่าที่หายไป — 'ไม่รู้' ต้องเป็น 'ไม่มีฟิลด์' ไม่ใช่ค่ามั่ว"""
+    s = raw[raw.find("{"):] if "{" in raw else ""
+    if not s:
+        return None
+    # ลองปิดวงเล็บเฉยๆ ก่อน — เคสที่ตัดตรง 'รอยต่อพอดี' (คู่สุดท้ายสมบูรณ์) จะได้ไม่เสียฟิลด์นั้นไปฟรีๆ
+    try:
+        out = json.loads(s + "}")
+        if isinstance(out, dict) and out:
+            return out
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # ตัดท้ายทีละคู่ หาจุดที่ปิด } แล้วอ่านได้ (ลองไม่เกิน 400 ครั้ง กันวนยาวในข้อความขยะ)
+    for _ in range(400):
+        cut = max(s.rfind(","), s.rfind("{"))
+        if cut <= 0:
+            return None
+        s = s[:cut]
+        try:
+            out = json.loads(s + "}")
+        except (json.JSONDecodeError, ValueError):
+            continue
+        return out if isinstance(out, dict) and out else None
+    return None
 
 
 def _coerce_gemini_fields(d: dict) -> dict:
@@ -4321,7 +4359,9 @@ def extract_reservation(text: str) -> dict:
     )
     response = _gemini_generate(prompt, json_mode=True)
     # parse แบบทนทาน: ถ้าโมเดลตอบไม่เป็น JSON ให้ถือว่า 'ไม่ใช่การจอง' (เงียบ) แทนที่จะ error
-    return _parse_gemini_json(response, {"is_reservation": False})
+    # '_unreadable' = แยก 'AI ตอบไม่ได้/อ่านไม่ออก' ออกจาก 'AI ตอบว่าไม่ใช่จอง' —
+    # สองอย่างนี้ต้องปฏิบัติต่างกัน (อย่างแรกต้องบอกให้พิมพ์ใหม่ ห้ามเงียบ · ดู handle_reservation_text)
+    return _parse_gemini_json(response, {"is_reservation": False, "_unreadable": True})
 
 
 def _resv_detail_lines(r: dict) -> str:
@@ -4506,6 +4546,18 @@ def handle_reservation_text(event, text: str, group_id: str):
         print(f"[resv] extract failed: {e}", flush=True)
         return False
     if not info.get("is_reservation"):
+        # ⚠️ 'AI ว่าไม่ใช่จอง' กับ 'AI อ่านไม่ออก' ไม่เหมือนกัน — อย่างหลังห้ามเงียบ
+        # เคสจริง 8 ก.ย. 26: 'รับจองคุณโอม 5 ท่านโต๊ะ B10 1 ทุ่ม' → JSON ถูกตัดกลางคัน → ตกมาที่ fallback
+        #   ซึ่งแปลว่า 'ไม่ใช่จอง' → บอทเงียบสนิท พนักงานคิดว่าจองเข้าแล้ว = จองหลุดโดยไม่มีใครรู้
+        # ถ้าข้อความหน้าตาเป็นจองชัดเจน (มีคำใบ้หนัก + สัญญาณครบ) แต่ AI ให้คำตอบไม่ได้ → ต้องบอกให้พิมพ์ใหม่
+        _strong_hint = any(h in _low for h in _RESV_HINTS if h not in _RESV_WEAK_HINTS)
+        if info.get("_unreadable") and _strong_hint and _resv_signal_hits(eff_text) >= 2:
+            print(f"[resv] 🔴 หน้าตาเป็นจองชัดเจน แต่ AI อ่านไม่ออก → บอกให้พิมพ์ใหม่ (ห้ามเงียบ)", flush=True)
+            _reply_with_mention(event,
+                "⚠️ อ่านข้อความจองนี้ไม่ออก (ระบบ AI ตอบไม่ครบ) — ยังไม่ได้บันทึกจอง\n"
+                "ช่วยพิมพ์ใหม่อีกครั้งครับ เช่น:\n"
+                "จองคุณโอม 5 ท่าน โต๊ะ B10 วันนี้ 19:00")
+            return True
         print(f"[resv] AI ว่าไม่ใช่การจอง → ข้าม", flush=True)
         return False
 
