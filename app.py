@@ -264,6 +264,18 @@ def _gemini_generate(contents, attempts=4, model=None, json_mode=False):
     raise last
 
 
+def _gemini_finish_reason(response) -> str:
+    """โมเดล 'หยุดตอบเพราะอะไร' (STOP / MAX_TOKENS / SAFETY ...) — ไว้ตอบคำถามว่าทำไมตอบไม่จบ
+
+    เคสจริง 8 ก.ย. 26: JSON ถูกตัดกลางคัน แต่ log เดิมบอกแค่ 'parse ไม่ได้'
+    ทำให้เดาไม่ออกว่าชนลิมิต token หรือสะดุดชั่วคราว — ต่างกันคนละวิธีแก้
+    ตัวนี้ใช้ตอน log เท่านั้น จึงห้ามโยน error ไม่ว่ารูปร่าง response จะเปลี่ยนไปแค่ไหน"""
+    try:
+        return str(getattr(response.candidates[0], "finish_reason", "") or "?")
+    except Exception:
+        return "?"
+
+
 def _parse_gemini_json(response, fallback: dict) -> dict:
     """แปลงผลลัพธ์ Gemini เป็น dict อย่างทนทาน — กันเคสโมเดลตอบไม่เป็น JSON (เช่น โน๊ตเขียนมือ/รูปกำกวม
     ทำให้ตอบเป็นข้อความบรรยาย) แล้ว json.loads โยน error หลุดไป 'error path' → เตือนผิดว่า 'ส่งสลิปใหม่'
@@ -285,9 +297,11 @@ def _parse_gemini_json(response, fallback: dict) -> dict:
             # ข้อมูลที่อ่านได้แล้วมีค่าเกินกว่าจะทิ้ง: ซ่อมด้วยการตัดคู่ที่ไม่สมบูรณ์ทิ้งแล้วปิดวงเล็บ
             repaired = _repair_truncated_json(raw)
             if repaired is not None:
-                print(f"[gemini] JSON ถูกตัดกลางคัน → ซ่อมแล้วใช้ต่อได้ ({len(raw)} ตัวอักษร)", flush=True)
+                print(f"[gemini] JSON ถูกตัดกลางคัน → ซ่อมแล้วใช้ต่อได้ "
+                      f"({len(raw)} ตัวอักษร · หยุดเพราะ {_gemini_finish_reason(response)})", flush=True)
                 return _coerce_gemini_fields(repaired)
-    print(f"[gemini] parse JSON ไม่ได้ → ใช้ fallback: {raw[:120]!r}", flush=True)
+    print(f"[gemini] parse JSON ไม่ได้ (หยุดเพราะ {_gemini_finish_reason(response)}) "
+          f"→ ใช้ fallback: {raw[:120]!r}", flush=True)
     return dict(fallback)
 
 
@@ -4357,11 +4371,22 @@ def extract_reservation(text: str) -> dict:
         "ฟิลด์ที่ไม่มีข้อมูลให้เป็น null\n\n"
         f"ข้อความ: {text}"
     )
-    response = _gemini_generate(prompt, json_mode=True)
     # parse แบบทนทาน: ถ้าโมเดลตอบไม่เป็น JSON ให้ถือว่า 'ไม่ใช่การจอง' (เงียบ) แทนที่จะ error
     # '_unreadable' = แยก 'AI ตอบไม่ได้/อ่านไม่ออก' ออกจาก 'AI ตอบว่าไม่ใช่จอง' —
     # สองอย่างนี้ต้องปฏิบัติต่างกัน (อย่างแรกต้องบอกให้พิมพ์ใหม่ ห้ามเงียบ · ดู handle_reservation_text)
-    return _parse_gemini_json(response, {"is_reservation": False, "_unreadable": True})
+    _fallback = {"is_reservation": False, "_unreadable": True}
+    info = _parse_gemini_json(_gemini_generate(prompt, json_mode=True), _fallback)
+    # ตอบมาแล้วแต่ 'ซ่อมไม่ขึ้นเลย' → ขอใหม่อีกรอบด้วยตัวเก่งขึ้น ก่อนจะยอมแพ้
+    # (_gemini_generate retry เฉพาะตอน 'เรียกไม่ติด' — คำตอบที่ตอบมาแต่ใช้ไม่ได้ ไม่เคยถูกลองซ้ำ
+    #  ซึ่งคือเคสจริง 8 ก.ย. 26 ที่จองหลุด · ยิงเพิ่มเฉพาะเคสที่พังจริง จึงไม่เปลืองโควตา)
+    if info.get("_unreadable"):
+        print("[resv] คำตอบแรกใช้ไม่ได้ → ขอใหม่ด้วย " + str(GEMINI_MODEL_RETRY), flush=True)
+        try:
+            info = _parse_gemini_json(
+                _gemini_generate(prompt, model=GEMINI_MODEL_RETRY, json_mode=True), _fallback)
+        except Exception as e:
+            print(f"[resv] ขอใหม่ไม่สำเร็จ: {str(e)[:120]}", flush=True)
+    return info
 
 
 def _resv_detail_lines(r: dict) -> str:
