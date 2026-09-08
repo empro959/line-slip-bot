@@ -2530,3 +2530,168 @@ class TestContentHeartbeatInDailyReport(unittest.TestCase):
         self._seed_slip(self.HB_GROUP, day)
         txt = app.build_daily_report(self.HB_GROUP, day)
         self.assertIn("วันหยุดร้าน (ปีใหม่)", txt)
+
+
+class TestTruncatedGeminiJson(unittest.TestCase):
+    """JSON ที่โมเดลตอบไม่จบ ต้องกู้ให้ได้ ไม่ใช่ทิ้งทั้งใบ
+
+    เคสจริง 8 ก.ย. 26 (log Render): 'รับจองคุณโอม 5 ท่านโต๊ะ B10  1 ทุ่ม ครับ @All'
+      [gemini] parse JSON ไม่ได้ → ใช้ fallback:
+        '{"is_reservation":true,"is_advance":false,"customer":"คุณโอม","people":"5 ท่าน",...
+      [resv] AI ว่าไม่ใช่การจอง → ข้าม        ← เงียบ ทั้งที่ AI ตอบ is_reservation:true มาแล้ว
+    AI อ่านถูกทุกช่อง แต่ JSON ขาด } ปิด → regex `\\{.*\\}` หาไม่เจอ → ตกไป fallback = 'ไม่ใช่จอง'"""
+
+    class _Resp:
+        def __init__(self, text): self.text = text
+
+    # ข้อความจริงจาก log (ตัดตรงที่ขาดจริงๆ)
+    REAL = ('{"is_reservation":true,"is_advance":false,"customer":"คุณโอม",'
+            '"people":"5 ท่าน","date":"วันนี้","resv_date":"2026-09-08"')
+
+    def test_real_truncated_case_is_recovered(self):
+        out = app._parse_gemini_json(self._Resp(self.REAL), {"is_reservation": False, "_unreadable": True})
+        self.assertTrue(out.get("is_reservation"), "ต้องกู้ได้ว่าเป็นการจอง ไม่ใช่ตกไป fallback")
+        self.assertEqual(out.get("customer"), "คุณโอม")
+        self.assertEqual(out.get("people"), "5 ท่าน")
+        self.assertNotIn("_unreadable", out, "กู้ได้แล้วต้องไม่ติดธง 'อ่านไม่ออก'")
+        self.assertEqual(out.get("resv_date"), "2026-09-08",
+                         "คู่สุดท้ายที่สมบูรณ์อยู่แล้วต้องไม่ถูกตัดทิ้งฟรีๆ — วันจองคือข้อมูลสำคัญ")
+
+    def test_cut_in_the_middle_of_a_value(self):
+        """ตัดกลางค่า (ไม่ใช่ตรงรอยต่อพอดี) — ต้องตัดคู่ที่ไม่สมบูรณ์ทิ้งแล้วเก็บที่เหลือ"""
+        raw = '{"is_reservation":true,"customer":"คุณโอม","people":"5 ท'
+        out = app._parse_gemini_json(self._Resp(raw), {"is_reservation": False})
+        self.assertTrue(out.get("is_reservation"))
+        self.assertEqual(out.get("customer"), "คุณโอม")
+        self.assertIsNone(out.get("people"), "ช่องที่ขาดต้องไม่มีค่ามั่ว")
+
+    def test_complete_json_still_parsed_normally(self):
+        raw = '{"is_reservation":true,"customer":"เอ","people":"4 คน"}'
+        out = app._parse_gemini_json(self._Resp(raw), {"is_reservation": False})
+        self.assertEqual(out.get("customer"), "เอ")
+
+    def test_json_inside_markdown_fence_still_works(self):
+        raw = '```json\n{"is_reservation":true,"customer":"บี"}\n```'
+        out = app._parse_gemini_json(self._Resp(raw), {"is_reservation": False})
+        self.assertEqual(out.get("customer"), "บี")
+
+    def test_real_garbage_still_falls_back(self):
+        """ข้อความบรรยายที่ไม่ใช่ JSON เลย ต้องยังตกไป fallback ตามเดิม (ไม่ใช่กู้มั่ว)"""
+        out = app._parse_gemini_json(self._Resp("ขอโทษครับ ผมไม่เข้าใจรูปนี้"),
+                                     {"is_reservation": False, "_unreadable": True})
+        self.assertFalse(out.get("is_reservation"))
+        self.assertTrue(out.get("_unreadable"), "อ่านไม่ออกจริงต้องติดธงไว้ให้ปลายทางรู้")
+
+    def test_empty_response_falls_back(self):
+        out = app._parse_gemini_json(self._Resp(""), {"is_slip": False})
+        self.assertEqual(out, {"is_slip": False})
+
+    def test_only_opening_brace_falls_back(self):
+        out = app._parse_gemini_json(self._Resp("{"), {"is_reservation": False})
+        self.assertFalse(out.get("is_reservation"))
+
+    def test_repair_never_invents_values(self):
+        """กติกาเหล็กของโปรเจกต์: ไม่รู้ = ไม่มีฟิลด์ ห้ามเดาค่าใส่แทน"""
+        raw = '{"is_reservation":true,"customer":"ซี","table":'
+        out = app._parse_gemini_json(self._Resp(raw), {"is_reservation": False})
+        self.assertEqual(out.get("customer"), "ซี")
+        self.assertIsNone(out.get("table"))
+
+
+class TestRetryWhenAnswerUnusable(unittest.TestCase):
+    """โมเดล 'ตอบมาแต่ใช้ไม่ได้' ต้องถูกลองใหม่ — ไม่ใช่ยอมแพ้ตั้งแต่รอบแรก
+
+    _gemini_generate มี retry อยู่แล้ว แต่ retry เฉพาะตอน 'เรียกไม่ติด' (exception)
+    คำตอบที่ตอบมาครบ 200 แต่เนื้อในใช้ไม่ได้ ไม่เคยถูกลองซ้ำเลย — คือเคสจริง 8 ก.ย. 26 ที่จองหลุด"""
+
+    class _Resp:
+        def __init__(self, text): self.text = text
+
+    def setUp(self):
+        self._orig = app._gemini_generate
+        self.calls = []
+
+    def tearDown(self):
+        app._gemini_generate = self._orig
+
+    def _install(self, answers):
+        """คืนคำตอบตามลำดับ; บันทึกโมเดลที่ถูกเรียกไว้ตรวจ"""
+        seq = list(answers)
+
+        def _fake(contents, attempts=4, model=None, json_mode=False):
+            self.calls.append(model)
+            return self._Resp(seq.pop(0) if seq else "")
+
+        app._gemini_generate = _fake
+
+    def test_รอบแรกใช้ไม่ได้_ต้องขอใหม่แล้วได้จองจริง(self):
+        self._install(['ขอโทษครับ อธิบายไม่ได้',
+                       '{"is_reservation":true,"customer":"คุณโอม","people":"5 ท่าน",'
+                       '"resv_date":"2026-09-08","time_hhmm":"19:00"}'])
+        info = app.extract_reservation("รับจองคุณโอม 5 ท่านโต๊ะ B10  1 ทุ่ม ครับ")
+        self.assertTrue(info.get("is_reservation"), "รอบสองอ่านออกแล้ว ต้องได้จอง ไม่ใช่ทิ้ง")
+        self.assertEqual(info.get("customer"), "คุณโอม")
+        self.assertFalse(info.get("_unreadable"))
+        self.assertEqual(len(self.calls), 2, "ต้องขอใหม่พอดี 1 ครั้ง")
+        self.assertEqual(self.calls[1], app.GEMINI_MODEL_RETRY, "รอบสองต้องใช้ตัวเก่งขึ้น")
+
+    def test_รอบแรกอ่านออก_ต้องไม่ยิงซ้ำ(self):
+        """ยิงซ้ำทุกครั้ง = เปลืองโควตาเปล่า — ต้องยิงเฉพาะตอนพังจริง"""
+        self._install(['{"is_reservation":false}'])
+        app.extract_reservation("วันนี้ลูกค้าเยอะจัง")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_รอบแรกถูกตัดกลางคัน_ซ่อมได้_ต้องไม่ยิงซ้ำ(self):
+        """ชั้นซ่อม JSON ทำงานก่อน — ซ่อมขึ้นแล้วไม่ต้องเสียเงินยิงใหม่"""
+        self._install(['{"is_reservation":true,"customer":"คุณโอม","resv_date":"2026-09-08"'])
+        info = app.extract_reservation("รับจองคุณโอม 5 ท่าน")
+        self.assertTrue(info.get("is_reservation"))
+        self.assertEqual(info.get("resv_date"), "2026-09-08")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_พังทั้งสองรอบ_ต้องติดธงอ่านไม่ออก_ไม่ใช่เงียบ(self):
+        self._install(['ไม่เข้าใจครับ', 'ก็ยังไม่เข้าใจครับ'])
+        info = app.extract_reservation("รับจองคุณโอม 5 ท่านโต๊ะ B10 1 ทุ่ม")
+        self.assertFalse(info.get("is_reservation"))
+        self.assertTrue(info.get("_unreadable"), "ธงนี้คือตัวที่ทำให้บอทตอบว่าอ่านไม่ออก แทนการเงียบ")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_ขอใหม่แล้วเรียกไม่ติด_ต้องไม่พังทั้งเส้น(self):
+        """รอบสองเน็ตล่ม/โควตาหมด ต้องคืนผลรอบแรก (ติดธง) ไม่ใช่โยน error ขึ้นไปทั้งเส้น"""
+        def _fake(contents, attempts=4, model=None, json_mode=False):
+            self.calls.append(model)
+            if len(self.calls) == 1:
+                return self._Resp("อ่านไม่ออกครับ")
+            raise RuntimeError("503 overloaded")
+
+        app._gemini_generate = _fake
+        info = app.extract_reservation("รับจองคุณโอม 5 ท่าน โต๊ะ B10")
+        self.assertTrue(info.get("_unreadable"))
+        self.assertFalse(info.get("is_reservation"))
+
+
+class TestFinishReasonLogged(unittest.TestCase):
+    """ต้องรู้ให้ได้ว่าโมเดล 'หยุดเพราะอะไร' — ชนลิมิต token กับสะดุดชั่วคราว แก้คนละวิธี
+    (log เดิมบอกแค่ 'parse ไม่ได้' จึงเหลือแต่การเดา)"""
+
+    class _Cand:
+        def __init__(self, reason): self.finish_reason = reason
+
+    class _Resp:
+        def __init__(self, text, reason=None):
+            self.text = text
+            if reason is not None:
+                self.candidates = [TestFinishReasonLogged._Cand(reason)]
+
+    def test_อ่านเหตุผลได้(self):
+        self.assertEqual(app._gemini_finish_reason(self._Resp("{}", "MAX_TOKENS")), "MAX_TOKENS")
+
+    def test_ไม่มีข้อมูล_ต้องไม่พัง(self):
+        """รูปร่าง response ต่างเวอร์ชันกันได้ — ตัววัดห้ามกลายเป็นจุดพังใหม่เสียเอง"""
+        self.assertEqual(app._gemini_finish_reason(self._Resp("{}")), "?")
+        self.assertEqual(app._gemini_finish_reason(None), "?")
+        self.assertEqual(app._gemini_finish_reason(self._Resp("{}", None)), "?")
+
+    def test_ยังคืนผล_parse_ได้ตามปกติแม้ไม่มี_candidates(self):
+        out = app._parse_gemini_json(self._Resp('{"is_reservation":true}'), {"is_reservation": False})
+        self.assertTrue(out.get("is_reservation"))
