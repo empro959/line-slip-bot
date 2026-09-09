@@ -791,9 +791,21 @@ def extract_payable_doc(image_bytes: bytes, retry: bool = False) -> dict:
         "    ถ้ามีส่วนลดจริง (>0) ให้ใช้ยอดหลังหักส่วนลด\n"
         "  • ถ้าเป็น 'payment': ใช้ยอดเงินที่โอนจริง\n"
         "ref_number: เลขอ้างอิงรายการ (เฉพาะสลิปโอน ถ้าไม่มีใส่ null)\n"
-        "sender: ชื่อผู้โอน/ชื่อบิล ถ้าอ่านได้ (ไม่มีใส่ null)\n"
+        "sender: ชื่อผู้โอน/ชื่อบิล ถ้าอ่านได้ — สลิปโอนให้ใส่ 'ชื่อ + เลขบัญชี' ฝั่งผู้โอนให้ครบเท่าที่เห็น "
+        "(เลขบัญชีที่ถูกปิดบางส่วน เช่น xxx-x-x4612-x ก็ใส่) เพราะระบบใช้ตรวจว่าอ่านสลับด้านหรือเปล่า; ไม่มีใส่ null\n"
         "receiver (เฉพาะ payment): 'ชื่อบัญชี/พร้อมเพย์/เลขบัญชีของผู้รับเงิน' บนสลิป (บรรทัด 'ไปยัง/ผู้รับ/โอนเข้า') "
         "อ่านให้ครบเท่าที่เห็น (ชื่อ + เลขบัญชี/พร้อมเพย์ ถ้ามี); ถ้าไม่ใช่ payment หรืออ่านไม่ได้ใส่ null\n"
+        # เคสจริง 9 ก.ย. 26 00:00: โอน 10,000 เข้า 'หจก. ดวงใจการสุรา xxx-x-x5342-x'
+        #   แต่ AI คืน receiver = ชื่อ+บัญชี 'ฝั่งผู้โอน' (xxx-x-x4612-x) → ด่านปลายทางปฏิเสธ 'จ่ายเจ้าอื่น'
+        # กฎกันสลับด้านชุดนี้มีอยู่ในพรอมป์ตสลิปรายรับตั้งแต่เคส 19/08/26 แต่ 'ไม่เคยถูกยกมาที่พรอมป์ตนี้'
+        "🧭 **วิธีดูว่าฝั่งไหนคือผู้รับ — สำคัญมาก ห้ามสลับ**\n"
+        "  - สลิปไทยเรียง 'บนลงล่าง' เสมอ: บล็อกบน = ผู้โอน · ลูกศร (↓/→) · บล็อกล่าง = **ผู้รับ**\n"
+        "  - ถ้ามีคำว่า 'จาก/From' กับ 'ไปยัง/ไปที่/To' ให้ยึดคำนั้นก่อนเสมอ\n"
+        "  - **รูปอาจถูกถ่ายเอียงหรือหมุน** ให้หมุนกลับในใจก่อนอ่าน แล้วค่อยดูว่าใครอยู่ต้นลูกศร ใครอยู่ปลายลูกศร\n"
+        "  - สองฝั่งเป็นธนาคารเดียวกัน (โลโก้เหมือนกันทั้งคู่) เป็นเรื่องปกติ — **ห้ามใช้โลโก้ตัดสินว่าใครเป็นผู้รับ** "
+        "ให้ดูตำแหน่ง/ลูกศรเท่านั้น\n"
+        "  - แถบแจ้งเตือนด้านบนจอ (เช่น 'มีเงินออก xxx-x-x9999-x') เป็นของ **เจ้าของเครื่อง = ผู้โอน** "
+        "ห้ามเอามาเป็น receiver เด็ดขาด\n"
         "doc_date: 'วันที่ล่าสุด/วันที่ออกเอกสารใบนี้' (บิล=วันที่ออกบิล, สลิป=วันที่โอน) แปลงเป็น ค.ศ. YYYY-MM-DD "
         "(พ.ศ. เช่น 2569 = ค.ศ. 2026 ให้ลบ 543). "
         "⚠️ ถ้าบนบิลมีหลายวันที่ (เช่นมีรายการ 'ยอดยกมา/ค้างเก่า' ที่เป็นวันก่อนๆ) ให้เลือก 'วันที่ใหม่สุด' เท่านั้น "
@@ -2905,6 +2917,26 @@ def build_payable_bill_list(acct: str, limit: int = 40) -> str:
     return "\n".join(lines)
 
 
+def _payable_kw_hit(text: str) -> bool:
+    """ข้อความนี้มีคำ/เลขบัญชีของเจ้าหนี้อยู่ไหม (normalize กัน OCR เพี้ยนก่อนเทียบ)"""
+    hay = _norm_match_text((text or "").strip())
+    return bool(hay) and any(_norm_match_text(k) in hay for k in PAYABLE_PAYEE_KEYWORDS)
+
+
+def _payable_payee_on_sender(info: dict) -> bool:
+    """เจอบัญชีเจ้าหนี้อยู่ 'ฝั่งผู้โอน' แทนที่จะเป็นฝั่งผู้รับ — สัญญาณว่าอาจอ่านสลับด้าน
+
+    เคสจริง 9 ก.ย. 26: โอน 10,000 เข้าดวงใจ (x5342) แต่ AI คืน receiver เป็นฝั่งผู้โอน (x4612)
+    → ด่านปลายทางปฏิเสธด้วยเหตุผลที่ผิด เจ้าของต้องมาพิมพ์ 'จ่าย' เองทุกครั้ง
+
+    ⚠️ ตั้งใจไม่กลับข้างให้เอง — สลิป 'ดวงใจโอนเงินคืนร้าน' หน้าตาแบบนี้เป๊ะเหมือนกัน
+    (sender=ดวงใจ จริงๆ) แยกจากกันไม่ได้ด้วยข้อมูลที่มี · เรื่องเงินมีมากกว่าหนึ่งความเป็นไปได้
+    = ให้คนตัดสิน (ยึดแนวเดียวกับด่านสลิปรายรับที่ทำไว้ตั้งแต่เคส 19/08/26)"""
+    if not PAYABLE_PAYEE_KEYWORDS:
+        return False
+    return _payable_kw_hit(info.get("sender") or "")
+
+
 def _payable_payee_ok(info: dict) -> bool:
     """สลิปจ่ายนี้ 'โอนเข้าบัญชีเจ้าหนี้ (ดวงใจ)' จริงไหม — เทียบ receiver บนสลิปกับ PAYABLE_PAYEE_KEYWORDS
     - ไม่ตั้ง keyword = ไม่เช็ค (คืน True เหมือนเดิม)
@@ -2912,10 +2944,27 @@ def _payable_payee_ok(info: dict) -> bool:
     - อ่าน receiver ได้ แต่ไม่ตรง keyword เลย = False (จ่ายเจ้าอื่น ไม่นับลดหนี้ดวงใจ)"""
     if not PAYABLE_PAYEE_KEYWORDS:
         return True
-    rcv = _norm_match_text((info.get("receiver") or "").strip())
-    if not rcv:
+    if not (info.get("receiver") or "").strip():
         return True
-    return any(_norm_match_text(k) in rcv for k in PAYABLE_PAYEE_KEYWORDS)
+    return _payable_kw_hit(info.get("receiver"))
+
+
+def _payable_recheck_payee(info: dict, image_bytes: bytes, group_id: str) -> dict:
+    """ปลายทางไม่ตรงเจ้าหนี้ = จุดที่พลาดแล้ว 'เสียเงินจริง' → อ่านซ้ำด้วยโมเดลเก่งก่อนปฏิเสธ
+
+    ของเดิม pro-retry ยิงเฉพาะตอน 'อ่านไม่ออก/ยอด<=0' — ไม่เคยยิงตอนอ่านปลายทางเพี้ยน
+    ทั้งที่อย่างหลังแพงกว่า (สลิปจ่ายจริงถูกปฏิเสธ เจ้าของต้องมาพิมพ์ 'จ่าย' เองทุกใบ)
+    รับผลรอบสองเฉพาะเมื่อ 'เป็นสลิป + ยอด>0 + ปลายทางตรงเจ้าหนี้' เท่านั้น ไม่งั้นคืนของเดิม"""
+    try:
+        info2 = extract_payable_doc(image_bytes, retry=True)
+    except Exception as e:
+        print(f"[payable] อ่านปลายทางซ้ำไม่สำเร็จ group={group_id}: {e}", flush=True)
+        return info
+    if ((info2.get("doc_type") or "").lower() == "payment"
+            and float(info2.get("amount") or 0) > 0 and _payable_payee_ok(info2)):
+        print(f"[payable] อ่านซ้ำด้วย pro แล้วปลายทางตรงเจ้าหนี้ group={group_id}", flush=True)
+        return info2
+    return info
 
 
 def _process_payable_image(event, group_id: str):
@@ -2986,9 +3035,24 @@ def _process_payable_image(event, group_id: str):
             return
         # เช็คปลายทาง: ต้องโอนเข้าบัญชีดวงใจจริงถึงจะนับลดหนี้ (กันสลิปจ่ายเจ้าอื่นหลุดนับผิด)
         if not _payable_payee_ok(info):
+            info = _payable_recheck_payee(info, image_bytes, group_id)   # อ่านซ้ำด้วยตัวเก่งก่อนปฏิเสธ
+            amount   = float(info.get("amount") or 0) or amount
+            doc_date = _sane_doc_date(info.get("doc_date")) or doc_date
+        if not _payable_payee_ok(info):
             record_image_miss(acct, "payable_other_payee")
-            notify(f"⛔ สลิปนี้จ่ายเข้า '{info.get('receiver') or '?'}' ไม่ใช่ {PAYABLE_VENDOR} → ไม่นับลดหนี้\n"
-                   "(ถ้าจ่ายดวงใจจริงแต่บอทอ่านปลายทางเพี้ยน พิมพ์ 'จ่าย <ยอด>' เอง/แจ้งแอดมินได้)", force=True)
+            _amt_txt = f"{amount:,.2f}"
+            if _payable_payee_on_sender(info):
+                # เจอบัญชีเจ้าหนี้อยู่ 'ฝั่งผู้โอน' — เป็นได้ 2 อย่าง แยกเองไม่ได้ ห้ามเดาเรื่องเงิน
+                print(f"[payable] ⚠️ อาจอ่านสลับด้าน group={group_id} amt={_amt_txt}", flush=True)
+                notify(f"⚠️ สลิปนี้ยังไม่นับลดหนี้ — บอทอ่านว่าปลายทางคือ '{info.get('receiver') or '?'}' "
+                       f"แต่เห็นบัญชี {PAYABLE_VENDOR} อยู่ 'ฝั่งผู้โอน'\n"
+                       "เป็นได้ 2 อย่าง บอทแยกเองไม่ได้:\n"
+                       f"  1) บอทอ่านสลับด้าน (จ่าย{PAYABLE_VENDOR}จริง) → พิมพ์ 'จ่าย {_amt_txt}' เพื่อบันทึก\n"
+                       f"  2) {PAYABLE_VENDOR} โอนคืนร้าน → ไม่ต้องทำอะไร", force=True)
+            else:
+                notify(f"⛔ สลิปนี้จ่ายเข้า '{info.get('receiver') or '?'}' ไม่ใช่ {PAYABLE_VENDOR} → ไม่นับลดหนี้\n"
+                       f"(ถ้าจ่าย{PAYABLE_VENDOR}จริงแต่บอทอ่านปลายทางเพี้ยน พิมพ์ 'จ่าย {_amt_txt}' เอง/แจ้งแอดมินได้)",
+                       force=True)
             return
         ref = info.get("ref_number")
         if _payment_ref_exists(acct, ref):
