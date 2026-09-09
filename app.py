@@ -3013,6 +3013,13 @@ def _process_payable_image(event, group_id: str):
     doc_type = (info.get("doc_type") or "other").lower()
     amount   = float(info.get("amount") or 0)
     doc_date = _sane_doc_date(info.get("doc_date"))   # ใช้วันที่บนเอกสารเฉพาะที่สมเหตุผล (กัน AI อ่านเพี้ยน) ไม่งั้น = วันนี้
+    # ⚠️ บรรทัดนี้คือของที่ 'ขาด' ตอนไล่เคส 9 ก.ย. 26 — ค้นคำว่า payable ใน log แล้วไม่เจออะไรเลย
+    # เส้นทางรูปเจ้าหนี้เคย log เฉพาะตอน 'พัง' (อ่านรูปไม่สำเร็จ/ไม่ใช่บิลสลิป/retry) ส่วนขาที่
+    # 'ทำงานได้' — บันทึกสำเร็จ และโดยเฉพาะ 'ปฏิเสธเพราะปลายทางไม่ตรง' — เงียบสนิททั้งคู่
+    # ทั้งที่ขาปฏิเสธคือขาที่ทำให้เงินหายจากบัญชีหนี้ (กติกาโปรเจกต์: เงียบอันตรายกว่า error)
+    print(f"[payable] อ่านได้: type={doc_type} amt={amount:,.2f} date={doc_date or '-'} "
+          f"receiver={(info.get('receiver') or '-')!r} sender={(info.get('sender') or '-')!r} "
+          f"ref={info.get('ref_number') or '-'} group={group_id}", flush=True)
 
     if doc_type == "bill":
         if amount <= 0:
@@ -3024,6 +3031,7 @@ def _process_payable_image(event, group_id: str):
             notify(f"🔁 บิลนี้ (วันที่ {eff_date} ยอด {amount:,.2f}) เคยบันทึกแล้ว — ไม่นับซ้ำ", force=True)
             return
         # บิลซื้อ: บันทึก แล้วเด้ง 'สรุปหนี้' ทุกกลุ่ม (primary=reply ฟรี, mirror=push)
+        print(f"[payable] ✅ บันทึกบิล {amount:,.2f} วันที่ {eff_date} group={group_id}", flush=True)
         save_payable_bill(acct, amount, note="รูป", doc_date=doc_date)
         _payable_push_summary(event, group_id, acct)
         return
@@ -3050,6 +3058,8 @@ def _process_payable_image(event, group_id: str):
                        f"  1) บอทอ่านสลับด้าน (จ่าย{PAYABLE_VENDOR}จริง) → พิมพ์ 'จ่าย {_amt_txt}' เพื่อบันทึก\n"
                        f"  2) {PAYABLE_VENDOR} โอนคืนร้าน → ไม่ต้องทำอะไร", force=True)
             else:
+                print(f"[payable] ⛔ ปฏิเสธ: ปลายทางไม่ตรงเจ้าหนี้ group={group_id} amt={_amt_txt} "
+                      f"receiver={(info.get('receiver') or '-')!r}", flush=True)
                 notify(f"⛔ สลิปนี้จ่ายเข้า '{info.get('receiver') or '?'}' ไม่ใช่ {PAYABLE_VENDOR} → ไม่นับลดหนี้\n"
                        f"(ถ้าจ่าย{PAYABLE_VENDOR}จริงแต่บอทอ่านปลายทางเพี้ยน พิมพ์ 'จ่าย {_amt_txt}' เอง/แจ้งแอดมินได้)",
                        force=True)
@@ -3064,6 +3074,8 @@ def _process_payable_image(event, group_id: str):
         _ai_date = _sane_doc_date(info.get("pay_for_date"))
         pay_for = _memo_dates if len(_memo_dates) >= 2 else (_ai_date or (_memo_dates[0] if _memo_dates else None))
         allocated, settled, settle_note = _payable_settle(acct, pay_for, amount)
+        print(f"[payable] ✅ บันทึกจ่าย {amount:,.2f} ตัดให้บิล {pay_for or '-'} "
+              f"ref={ref or '-'} group={group_id}", flush=True)
         save_payable_payment(acct, amount, sender=info.get("sender"),
                              ref_number=ref, slip_dt=info.get("datetime"),
                              doc_date=doc_date, allocated=allocated, settle_note=settle_note)
