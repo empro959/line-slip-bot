@@ -2695,3 +2695,161 @@ class TestFinishReasonLogged(unittest.TestCase):
     def test_ยังคืนผล_parse_ได้ตามปกติแม้ไม่มี_candidates(self):
         out = app._parse_gemini_json(self._Resp('{"is_reservation":true}'), {"is_reservation": False})
         self.assertTrue(out.get("is_reservation"))
+
+
+class TestPayableSideSwap(unittest.TestCase):
+    """สลิปจ่ายเจ้าหนี้ถูกอ่าน 'สลับด้าน' — ต้องไม่ปฏิเสธด้วยเหตุผลที่ผิด
+
+    เคสจริง 9 ก.ย. 26 00:00 (ภาพจากเจ้าของ · สลิป K+ กสิกร→กสิกร):
+      ผู้โอน  นาง พิมนภัทร์ ส        ธ.กสิกรไทย xxx-x-x4612-x
+        ↓
+      ผู้รับ  หจก. ดวงใจการสุรา      ธ.กสิกรไทย xxx-x-x5342-x     10,000.00 บาท
+      บอทตอบ: ⛔ สลิปนี้จ่ายเข้า 'นาง พิมลักษณ์ ส. ธ.กสิกรไทย xxx-x-x4612-x' ไม่ใช่ ดวงใจการสุรา
+
+    AI หยิบ 'ฝั่งผู้โอน' มาเป็น receiver → ด่านปลายทางปฏิเสธ ทั้งที่จ่ายเจ้าหนี้จริง
+    กฎกันสลับด้านมีในพรอมป์ตสลิปรายรับตั้งแต่เคส 19/08/26 แต่ไม่เคยถูกยกมาที่พรอมป์ตเจ้าหนี้
+
+    ⚖️ คุมสองทิศเสมอ:
+      1. จ่ายเจ้าอื่นจริง ต้องยังถูกปฏิเสธ (ไม่งั้นหนี้ลดมั่ว)
+      2. จ่ายเจ้าหนี้จริงแต่อ่านสลับ ต้องไม่ถูกปฏิเสธเงียบๆ ด้วยเหตุผลที่ผิด"""
+
+    RCV_REAL = "หจก. ดวงใจการสุรา ธ.กสิกรไทย xxx-x-x5342-x"
+    SND_REAL = "นาง พิมนภัทร์ ส ธ.กสิกรไทย xxx-x-x4612-x"
+
+    def setUp(self):
+        self._bak = app.PAYABLE_PAYEE_KEYWORDS
+        app.PAYABLE_PAYEE_KEYWORDS = ["ดวงใจ", "5342"]
+
+    def tearDown(self):
+        app.PAYABLE_PAYEE_KEYWORDS = self._bak
+
+    # ── ด่านปลายทาง: ทิศที่ต้องไม่พัง ──
+    def test_อ่านถูกด้าน_ต้องผ่าน(self):
+        self.assertTrue(app._payable_payee_ok(
+            {"receiver": self.RCV_REAL, "sender": self.SND_REAL}))
+
+    def test_เจอแค่เลขบัญชีไม่มีชื่อ_ก็ต้องผ่าน(self):
+        """เลข 5342 ที่เจ้าของเพิ่มลง env เมื่อ 2 ก.ย. ต้องใช้ได้จริง แม้ AI อ่านชื่อไม่ออก"""
+        self.assertTrue(app._payable_payee_ok({"receiver": "ธ.กสิกรไทย xxx-x-x5342-x"}))
+
+    def test_จ่ายเจ้าอื่นจริง_ต้องยังถูกปฏิเสธ(self):
+        """ทิศที่แพงกว่า — ถ้าปล่อยผ่าน หนี้จะลดมั่วโดยไม่มีใครเห็น"""
+        other = {"receiver": "บจก. อื่นๆ ธ.ไทยพาณิชย์ xxx-x-x9999-x", "sender": self.SND_REAL}
+        self.assertFalse(app._payable_payee_ok(other))
+        self.assertFalse(app._payable_payee_on_sender(other),
+                         "เจ้าอื่นล้วน ห้ามถูกตีเป็น 'อาจอ่านสลับด้าน'")
+
+    def test_อ่านปลายทางไม่ออก_ยังปล่อยผ่านเหมือนเดิม(self):
+        """OCR อ่านปลายทางไม่ออก = ไม่รู้ ไม่ใช่ 'ไม่ใช่ดวงใจ' — ห้ามบล็อกสลิปจริง"""
+        self.assertTrue(app._payable_payee_ok({"receiver": None}))
+        self.assertTrue(app._payable_payee_ok({"receiver": "   "}))
+
+    # ── ตัวจับสลับด้าน ──
+    def test_เคสจริง_9กย_จับได้ว่าอาจอ่านสลับด้าน(self):
+        """ข้อความจากสลิปจริง: receiver=ฝั่งผู้โอน · sender=ดวงใจ (คือด้านที่สลับกัน)"""
+        flipped = {"receiver": self.SND_REAL, "sender": self.RCV_REAL}
+        self.assertFalse(app._payable_payee_ok(flipped))
+        self.assertTrue(app._payable_payee_on_sender(flipped),
+                        "ต้องรู้ว่าเห็นบัญชีเจ้าหนี้อยู่ฝั่งผู้โอน ไม่ใช่ปฏิเสธด้วยเหตุผลที่ผิด")
+
+    def test_อ่านถูกด้าน_ต้องไม่ถูกตีว่าสลับ(self):
+        self.assertFalse(app._payable_payee_on_sender(
+            {"receiver": self.RCV_REAL, "sender": self.SND_REAL}))
+
+    def test_ไม่ตั้ง_keyword_ปิดทั้งด่านและตัวจับสลับ(self):
+        app.PAYABLE_PAYEE_KEYWORDS = []
+        self.assertTrue(app._payable_payee_ok({"receiver": "ใครก็ไม่รู้"}))
+        self.assertFalse(app._payable_payee_on_sender({"sender": "ดวงใจการสุรา"}))
+
+    def test_ocr_เพี้ยนไม้ม้วน_เลขไทย_ยังเทียบติด(self):
+        """_norm_match_text ต้องถูกใช้จริงทั้งสองทาง ไม่ใช่เทียบดิบ"""
+        app.PAYABLE_PAYEE_KEYWORDS = ["ไส้ย่างซอย4"]
+        self.assertTrue(app._payable_payee_ok({"receiver": "ใส้ ย่างซอย ๔"}))
+
+    # ── อ่านซ้ำด้วย pro ก่อนปฏิเสธ ──
+    def test_อ่านซ้ำแล้วเจอปลายทางถูก_ต้องใช้ผลรอบสอง(self):
+        good = {"doc_type": "payment", "amount": 10000.0, "receiver": self.RCV_REAL}
+        app_extract = app.extract_payable_doc
+        app.extract_payable_doc = lambda b, retry=False: good
+        try:
+            out = app._payable_recheck_payee(
+                {"doc_type": "payment", "amount": 10000.0, "receiver": self.SND_REAL}, b"x", "G")
+        finally:
+            app.extract_payable_doc = app_extract
+        self.assertTrue(app._payable_payee_ok(out))
+        self.assertEqual(out["amount"], 10000.0)
+
+    def test_อ่านซ้ำแล้วยังไม่ตรง_ต้องคืนของเดิม(self):
+        """รอบสองไม่ดีกว่า = อย่าเอาข้อมูลรอบสองมาทับ (กันยอดเพี้ยนจากการอ่านซ้ำ)"""
+        first = {"doc_type": "payment", "amount": 10000.0, "receiver": self.SND_REAL}
+        app_extract = app.extract_payable_doc
+        app.extract_payable_doc = lambda b, retry=False: {"doc_type": "payment", "amount": 999.0,
+                                                          "receiver": "เจ้าอื่น"}
+        try:
+            out = app._payable_recheck_payee(first, b"x", "G")
+        finally:
+            app.extract_payable_doc = app_extract
+        self.assertEqual(out["amount"], 10000.0, "ยอดต้องไม่ถูกรอบสองที่ใช้ไม่ได้ทับ")
+
+    def test_อ่านซ้ำแล้วยอดเป็นศูนย์_ห้ามรับ(self):
+        """รอบสองบอกว่าตรงเจ้าหนี้แต่ยอด 0 = ใช้ไม่ได้ (0 ไม่ใช่ 'ไม่รู้' และไม่ใช่ยอดจริง)"""
+        first = {"doc_type": "payment", "amount": 10000.0, "receiver": self.SND_REAL}
+        app_extract = app.extract_payable_doc
+        app.extract_payable_doc = lambda b, retry=False: {"doc_type": "payment", "amount": 0,
+                                                          "receiver": self.RCV_REAL}
+        try:
+            out = app._payable_recheck_payee(first, b"x", "G")
+        finally:
+            app.extract_payable_doc = app_extract
+        self.assertEqual(out["amount"], 10000.0)
+
+    def test_อ่านซ้ำพัง_ต้องไม่ล้มทั้งเส้น(self):
+        """Gemini ล่ม/โควตาหมดตอนอ่านซ้ำ ต้องกลับไปใช้ผลรอบแรก ไม่ใช่ error หลุดขึ้นไป"""
+        first = {"doc_type": "payment", "amount": 10000.0, "receiver": self.SND_REAL}
+        def _boom(b, retry=False):
+            raise RuntimeError("503 overloaded")
+        app_extract = app.extract_payable_doc
+        app.extract_payable_doc = _boom
+        try:
+            self.assertEqual(app._payable_recheck_payee(first, b"x", "G"), first)
+        finally:
+            app.extract_payable_doc = app_extract
+
+
+class TestPayablePromptHasAntiSwapRules(unittest.TestCase):
+    """พรอมป์ตเจ้าหนี้ต้องมีกฎกันอ่านสลับด้าน — บทเรียนจากเส้นสลิปรายรับ (19/08/26)
+    ที่ไม่เคยถูกยกมาที่นี่ จนเสียเวลาซ้ำอีกรอบ 9 ก.ย."""
+
+    def _prompt(self):
+        seen = {}
+
+        def _fake(parts, model=None, json_mode=False):
+            seen["p"] = parts[0]
+            raise RuntimeError("stop-after-prompt")
+
+        _orig = app._gemini_generate
+        app._gemini_generate = _fake
+        try:
+            app.extract_payable_doc(b"fake")
+        except Exception:
+            pass
+        finally:
+            app._gemini_generate = _orig
+        return seen.get("p", "")
+
+    def test_บอกลำดับบนลงล่างและลูกศร(self):
+        p = self._prompt()
+        self.assertIn("บล็อกล่าง", p)
+        self.assertIn("ลูกศร", p)
+
+    def test_บอกให้ยึดคำว่าจาก_ไปยัง(self):
+        self.assertIn("ไปยัง", self._prompt())
+
+    def test_ห้ามใช้โลโก้ตัดสิน_กรณีธนาคารเดียวกันสองฝั่ง(self):
+        """เคสจริงเป็นกสิกร→กสิกร โลโก้เหมือนกันทั้งสองฝั่ง แยกด้วยโลโก้ไม่ได้"""
+        self.assertIn("ห้ามใช้โลโก้ตัดสิน", self._prompt())
+
+    def test_ขอเลขบัญชีฝั่งผู้โอนด้วย(self):
+        """ตัวจับสลับด้านต้องมีเลขบัญชีฝั่งผู้โอนให้เทียบ ไม่งั้นจับไม่ได้"""
+        p = self._prompt()
+        self.assertIn("ฝั่งผู้โอน", p)
