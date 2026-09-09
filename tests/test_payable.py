@@ -10,10 +10,13 @@
 ไม่ต้องมี DB จริง/คีย์จริง — ใช้ SQLite ไฟล์ชั่วคราว และคีย์ปลอม (ไม่ยิงเน็ตออก)
 """
 import json
+import contextlib
+import io
 import os
 import sys
 import tempfile
 import unittest
+import uuid
 from datetime import datetime, timedelta
 
 # ── ต้องตั้ง env ก่อน import app (app.py อ่าน env ตอน import และสร้าง client ทันที) ──
@@ -2853,3 +2856,105 @@ class TestPayablePromptHasAntiSwapRules(unittest.TestCase):
         """ตัวจับสลับด้านต้องมีเลขบัญชีฝั่งผู้โอนให้เทียบ ไม่งั้นจับไม่ได้"""
         p = self._prompt()
         self.assertIn("ฝั่งผู้โอน", p)
+
+
+class TestPayableImagePathLeavesTrace(PayableTestCase):
+    """เส้นทางรูปเจ้าหนี้ต้องเหลือร่องรอยใน log — โดยเฉพาะขาที่ 'ปฏิเสธ'
+
+    เคสจริง 9 ก.ย. 26: สลิปจ่ายจริง 10,000 ถูกปฏิเสธ พอไปค้นคำว่า 'payable' ใน Render log
+    **ไม่เจออะไรเลยสักบรรทัด** — เพราะขาปฏิเสธเรียกแค่ record_image_miss() + notify()
+    ซึ่งไม่ print อะไรทั้งคู่ · ขาบันทึกสำเร็จก็เงียบเหมือนกัน
+    เดิม log เฉพาะตอน 'พัง' (โหลดรูปไม่ได้/ไม่ใช่บิลสลิป/retry) = ขาที่ทำให้เงินหายกลับมองไม่เห็น
+
+    เทสต์นี้จึงล็อกไว้ว่า 'ตัดสินใจอะไรกับรูปนี้' ต้องอ่านย้อนจาก log ได้เสมอ"""
+
+    class _Ev:
+        reply_token = "tok"
+        class message:
+            id = "mid-payable-log"
+        class source:
+            group_id = ACCT
+            user_id = "U1"
+            type = "group"
+
+    RCV_REAL = "หจก. ดวงใจการสุรา ธ.กสิกรไทย xxx-x-x5342-x"
+    SND_REAL = "นาง พิมนภัทร์ ส ธ.กสิกรไทย xxx-x-x4612-x"
+
+    def setUp(self):
+        super().setUp()
+        self._bak_kw = app.PAYABLE_PAYEE_KEYWORDS
+        app.PAYABLE_PAYEE_KEYWORDS = ["ดวงใจ", "5342"]
+        self._bak_extract, self._bak_send = app.extract_payable_doc, app._payable_send
+        self._bak_content = app.line_bot_api.get_message_content
+        self.sent = []
+        app._payable_send = lambda ev, gid, out, text: self.sent.append(text)
+        app.line_bot_api.get_message_content = lambda mid: type(
+            "C", (), {"iter_content": lambda self: [b"img"]})()
+
+    def tearDown(self):
+        app.PAYABLE_PAYEE_KEYWORDS = self._bak_kw
+        app.extract_payable_doc, app._payable_send = self._bak_extract, self._bak_send
+        app.line_bot_api.get_message_content = self._bak_content
+
+    def _run(self, first, second=None):
+        """รันฟังก์ชันจริง คืน (ข้อความที่ log, ข้อความที่ตอบในไลน์)"""
+        seq = [first] if second is None else [first, second]
+        calls = []
+
+        def _fake(image_bytes, retry=False):
+            calls.append(retry)
+            return seq[min(len(calls) - 1, len(seq) - 1)]
+
+        app.extract_payable_doc = _fake
+        # message_id ต้องไม่ซ้ำ ไม่งั้นโดนด่านกัน redelivery ตัดก่อนถึงเนื้อใน
+        self._Ev.message.id = f"mid-{uuid.uuid4().hex}"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app._process_payable_image(self._Ev(), ACCT)
+        return buf.getvalue(), "\n".join(self.sent)
+
+    def test_อ่านได้อะไร_ต้องอยู่ใน_log_เสมอ(self):
+        """บรรทัดที่คืน 9 ก.ย. ต้องการแต่ไม่มี — ต้องเห็นทั้งปลายทางและฝั่งผู้โอน"""
+        log, _ = self._run({"doc_type": "payment", "amount": 10000.0,
+                            "receiver": self.RCV_REAL, "sender": self.SND_REAL,
+                            "ref_number": "016252000037DTF07047"})
+        self.assertIn("[payable] อ่านได้:", log)
+        self.assertIn("ดวงใจการสุรา", log)
+        self.assertIn("พิมนภัทร์", log, "ต้องเห็นฝั่งผู้โอนด้วย ไม่งั้นดูไม่ออกว่าอ่านสลับด้านไหม")
+        self.assertIn("10,000.00", log)
+
+    def test_บันทึกจ่ายสำเร็จ_ต้องมีร่องรอย(self):
+        log, _ = self._run({"doc_type": "payment", "amount": 10000.0,
+                            "receiver": self.RCV_REAL, "ref_number": "R1"})
+        self.assertIn("✅ บันทึกจ่าย", log)
+        self.assertEqual(len(self.payments()), 1, "ต้องบันทึกจริง ไม่ใช่แค่ log")
+
+    def test_ปฏิเสธเพราะปลายทางไม่ตรง_ต้องมีร่องรอย(self):
+        """ขาที่ทำให้เงินหายจากบัญชีหนี้ ห้ามเงียบใน log"""
+        log, reply = self._run({"doc_type": "payment", "amount": 500.0,
+                                "receiver": "บจก. เจ้าอื่น xxx-x-x9999-x", "sender": "ใครไม่รู้"})
+        self.assertIn("⛔ ปฏิเสธ", log)
+        self.assertIn("เจ้าอื่น", log)
+        self.assertIn("ไม่นับลดหนี้", reply, "ต้องยังตอบในไลน์ด้วย ไม่ใช่ย้ายไปเงียบใน log แทน")
+        self.assertEqual(len(self.payments()), 0)
+
+    def test_เคสจริง_อ่านสลับด้าน_บอกความจริงทั้ง_log_และในไลน์(self):
+        """รอบสอง (pro) ก็ยังอ่านสลับ → ต้องบอกว่าเห็นเจ้าหนี้อยู่ฝั่งผู้โอน ไม่ใช่เหตุผลที่ผิด"""
+        flipped = {"doc_type": "payment", "amount": 10000.0,
+                   "receiver": self.SND_REAL, "sender": self.RCV_REAL}
+        log, reply = self._run(flipped)
+        self.assertIn("อาจอ่านสลับด้าน", log)
+        self.assertIn("ฝั่งผู้โอน", reply)
+        self.assertIn("จ่าย 10,000.00", reply, "ต้องเติมยอดให้เลย ไม่ใช่ให้ไปหาเอง")
+        self.assertEqual(len(self.payments()), 0, "ห้ามกลับข้างให้เอง — เรื่องเงินให้คนตัดสิน")
+
+    def test_อ่านซ้ำด้วย_pro_แล้วตรง_ต้องบันทึกให้เลย(self):
+        """สลิปจ่ายจริงที่รอบแรกอ่านสลับ ต้องได้เข้าระบบโดยเจ้าของไม่ต้องพิมพ์เอง"""
+        log, reply = self._run(
+            {"doc_type": "payment", "amount": 10000.0, "receiver": self.SND_REAL,
+             "sender": self.RCV_REAL},
+            {"doc_type": "payment", "amount": 10000.0, "receiver": self.RCV_REAL,
+             "sender": self.SND_REAL, "ref_number": "R2"})
+        self.assertIn("อ่านซ้ำด้วย pro แล้วปลายทางตรงเจ้าหนี้", log)
+        self.assertEqual(len(self.payments()), 1)
+        self.assertEqual(self.payments()[0]["amount"], 10000.0)
