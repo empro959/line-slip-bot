@@ -2958,3 +2958,136 @@ class TestPayableImagePathLeavesTrace(PayableTestCase):
         self.assertIn("อ่านซ้ำด้วย pro แล้วปลายทางตรงเจ้าหนี้", log)
         self.assertEqual(len(self.payments()), 1)
         self.assertEqual(self.payments()[0]["amount"], 10000.0)
+
+
+class TestPaymentDateContradiction(unittest.TestCase):
+    """วันโอนบนสลิป 'ย้อนไปก่อนบิลที่มันจ่าย' = เป็นไปไม่ได้ → ต้องไม่เอาไปลงบัญชี
+
+    เคสจริง 13 ก.ย. 26: สลิป '13 ก.ย. 69' ถูกอ่านเป็น 2026-07-13
+      (ก.ย.=09 กับ ก.ค.=07 ต่างกันตัวเดียว) · โน้ตบนสลิป 'ไส้ (5/9) ค้าง 12,667'
+      → เงินจ่าย 10,000 ไปโผล่ในสรุปหนี้วันที่ 13/07/26 ก่อนบิล 05/09 ที่มันจ่ายเกือบ 2 เดือน
+    ด่าน _sane_doc_date ปล่อยผ่าน เพราะ 62 วันยังไม่เกิน PAYABLE_DATE_MAX_DAYS (90)"""
+
+    def test_ย้อนก่อนบิลที่จ่าย_ต้องจับได้(self):
+        self.assertTrue(app._payment_date_contradicts(_d(62), [_d(8)]))
+
+    def test_วันโอนหลังบิล_ปกติ_ต้องปล่อยผ่าน(self):
+        self.assertFalse(app._payment_date_contradicts(_d(0), [_d(8)]))
+
+    def test_วันเดียวกับบิล_ปล่อยผ่าน(self):
+        """จ่ายวันเดียวกับที่รับบิลเป็นเรื่องปกติ ห้ามตีเป็นขัดแย้ง"""
+        self.assertFalse(app._payment_date_contradicts(_d(8), [_d(8)]))
+
+    def test_จ่ายหลายบิล_เทียบกับบิลที่เก่าที่สุด(self):
+        self.assertFalse(app._payment_date_contradicts(_d(5), [_d(8), _d(5)]))
+        self.assertTrue(app._payment_date_contradicts(_d(9), [_d(8), _d(5)]))
+
+    def test_ไม่มีโน้ตบอกบิล_ห้ามตัดสิน(self):
+        """ไม่มีข้อมูลว่าจ่ายให้บิลไหน = ไม่รู้ ไม่ใช่ผิด — ห้ามทิ้งวันที่ที่อาจถูกอยู่แล้ว
+        (เจ้าของส่งสลิปย้อนหลังเพื่อเก็บตกได้จริง)"""
+        self.assertFalse(app._payment_date_contradicts(_d(62), []))
+        self.assertFalse(app._payment_date_contradicts(None, [_d(8)]))
+
+
+class TestThaiMonthTableInPrompts(unittest.TestCase):
+    """ทั้งสองพรอมป์ตต้องมีตารางเดือนไทย + คู่ที่สลับกันบ่อย
+    (บทเรียน §3.18: แก้ทางเดียวแล้วบั๊กเดิมไปโผล่อีกทาง — คราวนี้ปิดพร้อมกัน)"""
+
+    def _capture(self, fn, *a, **kw):
+        seen = {}
+
+        def _fake(parts, model=None, json_mode=False):
+            seen["p"] = parts[0] if isinstance(parts, list) else parts
+            raise RuntimeError("stop-after-prompt")
+
+        _orig = app._gemini_generate
+        app._gemini_generate = _fake
+        try:
+            fn(*a, **kw)
+        except Exception:
+            pass
+        finally:
+            app._gemini_generate = _orig
+        return seen.get("p", "")
+
+    def _assert_months(self, p, where):
+        self.assertIn("ก.ย.=09", p, where)
+        self.assertIn("ก.ค.=07", p, where)
+        self.assertIn("ธ.ค.=12", p, where)
+        self.assertIn("ก.ย.(09) ↔ ก.ค.(07)", p, f"{where}: ต้องเตือนคู่ที่ทำให้เคส 13 ก.ย. พัง")
+
+    def test_พรอมป์ตเจ้าหนี้(self):
+        self._assert_months(self._capture(app.extract_payable_doc, b"x"), "extract_payable_doc")
+
+    def test_พรอมป์ตสลิปรายรับ(self):
+        self._assert_months(self._capture(app.extract_slip_info, b"x", dining=False), "extract_slip_info")
+
+
+class TestPaymentWrongMonthEndToEnd(PayableTestCase):
+    """เคสจริง 13 ก.ย. 26 ทั้งเส้น — สลิปอ่านเดือนเพี้ยน ต้องไม่ทำให้บัญชีลงวันผิดเงียบๆ"""
+
+    class _Ev:
+        reply_token = "tok"
+        class message:
+            id = "mid-wrongmonth"
+        class source:
+            group_id = ACCT
+            user_id = "U1"
+            type = "group"
+
+    def setUp(self):
+        super().setUp()
+        self._bak_kw = app.PAYABLE_PAYEE_KEYWORDS
+        app.PAYABLE_PAYEE_KEYWORDS = ["ดวงใจ", "5342"]
+        self._bak_extract, self._bak_send = app.extract_payable_doc, app._payable_send
+        self._bak_content = app.line_bot_api.get_message_content
+        self.sent = []
+        app._payable_send = lambda ev, gid, out, text: self.sent.append(text)
+        app.line_bot_api.get_message_content = lambda mid: type(
+            "C", (), {"iter_content": lambda self: [b"img"]})()
+
+    def tearDown(self):
+        app.PAYABLE_PAYEE_KEYWORDS = self._bak_kw
+        app.extract_payable_doc, app._payable_send = self._bak_extract, self._bak_send
+        app.line_bot_api.get_message_content = self._bak_content
+
+    def _send_slip(self, info):
+        app.extract_payable_doc = lambda b, retry=False: info
+        self._Ev.message.id = f"mid-{uuid.uuid4().hex}"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app._process_payable_image(self._Ev(), ACCT)
+        return buf.getvalue(), "\n".join(self.sent)
+
+    def test_เดือนเพี้ยน_ต้องลงวันนี้แทน_และบอกด้วย(self):
+        bill_day = _d(8)
+        app.save_payable_bill(ACCT, 22667.0, doc_date=bill_day)
+        log, reply = self._send_slip({
+            "doc_type": "payment", "amount": 10000.0,
+            "receiver": "หจก. ดวงใจการสุรา ธ.กสิกรไทย xxx-x-x5342-x",
+            "doc_date": _d(62),                       # ← เดือนอ่านเพี้ยน
+            "memo": f"ไส้ ({_dm(bill_day)}) ค้าง 12,667", "ref_number": "R-wrongmonth"})
+        pays = self.payments()
+        self.assertEqual(len(pays), 1)
+        self.assertEqual(pays[0]["doc_date"], _d(0), "ต้องลงเป็นวันที่ส่ง ไม่ใช่วันที่อ่านเพี้ยน")
+        self.assertIn("ย้อนก่อนบิลที่จ่าย", log)
+        self.assertIn("อ่านเดือนเพี้ยน", reply, "ห้ามแก้เงียบๆ — ต้องบอกว่าลงวันที่อะไรให้")
+
+    def test_เงินยังถูกตัดให้บิลตามโน้ตเหมือนเดิม(self):
+        """แก้เรื่องวันที่ต้องไม่ไปกระทบการตัดยอด — โน้ตบอกบิลไหนก็ยังตัดบิลนั้น"""
+        bill_day = _d(8)
+        app.save_payable_bill(ACCT, 22667.0, doc_date=bill_day)
+        self._send_slip({"doc_type": "payment", "amount": 10000.0,
+                         "receiver": "ดวงใจการสุรา x5342", "doc_date": _d(62),
+                         "memo": f"ไส้ ({_dm(bill_day)}) ค้าง 12,667", "ref_number": "R2"})
+        self.assertEqual(self.paid_on(bill_day), 10000.0, "ต้องตัดเข้าบิลตามโน้ต ไม่ใช่บิลอื่น")
+
+    def test_วันที่ถูกต้องอยู่แล้ว_ห้ามไปยุ่ง(self):
+        """ทิศตรงข้าม — สลิปที่วันถูกต้อง ต้องลงวันตามสลิป ไม่ใช่ถูกเปลี่ยนเป็นวันนี้หมด"""
+        bill_day = _d(8)
+        app.save_payable_bill(ACCT, 22667.0, doc_date=bill_day)
+        log, reply = self._send_slip({"doc_type": "payment", "amount": 10000.0,
+                                      "receiver": "ดวงใจการสุรา x5342", "doc_date": _d(3),
+                                      "memo": f"ไส้ ({_dm(bill_day)})", "ref_number": "R3"})
+        self.assertEqual(self.payments()[0]["doc_date"], _d(3))
+        self.assertNotIn("อ่านเดือนเพี้ยน", reply)
