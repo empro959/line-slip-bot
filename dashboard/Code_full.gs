@@ -1436,6 +1436,29 @@ function daySum_(d){
 function _avg_(arr){ return arr.length? arr.reduce(function(a,b){return a+b;},0)/arr.length : 0; }
 function _leakOf_(x){ var v=x.voids||{}; return (v.deleted||0)+(v.cancelled||0)+(v.returns||0)+(v.discount||0); }
 
+// รวมเงินรับ 'ทุกช่องทาง' ที่ใบ BalanceCashDrawer แกะออกมาได้
+function _payTotal_(pm){ var t=0; pm=pm||{};
+  Object.keys(pm).forEach(function(k){ if(typeof pm[k]==='number') t+=pm[k]; }); return t; }
+
+// บรรทัด 'ช่องทางรับเงิน' — ต้องโชว์ทุกช่องที่มียอด ไม่ใช่แค่ 3 ช่องที่เลือกไว้ตายตัว
+//
+// 🪤 เคสจริง 12/09/26: รายงานขึ้น 'โอน 73,292 · สด 4,224 · บัตร 8,590' = 86,106
+//    แต่ยอดขาย 88,823 → เงิน 2,717 หายไปจากสายตาโดยไม่มีใครรู้ว่าอยู่ช่องไหน
+//    ของเดิมพิมพ์แค่ 3 คีย์ ทั้งที่ PAY_MAP แกะมา 5 คีย์ — 'ค้างชำระ' กับ 'อื่นๆ' ถูกทิ้งเงียบ
+//    (parseBalance_ ถึงกับมีคอมเมนต์ว่า 'อื่นๆ' โผล่ 2 แถวต้องบวกสะสม = รู้อยู่แล้วว่ามีคีย์นี้)
+// ⚖️ 'ค้างชำระ' คือเงินที่ยังเก็บไม่ได้ = ตัวเลขที่เจ้าของต้องเห็นที่สุด กลับเป็นตัวที่ถูกซ่อน
+function _payLine_(pm){
+  pm=pm||{};
+  var main=['เงินโอน','เงินสด','บัตรเครดิต'], lbl={'เงินโอน':'โอน','เงินสด':'สด','บัตรเครดิต':'บัตร'};
+  var parts=main.map(function(k){ return lbl[k]+' '+fmtT_(pm[k]||0); });
+  // ช่องอื่นโชว์เฉพาะที่มียอดจริง (0 = ไม่มี ไม่ต้องรก) — แต่ห้ามตัดทิ้งเมื่อมียอด
+  Object.keys(pm).sort().forEach(function(k){
+    if(main.indexOf(k)>=0) return;
+    if(typeof pm[k]==='number' && pm[k]!==0) parts.push(k+' '+fmtT_(pm[k]));
+  });
+  return '💳 '+parts.join(' · ');
+}
+
 // สรุปวันล่าสุด + เตือนอัจฉริยะ (เทียบกับค่าเฉลี่ยของร้านเอง)
 function buildDailyMsg_(){
   var daily=loadDaily_(); if(!daily.length) return null;
@@ -1450,7 +1473,7 @@ function buildDailyMsg_(){
                : '💸 ค่าใช้จ่าย: — (ใบจ่ายเงินอ่านเป็นวันเดียวไม่ได้ ไม่ใช่ 0)',
     prof===null ? '⚠️ กำไร: — (คำนวณไม่ได้จนกว่าจะรู้ค่าใช้จ่ายจริง)'
                 : (prof>=0?'✅ กำไร: +฿':'🔻 ขาดทุน: -฿')+fmtT_(Math.abs(prof)),
-    '💳 โอน '+fmtT_(pm['เงินโอน']||0)+' · สด '+fmtT_(pm['เงินสด']||0)+' · บัตร '+fmtT_(pm['บัตรเครดิต']||0)];
+    _payLine_(pm)];
   if((d.bills||0)>0) lines.push('🧾 ยอดต่อบิล: ฿'+fmtT_(s.sales/d.bills)+' ('+d.bills+' บิล)');
   var smart=hist.length>=3;   // มีข้อมูลพอค่อยเทียบค่าเฉลี่ย (กันเตือนมั่วช่วงข้อมูลน้อย)
   var avgS=_avg_(hist.map(function(x){return daySum_(x).sales;}));
@@ -1459,6 +1482,14 @@ function buildDailyMsg_(){
   if(smart && avgS>0){ var dS=(s.sales-avgS)/avgS*100;
     lines.push('📊 เทียบค่าเฉลี่ยร้าน: ยอดขาย '+(dS>=0?'+':'')+dS.toFixed(0)+'%'+(dS>=25?' 🔥':(dS<=-25?' ⚠️':''))); }
   var al=[];
+  // 🔴 เงินที่ 'รับไม่ครบ/ยังไม่ได้รับ' ต้องดังที่สุด ไม่ใช่ตัวที่ถูกซ่อน
+  if((pm['ค้างชำระ']||0)>0)
+    al.push('🧾 ค้างชำระ ฿'+fmtT_(pm['ค้างชำระ'])+' — ยังเก็บเงินไม่ได้ ต้องตามเก็บ');
+  var payTot=_payTotal_(pm), payGap=s.sales-payTot;
+  if(payTot>0 && Math.abs(payGap)>Math.max(200, s.sales*0.01))
+    al.push('💳 เงินรับรวม ฿'+fmtT_(payTot)+' ไม่เท่ายอดขาย ฿'+fmtT_(s.sales)+
+            ' (ต่าง '+(payGap>0?'ขาด ':'เกิน ')+'฿'+fmtT_(Math.abs(payGap))+
+            ') — อาจมีช่องทางจ่ายที่ตัวอ่านใบยังไม่รู้จัก (ดู PAY_MAP)');
   if((v.deleted||0)>0) al.push('🗑️ ลบบิลหลังขาย ฿'+fmtT_(v.deleted)+' — ควรตรวจ (เสี่ยงทุจริต)');
   if(smart && avgCan>500 && (v.cancelled||0)>avgCan*2 && (v.cancelled||0)>1500)
     al.push('❌ ยกเลิกสูงผิดปกติ ฿'+fmtT_(v.cancelled)+' (~'+((v.cancelled||0)/avgCan).toFixed(1)+'× ค่าเฉลี่ย)');
