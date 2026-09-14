@@ -1193,32 +1193,63 @@ function debugReports(){
 var CLOSED_DAYS = ['2026-07-29', '2026-07-30'];
 
 // ===== ตรวจสอบว่าเดือนไหนมี "ข้อมูลรายวัน (daily_totals)" — รันแล้วก๊อป log มาดู =====
+function _ymOfPeriod_(period){
+  // 'กรกฎาคม 2569' → '2026-07' (พ.ศ. ลบ 543) · อ่านไม่ออกคืน '' — ห้ามเดา
+  var m=String(period||'').trim().split(/\s+/);
+  if(m.length<2) return '';
+  var i=THAI_MONTHS.indexOf(m[0]); var y=parseInt(m[1],10);
+  if(i<0 || isNaN(y)) return '';
+  if(y>2400) y-=543;
+  return y+'-'+('0'+(i+1)).slice(-2);
+}
+
+// ===== ตรวจสอบว่าเดือนไหนมี "ข้อมูลรายวัน (daily_totals)" — รันแล้วก๊อป log มาดู =====
+//
+// 🪤 เคสจริง 14/09/26: ของเดิมเช็ค 'วันที่ขาด' เฉพาะ **เดือนล่าสุดเดือนเดียว**
+//    เจ้าของเห็น 'กรกฎาคม = 29 วัน' (ควรมี 31) แต่เครื่องมือไม่เคยบอกว่าขาดวันไหน
+//    หรือแม้แต่ว่าขาด — เพราะมันมองแค่เดือนกันยายน · เดือนก่อนหน้าไม่เคยถูกตรวจเลย
+//    (กรณีนั้นสรุปแล้วคือวันร้านหยุด 2 วันที่อยู่ใน CLOSED_DAYS อยู่แล้ว = ครบ
+//     แต่ 'ครบเพราะร้านหยุด' กับ 'ขาดจริง' ต้องอ่านออกจากรายงาน ไม่ใช่มานั่งเดา)
+//
+// 🪤 และ saisang_data.json ขาด 'พฤษภาคม 2569' หายทั้งเดือน — ของเดิมพิมพ์ทุกเดือนที่ 'มี'
+//    เดือนที่ไม่มีจึงไม่มีบรรทัด = มองไม่เห็น (ยอดรวมทั้งปีขาดไป ~2.2 ล้านโดยไม่มีใครรู้)
 function debugDaily(){
   var daily=loadDaily_();
   var byP={}; daily.forEach(function(d){byP[d.period]=(byP[d.period]||0)+1;});
   Logger.log('📁 pos_daily.json มี '+daily.length+' วัน แยกตามเดือน:');
   Object.keys(byP).forEach(function(p){Logger.log('   • '+p+' = '+byP[p]+' วัน');});
-  // [ใหม่ 17/08/26] โชว์ "วันที่ขาด" ของเดือนล่าสุด — ไว้เช็กว่าวันไหนหาย (เช่น 11 ส.ค.)
+
   if(daily.length){
-    var latest=daily.reduce(function(a,b){return b.date>a.date?b:a;});
-    var ym=(latest.date||'').slice(0,7), have={};
-    daily.forEach(function(d){ if((d.date||'').indexOf(ym)===0) have[d.date]=true; });
-    var y=parseInt(ym.slice(0,4),10), mo=parseInt(ym.slice(5,7),10);
-    var lastDay=new Date(y,mo,0).getDate(), today=new Date(), miss=[];
-    // รายงาน POS ของวัน D เข้าเมลตอน ~00:3x ของวัน D+1 → 'วันนี้' ยังไม่มีข้อมูลเป็นเรื่องปกติ
-    // ไม่หักออก = ขึ้น 'ขาดวันนี้' ทุกครั้งที่รัน (เตือนหลอกถาวร) และเผลอใส่ CLOSED_DAYS ก็ผิด เพราะร้านไม่ได้หยุด
-    var maxD=(today.getFullYear()===y && (today.getMonth()+1)===mo)?today.getDate()-1:lastDay;
-    var closed=[];
-    for(var d2=1;d2<=maxD;d2++){ var k=ym+'-'+('0'+d2).slice(-2);
-      if(have[k]) continue;
-      if(CLOSED_DAYS.indexOf(k)>=0) closed.push(k);   // ร้านหยุด = ไม่มียอดถูกแล้ว ไม่ต้องไปกู้
-      else miss.push(k);
-    }
-    Logger.log('🔎 เดือนล่าสุด '+ym+': มี '+Object.keys(have).length+' วัน · ขาด '+miss.length+' วัน'+(miss.length?' → '+miss.join(', '):' ✅ ครบ')+
-               (closed.length?'  (ไม่นับวันร้านหยุด '+closed.length+' วัน: '+closed.join(', ')+')':''));
-    if(miss.length) Logger.log('   👉 กู้ด้วย backfillPos() (รันซ้ำได้จนครบ) แล้วปิดท้าย rebuildNow()'+
-                               '\n   ℹ️ ถ้าวันไหนในลิสต์คือวันร้านหยุด ให้ใส่ใน CLOSED_DAYS แทนการไปไล่กู้');
+    var dates=daily.map(function(d){return d.date||'';}).filter(function(x){return x;}).sort();
+    var firstDate=dates[0], today=new Date();
+    // จัดวันเข้ากลุ่มตามเดือน แล้วตรวจ 'ทุกเดือน' ไม่ใช่เดือนล่าสุดเดือนเดียว
+    var byYm={}; dates.forEach(function(dt){ var k=dt.slice(0,7); (byYm[k]=byYm[k]||{})[dt]=true; });
+    var yms=Object.keys(byYm).sort();
+    Logger.log('🔎 ตรวจวันที่ขาด ทุกเดือนที่มีข้อมูล ('+yms.length+' เดือน):');
+    var allMiss=[];
+    yms.forEach(function(ym){
+      var have=byYm[ym], y=parseInt(ym.slice(0,4),10), mo=parseInt(ym.slice(5,7),10);
+      var lastDay=new Date(y,mo,0).getDate();
+      // รายงาน POS ของวัน D เข้าเมลตอน ~00:3x ของวัน D+1 → 'วันนี้' ยังไม่มีข้อมูลเป็นเรื่องปกติ
+      var maxD=(today.getFullYear()===y && (today.getMonth()+1)===mo)?today.getDate()-1:lastDay;
+      // เดือนแรกสุดอาจเริ่มเก็บกลางเดือน — วันก่อนวันแรกที่มีข้อมูล ไม่ใช่ 'ขาด' (กันเตือนหลอก)
+      var minD=(ym===firstDate.slice(0,7))?parseInt(firstDate.slice(8,10),10):1;
+      var miss=[], closed=[];
+      for(var d2=minD;d2<=maxD;d2++){ var k=ym+'-'+('0'+d2).slice(-2);
+        if(have[k]) continue;
+        if(CLOSED_DAYS.indexOf(k)>=0) closed.push(k); else miss.push(k);
+      }
+      Logger.log('   • '+ym+': มี '+Object.keys(have).length+' วัน · ขาด '+miss.length+' วัน'+
+                 (miss.length?' → '+miss.join(', '):' ✅ ครบ')+
+                 (closed.length?'  (ไม่นับวันร้านหยุด '+closed.length+' วัน: '+closed.join(', ')+')':'')+
+                 (minD>1?'  (เริ่มเก็บวันที่ '+minD+')':''));
+      miss.forEach(function(k){allMiss.push(k);});
+    });
+    if(allMiss.length) Logger.log('   👉 กู้ด้วย importPosByDate() (ใส่วันในลิสต์ DATES) หรือ backfillPos() แล้วปิดท้าย rebuildNow()'+
+                                  '\n   ℹ️ ถ้าวันไหนคือวันร้านหยุด ให้ใส่ใน CLOSED_DAYS แทนการไปไล่กู้ (ตอนนี้มี '+CLOSED_DAYS.length+' วัน)');
+    else Logger.log('   ✅ ไม่มีวันขาดในทุกเดือนที่เก็บไว้');
   }
+
   var f=getFile_(), arr=[]; if(f){try{arr=JSON.parse(f.getBlob().getDataAsString('UTF-8'))||[];}catch(e){}}
   Logger.log('📊 saisang_data.json มี '+arr.length+' เดือน — เช็ก daily_totals:');
   arr.forEach(function(m){
@@ -1227,6 +1258,20 @@ function debugDaily(){
                '  | payment_days: '+(Array.isArray(pd)?(pd.length+' วัน'):'ไม่มี')+
                '  | ยอดขาย: '+Math.round(m.total_sales||0).toLocaleString());
   });
+  // เดือนที่ 'ไม่มีบรรทัด' คือเดือนที่มองไม่เห็น — ต้องพูดออกมา ไม่ใช่ปล่อยให้นับเอง
+  var yms2=arr.map(function(m){return _ymOfPeriod_(m.period);}).filter(function(x){return x;}).sort();
+  if(yms2.length>=2){
+    var gap=[], cur=yms2[0], last=yms2[yms2.length-1], guard=0;
+    while(cur<last && guard++<240){
+      var yy=parseInt(cur.slice(0,4),10), mm=parseInt(cur.slice(5,7),10)+1;
+      if(mm>12){mm=1;yy++;}
+      cur=yy+'-'+('0'+mm).slice(-2);
+      if(cur<last && yms2.indexOf(cur)<0) gap.push(cur);
+    }
+    if(gap.length) Logger.log('🔴 เดือนที่หายไปทั้งเดือน ('+gap.length+'): '+gap.join(', ')+
+                              '\n   👉 ยอดรวมข้ามเดือน/กราฟรายปี จะขาดไปเท่าเดือนพวกนี้ — ต้องกู้หรือยืนยันว่าร้านปิดจริง');
+    else Logger.log('✅ เดือนต่อเนื่องกันครบ ไม่มีเดือนไหนหายทั้งเดือน');
+  }
 }
 
 // ===== ดูข้อความจริงในใบขาย เฉพาะรอบๆ คำที่ระบุ — OCR แค่ใบเดียว (ประหยัดโควตา) =====
