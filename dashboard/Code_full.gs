@@ -511,6 +511,10 @@ function writeMonths_(months){
   if(f){try{arr=JSON.parse(f.getBlob().getDataAsString('UTF-8'))||[];}catch(e){arr=[];} if(!Array.isArray(arr))arr=[];}
   var per={}; months.forEach(function(m){per[m.period]=true;});
   arr=arr.filter(function(m){return !per[m.period];}).concat(months);
+  // เรียงตามเดือนจริง — เดือนที่เติมย้อนหลัง (เช่น กู้พฤษภาคม) จะได้ไม่ไปต่อท้ายสุดผิดลำดับ
+  // เดือนที่อ่าน period ไม่ออกดันไปท้ายสุด ไม่ทิ้ง (ข้อมูลที่อ่านไม่ออก ≠ ข้อมูลที่ไม่ต้องการ)
+  arr.sort(function(x,y){ var a=_ymOfPeriod_(x.period)||'9999-99', b=_ymOfPeriod_(y.period)||'9999-99';
+    return a<b?-1:(a>b?1:0); });
   if(f) f.setContent(JSON.stringify(arr)); else getFolder_().createFile(FILE_NAME,JSON.stringify(arr),'application/json');
   return arr.length;
 }
@@ -914,44 +918,69 @@ function _shiftIso_(iso, days){
   return d.getUTCFullYear()+'-'+('0'+(d.getUTCMonth()+1)).slice(-2)+'-'+('0'+d.getUTCDate()).slice(-2);
 }
 
-var _POS_MSG_CACHE_=null, _POS_ALT_CACHE_=null;
-function _findPosMsg_(iso){
-  if(!_POS_MSG_CACHE_){                      // สแกนเมลครั้งเดียว ใช้ได้ทุกวันที่ในรอบเดียวกัน
-    _POS_MSG_CACHE_={}; _POS_ALT_CACHE_={};
-    GmailApp.search('has:attachment filename:pdf newer_than:90d',0,150).forEach(function(t){
-      t.getMessages().forEach(function(msg){
-        var hasSale=false, fileIso=null;
-        msg.getAttachments().forEach(function(a){
-          var n=a.getName(); if(!/\.pdf$/i.test(n)) return;
-          if(/SaleReport/i.test(n)) hasSale=true;
-          var fi=_fileDateIso_(n); if(fi&&!fileIso) fileIso=fi;
-        });
-        if(!hasSale) return;                 // ไม่มีใบขาย = ไม่ใช่เมลรายงาน POS (กันไปเจอใบเสร็จ Grab)
-        var sIso=_subjDateIso_(msg.getSubject());
-        // หัวเรื่องบอก "วันไหน" ขึ้นกับว่าใครส่ง:
-        //   • ระบบส่งเองตอนตี 1 → หัวเรื่อง = วันที่ส่ง = วันทำการ + 1
-        //     (หลักฐาน 19/08/26: หัวเรื่อง 31/07 ส่ง 31/07 01:29 แต่เนื้อในเป็นของ 30/07)
-        //   • คน export ย้อนหลัง → หัวเรื่อง = วันทำการตรงๆ (11/08 ส่ง 13/08 21:34)
-        // แยกด้วย "ส่งวันเดียวกับหัวเรื่อง และก่อน 8 โมงเช้า" = เมลกลางคืนของระบบ
-        var bizIso=sIso, how='หัวเรื่อง';
-        if(sIso){
-          var aIso=Utilities.formatDate(msg.getDate(),'GMT+7','yyyy-MM-dd');
-          var aHr=parseInt(Utilities.formatDate(msg.getDate(),'GMT+7','H'),10);
-          if(aIso===sIso && aHr<8){ bizIso=_shiftIso_(sIso,-1); how='เมลกลางคืน (หัวเรื่อง−1วัน)'; }
-        }
-        if(bizIso && !_POS_MSG_CACHE_[bizIso]) _POS_MSG_CACHE_[bizIso]={msg:msg, how:how};
-        // ตัวสำรอง เผื่อกฎข้างบนเดาพลาด — ใช้ต่อเมื่อหาแบบหลักไม่เจอ
-        if(sIso && sIso!==bizIso && !_POS_ALT_CACHE_[sIso])   _POS_ALT_CACHE_[sIso]={msg:msg, how:'หัวเรื่องตรง (สำรอง)'};
-        if(fileIso && !_POS_MSG_CACHE_[fileIso] && !_POS_ALT_CACHE_[fileIso]) _POS_ALT_CACHE_[fileIso]={msg:msg, how:'ชื่อไฟล์แนบ'};
-      });
-    });
+var _POS_MSG_CACHE_=null, _POS_ALT_CACHE_=null, _POS_CACHE_KEY_=null;
+
+// ช่วงวันที่จะค้นเมล — คิดจาก 'วันที่ขอกู้' ไม่ใช่ 'กี่วันย้อนหลังจากวันนี้'
+// เผื่อหน้า 3 วัน/หลัง 5 วัน เพราะเมลของวัน D เข้ามาวัน D+1 และคน export ย้อนหลังทีหลังได้
+function _gmailWindow_(isos){
+  var s=isos.slice().sort();
+  var a=_shiftIso_(s[0],-3), b=_shiftIso_(s[s.length-1],5);
+  return {q:'has:attachment filename:pdf after:'+a.replace(/-/g,'/')+' before:'+b.replace(/-/g,'/'),
+          key:a+'~'+b};
+}
+
+function _scanPosMsg_(msg){
+  var hasSale=false, fileIso=null;
+  msg.getAttachments().forEach(function(a){
+    var n=a.getName(); if(!/\.pdf$/i.test(n)) return;
+    if(/SaleReport/i.test(n)) hasSale=true;
+    var fi=_fileDateIso_(n); if(fi&&!fileIso) fileIso=fi;
+  });
+  if(!hasSale) return;                 // ไม่มีใบขาย = ไม่ใช่เมลรายงาน POS (กันไปเจอใบเสร็จ Grab)
+  var sIso=_subjDateIso_(msg.getSubject());
+  // หัวเรื่องบอก "วันไหน" ขึ้นกับว่าใครส่ง:
+  //   • ระบบส่งเองตอนตี 1 → หัวเรื่อง = วันที่ส่ง = วันทำการ + 1
+  //     (หลักฐาน 19/08/26: หัวเรื่อง 31/07 ส่ง 31/07 01:29 แต่เนื้อในเป็นของ 30/07)
+  //   • คน export ย้อนหลัง → หัวเรื่อง = วันทำการตรงๆ (11/08 ส่ง 13/08 21:34)
+  // แยกด้วย "ส่งวันเดียวกับหัวเรื่อง และก่อน 8 โมงเช้า" = เมลกลางคืนของระบบ
+  var bizIso=sIso, how='หัวเรื่อง';
+  if(sIso){
+    var aIso=Utilities.formatDate(msg.getDate(),'GMT+7','yyyy-MM-dd');
+    var aHr=parseInt(Utilities.formatDate(msg.getDate(),'GMT+7','H'),10);
+    if(aIso===sIso && aHr<8){ bizIso=_shiftIso_(sIso,-1); how='เมลกลางคืน (หัวเรื่อง−1วัน)'; }
+  }
+  if(bizIso && !_POS_MSG_CACHE_[bizIso]) _POS_MSG_CACHE_[bizIso]={msg:msg, how:how};
+  // ตัวสำรอง เผื่อกฎข้างบนเดาพลาด — ใช้ต่อเมื่อหาแบบหลักไม่เจอ
+  if(sIso && sIso!==bizIso && !_POS_ALT_CACHE_[sIso])   _POS_ALT_CACHE_[sIso]={msg:msg, how:'หัวเรื่องตรง (สำรอง)'};
+  if(fileIso && !_POS_MSG_CACHE_[fileIso] && !_POS_ALT_CACHE_[fileIso]) _POS_ALT_CACHE_[fileIso]={msg:msg, how:'ชื่อไฟล์แนบ'};
+}
+
+// batch = ลิสต์วันที่ทั้งรอบ (ถ้ามี) → สแกนเมลครั้งเดียวครอบทุกวัน · ไม่ส่งมาก็ใช้ช่วงรอบๆ iso วันเดียว
+//
+// 🪤 เคสจริง 14/09/26: พฤษภาคม 2569 หายทั้งเดือน เจ้าของยืนยันว่า "เมลยังอยู่ ไปกู้มาได้เลย"
+//    แต่ของเดิมค้น 'newer_than:90d' = ย้อนได้แค่ ~16 มิ.ย. → **พฤษภาคมอยู่นอกกรอบทั้งเดือน**
+//    รันไปก็ขึ้น 'ไม่พบเมลรายงาน POS' ทั้งที่เมลอยู่ครบ = อ่านแล้วเข้าใจผิดว่าเมลหาย
+//    และ ',0,150' ตัดที่ 150 เธรด โดย Gmail คืน 'ใหม่สุดก่อน' → เดือนเก่าสุด (ตัวที่กำลังจะกู้พอดี)
+//    คือตัวที่ถูกตัดทิ้งเงียบๆ · ยิ่งกู้ย้อนไกล ยิ่งไม่มีทางเจอ
+function _findPosMsg_(iso, batch){
+  var w=_gmailWindow_((batch&&batch.length)?batch:[iso]);
+  if(_POS_CACHE_KEY_!==w.key){              // สแกนครั้งเดียวต่อช่วง ใช้ได้ทุกวันที่ในรอบเดียวกัน
+    _POS_CACHE_KEY_=w.key; _POS_MSG_CACHE_={}; _POS_ALT_CACHE_={};
+    var start=0, page, guard=0;
+    do {                                    // ไล่ทีละหน้าจนหมด ไม่ตัดกลางคัน
+      page=GmailApp.search(w.q, start, 100);
+      page.forEach(function(t){ t.getMessages().forEach(_scanPosMsg_); });
+      start+=page.length;
+    } while(page.length===100 && ++guard<20);
+    Logger.log('📬 ค้นเมลช่วง '+w.key+' → เจอเมลรายงาน POS '+Object.keys(_POS_MSG_CACHE_).length+' วัน'+
+               (guard>=20?'  ⚠️ ชนเพดาน 2,000 เธรด — ซอยช่วงให้แคบลง':''));
   }
   return _POS_MSG_CACHE_[iso]||_POS_ALT_CACHE_[iso]||null;
 }
 
-function _importPosOneDate_(iso){
-  var found=_findPosMsg_(iso);
-  if(!found){ Logger.log('❌ ไม่พบเมลรายงาน POS ของ '+iso+' (หาแล้วทั้งหัวเรื่องและชื่อไฟล์แนบ ใน 90 วันล่าสุด)'); return; }
+function _importPosOneDate_(iso, batch){
+  var found=_findPosMsg_(iso, batch);
+  if(!found){ Logger.log('❌ ไม่พบเมลรายงาน POS ของ '+iso+' (หาแล้วทั้งหัวเรื่องและชื่อไฟล์แนบ ในช่วงวันที่ค้น)'); return; }
   var hit=found.msg;
   Logger.log('📧 ใช้อีเมล: "'+hit.getSubject()+'"  (เข้ามา '+hit.getDate()+' · จับคู่จาก'+found.how+')');
   var att={};
@@ -1099,14 +1128,21 @@ function _saleWarn_(text, parsedTotal){
 // ⚠️ ห้ามเตือนแค่เพราะ From≠To: ร้านเปิด 08:30 ปิดตี 2 → ใบปกติของ 'คืนเดียว' ก็ข้ามเที่ยงคืนเสมอ
 // (From 11 ส.ค. 08:30 → To 12 ส.ค. 02:00) และยอดที่ลงวันที่ 12 คือรายการหลังเที่ยงคืนของคืนวันที่ 11
 // ซึ่งนับรวมเข้าวันที่ 11 ถูกต้องแล้ว → เตือนเฉพาะเมื่อห่างกัน 2 วันขึ้นไป (ของจริงหลายคืน)
-function _rangeWarn_(text){
-  if(!text) return '';
+// ช่วงวันที่ที่พิมพ์บนใบ ('ตั้งแต่ … ถึง …') → {a,b} เป็น ISO · อ่านไม่ออกคืน null (ห้ามเดา)
+function _docRange_(text){
+  if(!text) return null;
   var pat='[:\\s]*([0-9]{1,2})\\s+('+THAI_MONTHS.join('|')+')\\s+([0-9]{4})';
   var f=text.match(new RegExp('(?:ตั้งแต่|From)'+pat)), t=text.match(new RegExp('(?:ถึง|To)'+pat));
-  if(!f||!t) return '';
+  if(!f||!t) return null;
   var iso=function(m){ var y=parseInt(m[3],10); if(y>=2500) y-=543;
     return y+'-'+('0'+(THAI_MONTHS.indexOf(m[2])+1)).slice(-2)+'-'+('0'+m[1]).slice(-2); };
-  var a=iso(f), b=iso(t);
+  return {a:iso(f), b:iso(t)};
+}
+
+function _rangeWarn_(text){
+  var r=_docRange_(text);
+  if(!r) return '';
+  var a=r.a, b=r.b;
   var days=Math.round((new Date(b)-new Date(a))/86400000);
   if(days<2) return '';                     // 0 = วันเดียว · 1 = คืนเดียวข้ามเที่ยงคืน (ปกติทั้งคู่)
   return '\n   🔴 ใบนี้ครอบ '+days+' วัน ('+a+' ถึง '+b+') แต่ถูกบันทึกเป็นวันเดียว = '+a+
@@ -1139,6 +1175,16 @@ var DUMP_OCR = false;
 
 // 👉 ใส่วันที่ที่ต้องการกู้ตรงนี้ — ใส่กี่วันก็ได้ คั่นด้วยจุลภาค แล้วรันฟังก์ชันนี้ครั้งเดียว
 // ใช้ OCR ~4 ครั้ง/วัน · ชนลิมิต (⏳) ให้พัก ~5 นาทีแล้วรันซ้ำได้เลย — วันที่กู้สำเร็จแล้วจะถูกทับด้วยข้อมูลเดิม ไม่เสียหาย
+// สร้างลิสต์วันที่ทั้งเดือน — ใช้ตอนกู้เดือนที่หายทั้งเดือน จะได้ไม่ต้องพิมพ์ 31 บรรทัดเอง
+// ตัวอย่าง:  var DATES = monthDates_('2026-05');
+function monthDates_(ym){
+  var y=parseInt(ym.slice(0,4),10), mo=parseInt(ym.slice(5,7),10), out=[];
+  var last=new Date(y,mo,0).getDate();
+  for(var d=1;d<=last;d++){ var k=ym+'-'+('0'+d).slice(-2);
+    if(CLOSED_DAYS.indexOf(k)<0) out.push(k); }   // วันร้านหยุดไม่มีใบ ไม่ต้องเสียโควตาไปหา
+  return out;
+}
+
 function importPosByDate(){
   var DATES = ['2026-08-12'];   // ← เปลี่ยนเป็นวันที่ที่ขาดจริง (ดูจาก checkSaleTotals/debugDaily)
   _RUN_START_MS = Date.now();          // เริ่มจับเวลางบพักรอ rate limit ของรอบนี้
@@ -1147,7 +1193,7 @@ function importPosByDate(){
     var iso=DATES[i];
     if(left.length){ left.push(iso); continue; }          // โควตาหมดแล้ว เก็บชื่อวันที่เหลือไว้บอกเจ้าของ
     Logger.log('───── ' + (i + 1) + '/' + DATES.length + '  กู้วันที่ ' + iso + ' ─────');
-    try { _importPosOneDate_(iso); done++; }
+    try { _importPosOneDate_(iso, DATES); done++; }
     catch(e){
       Logger.log('❌ ' + iso + ' พัง: ' + e);
       // โควตา OCR หมด = วันที่เหลือก็พังเหมือนกันแน่นอน · ไล่บดต่อ = เสียเวลาจนชนลิมิต 6 นาที
@@ -1162,6 +1208,143 @@ function importPosByDate(){
   } else {
     Logger.log('🏁 จบ ' + DATES.length + ' วัน — เลื่อนอ่าน log ข้างบน หา ✅/❌ ของแต่ละวัน');
   }
+}
+
+// ===== เติม "เดือนที่หายทั้งเดือน" ด้วยตัวเลขที่อ่านจากใบ POS มาแล้ว — ไม่ใช้ OCR ไม่ค้นเมล =====
+//
+// ใช้ตอนมีใบ POS อยู่ในมือ (ไฟล์ PDF/หน้าจอ) แล้วอยากเติมเดือนนั้นให้จบในคลิกเดียว
+// เคสจริง 14/09/26: พฤษภาคม 2569 หายทั้งเดือน · เมล POS อยู่ saiyangsoi@gmail.com ซึ่งห้อง Code
+//   เข้าไม่ได้ → เจ้าของส่ง PDF 4 ใบมาให้อ่านตรงๆ แล้วกระทบยอดจากในใบ (ไม่ต้อง OCR ใหม่เลย)
+//
+// ⚖️ ตัวเลขข้างล่างต้อง "กระทบยอดได้จากในใบ" เท่านั้น ห้ามเดา/ห้ามเกลี่ย —
+//    ฟิลด์ที่ในใบไม่มีข้อมูลพอ (เช่น แยกภาษีรายหมวด) ให้ "ไม่ใส่" ดีกว่าใส่ค่าที่คิดขึ้นเอง
+function addMonthManual(){
+  // ── พฤษภาคม 2569 — อ่านจากใบ POS ช่วง 01/05/2569 08:30 → 31/05/2569 02:00 ──
+  // กระทบยอดที่ยืนยันแล้ว (เลขในใบเอง ไม่ใช่เลขที่คิดขึ้น):
+  //   รวม 2,406,275.54 − ยอดขายจากการชำระหนี้ 30,027.00 = ยอดขายจริง 2,376,248.54 ✔
+  //   อาหาร 939,963.61 + เครื่องดื่ม 1,303,751.89 + ภาษี 154,779.48
+  //     − ส่วนลด 22,106.25 − ส่วนลดท้ายบิล 140.19 = 2,376,248.54 ✔
+  //   ใบค่าใช้จ่าย: ยอดขายรวม 2,376,243.40 − ยอดรวมค่าใช้จ่าย 2,378,204.16 = คงเหลือ −1,960.76 ✔
+  //   วิธีชำระ 5 ช่องรวม = 2,406,349.00 ตรงกับยอดในวงเล็บที่ใบพิมพ์กำกับไว้ ✔
+  var M = {
+    period: 'พฤษภาคม 2569',
+    total_sales:    2376243.40,   // 'ยอดขายรวม' จากใบค่าใช้จ่าย (ใบขายได้ 2,376,248.54 ต่างกัน 5.14 = ปัดเศษ)
+    total_expenses: 2378204.16,   // 'ยอดรวมค่าใช้จ่าย' — เงินที่จ่ายออกจากลิ้นชักทั้งเดือน
+    net_profit:      -1960.76,    // 'คงเหลือ' ตามที่ใบพิมพ์เอง
+    payment_methods: [            // 5 ช่องเต็ม — ไม่ใช่แค่ โอน/สด/บัตร (ดู §3.20)
+      {method:'Prompay',     amount:2005407.00},
+      {method:'เงินสด',      amount: 309065.00},
+      {method:'บัตรเครดิต',  amount:  40845.00},
+      {method:'ค้างชำระ',    amount:  33919.00},
+      {method:'อื่นๆ',       amount:  17113.00}
+    ],
+    customers: 2936,              // 'ลูกค้า' · ยอดรวม/คน 809.40 × 2,936 ≈ 2,376,398 ✔ ใกล้ยอดขายจริง
+    source: 'manual_from_pos_pdf_2026-09-14'
+  };
+
+  // ⚠️ จงใจไม่ใส่:
+  //   daily_totals / payment_days — ใบสรุปเดือนไม่มีข้อมูลรายวัน (ม.ค.–มิ.ย. ก็ไม่มีอยู่แล้ว)
+  //   sales_categories — ในใบมีแต่ยอด 'ไม่รวมภาษี' รายหมวด (อาหาร/เครื่องดื่ม) ไม่มีภาษีแยกรายหมวด
+  //     ถ้าใส่ทั้งที่ไม่ครบ ตัวที่เอาไปรวมจะได้ยอดต่ำกว่าจริง 132,533.04 แบบเงียบๆ
+  //     (อาหาร 939,963.61 + เครื่องดื่ม 1,303,751.89 = 2,243,715.50 ซึ่งเป็นยอด 'ไม่รวมภาษี'
+  //      ต่างจากยอดขายจริง 2,376,248.54 เท่ากับ ภาษี 154,779.48 − ส่วนลด 22,106.25 − ส่วนลดท้ายบิล 140.19)
+  //   expense_categories / expense_records — ใบค่าใช้จ่ายมีรายการยิบย่อย 29 หน้า ยังไม่ได้แกะ
+  var n = writeMonths_([M]);
+  Logger.log('✅ เติม '+M.period+' แล้ว — ยอดขาย '+Math.round(M.total_sales).toLocaleString()+
+             '  ค่าใช้จ่าย '+Math.round(M.total_expenses).toLocaleString()+
+             '  คงเหลือ '+Math.round(M.net_profit).toLocaleString()+
+             '\n   saisang_data.json มี '+n+' เดือนแล้ว · ไม่ได้แตะ pos_daily.json'+
+             '\n   ⚠️ ค่าใช้จ่ายก้อนนี้คือ "เงินจ่ายออกจากลิ้นชัก" (รวมค่าของ/ค่าแรง/เก็บออม)'+
+             ' ไม่ใช่ค่าใช้จ่ายทางบัญชี — คงเหลือติดลบเล็กน้อยไม่ได้แปลว่าเดือนนั้นขาดทุนจริง'+
+             '\n   👉 รัน debugDaily() เช็กซ้ำว่าไม่มีเดือนไหนหายแล้ว');
+}
+
+// ===== กู้ "ยอดรวมทั้งเดือน" จากใบสรุปช่วงวันที่ใบเดียว — ใช้ OCR แค่ 1-2 ครั้ง =====
+//
+// ใช้ตอน "เดือนนั้นหายทั้งเดือน" แต่ไม่ต้องการข้อมูลรายวัน
+// เคสจริง 14/09/26: พฤษภาคม 2569 หายทั้งเดือนจาก saisang_data.json (ยอดปีขาด ~2.2 ล้าน)
+//   ถ้ากู้รายวันต้อง 31 วัน × ~4 OCR = ~124 ครั้ง ชนโควตาหลายรอบ กินเวลาทั้งวัน
+//   แต่ ม.ค.–มิ.ย. ทุกเดือน "ไม่มี daily_totals อยู่แล้ว" — พฤษภาคมจึงต้องการแค่ยอดรวมเดือนเดียว
+//   ก็เท่ากับเพื่อนบ้านมันทุกเดือน และยอดรวมทั้งปีหายเพี้ยนทันที
+//
+// ⚠️ ห้ามเอาใบสรุปเดือนไปใส่ importPosByDate เด็ดขาด — ตัวนั้นบันทึกเป็น "วันเดียว"
+//    = บั๊ก §3.12 เป๊ะ (ใบครอบ 1 สัปดาห์ถูกนับเป็นค่าใช้จ่ายวันเดียว ทำกำไรรายสัปดาห์เพี้ยน)
+//    ตัวนี้เขียนเฉพาะ saisang_data.json ระดับเดือน และ **ไม่แตะ pos_daily.json** เลย
+//
+// วิธีใช้: export ใบสรุปจาก POS ช่วง 1–31 ของเดือนนั้น ส่งเข้าเมล แล้วแก้ YM ข้างล่างแล้วกดรัน
+function importMonthTotal(){
+  var YM = '2026-05';        // ← เดือนที่จะกู้ (YYYY-MM)
+  var MAX_TRY = 5;           // เปิดใบมากสุดกี่ใบก่อนยอมแพ้ (คุมโควตา OCR)
+
+  var y=parseInt(YM.slice(0,4),10), mo=parseInt(YM.slice(5,7),10);
+  var first=YM+'-01', last=YM+'-'+('0'+new Date(y,mo,0).getDate()).slice(-2);
+  Logger.log('🎯 จะกู้ยอดรวมเดือน '+YM+' (ใบต้องครอบ '+first+' ถึง '+last+')');
+
+  // ใบเพิ่ง export ส่งเข้าเมล → หาจากใบใหม่สุดก่อน
+  var cands=[];
+  GmailApp.search('has:attachment filename:pdf newer_than:30d',0,100).forEach(function(t){
+    t.getMessages().forEach(function(msg){
+      msg.getAttachments().forEach(function(a){
+        if(/SaleReport/i.test(a.getName()) && /\.pdf$/i.test(a.getName()))
+          cands.push({msg:msg, att:a, when:msg.getDate()});
+      });
+    });
+  });
+  cands.sort(function(p,q){ return q.when-p.when; });          // ใหม่สุดก่อน
+  if(!cands.length){ Logger.log('❌ ไม่เจอไฟล์ SaleReport ในเมล 30 วันล่าสุด — ส่งใบเข้าเมลก่อน'); return; }
+  Logger.log('📬 เจอใบขาย '+cands.length+' ใบ — จะเปิดทีละใบจากใหม่สุด (มากสุด '+MAX_TRY+' ใบ)');
+
+  var hit=null, tried=0;
+  for(var i=0;i<cands.length && tried<MAX_TRY;i++){
+    tried++;
+    var st;
+    try{ st=pdfToText_(cands[i].att.copyBlob()); }
+    catch(e){ Logger.log('   ⚠️ ใบที่ '+tried+' เปิดไม่ได้: '+e); continue; }
+    var r=_docRange_(st);
+    Logger.log('   • ใบที่ '+tried+' ('+cands[i].att.getName()+') ครอบ '+(r?(r.a+' → '+r.b):'อ่านช่วงวันที่ไม่ออก'));
+    if(r && r.a===first && r.b===last){ hit={c:cands[i], text:st}; break; }
+  }
+  // ช่วงวันที่ไม่ตรงเป๊ะ = ไม่ใช่ใบของเดือนนี้ ห้ามบันทึก (บทเรียน 19/08/26: เชื่อหัวเรื่องแล้วทับผิดวัน)
+  if(!hit){
+    Logger.log('❌ ไม่เจอใบที่ครอบ '+first+' ถึง '+last+' พอดี ใน '+tried+' ใบที่เปิดดู'+
+               '\n   👉 export ใหม่ให้ช่วงเป็น 1–'+last.slice(8)+' ของเดือนนั้นพอดี แล้วส่งเข้าเมล แล้วรันซ้ำ');
+    return;
+  }
+
+  var sale=parseSale_(hit.text);
+  var sCats=sale.cats||[];
+  var totS=sCats.reduce(function(a,c){return a+(c.amount||0);},0);
+  if(totS<=0){ Logger.log('❌ แกะยอดขายจากใบไม่ได้เลย — ไม่บันทึก (0 ไม่ใช่ "ไม่รู้")'); return; }
+  Logger.log(_saleWarn_(hit.text, totS) || '   ✅ ยอดที่แกะได้ตรงกับเลขข้างป้ายยอดรวมในใบ');
+
+  // ใบจ่ายเงินของ "ช่วงเดียวกัน" เท่านั้นถึงจะเอามาเป็นค่าใช้จ่ายของเดือนนี้ได้
+  var totE=null, eRecs=[];
+  hit.c.msg.getAttachments().forEach(function(a){
+    if(totE!==null || !/PayoutReport/i.test(a.getName())) return;
+    try{
+      var pt=pdfToText_(a.copyBlob()), pr=_docRange_(pt);
+      if(pr && pr.a===first && pr.b===last){
+        eRecs=parsePayout_(pt).records||[];
+        totE=eRecs.reduce(function(x,c){return x+(c.amount||0);},0);
+        Logger.log('   💸 ใบจ่ายเงินครอบช่วงเดียวกัน → ค่าใช้จ่ายรวม '+Math.round(totE).toLocaleString());
+      } else {
+        Logger.log('   ⚠️ ใบจ่ายเงินครอบ '+(pr?(pr.a+' → '+pr.b):'?')+' ไม่ตรงเดือนนี้ → ไม่นับค่าใช้จ่าย');
+      }
+    }catch(e){ Logger.log('   ⚠️ อ่านใบจ่ายเงินไม่ได้: '+e); }
+  });
+
+  // ⚖️ ไม่รู้ค่าใช้จ่าย ≠ ค่าใช้จ่าย 0 — ปล่อยฟิลด์ว่างไว้ ห้ามใส่ 0 ให้กราฟอ่านว่า "กำไรเต็ม"
+  var rec={period:THAI_MONTHS[mo-1]+' '+(y+543), total_sales:r2_(totS),
+           sales_categories:sCats, source:'monthly_export'};
+  if(totE!==null){ rec.total_expenses=r2_(totE); rec.net_profit=r2_(totS-totE); rec.expense_records=eRecs; }
+  // จงใจไม่ใส่ daily_totals / payment_days — ใบสรุปเดือนไม่มีข้อมูลรายวัน
+  // (เท่ากับ ม.ค.–มิ.ย. ที่ไม่มีอยู่แล้ว · ใส่ค่าปลอมลงไปแย่กว่าไม่มี)
+  var n=writeMonths_([rec]);
+  Logger.log('✅ บันทึก '+rec.period+' แล้ว — ยอดขาย '+Math.round(totS).toLocaleString()+
+             (totE!==null?('  ค่าใช้จ่าย '+Math.round(totE).toLocaleString()+'  กำไร '+Math.round(totS-totE).toLocaleString())
+                         :'  ค่าใช้จ่าย: ไม่ทราบ (ไม่มีใบจ่ายเงินของช่วงนี้)')+
+             '\n   saisang_data.json มี '+n+' เดือนแล้ว · ไม่ได้แตะ pos_daily.json'+
+             '\n   👉 รัน debugDaily() เช็กซ้ำว่าเดือนที่หายหมดแล้ว');
 }
 
 // ===== ดูว่ามีไฟล์รายงาน POS วันไหนในเมลบ้าง (ไม่ OCR เลย = ไม่กินโควตา) =====
@@ -1193,32 +1376,63 @@ function debugReports(){
 var CLOSED_DAYS = ['2026-07-29', '2026-07-30'];
 
 // ===== ตรวจสอบว่าเดือนไหนมี "ข้อมูลรายวัน (daily_totals)" — รันแล้วก๊อป log มาดู =====
+function _ymOfPeriod_(period){
+  // 'กรกฎาคม 2569' → '2026-07' (พ.ศ. ลบ 543) · อ่านไม่ออกคืน '' — ห้ามเดา
+  var m=String(period||'').trim().split(/\s+/);
+  if(m.length<2) return '';
+  var i=THAI_MONTHS.indexOf(m[0]); var y=parseInt(m[1],10);
+  if(i<0 || isNaN(y)) return '';
+  if(y>2400) y-=543;
+  return y+'-'+('0'+(i+1)).slice(-2);
+}
+
+// ===== ตรวจสอบว่าเดือนไหนมี "ข้อมูลรายวัน (daily_totals)" — รันแล้วก๊อป log มาดู =====
+//
+// 🪤 เคสจริง 14/09/26: ของเดิมเช็ค 'วันที่ขาด' เฉพาะ **เดือนล่าสุดเดือนเดียว**
+//    เจ้าของเห็น 'กรกฎาคม = 29 วัน' (ควรมี 31) แต่เครื่องมือไม่เคยบอกว่าขาดวันไหน
+//    หรือแม้แต่ว่าขาด — เพราะมันมองแค่เดือนกันยายน · เดือนก่อนหน้าไม่เคยถูกตรวจเลย
+//    (กรณีนั้นสรุปแล้วคือวันร้านหยุด 2 วันที่อยู่ใน CLOSED_DAYS อยู่แล้ว = ครบ
+//     แต่ 'ครบเพราะร้านหยุด' กับ 'ขาดจริง' ต้องอ่านออกจากรายงาน ไม่ใช่มานั่งเดา)
+//
+// 🪤 และ saisang_data.json ขาด 'พฤษภาคม 2569' หายทั้งเดือน — ของเดิมพิมพ์ทุกเดือนที่ 'มี'
+//    เดือนที่ไม่มีจึงไม่มีบรรทัด = มองไม่เห็น (ยอดรวมทั้งปีขาดไป ~2.2 ล้านโดยไม่มีใครรู้)
 function debugDaily(){
   var daily=loadDaily_();
   var byP={}; daily.forEach(function(d){byP[d.period]=(byP[d.period]||0)+1;});
   Logger.log('📁 pos_daily.json มี '+daily.length+' วัน แยกตามเดือน:');
   Object.keys(byP).forEach(function(p){Logger.log('   • '+p+' = '+byP[p]+' วัน');});
-  // [ใหม่ 17/08/26] โชว์ "วันที่ขาด" ของเดือนล่าสุด — ไว้เช็กว่าวันไหนหาย (เช่น 11 ส.ค.)
+
   if(daily.length){
-    var latest=daily.reduce(function(a,b){return b.date>a.date?b:a;});
-    var ym=(latest.date||'').slice(0,7), have={};
-    daily.forEach(function(d){ if((d.date||'').indexOf(ym)===0) have[d.date]=true; });
-    var y=parseInt(ym.slice(0,4),10), mo=parseInt(ym.slice(5,7),10);
-    var lastDay=new Date(y,mo,0).getDate(), today=new Date(), miss=[];
-    // รายงาน POS ของวัน D เข้าเมลตอน ~00:3x ของวัน D+1 → 'วันนี้' ยังไม่มีข้อมูลเป็นเรื่องปกติ
-    // ไม่หักออก = ขึ้น 'ขาดวันนี้' ทุกครั้งที่รัน (เตือนหลอกถาวร) และเผลอใส่ CLOSED_DAYS ก็ผิด เพราะร้านไม่ได้หยุด
-    var maxD=(today.getFullYear()===y && (today.getMonth()+1)===mo)?today.getDate()-1:lastDay;
-    var closed=[];
-    for(var d2=1;d2<=maxD;d2++){ var k=ym+'-'+('0'+d2).slice(-2);
-      if(have[k]) continue;
-      if(CLOSED_DAYS.indexOf(k)>=0) closed.push(k);   // ร้านหยุด = ไม่มียอดถูกแล้ว ไม่ต้องไปกู้
-      else miss.push(k);
-    }
-    Logger.log('🔎 เดือนล่าสุด '+ym+': มี '+Object.keys(have).length+' วัน · ขาด '+miss.length+' วัน'+(miss.length?' → '+miss.join(', '):' ✅ ครบ')+
-               (closed.length?'  (ไม่นับวันร้านหยุด '+closed.length+' วัน: '+closed.join(', ')+')':''));
-    if(miss.length) Logger.log('   👉 กู้ด้วย backfillPos() (รันซ้ำได้จนครบ) แล้วปิดท้าย rebuildNow()'+
-                               '\n   ℹ️ ถ้าวันไหนในลิสต์คือวันร้านหยุด ให้ใส่ใน CLOSED_DAYS แทนการไปไล่กู้');
+    var dates=daily.map(function(d){return d.date||'';}).filter(function(x){return x;}).sort();
+    var firstDate=dates[0], today=new Date();
+    // จัดวันเข้ากลุ่มตามเดือน แล้วตรวจ 'ทุกเดือน' ไม่ใช่เดือนล่าสุดเดือนเดียว
+    var byYm={}; dates.forEach(function(dt){ var k=dt.slice(0,7); (byYm[k]=byYm[k]||{})[dt]=true; });
+    var yms=Object.keys(byYm).sort();
+    Logger.log('🔎 ตรวจวันที่ขาด ทุกเดือนที่มีข้อมูล ('+yms.length+' เดือน):');
+    var allMiss=[];
+    yms.forEach(function(ym){
+      var have=byYm[ym], y=parseInt(ym.slice(0,4),10), mo=parseInt(ym.slice(5,7),10);
+      var lastDay=new Date(y,mo,0).getDate();
+      // รายงาน POS ของวัน D เข้าเมลตอน ~00:3x ของวัน D+1 → 'วันนี้' ยังไม่มีข้อมูลเป็นเรื่องปกติ
+      var maxD=(today.getFullYear()===y && (today.getMonth()+1)===mo)?today.getDate()-1:lastDay;
+      // เดือนแรกสุดอาจเริ่มเก็บกลางเดือน — วันก่อนวันแรกที่มีข้อมูล ไม่ใช่ 'ขาด' (กันเตือนหลอก)
+      var minD=(ym===firstDate.slice(0,7))?parseInt(firstDate.slice(8,10),10):1;
+      var miss=[], closed=[];
+      for(var d2=minD;d2<=maxD;d2++){ var k=ym+'-'+('0'+d2).slice(-2);
+        if(have[k]) continue;
+        if(CLOSED_DAYS.indexOf(k)>=0) closed.push(k); else miss.push(k);
+      }
+      Logger.log('   • '+ym+': มี '+Object.keys(have).length+' วัน · ขาด '+miss.length+' วัน'+
+                 (miss.length?' → '+miss.join(', '):' ✅ ครบ')+
+                 (closed.length?'  (ไม่นับวันร้านหยุด '+closed.length+' วัน: '+closed.join(', ')+')':'')+
+                 (minD>1?'  (เริ่มเก็บวันที่ '+minD+')':''));
+      miss.forEach(function(k){allMiss.push(k);});
+    });
+    if(allMiss.length) Logger.log('   👉 กู้ด้วย importPosByDate() (ใส่วันในลิสต์ DATES) หรือ backfillPos() แล้วปิดท้าย rebuildNow()'+
+                                  '\n   ℹ️ ถ้าวันไหนคือวันร้านหยุด ให้ใส่ใน CLOSED_DAYS แทนการไปไล่กู้ (ตอนนี้มี '+CLOSED_DAYS.length+' วัน)');
+    else Logger.log('   ✅ ไม่มีวันขาดในทุกเดือนที่เก็บไว้');
   }
+
   var f=getFile_(), arr=[]; if(f){try{arr=JSON.parse(f.getBlob().getDataAsString('UTF-8'))||[];}catch(e){}}
   Logger.log('📊 saisang_data.json มี '+arr.length+' เดือน — เช็ก daily_totals:');
   arr.forEach(function(m){
@@ -1227,6 +1441,20 @@ function debugDaily(){
                '  | payment_days: '+(Array.isArray(pd)?(pd.length+' วัน'):'ไม่มี')+
                '  | ยอดขาย: '+Math.round(m.total_sales||0).toLocaleString());
   });
+  // เดือนที่ 'ไม่มีบรรทัด' คือเดือนที่มองไม่เห็น — ต้องพูดออกมา ไม่ใช่ปล่อยให้นับเอง
+  var yms2=arr.map(function(m){return _ymOfPeriod_(m.period);}).filter(function(x){return x;}).sort();
+  if(yms2.length>=2){
+    var gap=[], cur=yms2[0], last=yms2[yms2.length-1], guard=0;
+    while(cur<last && guard++<240){
+      var yy=parseInt(cur.slice(0,4),10), mm=parseInt(cur.slice(5,7),10)+1;
+      if(mm>12){mm=1;yy++;}
+      cur=yy+'-'+('0'+mm).slice(-2);
+      if(cur<last && yms2.indexOf(cur)<0) gap.push(cur);
+    }
+    if(gap.length) Logger.log('🔴 เดือนที่หายไปทั้งเดือน ('+gap.length+'): '+gap.join(', ')+
+                              '\n   👉 ยอดรวมข้ามเดือน/กราฟรายปี จะขาดไปเท่าเดือนพวกนี้ — ต้องกู้หรือยืนยันว่าร้านปิดจริง');
+    else Logger.log('✅ เดือนต่อเนื่องกันครบ ไม่มีเดือนไหนหายทั้งเดือน');
+  }
 }
 
 // ===== ดูข้อความจริงในใบขาย เฉพาะรอบๆ คำที่ระบุ — OCR แค่ใบเดียว (ประหยัดโควตา) =====
