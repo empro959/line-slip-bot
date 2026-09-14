@@ -914,44 +914,69 @@ function _shiftIso_(iso, days){
   return d.getUTCFullYear()+'-'+('0'+(d.getUTCMonth()+1)).slice(-2)+'-'+('0'+d.getUTCDate()).slice(-2);
 }
 
-var _POS_MSG_CACHE_=null, _POS_ALT_CACHE_=null;
-function _findPosMsg_(iso){
-  if(!_POS_MSG_CACHE_){                      // สแกนเมลครั้งเดียว ใช้ได้ทุกวันที่ในรอบเดียวกัน
-    _POS_MSG_CACHE_={}; _POS_ALT_CACHE_={};
-    GmailApp.search('has:attachment filename:pdf newer_than:90d',0,150).forEach(function(t){
-      t.getMessages().forEach(function(msg){
-        var hasSale=false, fileIso=null;
-        msg.getAttachments().forEach(function(a){
-          var n=a.getName(); if(!/\.pdf$/i.test(n)) return;
-          if(/SaleReport/i.test(n)) hasSale=true;
-          var fi=_fileDateIso_(n); if(fi&&!fileIso) fileIso=fi;
-        });
-        if(!hasSale) return;                 // ไม่มีใบขาย = ไม่ใช่เมลรายงาน POS (กันไปเจอใบเสร็จ Grab)
-        var sIso=_subjDateIso_(msg.getSubject());
-        // หัวเรื่องบอก "วันไหน" ขึ้นกับว่าใครส่ง:
-        //   • ระบบส่งเองตอนตี 1 → หัวเรื่อง = วันที่ส่ง = วันทำการ + 1
-        //     (หลักฐาน 19/08/26: หัวเรื่อง 31/07 ส่ง 31/07 01:29 แต่เนื้อในเป็นของ 30/07)
-        //   • คน export ย้อนหลัง → หัวเรื่อง = วันทำการตรงๆ (11/08 ส่ง 13/08 21:34)
-        // แยกด้วย "ส่งวันเดียวกับหัวเรื่อง และก่อน 8 โมงเช้า" = เมลกลางคืนของระบบ
-        var bizIso=sIso, how='หัวเรื่อง';
-        if(sIso){
-          var aIso=Utilities.formatDate(msg.getDate(),'GMT+7','yyyy-MM-dd');
-          var aHr=parseInt(Utilities.formatDate(msg.getDate(),'GMT+7','H'),10);
-          if(aIso===sIso && aHr<8){ bizIso=_shiftIso_(sIso,-1); how='เมลกลางคืน (หัวเรื่อง−1วัน)'; }
-        }
-        if(bizIso && !_POS_MSG_CACHE_[bizIso]) _POS_MSG_CACHE_[bizIso]={msg:msg, how:how};
-        // ตัวสำรอง เผื่อกฎข้างบนเดาพลาด — ใช้ต่อเมื่อหาแบบหลักไม่เจอ
-        if(sIso && sIso!==bizIso && !_POS_ALT_CACHE_[sIso])   _POS_ALT_CACHE_[sIso]={msg:msg, how:'หัวเรื่องตรง (สำรอง)'};
-        if(fileIso && !_POS_MSG_CACHE_[fileIso] && !_POS_ALT_CACHE_[fileIso]) _POS_ALT_CACHE_[fileIso]={msg:msg, how:'ชื่อไฟล์แนบ'};
-      });
-    });
+var _POS_MSG_CACHE_=null, _POS_ALT_CACHE_=null, _POS_CACHE_KEY_=null;
+
+// ช่วงวันที่จะค้นเมล — คิดจาก 'วันที่ขอกู้' ไม่ใช่ 'กี่วันย้อนหลังจากวันนี้'
+// เผื่อหน้า 3 วัน/หลัง 5 วัน เพราะเมลของวัน D เข้ามาวัน D+1 และคน export ย้อนหลังทีหลังได้
+function _gmailWindow_(isos){
+  var s=isos.slice().sort();
+  var a=_shiftIso_(s[0],-3), b=_shiftIso_(s[s.length-1],5);
+  return {q:'has:attachment filename:pdf after:'+a.replace(/-/g,'/')+' before:'+b.replace(/-/g,'/'),
+          key:a+'~'+b};
+}
+
+function _scanPosMsg_(msg){
+  var hasSale=false, fileIso=null;
+  msg.getAttachments().forEach(function(a){
+    var n=a.getName(); if(!/\.pdf$/i.test(n)) return;
+    if(/SaleReport/i.test(n)) hasSale=true;
+    var fi=_fileDateIso_(n); if(fi&&!fileIso) fileIso=fi;
+  });
+  if(!hasSale) return;                 // ไม่มีใบขาย = ไม่ใช่เมลรายงาน POS (กันไปเจอใบเสร็จ Grab)
+  var sIso=_subjDateIso_(msg.getSubject());
+  // หัวเรื่องบอก "วันไหน" ขึ้นกับว่าใครส่ง:
+  //   • ระบบส่งเองตอนตี 1 → หัวเรื่อง = วันที่ส่ง = วันทำการ + 1
+  //     (หลักฐาน 19/08/26: หัวเรื่อง 31/07 ส่ง 31/07 01:29 แต่เนื้อในเป็นของ 30/07)
+  //   • คน export ย้อนหลัง → หัวเรื่อง = วันทำการตรงๆ (11/08 ส่ง 13/08 21:34)
+  // แยกด้วย "ส่งวันเดียวกับหัวเรื่อง และก่อน 8 โมงเช้า" = เมลกลางคืนของระบบ
+  var bizIso=sIso, how='หัวเรื่อง';
+  if(sIso){
+    var aIso=Utilities.formatDate(msg.getDate(),'GMT+7','yyyy-MM-dd');
+    var aHr=parseInt(Utilities.formatDate(msg.getDate(),'GMT+7','H'),10);
+    if(aIso===sIso && aHr<8){ bizIso=_shiftIso_(sIso,-1); how='เมลกลางคืน (หัวเรื่อง−1วัน)'; }
+  }
+  if(bizIso && !_POS_MSG_CACHE_[bizIso]) _POS_MSG_CACHE_[bizIso]={msg:msg, how:how};
+  // ตัวสำรอง เผื่อกฎข้างบนเดาพลาด — ใช้ต่อเมื่อหาแบบหลักไม่เจอ
+  if(sIso && sIso!==bizIso && !_POS_ALT_CACHE_[sIso])   _POS_ALT_CACHE_[sIso]={msg:msg, how:'หัวเรื่องตรง (สำรอง)'};
+  if(fileIso && !_POS_MSG_CACHE_[fileIso] && !_POS_ALT_CACHE_[fileIso]) _POS_ALT_CACHE_[fileIso]={msg:msg, how:'ชื่อไฟล์แนบ'};
+}
+
+// batch = ลิสต์วันที่ทั้งรอบ (ถ้ามี) → สแกนเมลครั้งเดียวครอบทุกวัน · ไม่ส่งมาก็ใช้ช่วงรอบๆ iso วันเดียว
+//
+// 🪤 เคสจริง 14/09/26: พฤษภาคม 2569 หายทั้งเดือน เจ้าของยืนยันว่า "เมลยังอยู่ ไปกู้มาได้เลย"
+//    แต่ของเดิมค้น 'newer_than:90d' = ย้อนได้แค่ ~16 มิ.ย. → **พฤษภาคมอยู่นอกกรอบทั้งเดือน**
+//    รันไปก็ขึ้น 'ไม่พบเมลรายงาน POS' ทั้งที่เมลอยู่ครบ = อ่านแล้วเข้าใจผิดว่าเมลหาย
+//    และ ',0,150' ตัดที่ 150 เธรด โดย Gmail คืน 'ใหม่สุดก่อน' → เดือนเก่าสุด (ตัวที่กำลังจะกู้พอดี)
+//    คือตัวที่ถูกตัดทิ้งเงียบๆ · ยิ่งกู้ย้อนไกล ยิ่งไม่มีทางเจอ
+function _findPosMsg_(iso, batch){
+  var w=_gmailWindow_((batch&&batch.length)?batch:[iso]);
+  if(_POS_CACHE_KEY_!==w.key){              // สแกนครั้งเดียวต่อช่วง ใช้ได้ทุกวันที่ในรอบเดียวกัน
+    _POS_CACHE_KEY_=w.key; _POS_MSG_CACHE_={}; _POS_ALT_CACHE_={};
+    var start=0, page, guard=0;
+    do {                                    // ไล่ทีละหน้าจนหมด ไม่ตัดกลางคัน
+      page=GmailApp.search(w.q, start, 100);
+      page.forEach(function(t){ t.getMessages().forEach(_scanPosMsg_); });
+      start+=page.length;
+    } while(page.length===100 && ++guard<20);
+    Logger.log('📬 ค้นเมลช่วง '+w.key+' → เจอเมลรายงาน POS '+Object.keys(_POS_MSG_CACHE_).length+' วัน'+
+               (guard>=20?'  ⚠️ ชนเพดาน 2,000 เธรด — ซอยช่วงให้แคบลง':''));
   }
   return _POS_MSG_CACHE_[iso]||_POS_ALT_CACHE_[iso]||null;
 }
 
-function _importPosOneDate_(iso){
-  var found=_findPosMsg_(iso);
-  if(!found){ Logger.log('❌ ไม่พบเมลรายงาน POS ของ '+iso+' (หาแล้วทั้งหัวเรื่องและชื่อไฟล์แนบ ใน 90 วันล่าสุด)'); return; }
+function _importPosOneDate_(iso, batch){
+  var found=_findPosMsg_(iso, batch);
+  if(!found){ Logger.log('❌ ไม่พบเมลรายงาน POS ของ '+iso+' (หาแล้วทั้งหัวเรื่องและชื่อไฟล์แนบ ในช่วงวันที่ค้น)'); return; }
   var hit=found.msg;
   Logger.log('📧 ใช้อีเมล: "'+hit.getSubject()+'"  (เข้ามา '+hit.getDate()+' · จับคู่จาก'+found.how+')');
   var att={};
@@ -1139,6 +1164,16 @@ var DUMP_OCR = false;
 
 // 👉 ใส่วันที่ที่ต้องการกู้ตรงนี้ — ใส่กี่วันก็ได้ คั่นด้วยจุลภาค แล้วรันฟังก์ชันนี้ครั้งเดียว
 // ใช้ OCR ~4 ครั้ง/วัน · ชนลิมิต (⏳) ให้พัก ~5 นาทีแล้วรันซ้ำได้เลย — วันที่กู้สำเร็จแล้วจะถูกทับด้วยข้อมูลเดิม ไม่เสียหาย
+// สร้างลิสต์วันที่ทั้งเดือน — ใช้ตอนกู้เดือนที่หายทั้งเดือน จะได้ไม่ต้องพิมพ์ 31 บรรทัดเอง
+// ตัวอย่าง:  var DATES = monthDates_('2026-05');
+function monthDates_(ym){
+  var y=parseInt(ym.slice(0,4),10), mo=parseInt(ym.slice(5,7),10), out=[];
+  var last=new Date(y,mo,0).getDate();
+  for(var d=1;d<=last;d++){ var k=ym+'-'+('0'+d).slice(-2);
+    if(CLOSED_DAYS.indexOf(k)<0) out.push(k); }   // วันร้านหยุดไม่มีใบ ไม่ต้องเสียโควตาไปหา
+  return out;
+}
+
 function importPosByDate(){
   var DATES = ['2026-08-12'];   // ← เปลี่ยนเป็นวันที่ที่ขาดจริง (ดูจาก checkSaleTotals/debugDaily)
   _RUN_START_MS = Date.now();          // เริ่มจับเวลางบพักรอ rate limit ของรอบนี้
@@ -1147,7 +1182,7 @@ function importPosByDate(){
     var iso=DATES[i];
     if(left.length){ left.push(iso); continue; }          // โควตาหมดแล้ว เก็บชื่อวันที่เหลือไว้บอกเจ้าของ
     Logger.log('───── ' + (i + 1) + '/' + DATES.length + '  กู้วันที่ ' + iso + ' ─────');
-    try { _importPosOneDate_(iso); done++; }
+    try { _importPosOneDate_(iso, DATES); done++; }
     catch(e){
       Logger.log('❌ ' + iso + ' พัง: ' + e);
       // โควตา OCR หมด = วันที่เหลือก็พังเหมือนกันแน่นอน · ไล่บดต่อ = เสียเวลาจนชนลิมิต 6 นาที
