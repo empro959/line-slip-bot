@@ -3091,3 +3091,123 @@ class TestPaymentWrongMonthEndToEnd(PayableTestCase):
                                       "memo": f"ไส้ ({_dm(bill_day)})", "ref_number": "R3"})
         self.assertEqual(self.payments()[0]["doc_date"], _d(3))
         self.assertNotIn("อ่านเดือนเพี้ยน", reply)
+
+
+class TestReconZeroLedgerNoFalseAlarm(unittest.TestCase):
+    """สมุดจดที่อ่านยอดไม่ออก (ทุกช่อง 0) ต้องไม่กลายเป็น 'จดน้อยกว่า POS'
+
+    เคสจริง 15 ก.ย. 26 กลุ่ม Management 22:34: พนักงานส่งรูป **ใบสั่งซื้อของ**
+    (ตารางเส้นบรรทัดเขียนมือ รายการสินค้าเป็นแถวๆ + จำนวน) → AI ตอบ is_ledger=true
+    แต่อ่านยอดรับไม่ออกเลย ทุกช่องเป็น 0 → บอทเตือน:
+        1) เงินสด  จด 0 · POS 8,391  → จดน้อยกว่า POS 8,391 บาท
+        2) เงินโอน จด 0 · POS 67,363 → จดน้อยกว่า POS 67,363 บาท
+        ส่วนต่างสุทธิ (จด−POS): -75,754 บาท
+    ทั้งที่ไม่มีเงินหายเลย · พรอมป์ตเองสั่งว่า "ถ้าไม่ชัดจริงๆ ใส่ 0 (อย่าเดา)"
+    → 0 คือ 'ไม่รู้' แต่ปลายทางเอาไปคิดเป็น 'จดไว้ 0 บาท'
+
+    ⚖️ กติกาโปรเจกต์ที่ถูกละเมิด: **0 ≠ ไม่รู้** และ **สัญญาณหลอกแย่กว่าไม่เตือน**"""
+
+    class _Ev:
+        reply_token = "tok"
+        class message:
+            id = "mid-recon"
+        class source:
+            group_id = "Grecon"
+            user_id = "U1"
+            type = "group"
+
+    def setUp(self):
+        self._bak_ex = app.extract_ledger
+        self._bak_q = app._recon_try_or_queue
+        self._bak_reply = app._reply_with_mention
+        self._bak_content = app.line_bot_api.get_message_content
+        self.queued, self.replies = [], []
+        app._recon_try_or_queue = lambda g, d, hw: self.queued.append((g, d, dict(hw)))
+        app._reply_with_mention = lambda ev, text: self.replies.append(text)
+        app.line_bot_api.get_message_content = lambda mid: type(
+            "C", (), {"iter_content": lambda self: [b"img"]})()
+
+    def tearDown(self):
+        app.extract_ledger = self._bak_ex
+        app._recon_try_or_queue = self._bak_q
+        app._reply_with_mention = self._bak_reply
+        app.line_bot_api.get_message_content = self._bak_content
+
+    def _run(self, info):
+        app.extract_ledger = lambda b: info
+        self._Ev.message.id = f"mid-{uuid.uuid4().hex}"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app._process_recon_image(self._Ev(), "Grecon")
+        return buf.getvalue()
+
+    def test_เคสจริง_ทุกช่องศูนย์_ห้ามเข้าคิวเทียบ(self):
+        log = self._run({"is_ledger": True, "date": _d(0), "cash": 0, "transfer": 0, "card": 0})
+        self.assertEqual(self.queued, [], "ห้ามเอาไปเทียบ POS — จะได้ 'จดน้อยกว่า POS' ทุกช่อง")
+        self.assertIn("อ่านยอดรับไม่ได้เลย", log)
+
+    def test_ทุกช่องศูนย์_ต้องบอกในไลน์_ไม่เงียบ(self):
+        """เงียบก็ไม่ได้ — พนักงานจะไม่รู้ว่ารูปที่ส่งมาใช้ไม่ได้"""
+        self._run({"is_ledger": True, "date": _d(0), "cash": 0, "transfer": 0, "card": 0})
+        self.assertEqual(len(self.replies), 1)
+        self.assertIn("อ่านยอดรับในรูปนี้ไม่ออก", self.replies[0])
+        self.assertIn("ใบสั่งของ", self.replies[0], "ต้องบอกด้วยว่าถ้าเป็นใบสั่งของก็ไม่ต้องทำอะไร")
+
+    def test_มีช่องเดียวที่อ่านออก_ยังต้องเทียบตามปกติ(self):
+        """ทิศตรงข้าม — อ่านออกบางช่องคือข้อมูลจริง ห้ามทิ้ง
+        (จดสดไว้แต่ไม่มีโอนเลยก็เป็นไปได้จริง)"""
+        self._run({"is_ledger": True, "date": _d(0), "cash": 8391, "transfer": 0, "card": 0})
+        self.assertEqual(len(self.queued), 1)
+        self.assertEqual(self.queued[0][2]["cash"], 8391.0)
+        self.assertEqual(self.replies, [])
+
+    def test_ไม่ใช่สมุดจด_ข้ามเงียบเหมือนเดิม(self):
+        """is_ledger=false → เงียบตามเดิม ห้ามไปตอบทุกรูปในกลุ่ม (จะกลายเป็นสแปม)"""
+        log = self._run({"is_ledger": False})
+        self.assertEqual(self.queued, [])
+        self.assertEqual(self.replies, [])
+        self.assertIn("ไม่ใช่สมุดจดมือ", log)
+
+    def test_ค่าติดลบหรือ_none_ก็ต้องไม่พัง(self):
+        self._run({"is_ledger": True, "date": None, "cash": None, "transfer": None, "card": None})
+        self.assertEqual(self.queued, [])
+        self.assertEqual(len(self.replies), 1)
+
+
+class TestLedgerPromptHardened(unittest.TestCase):
+    """พรอมป์ตสมุดจดต้องปิด 2 ประตูที่เคสจริง 15 ก.ย. เปิดไว้"""
+
+    def _prompt(self):
+        seen = {}
+
+        def _fake(parts, model=None, json_mode=False):
+            seen["p"] = parts[0]
+            raise RuntimeError("stop")
+
+        _orig = app._gemini_generate
+        app._gemini_generate = _fake
+        try:
+            app.extract_ledger(b"x")
+        except Exception:
+            pass
+        finally:
+            app._gemini_generate = _orig
+        return seen.get("p", "")
+
+    def test_ปิดประตูใบสั่งซื้อของ(self):
+        p = self._prompt()
+        self.assertIn("ใบสั่งซื้อของ", p)
+        self.assertIn("ยอดซื้อของ", p)
+
+    def test_ต้องเห็นช่องรับสดโอนจริงถึงนับเป็นสมุด(self):
+        self.assertIn("'สด' กับ 'โอน' จริงๆ", self._prompt())
+
+    def test_มีตารางเดือนไทย_เส้นที่สาม(self):
+        """§3.19 ปิดไป 2 เส้น (สลิปรายรับ · เจ้าหนี้) เส้นสมุดจดคือเส้นที่ 3 ที่เพิ่งปิด"""
+        p = self._prompt()
+        self.assertIn("ก.ย.=09", p)
+        self.assertIn("ส.ค.=08", p)
+        self.assertIn("ส.ค.(08) ↔ ก.ย.(09)", p)
+
+    def test_เดือนอ่านไม่ชัดต้องใส่_null_ห้ามเดา(self):
+        self.assertIn("ห้ามเดา", self._prompt())
