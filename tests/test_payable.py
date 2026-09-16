@@ -3071,7 +3071,11 @@ class TestPaymentWrongMonthEndToEnd(PayableTestCase):
         self.assertEqual(len(pays), 1)
         self.assertEqual(pays[0]["doc_date"], _d(0), "ต้องลงเป็นวันที่ส่ง ไม่ใช่วันที่อ่านเพี้ยน")
         self.assertIn("ย้อนก่อนบิลที่จ่าย", log)
-        self.assertIn("อ่านเดือนเพี้ยน", reply, "ห้ามแก้เงียบๆ — ต้องบอกว่าลงวันที่อะไรให้")
+        # ข้อความถูกเขียนใหม่ 16 ก.ย. ให้บอกด้วยว่า "อะไรไม่กระทบ" (ดู TestDateGuardMessageTells...)
+        # เช็กที่ "ใจความ" ไม่ใช่ถ้อยคำเป๊ะ: ต้องบอกว่าทิ้งวันไหน · ลงวันไหนแทน · แก้ยังไง
+        self.assertIn("เป็นไปไม่ได้", reply, "ต้องบอกเหตุผลที่ทิ้งวันที่นั้น")
+        self.assertIn("วันที่ส่ง", reply, "ห้ามแก้เงียบๆ — ต้องบอกว่าลงวันที่อะไรให้")
+        self.assertIn("ลบจ่าย", reply, "ต้องบอกวิธีแก้ถ้าวันจริงไม่ใช่วันนี้")
 
     def test_เงินยังถูกตัดให้บิลตามโน้ตเหมือนเดิม(self):
         """แก้เรื่องวันที่ต้องไม่ไปกระทบการตัดยอด — โน้ตบอกบิลไหนก็ยังตัดบิลนั้น"""
@@ -3090,7 +3094,8 @@ class TestPaymentWrongMonthEndToEnd(PayableTestCase):
                                       "receiver": "ดวงใจการสุรา x5342", "doc_date": _d(3),
                                       "memo": f"ไส้ ({_dm(bill_day)})", "ref_number": "R3"})
         self.assertEqual(self.payments()[0]["doc_date"], _d(3))
-        self.assertNotIn("อ่านเดือนเพี้ยน", reply)
+        self.assertNotIn("เป็นไปไม่ได้", reply,
+                         "วันที่ถูกอยู่แล้ว ห้ามมีข้อความเตือนเรื่องวันที่โผล่มา")
 
 
 class TestReconZeroLedgerNoFalseAlarm(unittest.TestCase):
@@ -3211,3 +3216,83 @@ class TestLedgerPromptHardened(unittest.TestCase):
 
     def test_เดือนอ่านไม่ชัดต้องใส่_null_ห้ามเดา(self):
         self.assertIn("ห้ามเดา", self._prompt())
+
+
+class TestDateGuardMessageTellsWhatIsFine(PayableTestCase):
+    """ข้อความ 'วันที่เพี้ยน' ต้องบอกด้วยว่า 'อะไรไม่กระทบ'
+
+    เคสจริง 16 ก.ย. 26 00:17: สลิป 2 ใบ (3,615 · 8,231) จ่ายดวงใจ · วันบนสลิป '16 ก.ย. 69'
+    ถูกอ่านเป็น 16/07/26 (ก.ย.→ก.ค. อีกรอบ แม้พรอมป์ตมีตารางเดือนแล้ว) · ตัวจับขัดแย้งทำงานถูก
+    ทิ้งวันที่ผิดแล้วลง 16/09 · **การตัดยอดเข้าบิล 14/09 และ 15/09 ถูกต้องทั้งคู่**
+
+    แต่เจ้าของอ่านข้อความแล้วงง: *"ไม่เข้าใจ บอกว่าอ่านไม่ได้แต่ตัดยอดถูก"*
+    เพราะข้อความเดิมพูดแค่ 'บอทอ่านเดือนเพี้ยน' ไม่ได้บอกว่าเพี้ยนแค่ช่องวันที่
+    ส่วนยอดเงิน/บิลที่ตัดมาจาก 'บันทึกช่วยจำ' คนละช่องกันเลย
+
+    ⚖️ เครื่องมือที่ทำไว้กันพลาด ห้ามทำให้คนอ่านกังวลเกินเหตุเสียเอง"""
+
+    class _Ev:
+        reply_token = "tok"
+        class message:
+            id = "mid-msg"
+        class source:
+            group_id = ACCT
+            user_id = "U1"
+            type = "group"
+
+    def setUp(self):
+        super().setUp()
+        self._bak_kw = app.PAYABLE_PAYEE_KEYWORDS
+        app.PAYABLE_PAYEE_KEYWORDS = ["ดวงใจ", "5342"]
+        self._bak_ex, self._bak_send = app.extract_payable_doc, app._payable_send
+        self._bak_content = app.line_bot_api.get_message_content
+        self.sent = []
+        app._payable_send = lambda ev, gid, out, text: self.sent.append(text)
+        app.line_bot_api.get_message_content = lambda mid: type(
+            "C", (), {"iter_content": lambda self: [b"img"]})()
+
+    def tearDown(self):
+        app.PAYABLE_PAYEE_KEYWORDS = self._bak_kw
+        app.extract_payable_doc, app._payable_send = self._bak_ex, self._bak_send
+        app.line_bot_api.get_message_content = self._bak_content
+
+    def _send(self, info):
+        app.extract_payable_doc = lambda b, retry=False: info
+        self._Ev.message.id = f"mid-{uuid.uuid4().hex}"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app._process_payable_image(self._Ev(), ACCT)
+        return "\n".join(self.sent)
+
+    def _real_case(self):
+        bill = _d(2)
+        app.save_payable_bill(ACCT, 3615.0, doc_date=bill)
+        return bill, self._send({
+            "doc_type": "payment", "amount": 3615.0,
+            "receiver": "หจก. ดวงใจการสุรา ธ.กสิกรไทย xxx-x-x5342-x",
+            "doc_date": _d(62), "memo": f"ไส้ ({_dm(bill)})", "ref_number": "R-16sep"})
+
+    def test_บอกว่าอะไรไม่กระทบ(self):
+        _, reply = self._real_case()
+        self.assertIn("ไม่ได้ใช้วันที่นี้", reply,
+                      "ต้องบอกว่ายอด/บิลที่ตัดไม่ได้พึ่งวันที่ ไม่งั้นคนอ่านคิดว่าผิดทั้งใบ")
+        self.assertIn("บันทึกช่วยจำ", reply, "ต้องบอกว่าบิลที่ตัดมาจากช่องไหน")
+
+    def test_ยังบอกวันที่ที่ลงให้และคำสั่งแก้(self):
+        _, reply = self._real_case()
+        self.assertIn(_dmy(_d(0)), reply, "ต้องบอกว่าลงวันที่อะไรให้")
+        self.assertIn("ลบจ่าย", reply)
+
+    def test_คำสั่งที่บอกต้องแกะได้จริง(self):
+        """เคยพลาดมาแล้วเรื่องบอกคำสั่งที่ผู้ใช้พิมพ์ตามแล้วใช้ไม่ได้ — ล็อกไว้"""
+        _, reply = self._real_case()
+        import re
+        m = re.search(r"'ลบจ่าย ([\d/]+) ([\d,]+)'", reply)
+        self.assertIsNotNone(m, f"หารูปแบบคำสั่งในข้อความไม่เจอ: {reply!r}")
+        self.assertEqual(app._parse_thai_date(m.group(1)), _d(0),
+                         "วันที่ในคำสั่งต้องแกะได้และตรงกับวันที่ที่ลงจริง")
+        self.assertEqual(float(m.group(2).replace(",", "")), 3615.0)
+
+    def test_ตัดยอดเข้าบิลตามโน้ตถูกใบเหมือนเดิม(self):
+        bill, _ = self._real_case()
+        self.assertEqual(self.paid_on(bill), 3615.0)
