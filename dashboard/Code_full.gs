@@ -820,7 +820,8 @@ function _isBevItem_(it){
   return /ช้าง|สิงห์|ลีโอ|ไฮเนเก|บัดไวเซอร์|ไทเกอร์|มาย|hoegaarden|โฮการ์เดน|จินโร|โซจู|สปาย|ไนท์\s*ฮันเตอร์|โซดา|น้ำแข็ง|น้ำเปล่า|แสงโสม|หงษ์|รีเจนซี่|เบน\s*285|เมอริเดียน|ซิลเวอร์|เมาเทน|เฟอร์นานโด|เจมสัน|เทนโดะ|โซระ|เฮนเนซ/i.test(n);
 }
 
-function beverageQty(){
+function beverageQty(nMonths){
+  var N = nMonths || 3;                                  // ดีฟอลต์ 3 เดือน (เจ้าของขอ 17/09/2569)
   var f=getFile_();
   if(!f){ Logger.log('🔴 ไม่พบไฟล์ '+FILE_NAME+' ใน Drive — ยังไม่มีข้อมูลให้วิเคราะห์ (รัน rebuildNow ก่อน)'); return; }
   var months=[]; try{ months=JSON.parse(f.getBlob().getDataAsString('UTF-8'))||[]; }catch(e){
@@ -828,71 +829,103 @@ function beverageQty(){
   if(!months.length){ Logger.log('🔴 ไฟล์ว่าง ไม่มีเดือนเลย'); return; }
   months.sort(function(x,y){ return _periodOrd_(x.period)-_periodOrd_(y.period); });
 
-  // หาเดือนล่าสุด "ที่มี menu_items จริง" — ถ้าเดือนล่าสุดไม่มี ต้องบอกว่าไม่มี ไม่ใช่เงียบแล้วข้ามไป
-  var idx=-1;
-  for(var i=months.length-1;i>=0;i--){ if((months[i].menu_items||[]).length){ idx=i; break; } }
-  if(idx<0){
+  // เอาเฉพาะเดือนที่ "มีรายเมนู" — เดือนที่ดึงมาจากใบสรุปเดือนจะไม่มี menu_items
+  var withItems = months.filter(function(m){ return (m.menu_items||[]).length; });
+  if(!withItems.length){
     Logger.log('🔴 ทุกเดือนไม่มี menu_items เลย ('+months.length+' เดือน) — ใบที่ดึงมาอาจเป็นใบสรุปเดือน');
     Logger.log('   ใบที่มีรายเมนูคือ "SaleReport / รายงานสรุปยอดขายแยกตามหมวดสินค้า" → ต้องมีใบนั้นในเมล');
     return;
   }
-  if(idx !== months.length-1){
-    Logger.log('⚠️ เดือนล่าสุด ('+months[months.length-1].period+') ไม่มีรายเมนู — ใช้ '+months[idx].period+' แทน');
-  }
+  var use = withItems.slice(-N);
+  if(use.length < N) Logger.log('⚠️ ขอ '+N+' เดือน แต่มีรายเมนูแค่ '+use.length+' เดือน → ใช้เท่าที่มี');
+  var skipped = months.length - withItems.length;
+  if(skipped>0) Logger.log('ℹ️ ข้าม '+skipped+' เดือนที่ไม่มีรายเมนู: '+
+    months.filter(function(m){return !(m.menu_items||[]).length;}).map(function(m){return m.period;}).join(', '));
 
-  var cur=months[idx], prev=(idx>0?months[idx-1]:null);
-  var bev=(cur.menu_items||[]).filter(_isBevItem_);
-  if(!bev.length){
+  // จำนวนวันที่ "ขายจริง" ของแต่ละเดือน — ไม่มีข้อมูลรายวัน = เดือนนั้นคิดต่อวันไม่ได้ (ห้ามเดา 30)
+  var info = use.map(function(m){
+    var d=(m.daily_totals||[]).filter(function(x){ return (x.sales||0)>0; }).length;
+    return {period:m.period, days:d, items:{}};
+  });
+  use.forEach(function(m,i){
+    (m.menu_items||[]).filter(_isBevItem_).forEach(function(it){
+      var e=info[i].items[it.name]||(info[i].items[it.name]={qty:0,amount:0});
+      e.qty+=(it.qty||0); e.amount+=(it.amount||0);
+    });
+  });
+  var noDay = info.filter(function(x){ return !x.days; });
+  if(noDay.length) Logger.log('⚠️ เดือนที่ไม่มีข้อมูลรายวัน (คิด "ต่อวัน" ไม่ได้ ไม่เอาเข้าค่าเฉลี่ย): '+
+    noDay.map(function(x){return x.period;}).join(', '));
+
+  // รวมทุกชื่อที่เจอในทุกเดือนที่ใช้
+  var names={}; info.forEach(function(x){ Object.keys(x.items).forEach(function(n){ names[n]=1; }); });
+  var allNames=Object.keys(names);
+  if(!allNames.length){
     // ด่านที่คัดของออกต้องบอกว่า "เห็นอะไร" ไม่งั้นแก้ตัวกรองไม่ถูก (บทเรียนฝั่งบอท §3.26)
-    Logger.log('🔴 กรองไม่เจอเครื่องดื่มเลยใน '+cur.period+' (มีรายเมนูทั้งหมด '+(cur.menu_items||[]).length+' รายการ)');
-    var seen={}; (cur.menu_items||[]).forEach(function(it){ var c=it.category||'(ไม่มีหมวด)'; seen[c]=(seen[c]||0)+1; });
-    Logger.log('   หมวดที่มีในข้อมูล: '+Object.keys(seen).map(function(c){return c+' ('+seen[c]+')';}).join(' · '));
+    var last=use[use.length-1], seen={};
+    Logger.log('🔴 กรองไม่เจอเครื่องดื่มเลยใน '+use.map(function(m){return m.period;}).join(', '));
+    (last.menu_items||[]).forEach(function(it){ var c=it.category||'(ไม่มีหมวด)'; seen[c]=(seen[c]||0)+1; });
+    Logger.log('   หมวดที่มีใน '+last.period+': '+Object.keys(seen).map(function(c){return c+' ('+seen[c]+')';}).join(' · '));
     Logger.log('   → เอาชื่อหมวดข้างบนไปเพิ่มใน _isBevItem_ แล้วรันใหม่');
     return;
   }
 
-  // จำนวนวันที่ "ขายจริง" ของเดือนนั้น — ไม่มีข้อมูลรายวัน = คำนวณต่อวันไม่ได้ (ห้ามเดา 30)
-  var dts=(cur.daily_totals||[]).filter(function(d){ return (d.sales||0)>0; });
-  var days=dts.length;
-  var prevMap={}; if(prev) (prev.menu_items||[]).filter(_isBevItem_).forEach(function(it){ prevMap[it.name]=it; });
+  // ค่าเฉลี่ยต่อวัน = ยอดรวม ÷ จำนวนวันรวม — **เฉพาะเดือนที่ "มีรายการนี้อยู่ในใบ" และมีข้อมูลรายวัน**
+  // 🪤 เจอตอนรันทดสอบรอบสอง (17/09/2569): ของเดิมนับเดือนที่ "ไม่มีรายการนี้ในใบเลย" เป็น 0 ขวด
+  //   แต่ยังเอาจำนวนวันของเดือนนั้นมาหาร → โซดาที่เพิ่งมีในใบเดือน ก.ย. (25.6/วัน)
+  //   ได้ค่าเฉลี่ย 3 เดือน = 410/75 = **5.5/วัน ต่ำกว่าจริง 4 เท่า** → สั่งโซดาขาดหนัก
+  //   "ไม่มีรายการนี้ในใบ" ≠ "ขายได้ 0" (อาจยังไม่ได้ขายของนี้ / ชื่อเมนูคนละชื่อ)
+  // 📌 กติกาเดิมของโปรเจกต์: 0 ≠ ไม่รู้ — เดือนที่ไม่รู้ ต้องไม่ถ่วงค่าเฉลี่ย และต้องโชว์ '–'
+  //   พร้อมบอกว่าค่าเฉลี่ยยืนอยู่บนกี่เดือน (n/N) ให้คนตัดสินเองว่าเชื่อได้แค่ไหน
+  var rows=allNames.map(function(n){
+    var tq=0, ta=0, td=0, per=[], nm=0;
+    info.forEach(function(x){
+      var e=x.items[n];
+      if(e){
+        nm++;
+        if(x.days){ tq+=e.qty; td+=x.days; }
+        ta+=e.amount;
+      }
+      per.push({period:x.period, has:!!e, rate:(e&&x.days)?e.qty/x.days:null, qty:e?e.qty:0});
+    });
+    return {name:n, avg: td?tq/td:null, qty:tq, amount:ta, per:per, months:nm};
+  });
+  rows.sort(function(a,b){ return (b.avg===null?-1:b.avg)-(a.avg===null?-1:a.avg); });
+
+  var totDays=info.reduce(function(a,x){return a+x.days;},0);
+  Logger.log('🍺 ขายเครื่องดื่มรายตัว — เฉลี่ยจาก '+use.length+' เดือน ('+
+    use.map(function(m){return m.period;}).join(' · ')+') รวม '+totDays+' วันที่มีข้อมูล');
+  Logger.log('════════════════════════════════');
+  Logger.log('ชื่อ | เฉลี่ย/วัน | ' + info.map(function(x){return x.period.split(' ')[0]+(x.days?('('+x.days+'ว)'):'(ไม่มีรายวัน)');}).join(' | ') + ' | ยอดเงินรวม');
+  rows.forEach(function(r){
+    var cells=r.per.map(function(p){
+      if(!p.has)          return '–';                 // ไม่มีรายการนี้ในใบเดือนนั้น (ไม่ใช่ขายได้ 0)
+      if(p.rate===null)   return 'รวม '+p.qty;        // มีรายการ แต่เดือนนั้นไม่มีข้อมูลรายวัน
+      return p.rate.toFixed(1);
+    });
+    var base = r.months<info.length ? ('  ⚠️ ฐานแค่ '+r.months+'/'+info.length+' เดือน') : '';
+    Logger.log('  '+r.name+' | '+(r.avg===null?'—':r.avg.toFixed(1))+' | '+cells.join(' | ')+' | ฿'+fmtT_(r.amount)+base);
+  });
+  Logger.log('════════════════════════════════');
   // 🪤 เจอตอนรันทดสอบ 17/09/2569: เทียบ "ยอดรวมเดือน" ตรงๆ ให้คำตอบกลับด้าน —
   //   ส.ค. สิงห์ 540 ขวด/30 วัน = 18/วัน · ก.ย. 352 ขวด/16 วัน = 22/วัน (ขายเร็วขึ้น 22%)
-  //   แต่เลขดิบอ่านว่า "▼188 = ขายลดลง" → ถ้าเชื่อตามนั้นจะสั่งสิงห์น้อยกว่าที่ควร
-  //   เดือนที่ยังไม่จบ เทียบกับเดือนเต็มไม่ได้ ต้องเทียบ "ต่อวัน" เท่านั้น
-  var prevDays=prev?((prev.daily_totals||[]).filter(function(d){return (d.sales||0)>0;}).length):0;
-
-  bev.sort(function(a,b){ return (b.qty||0)-(a.qty||0); });
-  Logger.log('🍺 ขายเครื่องดื่มรายตัว — '+cur.period+(days?(' (มีข้อมูลขาย '+days+' วัน)'):' (ไม่มีข้อมูลรายวัน)'));
-  Logger.log('─────────────────────────────');
-  Logger.log('ชื่อ | ขาย(หน่วย) | ต่อวัน | ยอดเงิน | เทียบเดือนก่อน (ต่อวัน)');
-  if(prev) Logger.log('(เทียบเป็น "ต่อวัน" เพราะเดือนนี้อาจยังไม่จบ — เทียบยอดรวมจะอ่านกลับด้าน)');
-  bev.forEach(function(it){
-    var q=it.qty||0;
-    var perDay = days ? (q/days) : null;          // null = ไม่รู้ ไม่ใช่ 0
-    var pv=prevMap[it.name], cmp;
-    if(!prev)                         cmp='(ไม่มีเดือนก่อน)';
-    else if(!pv)                      cmp='🆕 เดือนก่อนไม่มีรายการนี้';
-    else if(!days || !prevDays)       cmp='เทียบต่อวันไม่ได้ (ขาดข้อมูลรายวัน) · เดือนก่อนรวม '+(pv.qty||0);
-    else {
-      // เทียบ "ต่อวัน" เท่านั้น — เดือนนี้อาจยังไม่จบ (ดูกับดักข้างบน)
-      var pd=(pv.qty||0)/prevDays, d=perDay-pd;
-      var pct=pd>0?(d/pd*100):null;
-      cmp=(d>=0?'▲+':'▼')+Math.abs(d).toFixed(1)+'/วัน'+(pct===null?'':' ('+(pct>=0?'+':'')+pct.toFixed(0)+'%)')
-          +' · เดือนก่อน '+pd.toFixed(1)+'/วัน';
-    }
-    Logger.log('  '+it.name+' | '+q+' | '+(perDay===null?'—':perDay.toFixed(1))+' | ฿'+fmtT_(it.amount)+' | '+cmp);
-  });
-  Logger.log('─────────────────────────────');
-  if(!days){
-    Logger.log('⚠️ เดือนนี้ไม่มี daily_totals → บอก "ต่อวัน" ไม่ได้ (โชว์ — ไม่ใช่ 0)');
-    Logger.log('   ใช้ยอดรวมเดือนหารจำนวนวันเปิดร้านเองไปก่อน หรือรัน backfillPos เติมข้อมูลรายวัน');
+  //   แต่เลขดิบอ่านว่า "ลดลง 188" → ถ้าเชื่อตามนั้นจะสั่งสิงห์น้อยกว่าที่ควร
+  //   เดือนที่ยังไม่จบเทียบกับเดือนเต็มไม่ได้ ทุกช่องในตารางนี้จึงเป็น "ต่อวัน" ทั้งหมด
+  Logger.log('📌 ทุกตัวเลขในตารางเป็น "ต่อวัน" — เดือนที่ยังไม่จบเทียบยอดรวมกับเดือนเต็มไม่ได้ (จะอ่านกลับด้าน)');
+  Logger.log('📌 \'–\' = เดือนนั้นไม่มีรายการนี้ในใบเลย (ไม่ใช่ขายได้ 0) → ไม่เอามาถ่วงค่าเฉลี่ย');
+  Logger.log('   รายการที่ติด ⚠️ ฐานไม่ครบ = ค่าเฉลี่ยยืนบนเดือนน้อย ดูเลขรายเดือนประกอบก่อนสั่ง');
+  if(totDays){
+    Logger.log('📌 วิธีใช้: ของที่มีอยู่ ÷ (เฉลี่ย/วัน) = พอขายอีกกี่วัน');
+    Logger.log('   สั่ง = (เฉลี่ย/วัน × จำนวนวันถึงรอบสั่งหน้า) − ของที่มีอยู่ + เผื่อ');
+    Logger.log('   ⚠️ ศุกร์-เสาร์ขายมากกว่าค่าเฉลี่ย → ถ้าของต้องพอข้ามสุดสัปดาห์ ให้คูณเพิ่ม');
+    Logger.log('   (รัน profitByWeekday เพื่อดูว่าศุกร์/เสาร์ของร้านนี้มากกว่าค่าเฉลี่ยกี่ %)');
   } else {
-    Logger.log('📌 วิธีใช้: ของที่มีอยู่ ÷ (ขวด/วัน) = พอขายอีกกี่วัน');
-    Logger.log('   สั่ง = (ขวด/วัน × จำนวนวันถึงรอบสั่งหน้า) − ของที่มีอยู่ + เผื่อ');
+    Logger.log('⚠️ ไม่มีเดือนไหนมีข้อมูลรายวันเลย → บอก "ต่อวัน" ไม่ได้ (โชว์ — ไม่ใช่ 0)');
+    Logger.log('   รัน backfillPos เติมข้อมูลรายวันก่อน หรือหารจำนวนวันเปิดร้านเองไปก่อน');
   }
-  var tq=bev.reduce(function(a,b){return a+(b.qty||0);},0);
-  var ta=bev.reduce(function(a,b){return a+(b.amount||0);},0);
-  Logger.log('รวมเครื่องดื่ม '+bev.length+' รายการ · '+tq+' หน่วย · ฿'+fmtT_(ta));
+  var tq=rows.reduce(function(a,b){return a+(b.qty||0);},0);
+  var ta=rows.reduce(function(a,b){return a+(b.amount||0);},0);
+  Logger.log('รวมเครื่องดื่ม '+rows.length+' รายการ · '+tq+' หน่วย (เฉพาะเดือนที่มีรายวัน) · ฿'+fmtT_(ta)+' (ทุกเดือนที่ใช้)');
   Logger.log('⚠️ "หน่วย" คือหน่วยที่ POS บันทึก (ขวด/แก้ว/กระป๋อง/เหยือก) ไม่ใช่ลัง — ดูชื่อเมนูประกอบ');
 }
 
