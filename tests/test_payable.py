@@ -3743,3 +3743,214 @@ class TestHeartbeatGroupGetsAReport(unittest.TestCase):
         finally:
             app.requests.get = _orig
         self.assertIn("สัญญาณชีพ", out, "กลุ่มที่ไม่มีสลิปก็ต้องเห็นสัญญาณชีพ")
+class TestLedgerBlankIsNotZero(unittest.TestCase):
+    """ช่องที่ "อ่านไม่ออก/ไม่มีในสมุด" ต้องไม่กลายเป็น "จด 0"
+
+    🪤 เคสจริง 16 ก.ย. 26 (เจ้าของยืนยัน 17 ก.ย.): ในสมุดเขียนช่องบัตรไว้ **1,852**
+      แต่บอทรายงานว่า `บัตรเครดิต จด 0 · POS 1,825 → จดน้อยกว่า POS 1,825`
+      = เตือนหลอก ทั้งที่จดไว้เรียบร้อยแล้ว
+
+    ต้นเหตุ 2 ชั้นซ้อน:
+      1) พรอมป์ตสั่งเองว่า "ไม่ชัดใส่ 0" → 0 มี 3 ความหมายทับกัน
+         (อ่านไม่ออก / ไม่มีช่องนั้น / จดเลขศูนย์จริง)
+      2) โค้ดเขียน `float(info.get(k) or 0)` → **ถึง AI ตอบ null ถูกต้อง โค้ดก็ทำลายความต่างทิ้ง**
+
+    ด่าน §3.22 เดิมกันได้แค่ตอน "ศูนย์ทั้งสามช่อง" — ช่องเดียวหลุดตาข่ายไปเงียบๆ"""
+
+    def test_ค่าที่แปลว่าไม่รู้_ต้องเป็น_None(self):
+        for v in (None, "", "   ", "อ่านไม่ออก", [], {}):
+            self.assertIsNone(app._ledger_amt(v), repr(v))
+
+    def test_ศูนย์จริง_ต้องเป็นศูนย์_ไม่ใช่_None(self):
+        """0 ที่ 'เห็นเลขศูนย์เขียนไว้จริง' ต้องยังเป็น 0 — ไม่ใช่กลืนเป็นไม่รู้"""
+        for v in (0, 0.0, "0", "0.00"):
+            self.assertEqual(app._ledger_amt(v), 0.0, repr(v))
+
+    def test_เลขปกติ_ต้องอ่านได้(self):
+        self.assertEqual(app._ledger_amt(1852), 1852.0)
+        self.assertEqual(app._ledger_amt("1852.5"), 1852.5)
+
+    def test_พรอมป์ตต้องสั่งให้ตอบ_null_ห้ามใส่_0(self):
+        """ต้นเหตุชั้นที่ 1 อยู่ในพรอมป์ตเอง — ถ้ายังสั่งให้ใส่ 0 โค้ดฝั่งรับก็ช่วยไม่ได้"""
+        seen = {}
+
+        def _fake(parts, model=None, json_mode=False):
+            seen["p"] = parts[0]
+            raise RuntimeError("stop")
+
+        _orig = app._gemini_generate
+        app._gemini_generate = _fake
+        try:
+            app.extract_ledger(b"x")
+        except Exception:
+            pass
+        finally:
+            app._gemini_generate = _orig
+        p = seen.get("p", "")
+        self.assertIn("null", p)
+        self.assertIn("ห้ามใส่ 0", p, "ต้องสั่งชัดว่าอ่านไม่ออก = null ห้ามใส่ 0")
+        self.assertNotIn("ถ้าไม่ชัดจริงๆ ใส่ 0", p, "คำสั่งเก่าที่เป็นต้นเหตุต้องไม่เหลืออยู่")
+
+
+class TestReconUnreadChannel(unittest.TestCase):
+    """ช่องที่อ่านไม่ออก: ห้ามฟ้องว่า "จดขาด" แต่ก็ห้ามเงียบ
+
+    เคสจริง 16 ก.ย. 26 — บัตร: สมุดมี 1,852 · POS 1,825 · บอทรายงาน 'จด 0 จดน้อยกว่า 1,825'
+    สิ่งที่ถูกต้องคือ: บอกว่า **อ่านช่องนี้ไม่ออก** แล้วขอให้คนบอกยอดมา"""
+
+    GID = "Greconunread"
+
+    def setUp(self):
+        self._bak = app._push
+        self.pushed = []
+        app._push = lambda gid, msg: self.pushed.append((gid, getattr(msg, "text", "")))
+
+    def tearDown(self):
+        app._push = self._bak
+
+    def _emit(self, hw, pos):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app._recon_emit(self.GID, _d(1), hw, pos)
+        return (self.pushed[-1][1] if self.pushed else ""), buf.getvalue()
+
+    def test_เคสจริง_บัตรอ่านไม่ออก_ช่องอื่นตรง_ต้องบอกว่าอ่านไม่ออก(self):
+        msg, _log = self._emit(
+            {"cash": 5000.0, "transfer": 60000.0, "card": None},
+            {"cash": 5000, "transfer": 60000, "card": 1825, "sales": 66825})
+        self.assertTrue(msg, "ห้ามเงียบ — เทียบไม่ครบแต่เจ้าของจะเข้าใจว่าตรงหมด")
+        self.assertIn("อ่าน", msg)
+        self.assertIn("1,825", msg)
+        self.assertNotIn("จดมือ vs POS ไม่ตรง", msg, "ห้ามขึ้นพาดหัวเตือน — บอทแค่อ่านไม่ออก")
+        self.assertNotIn("จุดที่ไม่ตรง", msg)
+        self.assertNotIn("จดน้อยกว่า", msg, "นี่คือข้อความที่ผิดในเคสจริง")
+
+    def test_บัตรอ่านไม่ออก_ช่องอื่นไม่ตรง_ต้องไม่นับบัตรเป็นจุดไม่ตรง(self):
+        msg, _ = self._emit(
+            {"cash": 5897.0, "transfer": 60900.0, "card": None},
+            {"cash": 4565, "transfer": 55302, "card": 1825, "sales": 64326})
+        self.assertIn("พบ 2 จุดที่ไม่ตรง", msg, "บัตรที่อ่านไม่ออกห้ามนับเป็นจุดที่ 3")
+        self.assertIn("ยังไม่ได้เทียบช่องนี้", msg, "ต้องเห็นว่าบัตรถูกข้าม ไม่ใช่หายไปเฉยๆ")
+        self.assertIn("2 ช่องที่อ่านได้", msg, "ยอดรวมต้องบอกว่ารวมแค่ช่องที่อ่านได้")
+
+    def test_จดศูนย์จริง_ต้องยังฟ้องว่าไม่ตรง(self):
+        """ถ้าในสมุดเขียน 0 ไว้จริง แล้ว POS มีเงิน = ไม่ตรงจริง ห้ามกลืน"""
+        msg, _ = self._emit(
+            {"cash": 5000.0, "transfer": 60000.0, "card": 0.0},
+            {"cash": 5000, "transfer": 60000, "card": 1825, "sales": 66825})
+        self.assertIn("ไม่ตรง", msg)
+        self.assertIn("บัตรเครดิต", msg)
+
+    def test_ช่องที่อ่านไม่ออกแต่_POS_ก็ไม่มีเงิน_ต้องเงียบตามเดิม(self):
+        """ไม่มีอะไรให้เทียบ = ไม่ต้องกวน (เตือนเกินจริงบ่อยๆ คนจะเลิกอ่าน)"""
+        msg, log = self._emit(
+            {"cash": 5000.0, "transfer": 60000.0, "card": None},
+            {"cash": 5000, "transfer": 60000, "card": 0, "sales": 65000})
+        self.assertEqual(msg, "")
+        self.assertIn("ตรง", log)
+
+    def test_ยอดรวมต้องไม่บวกช่องที่อ่านไม่ออกเป็นศูนย์(self):
+        """บวก None เป็น 0 = ยอดรวมต่ำกว่าจริง แล้วดูเหมือนเงินขาดทั้งที่ไม่ใช่"""
+        msg, _ = self._emit(
+            {"cash": 100.0, "transfer": None, "card": None},
+            {"cash": 200, "transfer": 55302, "card": 1825, "sales": 60000})
+        self.assertIn("จด 100 · POS 200", msg, "ยอดรวมต้องคิดแค่ช่องที่อ่านได้ทั้งสองฝั่ง")
+
+
+class TestReconTransposedDigitsHint(unittest.TestCase):
+    """เลขชุดเดียวกันแต่สลับตำแหน่ง ต้องบอกว่า 'น่าจะสลับ'
+
+    เคสจริง 16 ก.ย. 26: สมุด 1,852 · POS 1,825 — ด่าน 'ต่างหลักเดียว' จับไม่ได้
+    (ต่างกัน 2 ตำแหน่ง) ทั้งที่ตาเปล่าเห็นชัดว่าเป็นเลขสลับที่"""
+
+    def test_เคสจริง_1852_กับ_1825(self):
+        hint = app._recon_misread_hint(1852, 1825, 64326)
+        self.assertIsNotNone(hint, "ต้องมีคำใบ้ ไม่ใช่ปล่อยให้คนไปนั่งเทียบเอง")
+        self.assertIn("สลับ", hint)
+
+    def test_เลขคนละชุด_ต้องไม่อ้างว่าสลับ(self):
+        hint = app._recon_misread_hint(5897, 4565, 64326)
+        self.assertTrue(hint is None or "สลับ" not in hint)
+
+    def test_ด่านเดิมยังทำงาน_เกินยอดขายรวม(self):
+        self.assertIn("เกินยอดขายรวม", app._recon_misread_hint(90000, 5000, 64326))
+
+
+class TestReconQueueKeepsUnknown(unittest.TestCase):
+    """คิวเทียบยอดใน DB ต้องคง 'ไม่รู้' ไว้ — ผ่าน DB แล้วกลายเป็น 0 คือบั๊กเดิมย้ายที่"""
+
+    GID = "Greconq"
+
+    def tearDown(self):
+        with app._db() as conn:
+            conn.execute("DELETE FROM recon_pending WHERE group_id=?", (self.GID,))
+            conn.commit()
+
+    def test_ค่า_None_ต้องยังเป็น_None_หลังอ่านกลับจาก_DB(self):
+        d = _d(1)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app._recon_try_or_queue(self.GID, d, {"cash": 5000.0, "transfer": None, "card": None})
+        with app._db() as conn:
+            row = conn.execute("SELECT * FROM recon_pending WHERE group_id=? AND date_iso=?",
+                               (self.GID, d)).fetchone()
+        hw = {k: app._ledger_amt(row[k]) for k in ("cash", "transfer", "card")}
+        self.assertEqual(hw["cash"], 5000.0)
+        self.assertIsNone(hw["transfer"], "ผ่าน DB แล้วกลายเป็น 0 = กลับไปเตือนหลอกเหมือนเดิม")
+        self.assertIsNone(hw["card"])
+
+
+class TestReconImageKeepsUnknownChannel(unittest.TestCase):
+    """เส้นจริงจากรูป → คิว: ช่องที่ AI ตอบ null ต้องไปถึงคิวเป็น None"""
+
+    class _Ev:
+        reply_token = "tok"
+        class message:
+            id = "mid-unread"
+        class source:
+            group_id = "Grecimg"
+            user_id = "U1"
+            type = "group"
+
+    def setUp(self):
+        self._bak = (app.extract_ledger, app._recon_try_or_queue, app._reply_with_mention,
+                     app.line_bot_api.get_message_content)
+        self.queued, self.replies = [], []
+        app._recon_try_or_queue = lambda g, d, hw: self.queued.append(dict(hw))
+        app._reply_with_mention = lambda ev, t: self.replies.append(t)
+        app.line_bot_api.get_message_content = lambda mid: type(
+            "C", (), {"iter_content": lambda self: [b"img"]})()
+
+    def tearDown(self):
+        (app.extract_ledger, app._recon_try_or_queue, app._reply_with_mention,
+         app.line_bot_api.get_message_content) = self._bak
+
+    def _run(self, info):
+        app.extract_ledger = lambda b: info
+        self._Ev.message.id = f"mid-{uuid.uuid4().hex}"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app._process_recon_image(self._Ev(), "Grecimg")
+        return buf.getvalue()
+
+    def test_บัตร_null_ต้องเข้าคิวเป็น_None_และเทียบช่องอื่นต่อ(self):
+        log = self._run({"is_ledger": True, "date": _d(1), "saw": "สมุดจดยอดรับ",
+                         "cash": 5897, "transfer": 60900, "card": None})
+        self.assertEqual(len(self.queued), 1, "ช่องอื่นอ่านได้ ต้องเทียบต่อ ไม่ใช่ทิ้งทั้งใบ")
+        self.assertIsNone(self.queued[0]["card"])
+        self.assertEqual(self.queued[0]["cash"], 5897.0)
+        self.assertIn("อ่านไม่ออก", log, "log ต้องบอกว่าช่องไหนอ่านไม่ออก")
+
+    def test_ทุกช่อง_null_ต้องไม่เทียบ_และบอกในไลน์(self):
+        log = self._run({"is_ledger": True, "date": _d(1), "saw": "รูปเบลอ",
+                         "cash": None, "transfer": None, "card": None})
+        self.assertEqual(self.queued, [])
+        self.assertIn("อ่านยอดรับไม่ได้เลย", log)
+        self.assertIn("null", log, "ต้องแยกออกว่า 'อ่านไม่ออกทุกช่อง' ไม่ใช่ 'จดศูนย์ทุกช่อง'")
+        self.assertTrue(self.replies, "ห้ามเงียบ")
+
+    def test_ทุกช่องศูนย์_ยังต้องกันไว้เหมือนเดิม(self):
+        """โมเดลอาจยังติดนิสัยตอบ 0 แบบพรอมป์ตเก่า — ด่าน §3.22 ต้องไม่หายไป"""
+        log = self._run({"is_ledger": True, "date": _d(1), "cash": 0, "transfer": 0, "card": 0})
+        self.assertEqual(self.queued, [])
+        self.assertIn("ทุกช่องเป็น 0", log)
