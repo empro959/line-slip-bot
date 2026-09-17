@@ -3672,3 +3672,74 @@ class TestPayablePaymentSlipDatetimeSanity(unittest.TestCase):
         src = inspect.getsource(app._process_payable_image)
         self.assertIn("slip_dt=_sane_slip_dt(", src,
                       "เส้นจ่ายเจ้าหนี้ต้องกรองวันเวลาบนสลิปก่อนลง DB")
+
+
+class TestHeartbeatGroupGetsAReport(unittest.TestCase):
+    """สัญญาณชีพคอนเทนต์ต้องมี "พาหนะ" — กลุ่มที่ไม่เคยส่งสลิปก็ต้องได้รายงาน
+
+    เคสจริง §3.16: บรรทัดสัญญาณชีพไม่เคยโผล่เลยตั้งแต่ทำมา 7 ก.ย.
+    เดาไว้ว่า env ตั้งไม่ครบ — **เดาผิด** เจ้าของเปิด Render ให้ดู 17 ก.ย. เห็นว่าตั้งครบทั้ง 2 ตัว
+    ต้นเหตุจริง: สัญญาณชีพต่อท้าย 'รายงานของกลุ่มนั้น' แต่ห้องคอนเทนต์ไม่เคยส่งสลิป
+    → ไม่มีแถวในตาราง groups → ไม่เคยเป็นเป้ารายงาน → พาหนะไม่มีอยู่จริง"""
+
+    GHB = "Gcontentroom"
+    GSLIP = "Gslipnormal"
+
+    def setUp(self):
+        self._bak = (app.CONTENT_HEARTBEAT_GROUP, app.CONTENT_HEARTBEAT_URL)
+        app.CONTENT_HEARTBEAT_GROUP = self.GHB
+        app.CONTENT_HEARTBEAT_URL = "https://script.test/exec"
+        with app._db() as conn:
+            conn.execute("DELETE FROM groups WHERE group_id IN (?,?)", (self.GHB, self.GSLIP))
+            conn.execute("INSERT INTO groups (group_id) VALUES (?)", (self.GSLIP,))
+            conn.commit()
+        app._set_meta(f"noreport:{self.GHB}", "")
+        app._set_meta(f"slipoff:{self.GHB}", "")
+
+    def tearDown(self):
+        (app.CONTENT_HEARTBEAT_GROUP, app.CONTENT_HEARTBEAT_URL) = self._bak
+        with app._db() as conn:
+            conn.execute("DELETE FROM groups WHERE group_id IN (?,?)", (self.GHB, self.GSLIP))
+            conn.commit()
+        app._set_meta(f"noreport:{self.GHB}", "")
+
+    def test_กลุ่มไม่เคยมีสลิป_ต้องถูกเพิ่มเข้าเป้ารายงาน(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            targets = app._report_targets()
+        self.assertIn(self.GHB, targets, "ไม่มีในเป้า = สัญญาณชีพไม่มีพาหนะ = เงียบเหมือนเดิม")
+        self.assertIn("[heartbeat]", buf.getvalue(), "ต้อง log ว่าเพิ่มเข้าเอง ไม่งั้นไล่เหตุไม่ได้")
+
+    def test_ไม่ตั้ง_env_ต้องไม่ยัดกลุ่มแปลกเข้ามา(self):
+        """ปิดฟีเจอร์ = ต้องไม่มีผลกับรายงานกลุ่มไหนเลย (พฤติกรรมเดิมเป๊ะ)"""
+        app.CONTENT_HEARTBEAT_URL = ""
+        self.assertNotIn(self.GHB, app._report_targets())
+        app.CONTENT_HEARTBEAT_URL = "https://script.test/exec"
+        app.CONTENT_HEARTBEAT_GROUP = ""
+        _t = app._report_targets()
+        self.assertNotIn(self.GHB, _t)
+        self.assertIn(self.GSLIP, _t, "กลุ่มที่มีสลิปปกติต้องยังได้รายงานเหมือนเดิม")
+
+    def test_สั่งปิดรายงานไว้_ต้องไม่ฝืนส่ง_แต่ต้องบอกเหตุ(self):
+        """เจ้าของสั่งปิดรายงานกลุ่มนั้น = ต้องเคารพ แต่ห้ามเงียบ (บทเรียน §3.26)"""
+        app._set_meta(f"noreport:{self.GHB}", "1")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            targets = app._report_targets()
+        self.assertNotIn(self.GHB, targets)
+        self.assertIn("ปิดรายงาน", buf.getvalue())
+
+    def test_กลุ่มที่มีสลิปอยู่แล้ว_ต้องไม่ถูกเพิ่มซ้ำ(self):
+        app.CONTENT_HEARTBEAT_GROUP = self.GSLIP
+        self.assertEqual(app._report_targets().count(self.GSLIP), 1)
+
+    def test_รายงานของกลุ่มที่ไม่มีสลิป_ต้องยังมีบรรทัดสัญญาณชีพ(self):
+        """ปลายทางของพาหนะ: รายงาน 'ไม่มีสลิป' ต้องยังพาสัญญาณชีพไปด้วย"""
+        _orig = app.requests.get
+        app.requests.get = lambda url, timeout=None: type(
+            "R", (), {"status_code": 200, "json": lambda self: {"posts": 3}})()
+        try:
+            out = app.build_daily_report(self.GHB, _d(1))
+        finally:
+            app.requests.get = _orig
+        self.assertIn("สัญญาณชีพ", out, "กลุ่มที่ไม่มีสลิปก็ต้องเห็นสัญญาณชีพ")
