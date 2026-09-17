@@ -1109,6 +1109,43 @@ def _postback_once(token: str) -> bool:
         _set_meta(f"pb_done:{token}", datetime.now(TZ).date().isoformat())   # เก็บวันที่ไว้ให้ cleanup ลบทีหลัง
         return True
 
+# วันเวลาบนสลิปย้อนหลังได้ไม่เกินกี่วัน (สลิปถ่ายส่งวันเดียวกันเป็นปกติ · เผื่อส่งย้อนหลัง)
+SLIP_DT_MAX_DAYS = int(os.environ.get("SLIP_DT_MAX_DAYS", "120"))
+
+
+def _sane_slip_dt(dt):
+    """รับ 'วันเวลาบนสลิป' เฉพาะที่สมเหตุผล — ไม่ใช่อนาคต และไม่เก่าเกิน SLIP_DT_MAX_DAYS
+    คืน None ถ้าไม่สมเหตุผล = **ไม่รู้** (ดีกว่าเก็บค่าที่ผิด)
+
+    🪤 เคสจริง 17 ก.ย. 26 12:59: สลิป K+ 350 บาท วันบนสลิป '17 ก.ย. 69' (= ค.ศ. 2026)
+      แต่ในฐานข้อมูลมีใบเดิม ref เดียวกัน ยอดเดียวกัน เวลา 12:59:00 เหมือนกัน
+      **แต่ปีเป็น 2024** → บอทเตือนว่า 'สลิปปลอม/ซ้ำ' โดยอ้างใบปี 2024 ที่ไม่มีอยู่จริง
+      (เลข 69 ถูกอ่านเป็น 67 → 2567−543 = 2024 · หรือแปลง พ.ศ. พลาด)
+
+    ⚖️ ของเดิม `save_slip` เก็บ `info['datetime']` จาก AI **ตรงๆ ไม่ตรวจอะไรเลย** ต่างจากเส้น
+    เจ้าหนี้ที่มี `_sane_doc_date` มาตั้งแต่ §3.12 — ปีที่ผิดไป 2 ปีจึงลงฐานข้อมูลได้สบาย
+    แล้วไปพังต่อ 2 ทาง: ตัวจับสลิปซ้ำ (`amount_time`) เทียบผิด · ข้อความเตือนอ้างวันที่ที่ไม่มีจริง
+    📌 บทเรียน §3.23: พรอมป์ตคือการขอร้อง ไม่ใช่การรับประกัน — เรื่องเงินต้องมีตาข่ายในโค้ด"""
+    if not dt:
+        return None
+    raw = str(dt).strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            d = datetime.strptime(raw, fmt)
+            break
+        except ValueError:
+            d = None
+    if d is None:
+        return None
+    today = datetime.now(TZ).date()
+    # เผื่ออนาคต 1 วัน: สลิปโอนข้ามเที่ยงคืน/เครื่องตั้งเวลาคลาด ยังถือว่าปกติ
+    if d.date() > today + timedelta(days=1) or (today - d.date()).days > SLIP_DT_MAX_DAYS:
+        print(f"[slip] ⚠️ วันเวลาบนสลิป {raw!r} ไม่สมเหตุผล (ห่างจากวันนี้เกิน {SLIP_DT_MAX_DAYS} วัน) "
+              f"→ ไม่เก็บวันเวลา (ถือว่าไม่รู้) กันไปทำให้จับซ้ำ/เตือนผิด", flush=True)
+        return None
+    return raw
+
+
 def find_duplicate(group_id: str, info: dict):
     """หาความซ้ำ/ความผิดปกติเทียบกับใบก่อนหน้าในกรุ๊ป — คืน (type, prev_amount, prev)
     prev = dict ข้อมูลสลิปใบก่อนที่ตรง (sender/slip_datetime/ref_number/recorded_at) ไว้โชว์ว่าซ้ำกับใบไหน
@@ -1372,9 +1409,18 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None, 
         issue_text = "\n".join(issues)
         group_msg  = (f"🚨 ตรวจพบสลิปต้องสงสัย!\n─────────────────\n{base_info}\n"
                       f"─────────────────\n{issue_text}\n⛔ กรุณาอย่ายืนยันการรับเงินก่อนตรวจสอบ")
-        admin_msg  = (f"🚨 [ALERT] สลิปปลอมจาก {sender}!\n"
+        # พาดหัวต้องตรงกับสิ่งที่ 'พิสูจน์ได้' — ไม่ใช่เหมาว่าปลอมทุกกรณี
+        # เคสจริง 17 ก.ย. 26: ใบเดิมส่งซ้ำ (ref+ยอดตรงกันเป๊ะ) ขึ้นพาดหัว 'สลิปปลอม'
+        #   เจ้าของอ่านแล้วตกใจ ทั้งที่เป็นเงินจริง 350 บาทที่ส่งมาสองรอบ
+        # ⚖️ เตือนเกินจริงบ่อยๆ = พนักงานเลิกอ่าน แล้ววันที่ปลอมจริงจะไม่มีใครสนใจ
+        _dup_only = dup_type in ("ref", "amount_time") and not any("ตัดต่อ" in i for i in issues)
+        _head = ("🚨 [ALERT] สลิปถูกตัดต่อ" if dup_type == "ref_mismatch"
+                 else "⚠️ [ALERT] สลิปส่งซ้ำ (ยอด+เลขอ้างอิงตรงกับใบก่อน)" if _dup_only
+                 else "🚨 [ALERT] สลิปต้องสงสัย")
+        admin_msg  = (f"{_head} — จาก {sender}\n"
                       f"จำนวน: {amount_str} บาท | อ้างอิง: {ref}\n─────────────────\n{issue_text}\n"
-                      "กรุณาดำเนินการทันที")
+                      + ("👉 ถ้าเป็นใบเดิมที่ส่งซ้ำ ไม่ต้องทำอะไร — บอทไม่นับซ้ำให้แล้ว"
+                         if _dup_only else "กรุณาดำเนินการทันที"))
 
     return {"status": status, "issues": issues, "group_msg": group_msg, "admin_msg": admin_msg}
 
@@ -1393,7 +1439,7 @@ def save_slip(group_id: str, info: dict, verdict_status: str, message_id: str = 
             "INSERT INTO slips (group_id, slip_date, sender, amount, bank, ref_number, slip_datetime, verdict, recorded_at, account_label, message_id) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (group_id, today, info.get("sender"), float(info.get("amount") or 0),
-             info.get("bank"), info.get("ref_number"), info.get("datetime"), verdict_status, recorded_at,
+             info.get("bank"), info.get("ref_number"), _sane_slip_dt(info.get("datetime")), verdict_status, recorded_at,
              _slip_account_label(info), message_id)
         )
         conn.execute("INSERT INTO groups (group_id) VALUES (?) ON CONFLICT DO NOTHING", (group_id,))

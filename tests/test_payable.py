@@ -3301,3 +3301,75 @@ class TestDateGuardMessageTellsWhatIsFine(PayableTestCase):
     def test_ตัดยอดเข้าบิลตามโน้ตถูกใบเหมือนเดิม(self):
         bill, _ = self._real_case()
         self.assertEqual(self.paid_on(bill), 3615.0)
+
+
+class TestSlipDatetimeSanity(unittest.TestCase):
+    """วันเวลาบนสลิปที่ 'เป็นไปไม่ได้' ต้องไม่ลงฐานข้อมูล
+
+    เคสจริง 17 ก.ย. 26 12:59: สลิป K+ 350 บาท วันบนสลิป '17 ก.ย. 69' (= ค.ศ. 2026)
+    แต่ในฐานข้อมูลมีใบเดิม ref เดียวกัน ยอดเดียวกัน เวลา 12:59:00 เหมือนกัน
+    **แต่ปีเป็น 2024** → บอทเตือน 'สลิปปลอม' โดยอ้างใบปี 2024 ที่ไม่มีอยู่จริง
+
+    ⚖️ ของเดิม save_slip เก็บ info['datetime'] จาก AI ตรงๆ ไม่ตรวจอะไรเลย
+    ต่างจากเส้นเจ้าหนี้ที่มี _sane_doc_date มาตั้งแต่ §3.12
+    ปีผิดไป 2 ปีจึงลง DB ได้ แล้วพังต่อ 2 ทาง: ตัวจับซ้ำเทียบผิด · ข้อความเตือนอ้างวันที่ไม่มีจริง"""
+
+    def test_ปีเพี้ยนย้อนไป_2_ปี_ต้องไม่เก็บ(self):
+        self.assertIsNone(app._sane_slip_dt("2024-09-17T12:59:00"))
+
+    def test_วันเวลาปกติของวันนี้_ต้องเก็บตามเดิม(self):
+        dt = datetime.now(app.TZ).strftime("%Y-%m-%dT%H:%M:%S")
+        self.assertEqual(app._sane_slip_dt(dt), dt)
+
+    def test_ย้อนหลังไม่กี่วัน_ยังเก็บ(self):
+        """ลูกค้าส่งสลิปย้อนหลัง/กู้สลิปเก่า เป็นเรื่องปกติ ห้ามตัดทิ้ง"""
+        dt = (datetime.now(app.TZ) - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%S")
+        self.assertEqual(app._sane_slip_dt(dt), dt)
+
+    def test_อนาคตไกล_ต้องไม่เก็บ(self):
+        dt = (datetime.now(app.TZ) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S")
+        self.assertIsNone(app._sane_slip_dt(dt))
+
+    def test_อนาคตหนึ่งวัน_ยังเก็บ(self):
+        """โอนข้ามเที่ยงคืน / เครื่องตั้งเวลาคลาดเล็กน้อย = ปกติ ห้ามตัด"""
+        dt = (datetime.now(app.TZ) + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%S")
+        self.assertEqual(app._sane_slip_dt(dt), dt)
+
+    def test_รูปแบบอื่นและค่าว่าง_ต้องไม่พัง(self):
+        for bad in (None, "", "อ่านไม่ออก", "17/09/2569", "2026-13-45T99:99:99"):
+            self.assertIsNone(app._sane_slip_dt(bad), f"ค่า {bad!r} ต้องคืน None")
+
+    def test_รูปแบบวันเดียวไม่มีเวลา_ยังรับ(self):
+        d = datetime.now(app.TZ).date().isoformat()
+        self.assertEqual(app._sane_slip_dt(d), d)
+
+
+class TestDupAlertWording(unittest.TestCase):
+    """'ส่งซ้ำ' ไม่ใช่ 'ปลอม' — พาดหัวต้องตรงกับสิ่งที่พิสูจน์ได้
+
+    เคสจริง 17 ก.ย. 26: ใบเดิมส่งซ้ำ (ref + ยอดตรงกันเป๊ะ) ขึ้นพาดหัว '🚨 สลิปปลอม'
+    เจ้าของอ่านแล้วตกใจ ทั้งที่เป็นเงินจริง 350 บาทที่ส่งมาสองรอบ
+    ⚖️ เตือนเกินจริงบ่อยๆ = พนักงานเลิกอ่าน แล้ววันที่ปลอมจริงจะไม่มีใครสนใจ"""
+
+    PREV = {"sender": "นาย บัณฑิตะ ศ", "ref_number": "016260125933AQR09626",
+            "slip_datetime": None, "recorded_at": "12:59:00", "amount": 350.0}
+
+    def _verdict(self, info, dup_type, prev_amount=None):
+        return app.build_verdict(info, {}, dup_type, prev_amount, self.PREV)
+
+    def test_ส่งซ้ำ_ห้ามพาดหัวว่าปลอม(self):
+        v = self._verdict({"amount": 350.0, "sender": "นาย บัณฑิตะ ศ",
+                           "ref_number": self.PREV["ref_number"]}, "ref")
+        adm = v.get("admin_msg") or ""
+        self.assertNotIn("สลิปปลอม", adm, "ส่งซ้ำไม่ใช่ปลอม — พาดหัวนี้ทำให้เจ้าของตกใจเปล่าๆ")
+        self.assertIn("ส่งซ้ำ", adm)
+        self.assertIn("ไม่ต้องทำอะไร", adm, "ต้องบอกว่าไม่ต้องทำอะไรถ้าเป็นใบเดิม")
+
+    def test_ยอดไม่ตรงแต่เลขอ้างอิงเดียวกัน_ยังต้องบอกว่าตัดต่อ(self):
+        """ทิศตรงข้าม — เคสที่พิสูจน์ได้ว่าถูกแก้ ต้องดังเหมือนเดิม ห้ามลดเสียง"""
+        v = self._verdict({"amount": 350.0, "sender": "นาย ก",
+                           "ref_number": self.PREV["ref_number"]}, "ref_mismatch", 9999.0)
+        adm = v.get("admin_msg") or ""
+        self.assertIn("ตัดต่อ", adm)
+        self.assertIn("🚨", adm)
+        self.assertNotIn("ไม่ต้องทำอะไร", adm)
