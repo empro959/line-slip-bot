@@ -797,6 +797,105 @@ function beverageWatch(){
   }
 }
 
+// ===== 🍺 ขายเครื่องดื่ม "กี่ขวด" ต่อเดือน/ต่อวัน — ใช้ตั้งยอดสั่งของ (ไม่กิน OCR) =====
+// ทำไมต้องมี (17/09/2569): เจ้าของถามว่า "ใบสั่งของ 18/9 สั่งพอดีไหม" แล้วตอบไม่ได้ —
+//   ข้อมูลที่เข้าระบบมีแต่ "ยอดเงิน" (สด/โอน/บัตร) ไม่มีว่าสิงห์ขายไปกี่ขวด
+//   ทั้งที่ menu_items เก็บ {name, qty, amount} รายเดือนไว้อยู่แล้วตั้งแต่ต้น
+//   beverageWatch() ใช้ข้อมูลชุดนี้ดูแค่ "กำไร %" — จำนวนขวดที่ต้องใช้ตัดสินใจสั่งของไม่มีใครเคยดึงมาดู
+// สูตรที่ใช้ตั้งยอดสั่ง:  สั่ง = (ขวด/วัน × จำนวนวันถึงรอบหน้า) − ของที่มีอยู่ + เผื่อ
+//   ฟังก์ชันนี้ให้ตัวเลข "ขวด/วัน" ที่เป็นก้อนซ้ายของสูตร (ของที่มีอยู่มาจากใบยอดคงเหลือ)
+// ⚠️ กติกาของโปรเจกต์: ห้ามเงียบ — ไม่มีข้อมูลต้องบอกว่าไม่มีและบอกว่าทำไม
+//   และห้ามโชว์ 0 แทน "ไม่รู้" (ไม่มีข้อมูลรายวัน → ขวด/วัน เป็น '—' ไม่ใช่ 0)
+
+function _periodOrd_(p){
+  var a=(p||'').split(' ');
+  return (parseInt(a[1],10)||0)*12 + THAI_MONTHS.indexOf(a[0]);
+}
+
+// คืน true ถ้ารายการนี้เป็น "เครื่องดื่มที่ต้องสั่งของ" (เบียร์/เหล้า/โซดา/น้ำ/โซจู/สปาย ฯลฯ)
+function _isBevItem_(it){
+  var c=(it.category||''), n=(it.name||'');
+  if(/สุรา|เหล้า|เบียร์|เครื่องดื่ม|ไวน์|วิสกี้|drink|beverage|liquor|beer/i.test(c)) return true;
+  // เผื่อหมวดใน POS ไม่ได้ตั้งชื่อสื่อความ — จับจากชื่อสินค้าจริงของร้าน
+  return /ช้าง|สิงห์|ลีโอ|ไฮเนเก|บัดไวเซอร์|ไทเกอร์|มาย|hoegaarden|โฮการ์เดน|จินโร|โซจู|สปาย|ไนท์\s*ฮันเตอร์|โซดา|น้ำแข็ง|น้ำเปล่า|แสงโสม|หงษ์|รีเจนซี่|เบน\s*285|เมอริเดียน|ซิลเวอร์|เมาเทน|เฟอร์นานโด|เจมสัน|เทนโดะ|โซระ|เฮนเนซ/i.test(n);
+}
+
+function beverageQty(){
+  var f=getFile_();
+  if(!f){ Logger.log('🔴 ไม่พบไฟล์ '+FILE_NAME+' ใน Drive — ยังไม่มีข้อมูลให้วิเคราะห์ (รัน rebuildNow ก่อน)'); return; }
+  var months=[]; try{ months=JSON.parse(f.getBlob().getDataAsString('UTF-8'))||[]; }catch(e){
+    Logger.log('🔴 อ่านไฟล์ไม่ได้: '+e); return; }
+  if(!months.length){ Logger.log('🔴 ไฟล์ว่าง ไม่มีเดือนเลย'); return; }
+  months.sort(function(x,y){ return _periodOrd_(x.period)-_periodOrd_(y.period); });
+
+  // หาเดือนล่าสุด "ที่มี menu_items จริง" — ถ้าเดือนล่าสุดไม่มี ต้องบอกว่าไม่มี ไม่ใช่เงียบแล้วข้ามไป
+  var idx=-1;
+  for(var i=months.length-1;i>=0;i--){ if((months[i].menu_items||[]).length){ idx=i; break; } }
+  if(idx<0){
+    Logger.log('🔴 ทุกเดือนไม่มี menu_items เลย ('+months.length+' เดือน) — ใบที่ดึงมาอาจเป็นใบสรุปเดือน');
+    Logger.log('   ใบที่มีรายเมนูคือ "SaleReport / รายงานสรุปยอดขายแยกตามหมวดสินค้า" → ต้องมีใบนั้นในเมล');
+    return;
+  }
+  if(idx !== months.length-1){
+    Logger.log('⚠️ เดือนล่าสุด ('+months[months.length-1].period+') ไม่มีรายเมนู — ใช้ '+months[idx].period+' แทน');
+  }
+
+  var cur=months[idx], prev=(idx>0?months[idx-1]:null);
+  var bev=(cur.menu_items||[]).filter(_isBevItem_);
+  if(!bev.length){
+    // ด่านที่คัดของออกต้องบอกว่า "เห็นอะไร" ไม่งั้นแก้ตัวกรองไม่ถูก (บทเรียนฝั่งบอท §3.26)
+    Logger.log('🔴 กรองไม่เจอเครื่องดื่มเลยใน '+cur.period+' (มีรายเมนูทั้งหมด '+(cur.menu_items||[]).length+' รายการ)');
+    var seen={}; (cur.menu_items||[]).forEach(function(it){ var c=it.category||'(ไม่มีหมวด)'; seen[c]=(seen[c]||0)+1; });
+    Logger.log('   หมวดที่มีในข้อมูล: '+Object.keys(seen).map(function(c){return c+' ('+seen[c]+')';}).join(' · '));
+    Logger.log('   → เอาชื่อหมวดข้างบนไปเพิ่มใน _isBevItem_ แล้วรันใหม่');
+    return;
+  }
+
+  // จำนวนวันที่ "ขายจริง" ของเดือนนั้น — ไม่มีข้อมูลรายวัน = คำนวณต่อวันไม่ได้ (ห้ามเดา 30)
+  var dts=(cur.daily_totals||[]).filter(function(d){ return (d.sales||0)>0; });
+  var days=dts.length;
+  var prevMap={}; if(prev) (prev.menu_items||[]).filter(_isBevItem_).forEach(function(it){ prevMap[it.name]=it; });
+  // 🪤 เจอตอนรันทดสอบ 17/09/2569: เทียบ "ยอดรวมเดือน" ตรงๆ ให้คำตอบกลับด้าน —
+  //   ส.ค. สิงห์ 540 ขวด/30 วัน = 18/วัน · ก.ย. 352 ขวด/16 วัน = 22/วัน (ขายเร็วขึ้น 22%)
+  //   แต่เลขดิบอ่านว่า "▼188 = ขายลดลง" → ถ้าเชื่อตามนั้นจะสั่งสิงห์น้อยกว่าที่ควร
+  //   เดือนที่ยังไม่จบ เทียบกับเดือนเต็มไม่ได้ ต้องเทียบ "ต่อวัน" เท่านั้น
+  var prevDays=prev?((prev.daily_totals||[]).filter(function(d){return (d.sales||0)>0;}).length):0;
+
+  bev.sort(function(a,b){ return (b.qty||0)-(a.qty||0); });
+  Logger.log('🍺 ขายเครื่องดื่มรายตัว — '+cur.period+(days?(' (มีข้อมูลขาย '+days+' วัน)'):' (ไม่มีข้อมูลรายวัน)'));
+  Logger.log('─────────────────────────────');
+  Logger.log('ชื่อ | ขาย(หน่วย) | ต่อวัน | ยอดเงิน | เทียบเดือนก่อน (ต่อวัน)');
+  if(prev) Logger.log('(เทียบเป็น "ต่อวัน" เพราะเดือนนี้อาจยังไม่จบ — เทียบยอดรวมจะอ่านกลับด้าน)');
+  bev.forEach(function(it){
+    var q=it.qty||0;
+    var perDay = days ? (q/days) : null;          // null = ไม่รู้ ไม่ใช่ 0
+    var pv=prevMap[it.name], cmp;
+    if(!prev)                         cmp='(ไม่มีเดือนก่อน)';
+    else if(!pv)                      cmp='🆕 เดือนก่อนไม่มีรายการนี้';
+    else if(!days || !prevDays)       cmp='เทียบต่อวันไม่ได้ (ขาดข้อมูลรายวัน) · เดือนก่อนรวม '+(pv.qty||0);
+    else {
+      // เทียบ "ต่อวัน" เท่านั้น — เดือนนี้อาจยังไม่จบ (ดูกับดักข้างบน)
+      var pd=(pv.qty||0)/prevDays, d=perDay-pd;
+      var pct=pd>0?(d/pd*100):null;
+      cmp=(d>=0?'▲+':'▼')+Math.abs(d).toFixed(1)+'/วัน'+(pct===null?'':' ('+(pct>=0?'+':'')+pct.toFixed(0)+'%)')
+          +' · เดือนก่อน '+pd.toFixed(1)+'/วัน';
+    }
+    Logger.log('  '+it.name+' | '+q+' | '+(perDay===null?'—':perDay.toFixed(1))+' | ฿'+fmtT_(it.amount)+' | '+cmp);
+  });
+  Logger.log('─────────────────────────────');
+  if(!days){
+    Logger.log('⚠️ เดือนนี้ไม่มี daily_totals → บอก "ต่อวัน" ไม่ได้ (โชว์ — ไม่ใช่ 0)');
+    Logger.log('   ใช้ยอดรวมเดือนหารจำนวนวันเปิดร้านเองไปก่อน หรือรัน backfillPos เติมข้อมูลรายวัน');
+  } else {
+    Logger.log('📌 วิธีใช้: ของที่มีอยู่ ÷ (ขวด/วัน) = พอขายอีกกี่วัน');
+    Logger.log('   สั่ง = (ขวด/วัน × จำนวนวันถึงรอบสั่งหน้า) − ของที่มีอยู่ + เผื่อ');
+  }
+  var tq=bev.reduce(function(a,b){return a+(b.qty||0);},0);
+  var ta=bev.reduce(function(a,b){return a+(b.amount||0);},0);
+  Logger.log('รวมเครื่องดื่ม '+bev.length+' รายการ · '+tq+' หน่วย · ฿'+fmtT_(ta));
+  Logger.log('⚠️ "หน่วย" คือหน่วยที่ POS บันทึก (ขวด/แก้ว/กระป๋อง/เหยือก) ไม่ใช่ลัง — ดูชื่อเมนูประกอบ');
+}
+
 // ===== เติม "จำนวนบิล" ให้วันที่เก็บไว้แล้ว (OCR เฉพาะรายงานลูกค้า) — รันครั้งเดียว รันซ้ำได้ =====
 function backfillBills(){
   var threads=GmailApp.search('has:attachment filename:pdf newer_than:40d',0,80), cust={};
