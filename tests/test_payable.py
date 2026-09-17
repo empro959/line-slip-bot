@@ -3449,3 +3449,226 @@ class TestReconLogSaysWhatItSaw(unittest.TestCase):
         p = seen.get("p", "")
         self.assertIn('"saw"', p)
         self.assertIn("แม้ is_ledger=false", p, "ต้องบังคับให้ตอบ saw แม้ตอบว่าไม่ใช่สมุด")
+
+
+class TestResvDateSanity(unittest.TestCase):
+    """วันจองที่ 'รูปแบบถูกแต่เป็นไปไม่ได้' ต้องไม่ลง DB — ไม่งั้นจองหายเงียบ
+
+    ไล่ตาข่ายวันที่ทุกเส้นที่เก็บ 'วันจาก AI' ลง DB (17 ก.ย. 26) แล้วพบว่าเส้นจอง
+    เป็นเส้นเดียวที่เหลือซึ่งตรวจแค่ `_valid_ymd` = รูปแบบถูก ไม่ได้ตรวจว่าเป็นไปได้ไหม
+    (เจ้าหนี้มี `_sane_doc_date` §3.12 · สลิปมี `_sane_slip_dt` §3.25)
+
+    ความเสียหายถ้าวันเพี้ยน: จองไปอยู่วันที่ไม่มีใครเห็น (สรุป 'จองวันนี้' query resv_date=วันนี้)
+    และ `_cleanup_old_data` ลบทิ้งเมื่อเก่าเกิน RESV_KEEP_DAYS — **ไม่มีเสียงเตือนใดๆ**"""
+
+    def _iso(self, days_ahead: int) -> str:
+        return (datetime.now(app.TZ).date() + timedelta(days=days_ahead)).isoformat()
+
+    def test_วันที่ใช้ได้_ต้องผ่าน(self):
+        """ห้ามรัดจนของจริงหลุด (บทเรียน §3.24) — วันนี้/พรุ่งนี้/เมื่อวาน/ล่วงหน้าไกลสุด ต้องผ่านหมด"""
+        for ahead in (0, 1, 2, 30, 180, app.RESV_AHEAD_MAX_DAYS, -app.RESV_PAST_GRACE_DAYS):
+            want = self._iso(ahead)
+            self.assertEqual(app._sane_resv_date(want), want, f"ห่าง {ahead} วัน ต้องรับ")
+
+    def test_วันที่เป็นไปไม่ได้_ต้องคืน_None(self):
+        for ahead in (-2, -30, -400, -730, app.RESV_AHEAD_MAX_DAYS + 1, 800):
+            self.assertIsNone(app._sane_resv_date(self._iso(ahead)), f"ห่าง {ahead} วัน ต้องทิ้ง")
+
+    def test_ปีเพี้ยนแบบเคสจริง_พศ_แปลงพลาด(self):
+        """เลข 69 ถูกอ่านเป็น 67 → 2567−543 = 2024 (เคสเดียวกับที่ทำสลิปเตือนปลอม §3.25)"""
+        d = datetime.now(app.TZ).date()
+        self.assertIsNone(app._sane_resv_date(d.replace(year=d.year - 2).isoformat()))
+
+    def test_รูปแบบพัง_ต้องคืน_None_ไม่ระเบิด(self):
+        for bad in (None, "", "พรุ่งนี้", "2026-13-40", "26/09/2026", 0, "0"):
+            self.assertIsNone(app._sane_resv_date(bad), repr(bad))
+
+    def test_ทิ้งวันแล้วต้องบอกเหตุใน_log(self):
+        """ด่านที่คัดของออกแบบเงียบ = ไล่เหตุไม่ได้ (กติกาประจำโปรเจกต์)"""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app._sane_resv_date(self._iso(-400))
+        self.assertIn("[resv]", buf.getvalue())
+        self.assertIn("เป็นไปไม่ได้", buf.getvalue())
+
+
+class TestSaveReservationRefusesInsaneDate(unittest.TestCase):
+    """ตาข่ายเส้นสุดท้าย: ถึงจะมีเส้นทางไหนข้ามด่าน handler มา ก็ห้ามเก็บวันผิดลง DB
+
+    เก็บ NULL (= ยังไม่รู้วัน) ดีกว่าเก็บวันที่ผิด — จองที่ไม่มีวันยังโผล่ในสรุปของวันที่แจ้ง
+    แต่จองที่วันผิดหายไปเลย (กติกา 0 ≠ ไม่รู้)"""
+
+    GID = "Gresvsane"
+
+    def _rows(self):
+        with app._db() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM reservations WHERE origin_group_id=? ORDER BY id", (self.GID,)).fetchall()]
+
+    def setUp(self):
+        self._clear()
+
+    def tearDown(self):
+        self._clear()
+
+    def _clear(self):
+        with app._db() as conn:
+            conn.execute("DELETE FROM reservations WHERE origin_group_id=?", (self.GID,))
+            conn.commit()
+
+    def _save(self, rd):
+        info = {"customer": "คุณเอ", "people": "4 ท่าน", "table": "A", "time_hhmm": "19:00", "resv_date": rd}
+        return app.save_reservation(self.GID, "Doi", info, "จองคุณเอ 4 คน", self.GID)
+
+    def test_วันเพี้ยนไปอดีต_เก็บเป็น_NULL(self):
+        past = (datetime.now(app.TZ).date() - timedelta(days=400)).isoformat()
+        self._save(past)
+        row = self._rows()[0]
+        self.assertIsNone(row["resv_date"], f"ห้ามเก็บ {past} — จองจะโดน cleanup ลบทิ้งเงียบๆ")
+
+    def test_วันล่วงหน้าไกลเกิน_เก็บเป็น_NULL(self):
+        self._save((datetime.now(app.TZ).date() + timedelta(days=800)).isoformat())
+        self.assertIsNone(self._rows()[0]["resv_date"])
+
+    def test_วันจองจริง_ต้องเก็บตามนั้น(self):
+        want = (datetime.now(app.TZ).date() + timedelta(days=3)).isoformat()
+        self._save(want)
+        self.assertEqual(self._rows()[0]["resv_date"], want)
+
+    def test_วันเพี้ยนในอดีต_ถ้าเก็บลงไปจะโดน_cleanup_ลบทิ้ง(self):
+        """เอกสารความเสียหาย: เขียนวันเพี้ยนลง DB ตรงๆ แล้วรัน cleanup → หายทั้งใบ"""
+        with app._db() as conn:
+            conn.execute(
+                "INSERT INTO reservations (origin_group_id, requested_by, customer, status, created_at, resv_date) "
+                "VALUES (?,?,?,?,?,?)",
+                (self.GID, "Doi", "คุณเอ", "PENDING",
+                 datetime.now(app.TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                 (datetime.now(app.TZ).date() - timedelta(days=400)).isoformat()))
+            conn.commit()
+        self.assertEqual(len(self._rows()), 1)
+        app._cleanup_old_data()
+        self.assertEqual(self._rows(), [], "วันเพี้ยน = cleanup ลบทิ้งทันที นี่คือเหตุที่ต้องมีด่าน")
+
+
+class TestResvInsaneDateAsksInsteadOfSaving(unittest.TestCase):
+    """end-to-end: AI ให้วันเพี้ยนมาพร้อมข้อมูลครบ → บอทต้อง 'ถามวันที่' ไม่ใช่บันทึกเงียบ
+
+    นี่คือจุดที่ต่างจากเส้นเจ้าหนี้: เจ้าหนี้ทิ้งวันแล้วใช้ 'วันนี้' แทนได้ (ยอดไม่พึ่งวันที่)
+    แต่จองผิดวัน = ลูกค้ามาผิดวัน/โต๊ะไม่ว่าง → ต้องถามให้ชัด ห้ามเดา"""
+
+    GID = "Gresve2e"
+
+    class _Ev:
+        reply_token = "tok"
+        class message:
+            id = "mid-resv-sane"
+        class source:
+            group_id = "Gresve2e"
+            user_id = "U1"
+            type = "group"
+
+    def setUp(self):
+        self._bak = (app.extract_reservation, app._reply_with_mention, app.get_display_name,
+                     app.RESV_GROUPS, app.BAR_GROUP_ID, app.STAFF_GROUP_ID,
+                     app.line_bot_api.reply_message, app.line_bot_api.push_message)
+        self.replies, self.cards = [], []
+        app._reply_with_mention = lambda ev, t: self.replies.append(t)
+        app.get_display_name = lambda src: "ดอย"
+        app.RESV_GROUPS = [self.GID]
+        app.BAR_GROUP_ID = self.GID
+        app.STAFF_GROUP_ID = self.GID
+        app.line_bot_api.reply_message = lambda tok, msgs: self.cards.append(msgs)
+        app.line_bot_api.push_message = lambda gid, msgs: self.cards.append(msgs)
+        app._resv_draft_clear(self.GID)
+        self._clear()
+
+    def tearDown(self):
+        (app.extract_reservation, app._reply_with_mention, app.get_display_name,
+         app.RESV_GROUPS, app.BAR_GROUP_ID, app.STAFF_GROUP_ID,
+         app.line_bot_api.reply_message, app.line_bot_api.push_message) = self._bak
+        app._resv_draft_clear(self.GID)
+        self._clear()
+
+    def _clear(self):
+        with app._db() as conn:
+            conn.execute("DELETE FROM reservations WHERE origin_group_id=?", (self.GID,))
+            conn.commit()
+
+    def _rows(self):
+        with app._db() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM reservations WHERE origin_group_id=?", (self.GID,)).fetchall()]
+
+    def _run(self, resv_date, text="จองคุณโอม 5 ท่าน โต๊ะ B10 1 ทุ่ม", time_hhmm="19:00"):
+        app.extract_reservation = lambda t: {
+            "is_reservation": True, "is_advance": True, "customer": "คุณโอม",
+            "people": "5 ท่าน", "table": "B10", "time_hhmm": time_hhmm, "resv_date": resv_date}
+        self._Ev.message.id = f"mid-{uuid.uuid4().hex}"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app.handle_reservation_text(self._Ev(), text, self.GID)
+        return buf.getvalue()
+
+    def test_ปีเพี้ยน2ปี_ต้องถามวันที่_ไม่บันทึก(self):
+        d = datetime.now(app.TZ).date()
+        self._run(d.replace(year=d.year - 2).isoformat())
+        self.assertEqual(self._rows(), [], "วันเพี้ยนต้องยังไม่บันทึก")
+        self.assertTrue(self.replies, "ห้ามเงียบ — ต้องถามกลับ")
+        self.assertIn("วันไหน", self.replies[-1], "ต้องถามวันที่ให้ชัด")
+
+    def test_ล่วงหน้าไกลเกินจริง_ต้องถามวันที่(self):
+        self._run((datetime.now(app.TZ).date() + timedelta(days=900)).isoformat())
+        self.assertEqual(self._rows(), [])
+        self.assertIn("วันไหน", self.replies[-1])
+
+    def test_จองพรุ่งนี้ปกติ_ต้องบันทึกได้ตามเดิม(self):
+        """ทิศกลับ: ด่านต้องไม่กินของจริง (จองล่วงหน้าปกติต้องผ่านและได้การ์ด)"""
+        want = (datetime.now(app.TZ).date() + timedelta(days=1)).isoformat()
+        self._run(want)
+        rows = self._rows()
+        self.assertEqual(len(rows), 1, "จองปกติต้องบันทึก")
+        self.assertEqual(rows[0]["resv_date"], want)
+        self.assertTrue(self.cards, "ต้องมีการ์ดจองออกไป")
+
+    def test_เดี๋ยวมา_วันเพี้ยน_ต้องกลายเป็นวันนี้_ไม่ต้องถาม(self):
+        """'เดี๋ยวมา' บอกชัดว่ามาวันนี้ → ทับด้วยวันนี้ได้เลย ไม่ต้องกวนถาม"""
+        self._run((datetime.now(app.TZ).date() - timedelta(days=500)).isoformat(),
+                  text="จองคุณโอม 5 ท่าน โต๊ะ B10 เดี๋ยวมา", time_hhmm=None)
+        rows = self._rows()
+        self.assertEqual(len(rows), 1, f"ต้องบันทึกได้ (ตอบกลับ: {self.replies})")
+        self.assertEqual(rows[0]["resv_date"], datetime.now(app.TZ).date().isoformat())
+
+
+class TestPayablePaymentSlipDatetimeSanity(unittest.TestCase):
+    """เส้นเจ้าหนี้: ช่อง slip_datetime เคยเก็บวันเวลาจาก AI ตรงๆ ไม่ผ่านด่านเลย
+
+    เจอตอนไล่ตาข่ายวันที่ทุกเส้น (17 ก.ย. 26) — เส้นสลิปรายรับมี `_sane_slip_dt` แล้ว (§3.25)
+    แต่เส้นจ่ายเจ้าหนี้ยังส่ง `info['datetime']` ดิบๆ ลง DB · วันผิดในบัญชีเงิน = หลักฐานผิด"""
+
+    ACCT = "Gpayslipdt"
+
+    def tearDown(self):
+        with app._db() as conn:
+            conn.execute("DELETE FROM payable_payments WHERE group_id=?", (self.ACCT,))
+            conn.commit()
+
+    def _dt(self, rid):
+        with app._db() as conn:
+            return conn.execute("SELECT slip_datetime FROM payable_payments WHERE id=?", (rid,)).fetchone()["slip_datetime"]
+
+    def test_วันเวลาเพี้ยน_ต้องเก็บเป็น_NULL(self):
+        bad = "2024-09-17T12:59:00"
+        rid = app.save_payable_payment(self.ACCT, 350, slip_dt=app._sane_slip_dt(bad))
+        self.assertIsNone(self._dt(rid), f"ห้ามเก็บ {bad} — เป็นปีที่อ่านเพี้ยน")
+
+    def test_วันเวลาจริง_ต้องเก็บตามนั้น(self):
+        good = datetime.now(app.TZ).strftime("%Y-%m-%dT%H:%M:%S")
+        rid = app.save_payable_payment(self.ACCT, 350, slip_dt=app._sane_slip_dt(good))
+        self.assertEqual(self._dt(rid), good)
+
+    def test_เส้นบันทึกจ่ายต้องเรียกด่านก่อนเก็บ(self):
+        """เทสต์ข้างบนเรียกด่านเอง — อันนี้ยืนยันว่า 'โค้ดจริง' ก็เรียก ไม่ใช่แค่เทสต์"""
+        import inspect
+        src = inspect.getsource(app._process_payable_image)
+        self.assertIn("slip_dt=_sane_slip_dt(", src,
+                      "เส้นจ่ายเจ้าหนี้ต้องกรองวันเวลาบนสลิปก่อนลง DB")

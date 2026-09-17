@@ -139,6 +139,9 @@ RESV_TODAY_SUMMARY_HOUR   = int(os.environ.get("RESV_TODAY_SUMMARY_HOUR", "16"))
 RESV_REPORT_DAYS   = int(os.environ.get("RESV_REPORT_DAYS", "7"))
 # ลบข้อมูลเก่าอัตโนมัติ (วันละครั้ง) กัน DB บวม
 RESV_KEEP_DAYS     = int(os.environ.get("RESV_KEEP_DAYS", "15"))  # จองที่ผ่านวันมาแล้ว เก็บ 15 วัน
+# กรอบ "วันจองที่เป็นไปได้" — จองคือเรื่องอนาคต: ย้อนหลังได้แค่ข้ามคืน ล่วงหน้าได้ไม่เกิน 1 ปี
+RESV_PAST_GRACE_DAYS = int(os.environ.get("RESV_PAST_GRACE_DAYS", "1"))   # พิมพ์ '29/8' ตอนดึกของ 30/8 ยังถือว่าปกติ
+RESV_AHEAD_MAX_DAYS  = int(os.environ.get("RESV_AHEAD_MAX_DAYS", "365"))  # ไกลกว่านี้ = AI คิดปีเพี้ยน
 MISS_KEEP_DAYS     = int(os.environ.get("MISS_KEEP_DAYS", "14"))  # ตัวนับรูปตกหล่น เก็บ 14 วัน
 SLIP_KEEP_DAYS     = int(os.environ.get("SLIP_KEEP_DAYS", "60"))  # สลิป เก็บ 60 วัน
 # เวลาเปิดร้าน (ชั่วโมง) สำหรับตรวจเวลาจอง — เปิด 11:00 ถึง 00:00 (เที่ยงคืน)
@@ -3221,7 +3224,8 @@ def _process_payable_image(event, group_id: str):
         print(f"[payable] ✅ บันทึกจ่าย {amount:,.2f} ตัดให้บิล {pay_for or '-'} "
               f"ref={ref or '-'} group={group_id}", flush=True)
         save_payable_payment(acct, amount, sender=info.get("sender"),
-                             ref_number=ref, slip_dt=info.get("datetime"),
+                             # วันเวลาบนสลิปต้องผ่านด่านเดียวกับเส้นสลิปรายรับ (§3.25) ไม่งั้นปีเพี้ยนลง DB ได้
+                             ref_number=ref, slip_dt=_sane_slip_dt(info.get("datetime")),
                              doc_date=doc_date, allocated=allocated, settle_note=settle_note)
         # มีการจ่าย → เด้ง 'สรุปหนี้' ทุกครั้ง (กลุ่ม 1 ไม่มียอดรวม / กลุ่ม 2 มียอดรวม) แล้วลบบรรทัดที่จ่ายครบ (รอบหน้าหาย)
         _payable_push_summary(event, group_id, acct, cleanup=True)
@@ -4649,7 +4653,9 @@ def _within_open_hours(tmin: int) -> bool:
 def save_reservation(origin_group_id: str, requested_by: str, info: dict, raw_text: str,
                      notify_group_id: str) -> int:
     created_at = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-    resv_date = info.get("resv_date") if _valid_ymd(info.get("resv_date")) else None
+    # ตาข่ายเส้นสุดท้ายก่อนลง DB: วันจองที่ "เป็นไปไม่ได้" ห้ามลง (ดู _sane_resv_date)
+    # ถ้าถึงตรงนี้แล้วยังไม่สมเหตุผล = มีเส้นทางที่ข้ามด่านฝั่ง handler มา → เก็บเป็น NULL ดีกว่าเก็บวันผิด
+    resv_date = _sane_resv_date(info.get("resv_date"))
     with _db() as conn:
         rid = conn.insert_returning_id(
             "INSERT INTO reservations "
@@ -4671,7 +4677,7 @@ def _find_dup_reservation(info) -> dict:
     cust = (info.get("customer") or "").strip()
     if not cust:
         return None   # ไม่มีชื่อลูกค้า → ตัดสินไม่ได้ว่าซ้ำ ปล่อยผ่าน
-    rd = info.get("resv_date") if _valid_ymd(info.get("resv_date")) else datetime.now(TZ).date().isoformat()
+    rd = _sane_resv_date(info.get("resv_date")) or datetime.now(TZ).date().isoformat()
     try:
         with _db() as conn:
             row = conn.execute(
@@ -4694,6 +4700,37 @@ def _valid_ymd(s) -> bool:
         return True
     except Exception:
         return False
+
+
+def _sane_resv_date(rd):
+    """รับ 'วันที่จอง' เฉพาะที่เป็นไปได้ — คืน None ถ้าไม่สมเหตุผล (= ยังไม่รู้วัน → ต้องถามกลับ)
+
+    จองคือเรื่อง **อนาคต**: ย้อนหลังได้แค่ RESV_PAST_GRACE_DAYS วัน (พิมพ์ '29/8' ตอนดึกของ 30/8)
+    และล่วงหน้าไม่เกิน RESV_AHEAD_MAX_DAYS วัน
+
+    ⚖️ ของเดิมเส้นจองตรวจแค่ `_valid_ymd` = **รูปแบบถูก** เท่านั้น ไม่ได้ตรวจว่า 'เป็นไปได้ไหม'
+    ต่างจากเส้นเจ้าหนี้ (`_sane_doc_date` §3.12) และเส้นสลิป (`_sane_slip_dt` §3.25)
+    → ถ้า AI คิดปี/เดือนเพี้ยน (เช่น พ.ศ.→ค.ศ. พลาด ได้ 2024 หรือ '16/7' ของปีที่แล้ว) วันนั้นลง DB ได้สบาย
+    แล้ว **จองหายเงียบ 2 ทาง**:
+      1) วันอยู่ในอดีต → ไม่โผล่ในสรุป 'จองวันนี้' (query resv_date = วันนี้) และ `_cleanup_old_data`
+         ลบทิ้งทันทีที่เก่าเกิน RESV_KEEP_DAYS (ปีเพี้ยน = โดนลบรอบถัดไปเลย)
+      2) วันอยู่อนาคตไกล → ไม่โผล่ทั้งสรุปวันนี้และวันงานจริง
+    ทั้งสองทาง **ไม่มีใครได้ยินเสียงอะไรเลย** — พนักงานเห็นการ์ดเด้งก็คิดว่าจองเข้าแล้ว
+    📌 เพราะงั้นตรงนี้ต้องคืน None ไม่ใช่ 'เดาเป็นวันนี้': ปลายทาง (`handle_reservation_text`)
+       จะถามวันที่กลับให้ชัด — จองผิดวันแย่กว่าถามเพิ่มหนึ่งคำถาม"""
+    if not _valid_ymd(rd):
+        return None
+    try:
+        d = datetime.strptime(str(rd), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    today = datetime.now(TZ).date()
+    delta = (d - today).days
+    if delta < -RESV_PAST_GRACE_DAYS or delta > RESV_AHEAD_MAX_DAYS:
+        print(f"[resv] ⚠️ วันจอง {rd!r} เป็นไปไม่ได้ (ห่างจากวันนี้ {delta} วัน) "
+              f"→ ทิ้งวันนั้น แล้วถามวันที่กลับ (กันจองตกไปอยู่วันที่ไม่มีใครเห็น)", flush=True)
+        return None
+    return rd
 
 
 def get_reservation(resv_id: int) -> dict:
@@ -4811,7 +4848,7 @@ def handle_reservation_text(event, text: str, group_id: str):
         info["time_hhmm"] = datetime.now(TZ).strftime("%H:%M")
         info["is_advance"] = False
         info["date"] = info.get("date") or "วันนี้"
-        if not _valid_ymd(info.get("resv_date")):
+        if not _sane_resv_date(info.get("resv_date")):   # ไม่มีวัน/วันเพี้ยน → ทับด้วยวันนี้ (ข้อความบอกชัดว่ามาเลย)
             info["resv_date"] = datetime.now(TZ).date().isoformat()
         print(f"[resv] 'ซักครู่/เดี๋ยว/กำลังมา' = จองตอนนี้ → เวลา {info['time_hhmm']} วันนี้", flush=True)
 
@@ -4832,6 +4869,12 @@ def handle_reservation_text(event, text: str, group_id: str):
         print(f"[resv] ใช้วันที่ที่เขียนมาในข้อความ {_td} (AI ให้ {info.get('resv_date')}) group={group_id}", flush=True)
         info["resv_date"] = _td
         info["is_advance"] = _td != datetime.now(TZ).date().isoformat()
+
+    # ── ด่านวันจอง: "รูปแบบถูก" ไม่พอ ต้อง "เป็นไปได้" ด้วย ──
+    # วันจองที่เพี้ยนไปอดีต/อนาคตไกล = จองหายเงียบ (ไม่โผล่สรุปวันนี้ + cleanup ลบทิ้ง) ดู _sane_resv_date
+    # ทิ้งวันนั้นแล้วปล่อยให้ตกไปที่ missing 'date' ข้างล่าง = ถามวันที่กลับ — ห้ามเดาเป็นวันนี้เอง
+    if info.get("resv_date") and not _sane_resv_date(info["resv_date"]):
+        info["resv_date"] = None
 
     # ไม่มีคำว่า คน/ท่าน/จำนวน ในข้อความเลย แต่ AI ให้จำนวนคนมา = น่าจะหยิบเลขโต๊ะมา → ทิ้ง แล้วถามแทน
     if info.get("people") and not _people_is_trustworthy(eff_text):
