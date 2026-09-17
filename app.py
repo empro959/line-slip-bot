@@ -4146,6 +4146,43 @@ def _report_dest(group_id: str) -> str:
     return REPORT_REDIRECT.get(group_id, group_id)
 
 
+def _report_targets() -> list:
+    """กลุ่มที่ต้องได้รายงานสรุป 00:30 — จากตาราง `groups` (กลุ่มที่เคยมีสลิป/บิลเข้ามา)
+    ข้ามกลุ่มที่บอทถูกเตะออก (`_group_left`) / สั่งเมิน (IGNORE_GROUPS) / ปิดรายงาน / ปิดสลิป
+    / กลุ่มบัญชีเจ้าหนี้ (มีสรุปหนี้ของตัวเองอยู่แล้ว) — กันค้าง retry/สแปม
+
+    🪤 เคสจริง §3.16: **บรรทัด "สัญญาณชีพคอนเทนต์" ไม่เคยโผล่เลยตั้งแต่ทำมา (7 ก.ย.)**
+      ตอนแรกเดาว่า env ตั้งไม่ครบ — **เดาผิด** เจ้าของเปิด Render ให้ดู 17 ก.ย. แล้วเห็นว่าตั้งครบทั้ง
+      `CONTENT_HEARTBEAT_GROUP` และ `CONTENT_HEARTBEAT_URL`
+      ต้นเหตุจริงอยู่ที่ดีไซน์: สัญญาณชีพ **อาศัย "รายงานของกลุ่มนั้น" เป็นพาหนะ**
+      (`build_daily_report` ต่อท้ายเมื่อ `group_id == CONTENT_HEARTBEAT_GROUP`)
+      แต่ห้องคอนเทนต์ **ไม่เคยส่งสลิป** → ไม่มีแถวในตาราง `groups` → ไม่เคยเป็นเป้ารายงาน
+      → พาหนะไม่มีอยู่จริง = ฟีเจอร์เงียบสนิทมา 10 วันโดยไม่มี log บอกอะไรเลย
+    📌 บทเรียน: ฟีเจอร์ที่เกาะพาหนะของคนอื่น ต้องเช็คว่า "พาหนะนั้นวิ่งจริงไหม" ไม่ใช่แค่ตั้งค่าครบ"""
+    with _db() as conn:
+        group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
+    targets = [g for g in group_ids
+               if _slip_enabled(g) and not _group_left(g)
+               and g not in IGNORE_GROUPS and g not in PAYABLE_GROUPS
+               and not _report_off(g)]
+    # กลุ่มสัญญาณชีพต้องได้รายงานเสมอ แม้ไม่มีสลิปในกลุ่มนั้นสักใบ
+    # (`build_daily_report` มีขา "ไม่มีสลิป" ที่ยังต่อบรรทัดสัญญาณชีพให้อยู่แล้ว)
+    _hb = CONTENT_HEARTBEAT_GROUP
+    if _hb and CONTENT_HEARTBEAT_URL and _hb not in targets:
+        _why = ("บอทถูกเตะออกจากกลุ่ม" if _group_left(_hb) else
+                "อยู่ใน IGNORE_GROUPS" if _hb in IGNORE_GROUPS else
+                "สั่งปิดรายงานไว้" if _report_off(_hb) else
+                "สั่งปิดสลิปไว้" if not _slip_enabled(_hb) else None)
+        if _why:
+            # ด่านที่ตัดออกต้องบอกเหตุ (บทเรียน §3.26) ไม่งั้นเงียบแบบเดิมอีกรอบ
+            print(f"[heartbeat] ⚠️ กลุ่ม {_hb[:10]}… ไม่ได้รับรายงาน ({_why}) → สัญญาณชีพไม่ออก", flush=True)
+        else:
+            targets.append(_hb)
+            print(f"[heartbeat] กลุ่ม {_hb[:10]}… ไม่เคยมีสลิปเข้า (ไม่มีในตาราง groups) "
+                  f"→ เพิ่มเข้าเป้ารายงานเอง เพื่อให้สัญญาณชีพมีพาหนะ", flush=True)
+    return targets
+
+
 def maybe_send_daily_report():
     """ส่งรายงานสรุป 'ของเมื่อวาน' เมื่อเลย 00:30 เวลาไทย วันละครั้ง
     เรียกได้บ่อย (จากทุก /health ping + thread สำรอง) — กันส่งซ้ำด้วย last_report_date + lock จึงทนรีสตาร์ท/หลาย thread
@@ -4159,13 +4196,7 @@ def maybe_send_daily_report():
         if _get_meta("last_report_date") == today:
             return
         yesterday = (now.date() - timedelta(days=1)).isoformat()
-        with _db() as conn:
-            group_ids = [r["group_id"] for r in conn.execute("SELECT group_id FROM groups").fetchall()]
-        # ข้ามกลุ่มที่บอทถูกเตะออก (_group_left) / สั่งเมิน (IGNORE_GROUPS) / สั่งปิดรายงาน/ปิดสลิป — กันค้าง retry/สแปม
-        targets = [g for g in group_ids
-                   if _slip_enabled(g) and not _group_left(g)
-                   and g not in IGNORE_GROUPS and g not in PAYABLE_GROUPS
-                   and not _report_off(g)]
+        targets = _report_targets()
         print(f"[report] trigger {today} → ส่งรายงานวันที่ {yesterday} ให้ {len(targets)} กลุ่ม", flush=True)
         failed = 0
         # idempotent รายกลุ่ม: กลุ่มที่ส่งสำเร็จแล้ววันนี้จะไม่ส่งซ้ำ แม้กลุ่มอื่นพลาดแล้วต้อง retry
