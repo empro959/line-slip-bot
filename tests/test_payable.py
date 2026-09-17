@@ -3373,3 +3373,79 @@ class TestDupAlertWording(unittest.TestCase):
         self.assertIn("ตัดต่อ", adm)
         self.assertIn("🚨", adm)
         self.assertNotIn("ไม่ต้องทำอะไร", adm)
+
+
+class TestReconLogSaysWhatItSaw(unittest.TestCase):
+    """log ต้องบอกว่า 'เห็นรูปเป็นอะไร' ไม่ใช่แค่ 'ไม่ใช่สมุดจด'
+
+    🪤 เคสจริง 15-17 ก.ย. 26: log เขียนแค่ '[recon] ไม่ใช่สมุดจดมือ (ข้าม)'
+    → อ่านแล้วบอกไม่ได้ว่ารูปนั้นเป็นอะไร และทำไมถูกคัด
+    → แยกไม่ออกระหว่าง 'คัดถูก (ใบสั่งของ)' กับ 'คัดผิด (สมุดจดแท้)'
+    ไล่เหตุ 2 วันโดยต้องเดาทุกครั้ง แก้พรอมป์ตไป-กลับ 2 รอบ (§3.22 รัดแน่น → §3.24 คลาย)
+
+    📌 เครื่องมือวินิจฉัยที่ไม่บอกว่าเห็นอะไร = ต้องเดาต่อไปเรื่อยๆ"""
+
+    class _Ev:
+        reply_token = "tok"
+        class message:
+            id = "mid-saw"
+        class source:
+            group_id = "Gsaw"
+            user_id = "U1"
+            type = "group"
+
+    def setUp(self):
+        self._bak = (app.extract_ledger, app._recon_try_or_queue,
+                     app._reply_with_mention, app.line_bot_api.get_message_content)
+        app._recon_try_or_queue = lambda g, d, hw: None
+        app._reply_with_mention = lambda ev, t: None
+        app.line_bot_api.get_message_content = lambda mid: type(
+            "C", (), {"iter_content": lambda self: [b"img"]})()
+
+    def tearDown(self):
+        (app.extract_ledger, app._recon_try_or_queue,
+         app._reply_with_mention, app.line_bot_api.get_message_content) = self._bak
+
+    def _run(self, info):
+        app.extract_ledger = lambda b: info
+        self._Ev.message.id = f"mid-{uuid.uuid4().hex}"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app._process_recon_image(self._Ev(), "Gsaw")
+        return buf.getvalue()
+
+    def test_คัดออก_ต้องบอกว่าเห็นเป็นอะไร(self):
+        log = self._run({"is_ledger": False, "saw": "ใบสั่งซื้อของเขียนมือ"})
+        self.assertIn("ไม่ใช่สมุดจดมือ", log)
+        self.assertIn("ใบสั่งซื้อของเขียนมือ", log, "ต้องเห็นว่ารูปนั้นเป็นอะไร ไม่งั้นวินิจฉัยไม่ได้")
+
+    def test_AI_ไม่บอก_ก็ต้องรู้ว่าไม่บอก(self):
+        """ไม่มีข้อมูล ต้องเขียนว่าไม่มี — ไม่ใช่เว้นว่างให้เดาว่าลืม log"""
+        self.assertIn("(AI ไม่บอก)", self._run({"is_ledger": False}))
+
+    def test_รับเป็นสมุดจด_ต้องโชว์เลขที่อ่านได้(self):
+        """จับ 'อ่านเลขผิด' ได้ทันทีจาก log ไม่ต้องรอผลเทียบตอนเช้า"""
+        log = self._run({"is_ledger": True, "saw": "สมุดจดยอดรับรายวัน",
+                         "date": _d(0), "cash": 8391, "transfer": 67363, "card": 0})
+        self.assertIn("รับเป็นสมุดจด", log)
+        self.assertIn("8,391", log)
+        self.assertIn("67,363", log)
+
+    def test_พรอมป์ตต้องขอ_saw_ทุกครั้งแม้ไม่ใช่สมุด(self):
+        seen = {}
+
+        def _fake(parts, model=None, json_mode=False):
+            seen["p"] = parts[0]
+            raise RuntimeError("stop")
+
+        _orig = app._gemini_generate
+        app._gemini_generate = _fake
+        try:
+            app.extract_ledger(b"x")
+        except Exception:
+            pass
+        finally:
+            app._gemini_generate = _orig
+        p = seen.get("p", "")
+        self.assertIn('"saw"', p)
+        self.assertIn("แม้ is_ledger=false", p, "ต้องบังคับให้ตอบ saw แม้ตอบว่าไม่ใช่สมุด")
