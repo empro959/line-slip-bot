@@ -156,6 +156,19 @@
 
 ### 3.4 เส้นเชื่อม "ใครจำ URL/กุญแจใคร" — ไล่ให้ครบทุกครั้งที่ย้ายอะไร
 
+**URL แต่ละเส้น "เอามาจากไหน"** (ถามซ้ำ 18 ก.ย. — จดไว้ให้ค้นเจอครั้งเดียวจบ):
+
+| URL / env | ต้นทางที่ไปเอามา |
+|---|---|
+| `CONTENT_HEARTBEAT_URL` | **ห้องคอนเทนต์ส่งให้เจ้าของเอง** — ไม่ได้เอามาจากเว็บไหน · ตัว endpoint เป็น Apps Script เว็บแอปของฝั่งคอนเทนต์ (`script.google.com/macros/s/AK…/exec`) · **มีรหัสลับต่อท้าย → ห้ามวางในกล่องกลาง/ในรีโป/ในแชท ก๊อปใส่ Render ตรงๆ** (ตกลงกันไว้ใน PR #143) · เอาใหม่ได้ที่ Apps Script ตัวนั้น → ทำให้ใช้งาน (Deploy) → จัดการการติดตั้งใช้งาน → คัดลอก URL เว็บแอป |
+| Webhook ของ LINE OA | ตั้งที่ **LINE Developers Console** → Messaging API → Webhook URL · ตอนนี้ชี้ `line_bridge` (Apps Script ห้องคอนเทนต์) แล้ว forward เข้า `iq8e/callback` |
+| `SLIP_API_URL` (Apps Script → บอท) | **Render** → service `line-slip-bot-1-iq8e` → URL ด้านบนหน้า service + `/api/slip_daily?token=…` (token มาจาก env ของบอท) · ตั้งใน Script Properties ไม่ฝังในโค้ด |
+| `SYNC_URL` (บอท → Apps Script) | Apps Script ของร้าน → Deploy → Web app → `/exec` |
+| `DATABASE_URL` | **Supabase** (โปรเจกต์ `saiyangsoi4`) → Connect → Connection string |
+| `GEMINI_API_KEY` | **Google AI Studio / Cloud** ของบัญชีร้าน |
+| `RENDER_DEPLOY_HOOK` | **Render** → service → Settings → Deploy Hook (เก็บเป็น GitHub Secret) |
+
+
 ทุกครั้งที่ระบบพังเงียบในโปรเจกต์นี้ ต้นเหตุคือเส้นพวกนี้ชี้ไปที่เก่า:
 
 ```
@@ -698,7 +711,7 @@ URL ของ Apps Script ที่แจ้งกันรอบก่อน **
 
 ---
 
-## 3.16 🫀 สัญญาณชีพคอนเทนต์ต่อท้ายรายงาน 00:30 — เขียนเสร็จ 7 ก.ย. (PR #143 ยังไม่ merge)
+## 3.16 🫀 สัญญาณชีพคอนเทนต์ต่อท้ายรายงาน 00:30 — 7 ก.ย. 2026 (PR #143 merge แล้ว 7 ก.ย. · ดู §3.28 ว่าทำไมไม่เคยโผล่)
 
 **ปัญหาที่แก้:** ระบบคอนเทนต์เคย **ตายเงียบ 7 วัน** โดยไม่มีอะไรฟ้อง และรอบ 5 ก.ย. ก็เงียบอีกหลายวัน
 — เพราะ "ไม่มีข้อความออกมา" หน้าตาเหมือน "วันนี้ไม่มีอะไรเกิดขึ้น" เป๊ะ
