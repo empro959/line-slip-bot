@@ -172,10 +172,14 @@
 ทุกครั้งที่ระบบพังเงียบในโปรเจกต์นี้ ต้นเหตุคือเส้นพวกนี้ชี้ไปที่เก่า:
 
 ```
-LINE OA ── webhook ──→ line_bridge (Apps Script ห้องคอนเทนต์) ──forward──→ iq8e /callback
-   ⚠️ ยืนยันด้วยตา 19 ส.ค.: webhook = script.google.com/macros/s/AKfycb24qjDXw…/exec
-   ⚠️ = บอทร้านฝากทางเข้าไว้กับสคริปต์ของอีกห้อง · เขา deploy พลาดเมื่อไหร่ร้านดับ
-   ทางลด: app.py มี WEBHOOK_FORWARD_URLS (ปิดอยู่) ไว้สลับให้ Render เป็นทางเข้าแทน
+LINE OA ── webhook ──→ iq8e /callback ── fan-out (WEBHOOK_FORWARD_URLS) ──→ line_bridge
+   ✅ สลับทิศแล้ว 5-7 ก.ย. 2569 — **Render เป็นทางเข้า** ไม่ได้ฝากทางเข้าไว้กับสคริปต์ห้องอื่นแล้ว
+   ✅ WEBHOOK_FORWARD_URLS = **ตั้งแล้ว** (7 ก.ย. ~15:53) = URL ของ bridge + `?src=render`
+   ✅ ฝั่ง bridge ตั้ง STANDALONE = true → ไม่ forward กลับ (กันลูป 2 ชั้นคู่กับ ?src=render)
+   ℹ️ 20 ก.ย. ห้องคอนเทนต์แจ้งว่า deployment ที่ LINE เคยยิงคือ `AKfycbz4qjDX…`
+      (**ตัวที่ 7 เป็น z ไม่ใช่เลข 2** — ของที่เขียนไว้ในไฟล์นี้เดิมเป็น `AKfycb24qjDX…` ผิด)
+      ค่าที่ใช้จริงตอนนี้อยู่ใน env `WEBHOOK_FORWARD_URLS` ที่ Render — ถ้าต้องตั้งใหม่ ก๊อปจากที่นั่น
+      หรือขอจากห้องคอนเทนต์ **อย่าพิมพ์จากเอกสารนี้**
 UptimeRobot ── ping ────────→ iq8e /health
 Apps Script ── SLIP_API_URL ─→ iq8e (มี token ฝังใน property)
 บอท ────────── SYNC_URL ────→ Apps Script /exec
