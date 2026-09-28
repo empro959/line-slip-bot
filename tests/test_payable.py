@@ -3954,3 +3954,84 @@ class TestReconImageKeepsUnknownChannel(unittest.TestCase):
         log = self._run({"is_ledger": True, "date": _d(1), "cash": 0, "transfer": 0, "card": 0})
         self.assertEqual(self.queued, [])
         self.assertIn("ทุกช่องเป็น 0", log)
+
+
+class TestReconImpossibleRead(unittest.TestCase):
+    """อ่านยอดจากสมุดผิดช่อง → ห้ามกลายเป็นคำเตือน "เงินไม่ตรงหกหมื่น"
+
+    🪤 เคสจริง 28 ก.ย. 26 (เจ้าของทักว่า "รายงานขัดแย้งกันเองนะ"):
+        1) เงินสด  จด 55,214 · POS 5,465  → จดมากกว่า POS 49,749
+        2) เงินโอน จด 54,215 · POS 43,623 → จดมากกว่า POS 10,592
+        ส่วนต่างสุทธิ +60,341
+      ของจริงในสมุดแถวนั้น: สด −5,465 · โอน 43,623 = **ตรงกับ POS เป๊ะทั้งคู่**
+      AI หยิบเลขจาก 2 คอลัมน์ขวา (ฝั่งจ่าย/ยอดรวม) มาแทนคอลัมน์ 'รับ สด/โอน'
+
+    ⚖️ ด่านเดิมเช็ค "ทีละช่องเกินยอดขายไหม" — เคสนี้แต่ละช่องไม่ถึง (55,214 · 54,215 < 57,289)
+       **แต่รวมกัน 109,429 = 1.9 เท่าของยอดขายทั้งวัน** → หลุดด่านไปเป็นคำเตือนที่ไม่จริง
+    📌 ตระกูลเดิม (§3.19 · §3.22 · §3.29): สัญญาณหลอกเรื่องเงินแย่กว่าไม่เตือน"""
+
+    GID = "Greconimp"
+    POS = {"cash": 5465, "transfer": 43623, "card": 7260, "sales": 57289}
+
+    def setUp(self):
+        self._bak = app._push
+        self.pushed = []
+        app._push = lambda gid, msg: self.pushed.append(getattr(msg, "text", ""))
+
+    def tearDown(self):
+        app._push = self._bak
+
+    def _emit(self, hw, pos=None):
+        self.pushed.clear()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app._recon_emit(self.GID, _d(1), hw, dict(pos or self.POS))
+        return (self.pushed[-1] if self.pushed else ""), buf.getvalue()
+
+    def test_เคสจริง_28_กย_ห้ามบอกว่าเงินไม่ตรง(self):
+        msg, log = self._emit({"cash": 55214.0, "transfer": 54215.0, "card": None})
+        self.assertNotIn("จดมือ vs POS ไม่ตรง", msg, "นี่คือคำเตือนที่ผิดในเคสจริง")
+        self.assertNotIn("จดมากกว่า POS", msg)
+        self.assertIn("ไม่ถูกช่อง", msg, "ต้องบอกว่าอ่านผิดช่อง")
+        self.assertIn("ไม่เทียบ", log)
+
+    def test_ต้องโชว์เลขที่อ่านได้_และเหตุผลที่รู้ว่าผิด(self):
+        """ไม่โชว์ = เจ้าของไล่ไม่ได้ว่าบอทไปหยิบช่องไหนมา (บทเรียน §3.26)"""
+        msg, _ = self._emit({"cash": 55214.0, "transfer": 54215.0, "card": None})
+        self.assertIn("55,214", msg)
+        self.assertIn("54,215", msg)
+        self.assertIn("1.9 เท่า", msg)
+        self.assertIn("57,289", msg, "ต้องโชว์ยอดขายที่ใช้เทียบด้วย")
+
+    def test_ต้องโชว์เลข_POS_ให้เทียบเองได้ทันที(self):
+        msg, _ = self._emit({"cash": 55214.0, "transfer": 54215.0, "card": None})
+        self.assertIn("43,623", msg, "โชว์ POS ไว้ เจ้าของจะเห็นเองว่าสมุดตรงอยู่แล้ว")
+
+    def test_ค่าติดลบ_ก็เป็นไปไม่ได้(self):
+        """หน้าสมุดหน้านี้เขียน สด เป็น −5,465 จริง — ถ้า AI หยิบมาตรงๆ ห้ามเทียบ"""
+        msg, _ = self._emit({"cash": -5465.0, "transfer": 43623.0, "card": None})
+        self.assertIn("ติดลบ", msg)
+        self.assertNotIn("จดน้อยกว่า POS", msg)
+
+    # ── ทิศกลับ: ห้ามกลืนเคสที่ "ไม่ตรงจริง" ─────────────────────────────
+    def test_ไม่ตรงจริงเล็กน้อย_ต้องยังเตือนเหมือนเดิม(self):
+        msg, _ = self._emit({"cash": 6000.0, "transfer": 43623.0, "card": 7260.0})
+        self.assertIn("ไม่ตรง", msg, "ส่วนต่างจริงต้องยังดัง")
+        self.assertIn("เงินสด", msg)
+
+    def test_รวมเกินนิดเดียว_ยังอยู่ในเกณฑ์_ต้องเตือนปกติ(self):
+        """เกินยอดขาย 5% ยังเป็นไปได้ (เศษ/ต่างช่วงเวลา) — ห้ามเหมาว่าอ่านผิด"""
+        pos = dict(self.POS, sales=50000)
+        msg, _ = self._emit({"cash": 5465.0, "transfer": 43623.0, "card": 3000.0}, pos)
+        self.assertIn("ไม่ตรง", msg)
+
+    def test_ไม่รู้ยอดขาย_ต้องไม่ฟันธงว่าอ่านผิด(self):
+        """ไม่มี pos_sales = ตัดสินไม่ได้ → ต้องเทียบตามปกติ ไม่ใช่เหมาว่าผิด"""
+        pos = dict(self.POS, sales=0)
+        msg, _ = self._emit({"cash": 55214.0, "transfer": 54215.0, "card": None}, pos)
+        self.assertIn("ไม่ตรง", msg)
+
+    def test_ตรงกันพอดี_ต้องยังเงียบ(self):
+        msg, log = self._emit({"cash": 5465.0, "transfer": 43623.0, "card": 7260.0})
+        self.assertEqual(msg, "")
+        self.assertIn("ตรง", log)
