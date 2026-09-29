@@ -3956,6 +3956,96 @@ class TestReconImageKeepsUnknownChannel(unittest.TestCase):
         self.assertIn("ทุกช่องเป็น 0", log)
 
 
+class TestGeminiErrorTipMatchesCause(unittest.TestCase):
+    """ข้อความเตือนแอดมินต้องบอก "เหตุจริง" — ไม่ใช่เหมาว่าโควตาหมดทุกเคส
+
+    🪤 เคสจริง 23 ก.ย. 26: Gemini คืน 503 'This model is currently experiencing high demand'
+      บอทเตือนว่า *"น่าจะเป็นโควต้า Gemini ฟรีหมดรายวัน → พิจารณาเปิดบิลลิ่ง"*
+      → **วินิจฉัยผิด** · 503 = ฝั่ง Google ล้น ไม่ใช่โควตาเรา · เปิดบิลลิ่งไม่ช่วยเลย
+      ถ้าเจ้าของเชื่อตามก็เสียเงินฟรีโดยที่อาการไม่หาย
+
+    ⚖️ 503 (ปลายทางล้น · รอแล้วหาย) กับ 429 (โควตาบัญชีเรา · เปิดบิลลิ่งช่วยจริง)
+       คนละเหตุคนละวิธีแก้ — ห้ามรวมเป็นข้อความเดียว"""
+
+    ERR_503 = ("503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently "
+               "experiencing high demand. Spikes in demand are usually temporary. "
+               "Please try again later.', 'status': 'UNAVAILABLE'}}")
+    ERR_429 = ("429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'Quota exceeded for "
+               "quota metric generate_requests_per_model_per_day', 'status': 'RESOURCE_EXHAUSTED'}}")
+    ERR_CREDIT = ("429 RESOURCE_EXHAUSTED. {'error': {'message': 'Your prepay credit balance is "
+                  "depleted. Please add credits.', 'status': 'RESOURCE_EXHAUSTED'}}")
+    @staticmethod
+    def _err_gone():
+        """ต้องเป็น LineBotApiError จริง — `_is_content_gone` ดู isinstance + status_code
+        (เทสต์ด้วยสตริงเปล่าๆ จะไม่เข้าด่านนี้ = เทสต์ผ่านแบบหลอกตัวเอง)"""
+        from linebot.models.error import Error
+        return app.LineBotApiError(status_code=410, headers={}, request_id="r",
+                                   accepted_request_id=None, error=Error(message="content is gone"))
+
+    def setUp(self):
+        self._bak = (app._push, app.ADMIN_USER_ID, app._last_admin_error_ts)
+        self.sent = []
+        app._push = lambda uid, msg: self.sent.append(getattr(msg, "text", ""))
+        app.ADMIN_USER_ID = "Uadmin"
+
+    def tearDown(self):
+        (app._push, app.ADMIN_USER_ID, app._last_admin_error_ts) = self._bak
+
+    def _tip(self, err):
+        app._last_admin_error_ts = 0          # ปลดดีบาวน์ 30 นาที
+        self.sent.clear()
+        app.notify_admin_error("Gtest", err)
+        self.assertTrue(self.sent, "ต้องมีข้อความเตือนออกไป")
+        return self.sent[-1]
+
+    # ── ตัวแยกเหตุ ──────────────────────────────────────────────────────────
+    def test_แยก_503_ออกจาก_429_ได้(self):
+        self.assertTrue(app._is_model_overloaded(self.ERR_503))
+        self.assertFalse(app._is_model_overloaded(self.ERR_429))
+        self.assertTrue(app._is_rate_limited(self.ERR_429))
+        self.assertFalse(app._is_rate_limited(self.ERR_503))
+
+    # ── เคสจริงที่เป็นเหตุให้แก้ ────────────────────────────────────────────
+    def test_เคสจริง_503_ห้ามบอกว่าโควตาหมด_ห้ามชวนเปิดบิลลิ่ง(self):
+        t = self._tip(self.ERR_503)
+        self.assertNotIn("โควต้า", t, "503 ไม่ใช่โควตาหมด")
+        self.assertNotIn("โควตาเราหมด", t.replace("ไม่ใช่โควตาเราหมด", ""), "ห้ามสรุปว่าโควตาหมด")
+        self.assertNotIn("พิจารณาเปิดบิลลิ่ง", t, "เปิดบิลลิ่งไม่ช่วยเคส 503 = แนะนำให้เสียเงินฟรี")
+        self.assertIn("503", t)
+        self.assertIn("ไม่ช่วย", t, "ต้องบอกตรงๆ ว่าเปิดบิลลิ่งไม่ช่วย")
+
+    def test_503_ต้องบอกว่าลองซ้ำให้แล้วกี่รอบ(self):
+        """เจ้าของต้องรู้ว่าบอทพยายามแล้ว ไม่ใช่ยอมแพ้ตั้งแต่ครั้งแรก"""
+        t = self._tip(self.ERR_503)
+        self.assertIn(str(app.SLIP_RETRY_MAX), t)
+        self.assertIn(str(app.SLIP_RETRY_DELAY), t)
+
+    # ── ทิศกลับ: 429 จริงต้องยังแนะนำบิลลิ่งเหมือนเดิม ──────────────────────
+    def test_429_จริง_ต้องยังแนะนำบิลลิ่ง(self):
+        t = self._tip(self.ERR_429)
+        self.assertIn("429", t)
+        self.assertIn("บิลลิ่ง", t, "เคสนี้เปิดบิลลิ่งช่วยได้จริง ห้ามตัดคำแนะนำทิ้ง")
+
+    def test_เครดิตหมด_ต้องไม่ถูกด่าน_429_ใหม่แย่งไป(self):
+        """เครดิต prepay หมด = ต้องเติมเงิน คนละเรื่องกับ rate-limit — ด่านเครดิตต้องมาก่อน"""
+        t = self._tip(self.ERR_CREDIT)
+        self.assertIn("เครดิต", t)
+        self.assertIn("เติม", t)
+
+    def test_รูปหาย_410_ต้องไม่โทษ_Gemini_เหมือนเดิม(self):
+        t = self._tip(self._err_gone())
+        self.assertIn("ไม่เกี่ยวกับ Gemini", t)
+
+    # ── สิ่งที่เจ้าของอยากรู้ที่สุด: เงินหายไหม ─────────────────────────────
+    def test_ทุกเคสฝั่ง_Gemini_ต้องบอกว่าสลิปไม่หาย(self):
+        for err in (self.ERR_503, self.ERR_429, self.ERR_CREDIT):
+            t = self._tip(err)
+            self.assertIn("ไม่หาย", t, f"ต้องตอบคำถาม 'เงินหายไหม' ทุกครั้ง: {err[:40]}")
+            self.assertIn("กู้สลิป", t, "ต้องบอกวิธีกู้เองด้วย")
+
+    def test_รูปหาย_410_ไม่ต้องพูดเรื่องกู้สลิป(self):
+        """รูปหมดอายุไปแล้ว กู้ไม่ได้จริง — บอกว่ากู้ได้จะเป็นการหลอก"""
+        self.assertNotIn("ตัวกู้จะย้อนอ่าน", self._tip(self._err_gone()))
 class TestReconImpossibleRead(unittest.TestCase):
     """อ่านยอดจากสมุดผิดช่อง → ห้ามกลายเป็นคำเตือน "เงินไม่ตรงหกหมื่น"
 
