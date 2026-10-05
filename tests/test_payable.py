@@ -2092,6 +2092,20 @@ class TestResvLabelShowsRealDate(unittest.TestCase):
         d = datetime.now(app.TZ).date() + timedelta(days=5)
         self.assertIn(str(d.day), lbl)
 
+    def test_far_dates_show_how_far_away(self):
+        """เคสจริง 5 ต.ค. 69 จอง #91: การ์ดขึ้น 'วันศุกร์ 6 พ.ย. 17:00' = ไกล 32 วัน
+
+        ชื่อวันบนการ์ดคำนวณจาก resv_date เอง ไม่ได้มาจากที่พนักงานพิมพ์ → เดือนเพี้ยนแล้ว
+        การ์ดก็ยังดูสมเหตุผลกับตัวเอง (6 พ.ย. เป็นวันศุกร์จริง) คนอ่านเลยจับไม่ได้
+        ต้องบอกระยะห่างเป็นวัน ให้ 'จองเดือนหน้าโดยไม่ตั้งใจ' สะดุดตาตั้งแต่การ์ดเด้ง"""
+        self.assertIn("(อีก 32 วัน)", self._label(32))
+        self.assertIn("(อีก 5 วัน)", self._label(5))
+
+    def test_near_dates_stay_short(self):
+        """วันนี้/พรุ่งนี้/มะรืน ชัดอยู่แล้ว — ห้ามรกการ์ดด้วย '(อีก 0 วัน)'"""
+        for ahead in (0, 1, 2):
+            self.assertNotIn("อีก", self._label(ahead))
+
 
 class TestTableNumbersAreNotPeople(unittest.TestCase):
     """เลขโต๊ะต้องไม่ถูกอ่านเป็นจำนวนคน
