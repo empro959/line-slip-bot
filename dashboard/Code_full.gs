@@ -1680,9 +1680,87 @@ function fillMissingDays(){
   Logger.log('📊 สรุป: กู้สำเร็จ '+done+' วัน · เหลือขาดอีก '+after.all.length+' วัน'+
              (after.all.length?' → '+after.all.join(', '):' ✅ ครบแล้ว'));
   if(stopped) Logger.log('⛔ หยุดก่อนเพราะ'+stopped+' — พักสัก 1 ชม. แล้วกด fillMissingDays ซ้ำได้เลย '+
-                         '(มันจำเองว่าเหลือวันไหน ไม่ต้องแก้อะไร)');
+                         '(มันจำเองว่าเหลือวันไหน ไม่ต้องแก้อะไร)'+
+                         '\n   💡 ไม่อยากมานั่งกดเอง: กด startFillLoop ครั้งเดียว มันจะลองเองทุกชั่วโมงจนครบ แล้วปิดตัวเอง');
   else if(after.all.length) Logger.log('⚠️ ยังเหลือวันที่กู้ไม่ได้ — เลื่อนอ่าน log ข้างบนหา ❌ ของวันนั้น '+
                                        '(ถ้าขึ้น "ไม่พบเมลรายงาน POS" = เมลวันนั้นยังไม่เข้า หรือเป็นวันร้านหยุด)');
+}
+
+
+// ===== 🔁 กดครั้งเดียว แล้วมันไล่กู้เองทุกชั่วโมงจนครบ =====
+// ทำไมต้องมี (5 ต.ค. 69 15:26): เจ้าของกด fillMissingDays แล้ว log ออกมาแบบนี้
+//   📧 ใช้อีเมล: "รายงานยอดรายวันSYS4 14/09/2569" (เข้ามา 4 ต.ค. 20:33)  ← หาเมลเจอแล้ว
+//   ❌ drive.files.insert failed: User rate limit exceeded for OCR       ← ตายที่ OCR
+//   📊 สรุป: กู้สำเร็จ 0 วัน · เหลือขาดอีก 5 วัน
+// คือ "รอบนี้เสียฟรี" — พัก 60+120 วิ = 3 นาที แล้วชนเพดาน 6 นาทีของ Apps Script
+// ตายคาวันแรก ยังไม่ทันแตะวันที่ 2-5 ด้วยซ้ำ
+//
+// 📌 งานที่เหลือคือ 5 วัน × สูงสุด 4 ใบ = สูงสุด 20 ครั้ง OCR
+//    ถ้าให้คนกด ▷ เองทุกชั่วโมง = กด 5-10 รอบ ซึ่งคือปัญหาเดิมที่เจ้าของบอกว่า "ยากไป"
+//
+// ⚖️ ทำไมเลือก "วนเองทุกชั่วโมง" แทนการไปแก้ตัวพักรอให้นานขึ้น:
+//    เพดาน 6 นาทีเป็นของ Apps Script แก้ไม่ได้ · และเราไม่รู้ว่าโควตา OCR ที่ชนเป็นแบบ
+//    "คลายในไม่กี่นาที" หรือ "รายวัน" (Google ไม่ประกาศตัวเลข) — เดาผิดทางไหนก็เสียรอบ
+//    วนทุกชั่วโมงแล้วหยุดเองเมื่อครบ ใช้ได้กับทั้งสองแบบโดยไม่ต้องรู้คำตอบ
+//
+// ปลอดภัยเพราะ fillMissingDays เป็น idempotent อยู่แล้ว (วันที่กู้แล้วไม่ถูกนับเป็นวันขาดอีก)
+// → วนซ้ำกี่รอบก็ไม่เขียนทับของดี และไม่มี state ให้จำนอกจาก "นับรอบ" กันวนไม่รู้จบ
+var FILL_LOOP_FN       = 'fillMissingDaysLoop';
+var FILL_LOOP_MAX_TRIES = 24;              // 24 รอบ = ~1 วัน · ครบแล้วหยุดเอง ไม่วนทิ้งไว้ลืม
+var FILL_LOOP_PROP     = 'FILL_LOOP_TRIES';
+
+// 🔘 ปุ่มที่เจ้าของกด: ตั้งรอบอัตโนมัติ + ลองทันทีรอบแรก (ไม่ต้องรออีก 1 ชม.)
+function startFillLoop(){
+  var m=_missingDays_();
+  if(!m.all.length){
+    Logger.log('✅ ไม่มีวันที่ขาด — ไม่ต้องตั้งรอบอัตโนมัติ');
+    stopFillLoop();                        // เผื่อมีของค้างจากรอบก่อน
+    return;
+  }
+  stopFillLoop();                          // กันตั้งซ้อนกันหลายตัวถ้ากดหลายครั้ง
+  PropertiesService.getScriptProperties().setProperty(FILL_LOOP_PROP,'0');
+  ScriptApp.newTrigger(FILL_LOOP_FN).timeBased().everyHours(1).create();
+  Logger.log('🔁 ตั้งรอบอัตโนมัติแล้ว — จะลองกู้เองทุก 1 ชม. จนครบ (สูงสุด '+FILL_LOOP_MAX_TRIES+' รอบ)');
+  Logger.log('   เหลือ '+m.all.length+' วัน → '+m.all.join(', '));
+  Logger.log('   หยุดกลางคันได้ด้วย stopFillLoop · ดูความคืบหน้าที่เมนู "การดำเนินการ" ซ้ายมือ');
+  Logger.log('─────────────────────────────');
+  fillMissingDaysLoop();                   // ลองรอบแรกเลย ไม่เสียเวลารอ
+}
+
+// 🛑 ปิดรอบอัตโนมัติ — ลบเฉพาะ trigger ของตัวเอง ห้ามแตะ trigger ตัวอื่นของโปรเจกต์
+function stopFillLoop(){
+  var n=0;
+  ScriptApp.getProjectTriggers().forEach(function(t){
+    if(t.getHandlerFunction()===FILL_LOOP_FN){ ScriptApp.deleteTrigger(t); n++; }
+  });
+  if(n) Logger.log('🛑 ปิดรอบอัตโนมัติแล้ว ('+n+' ตัว)');
+  return n;
+}
+
+// ตัวที่ trigger เรียกทุกชั่วโมง — ไม่ต้องกดเอง
+function fillMissingDaysLoop(){
+  var p=PropertiesService.getScriptProperties();
+  var tries=parseInt(p.getProperty(FILL_LOOP_PROP)||'0',10)+1;
+  p.setProperty(FILL_LOOP_PROP,String(tries));
+  Logger.log('🔁 รอบอัตโนมัติครั้งที่ '+tries+'/'+FILL_LOOP_MAX_TRIES+' — '+
+             Utilities.formatDate(new Date(),'GMT+7','dd/MM HH:mm'));
+
+  // พังยังไงก็ห้ามทำให้รอบถัดไปไม่เกิด — จับไว้แล้วไปต่อ
+  try { fillMissingDays(); }
+  catch(e){ Logger.log('❌ รอบนี้พัง: '+e+' — รอบหน้าลองใหม่'); }
+
+  var left=_missingDays_().all;
+  if(!left.length){
+    Logger.log('🎉 ครบทุกวันแล้ว → ปิดรอบอัตโนมัติให้เอง ไม่ต้องไปลบ trigger');
+    stopFillLoop(); p.deleteProperty(FILL_LOOP_PROP); return;
+  }
+  if(tries>=FILL_LOOP_MAX_TRIES){
+    // ⛔ ครบเพดานแล้วยังไม่จบ = มีอย่างอื่นผิด ไม่ใช่แค่โควตา — หยุดแล้วบอก ดีกว่าวนเงียบ
+    Logger.log('⛔ ครบ '+FILL_LOOP_MAX_TRIES+' รอบแล้วยังเหลือ '+left.length+' วัน → '+left.join(', ')+
+               '\n   ปิดรอบอัตโนมัติแล้ว — เลื่อนอ่าน log หา ❌ ของวันพวกนี้ (น่าจะไม่ใช่เรื่องโควตาแล้ว)');
+    stopFillLoop(); p.deleteProperty(FILL_LOOP_PROP); return;
+  }
+  Logger.log('⏳ เหลืออีก '+left.length+' วัน ('+left.join(', ')+') → ลองใหม่เองในอีก ~1 ชม.');
 }
 
 
