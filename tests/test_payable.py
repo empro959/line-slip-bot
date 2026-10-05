@@ -2119,6 +2119,21 @@ class TestResvDayOnlyDate(unittest.TestCase):
                   "คุณบี 4 คน 2 ทุ่ม", "จอง 4 คน a8 0974535253"):
             self.assertIsNone(app._resv_day_only_from_text(t), t)
 
+    def test_time_unit_after_number_is_not_a_day(self):
+        """'วันที่ 6 โมงเย็น' — เลข 6 เป็นของ 'โมง' ไม่ใช่เลขวัน
+
+        รูที่เปิดตอนทำตัวแกะนี้เอง: คนก็ยังตีความได้สองทาง → ตัวแกะต้องไม่มั่นใจผิด
+        แล้วไปชนะวันที่ของ AI (ตัวแกะชนะ AI เสมอ จึงต้องถอยเมื่อไม่ชัด)"""
+        for t in ("จองวันที่ 6 โมงเย็น 4 คน", "จองวันที่ 2 ทุ่ม 4 คน",
+                  "จองวันที่ 19 นาฬิกา 4 คน"):
+            self.assertIsNone(app._resv_day_only_from_text(t), t)
+
+    def test_real_day_with_time_elsewhere_still_works(self):
+        """ทิศกลับ: บอกเวลาไว้คนละที่ ต้องยังอ่านเลขวันได้ปกติ"""
+        d = datetime.now(app.TZ).date() + timedelta(days=1)
+        self.assertEqual(app._resv_day_only_from_text(f"จอง 6 โมงเย็น วันที่ {d.day} 4 คน"),
+                         d.isoformat())
+
     def test_slash_form_still_wins(self):
         """ของเดิมต้องไม่ถูกแย่ง — มีสแลชแปลว่าบอกเดือนมาด้วย ข้อมูลครบกว่า"""
         d = self._today() + timedelta(days=3)
