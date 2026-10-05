@@ -2072,6 +2072,61 @@ class TestResvExplicitDateWins(unittest.TestCase):
             self.assertIsNone(app._resv_date_from_text(t), t)
 
 
+class TestResvDayOnlyDate(unittest.TestCase):
+    """'วันที่ 6' (บอกแต่เลขวัน) ต้องแกะเองด้วยโค้ด ห้ามปล่อยให้ AI บวกวันเอง
+
+    เคสจริง 5 ต.ค. 69 จอง #91 — เจ้าของทักว่า "บอทบอกเดือนผิด":
+      ข้อความ: 'จองโต๊ะ วันที่ 6 4 คน เวลา 17.00 น. ครับ  a8 .... โต๊ะ อ.โน๊ต 097xxxxxxx'
+      การ์ด:   'วันศุกร์ 6 พ.ย. 17:00'  ← ควรเป็น 6 ต.ค. (พรุ่งนี้)
+    ตัวแกะเดิมรองรับแค่รูปแบบมีสแลช ('6/10') → ข้อความนี้ไม่แมตช์ วันเลยตกไปอยู่กับ AI ล้วนๆ
+    จองไปนอนอยู่เดือนหน้า ไม่โผล่ในสรุปจองวันไหนเลย ลูกค้ามาพรุ่งนี้แล้วไม่มีโต๊ะ"""
+
+    def _today(self):
+        return datetime.now(app.TZ).date()
+
+    def test_real_case_91_day_not_passed_is_this_month(self):
+        d = self._today() + timedelta(days=1)
+        txt = (f"จองโต๊ะ วันที่ {d.day} 4 คน เวลา 17.00 น. ครับ  a8 "
+               f".... โต๊ะ อ.โน๊ต  0974535253")
+        self.assertEqual(app._resv_day_only_from_text(txt), d.isoformat(), txt)
+
+    def test_today_itself_is_accepted(self):
+        d = self._today()
+        self.assertEqual(app._resv_day_only_from_text(f"จองวันที่ {d.day} 4 คน"), d.isoformat())
+
+    def test_day_already_passed_goes_forward_not_backward(self):
+        """ผ่านแล้ว = เดือนถัดไป — ห้ามคืนวันในอดีต (จองคือเรื่องอนาคต)"""
+        today = self._today()
+        if today.day < 2:
+            self.skipTest("วันนี้เป็นวันที่ 1 ไม่มีวันที่ผ่านมาแล้วในเดือนนี้")
+        day = today.day - 1
+        got = app._resv_day_only_from_text(f"จองวันที่ {day} 4 คน")
+        self.assertIsNotNone(got)
+        d = datetime.strptime(got, "%Y-%m-%d").date()
+        self.assertEqual(d.day, day)
+        self.assertGreater(d, today)                    # ต้องเป็นอนาคตเสมอ
+        self.assertLess((d - today).days, 40)           # และไม่กระโดดไกลเกินหนึ่งเดือน
+
+    def test_month_written_out_is_left_to_ai(self):
+        """บอกเดือนมาแล้ว = ไม่ใช่หน้าที่ตัวนี้ (ห้ามทับเป็นเดือนนี้)"""
+        for t in ("จองโต๊ะ วันที่ 6 พ.ย. 4 คน", "จองโต๊ะ วันที่ 6 พฤศจิกายน 4 คน",
+                  "จองโต๊ะ วันที่ 6/11 4 คน", "จองวันที่ 2 เดือนหน้า 4 คน"):
+            self.assertIsNone(app._resv_day_only_from_text(t), t)
+
+    def test_numbers_that_are_not_dates(self):
+        """ทิศกลับ: ไม่มีคำว่า 'วันที่' ห้ามเดาว่าเลขไหนคือวัน"""
+        for t in ("จองโต๊ะ 6 คน 2 ทุ่ม", "เวลา 19.00 โซน A4", "โต๊ะ L 1 2 3 12",
+                  "คุณบี 4 คน 2 ทุ่ม", "จอง 4 คน a8 0974535253"):
+            self.assertIsNone(app._resv_day_only_from_text(t), t)
+
+    def test_slash_form_still_wins(self):
+        """ของเดิมต้องไม่ถูกแย่ง — มีสแลชแปลว่าบอกเดือนมาด้วย ข้อมูลครบกว่า"""
+        d = self._today() + timedelta(days=3)
+        txt = f"จองโต๊ะ วันที่ {d.day}/{d.month} 6 ท่าน"
+        self.assertEqual(app._resv_date_from_text(txt), d.isoformat())
+        self.assertIsNone(app._resv_day_only_from_text(txt))
+
+
 class TestResvLabelShowsRealDate(unittest.TestCase):
     """คำว่าพรุ่งนี้/มะรืน อ่านตอนไหนก็เปลี่ยนความหมาย — ต้องมีวันที่จริงกำกับเสมอ"""
 
@@ -2091,6 +2146,20 @@ class TestResvLabelShowsRealDate(unittest.TestCase):
         lbl = self._label(5)
         d = datetime.now(app.TZ).date() + timedelta(days=5)
         self.assertIn(str(d.day), lbl)
+
+    def test_far_dates_show_how_far_away(self):
+        """เคสจริง 5 ต.ค. 69 จอง #91: การ์ดขึ้น 'วันศุกร์ 6 พ.ย. 17:00' = ไกล 32 วัน
+
+        ชื่อวันบนการ์ดคำนวณจาก resv_date เอง ไม่ได้มาจากที่พนักงานพิมพ์ → เดือนเพี้ยนแล้ว
+        การ์ดก็ยังดูสมเหตุผลกับตัวเอง (6 พ.ย. เป็นวันศุกร์จริง) คนอ่านเลยจับไม่ได้
+        ต้องบอกระยะห่างเป็นวัน ให้ 'จองเดือนหน้าโดยไม่ตั้งใจ' สะดุดตาตั้งแต่การ์ดเด้ง"""
+        self.assertIn("(อีก 32 วัน)", self._label(32))
+        self.assertIn("(อีก 5 วัน)", self._label(5))
+
+    def test_near_dates_stay_short(self):
+        """วันนี้/พรุ่งนี้/มะรืน ชัดอยู่แล้ว — ห้ามรกการ์ดด้วย '(อีก 0 วัน)'"""
+        for ahead in (0, 1, 2):
+            self.assertNotIn("อีก", self._label(ahead))
 
 
 class TestTableNumbersAreNotPeople(unittest.TestCase):
@@ -3629,6 +3698,24 @@ class TestResvInsaneDateAsksInsteadOfSaving(unittest.TestCase):
         self.assertEqual(len(rows), 1, "จองปกติต้องบันทึก")
         self.assertEqual(rows[0]["resv_date"], want)
         self.assertTrue(self.cards, "ต้องมีการ์ดจองออกไป")
+
+    def test_เคสจริง91_วันที่ที่พนักงานเขียน_ต้องชนะวันที่AIคิดเอง(self):
+        """จอง #91 (5 ต.ค. 69) — เจ้าของทักว่า "บอทบอกเดือนผิด"
+
+        ข้อความจริง: 'จองโต๊ะ วันที่ 6 4 คน เวลา 17.00 น. ครับ  a8 .... โต๊ะ อ.โน๊ต 097xxxxxxx'
+        วันนี้ 5 ต.ค. → 'วันที่ 6' คือพรุ่งนี้ แต่ AI ตอบ 2026-11-06 (วันที่ 6 ของเดือนถัดไป)
+        การ์ดขึ้น 'วันศุกร์ 6 พ.ย.' ซึ่งดูสมเหตุผลกับตัวเอง (6 พ.ย. เป็นศุกร์จริง) จับไม่ได้ด้วยตา
+        ผล: จองไปนอนอยู่เดือนหน้า ไม่โผล่ในสรุปจองของวันไหนเลย ลูกค้ามาพรุ่งนี้แล้วไม่มีโต๊ะ"""
+        tomorrow = datetime.now(app.TZ).date() + timedelta(days=1)
+        wrong = tomorrow + timedelta(days=28)            # วันที่เดียวกันของเดือนถัดไป
+        while wrong.day != tomorrow.day:
+            wrong += timedelta(days=1)
+        self._run(wrong.isoformat(),
+                  text=f"จองโต๊ะ วันที่ {tomorrow.day} 5 ท่าน เวลา 17.00 น. ครับ B10")
+        rows = self._rows()
+        self.assertEqual(len(rows), 1, f"ต้องบันทึกได้ (ตอบกลับ: {self.replies})")
+        self.assertEqual(rows[0]["resv_date"], tomorrow.isoformat(),
+                         f"วันที่พนักงานเขียนมาเองต้องชนะ AI (AI ให้ {wrong.isoformat()})")
 
     def test_เดี๋ยวมา_วันเพี้ยน_ต้องกลายเป็นวันนี้_ไม่ต้องถาม(self):
         """'เดี๋ยวมา' บอกชัดว่ามาวันนี้ → ทับด้วยวันนี้ได้เลย ไม่ต้องกวนถาม"""
