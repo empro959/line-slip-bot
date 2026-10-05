@@ -929,6 +929,78 @@ function beverageQty(nMonths){
   Logger.log('⚠️ "หน่วย" คือหน่วยที่ POS บันทึก (ขวด/แก้ว/กระป๋อง/เหยือก) ไม่ใช่ลัง — ดูชื่อเมนูประกอบ');
 }
 
+// ===== 💵 ราคาเมนู "ที่เก็บเงินได้จริง" ต่อหน่วย — ใช้เป็นฐานตั้งราคาใหม่ (ไม่กิน OCR) =====
+// ทำไมต้องมี (01/10/2569): เจ้าของสั่ง "มีราคาเมนูเก่าใช่ไหม เสนอราคาใหม่มาเลย"
+//   → ห้อง Code **ไม่มีราคาเมนูเลย** (ไม่อยู่ในรีโป · ไฟล์ saisang_data.json อยู่ Drive อีกบัญชี)
+//   แต่ `menu_items` เก็บ {name, qty, amount} ไว้แล้ว → **amount ÷ qty = ราคาต่อหน่วยที่เก็บเงินได้จริง**
+// ⚖️ ค่านี้ "ดีกว่าราคาบนป้ายเมนู" สำหรับการตั้งราคา เพราะรวมผลของส่วนลดที่ให้จริงไปแล้ว
+//   (ป้ายเขียน 120 แต่เฉลี่ยเก็บได้ 108 = มีส่วนลด/ราคาโปรอยู่ 10%)
+// 🔴 ฟังก์ชันนี้ให้ "ราคาเก่า + ปริมาณขาย" เท่านั้น — **ไม่มีต้นทุนต่อเมนู**
+//   เสนอราคาใหม่โดยไม่รู้ต้นทุน = เดา · ดูหมายเหตุท้าย log
+
+function menuPriceList(nMonths, topN){
+  var N = nMonths || 3, TOP = topN || 60;
+  var f = getFile_();
+  if(!f){ Logger.log('🔴 ไม่พบไฟล์ '+FILE_NAME+' ใน Drive (รัน rebuildNow ก่อน)'); return; }
+  var months=[]; try{ months = JSON.parse(f.getBlob().getDataAsString('UTF-8'))||[]; }
+  catch(e){ Logger.log('🔴 อ่านไฟล์ไม่ได้: '+e); return; }
+  if(!months.length){ Logger.log('🔴 ไฟล์ว่าง ไม่มีเดือนเลย'); return; }
+  months.sort(function(x,y){ return _periodOrd_(x.period)-_periodOrd_(y.period); });
+
+  var withItems = months.filter(function(m){ return (m.menu_items||[]).length; });
+  if(!withItems.length){
+    Logger.log('🔴 ทุกเดือนไม่มี menu_items ('+months.length+' เดือน) — ใบที่ดึงมาเป็นใบสรุปเดือน');
+    Logger.log('   ต้องมีใบ "SaleReport / รายงานสรุปยอดขายแยกตามหมวดสินค้า" ในเมล');
+    return;
+  }
+  var use = withItems.slice(-N);
+  if(use.length < N) Logger.log('⚠️ ขอ '+N+' เดือน มีรายเมนูแค่ '+use.length+' เดือน → ใช้เท่าที่มี');
+
+  // รวมทุกเดือนที่ใช้: ชื่อ → {qty, amount, cat, เดือนที่เจอ}
+  var agg = {}, grand = 0;
+  use.forEach(function(m){
+    (m.menu_items||[]).forEach(function(it){
+      var k = it.name || '(ไม่มีชื่อ)';
+      var e = agg[k] || (agg[k] = {qty:0, amount:0, cat:it.category||'-', months:0, last:null});
+      e.qty += (it.qty||0); e.amount += (it.amount||0); e.months++;
+      e.last = (it.qty||0) > 0 ? (it.amount||0)/(it.qty||0) : e.last;   // ราคาเดือนล่าสุดที่มีขาย
+      grand += (it.amount||0);
+    });
+  });
+  var rows = Object.keys(agg).map(function(k){
+    var e = agg[k];
+    return {name:k, cat:e.cat, qty:e.qty, amount:e.amount, months:e.months,
+            // ไม่มีจำนวนขาย = คิดราคาต่อหน่วยไม่ได้ → null (ห้ามโชว์ 0 แทนไม่รู้)
+            unit: e.qty > 0 ? e.amount/e.qty : null, last:e.last};
+  }).sort(function(a,b){ return b.amount - a.amount; });
+
+  Logger.log('💵 ราคาต่อหน่วยที่เก็บเงินได้จริง — '+use.length+' เดือน ('+
+             use.map(function(m){return m.period;}).join(' · ')+') · ยอดรวม ฿'+fmtT_(grand));
+  Logger.log('⚠️ นี่คือราคา "หลังส่วนลด" ที่เก็บได้จริง ไม่ใช่ราคาบนป้ายเมนู');
+  Logger.log('════════════════════════════════════════');
+  Logger.log('อันดับ | ชื่อเมนู | หมวด | ขาย(หน่วย) | ราคา/หน่วย | ยอดเงิน | %ยอดขาย | สะสม%');
+  var cum = 0, shown = 0, c80 = 0;
+  rows.forEach(function(r, i){
+    var pct = grand > 0 ? r.amount/grand*100 : 0;
+    cum += pct;
+    if(c80 === 0 && cum >= 80) c80 = i + 1;          // กี่เมนูแรกรวมกันได้ 80% ของยอดขาย
+    if(i < TOP){
+      shown++;
+      Logger.log('  '+(i+1)+'. '+r.name+' | '+r.cat+' | '+r.qty+' | '+
+                 (r.unit === null ? '—' : '฿'+r.unit.toFixed(2))+' | ฿'+fmtT_(r.amount)+' | '+
+                 pct.toFixed(1)+'% | '+cum.toFixed(1)+'%'+
+                 (r.months < use.length ? '  ⚠️ มีขายแค่ '+r.months+'/'+use.length+' เดือน' : ''));
+    }
+  });
+  Logger.log('════════════════════════════════════════');
+  if(rows.length > shown) Logger.log('(แสดง '+shown+' จาก '+rows.length+' เมนู — เรียงตามยอดเงิน · ที่เหลือยอดน้อยกว่านี้)');
+  if(c80) Logger.log('📌 เมนู '+c80+' อันดับแรก = 80% ของยอดขายทั้งหมด → ขยับราคาตรงนี้เท่านั้นที่มีผลจริง');
+  Logger.log('📌 ส่งทั้งก้อนนี้ให้ห้อง Code เพื่อวิเคราะห์ตั้งราคาใหม่');
+  Logger.log('🔴 ยังขาดอีกอย่างเดียวคือ "ต้นทุนต่อเมนู" — ไม่มีในข้อมูลชุดนี้');
+  Logger.log('   เสนอราคาใหม่โดยไม่รู้ต้นทุน = เดา · ให้ต้นทุนเฉพาะเมนูใน 80% แรกก็พอ');
+  Logger.log('   (ภาพรวมกำไรเครื่องดื่มรายเดือนดูได้จาก beverageWatch — แต่เป็นระดับหมวด ไม่ใช่รายเมนู)');
+}
+
 // ===== เติม "จำนวนบิล" ให้วันที่เก็บไว้แล้ว (OCR เฉพาะรายงานลูกค้า) — รันครั้งเดียว รันซ้ำได้ =====
 function backfillBills(){
   var threads=GmailApp.search('has:attachment filename:pdf newer_than:40d',0,80), cust={};
