@@ -929,6 +929,78 @@ function beverageQty(nMonths){
   Logger.log('⚠️ "หน่วย" คือหน่วยที่ POS บันทึก (ขวด/แก้ว/กระป๋อง/เหยือก) ไม่ใช่ลัง — ดูชื่อเมนูประกอบ');
 }
 
+// ===== 💵 ราคาเมนู "ที่เก็บเงินได้จริง" ต่อหน่วย — ใช้เป็นฐานตั้งราคาใหม่ (ไม่กิน OCR) =====
+// ทำไมต้องมี (01/10/2569): เจ้าของสั่ง "มีราคาเมนูเก่าใช่ไหม เสนอราคาใหม่มาเลย"
+//   → ห้อง Code **ไม่มีราคาเมนูเลย** (ไม่อยู่ในรีโป · ไฟล์ saisang_data.json อยู่ Drive อีกบัญชี)
+//   แต่ `menu_items` เก็บ {name, qty, amount} ไว้แล้ว → **amount ÷ qty = ราคาต่อหน่วยที่เก็บเงินได้จริง**
+// ⚖️ ค่านี้ "ดีกว่าราคาบนป้ายเมนู" สำหรับการตั้งราคา เพราะรวมผลของส่วนลดที่ให้จริงไปแล้ว
+//   (ป้ายเขียน 120 แต่เฉลี่ยเก็บได้ 108 = มีส่วนลด/ราคาโปรอยู่ 10%)
+// 🔴 ฟังก์ชันนี้ให้ "ราคาเก่า + ปริมาณขาย" เท่านั้น — **ไม่มีต้นทุนต่อเมนู**
+//   เสนอราคาใหม่โดยไม่รู้ต้นทุน = เดา · ดูหมายเหตุท้าย log
+
+function menuPriceList(nMonths, topN){
+  var N = nMonths || 3, TOP = topN || 60;
+  var f = getFile_();
+  if(!f){ Logger.log('🔴 ไม่พบไฟล์ '+FILE_NAME+' ใน Drive (รัน rebuildNow ก่อน)'); return; }
+  var months=[]; try{ months = JSON.parse(f.getBlob().getDataAsString('UTF-8'))||[]; }
+  catch(e){ Logger.log('🔴 อ่านไฟล์ไม่ได้: '+e); return; }
+  if(!months.length){ Logger.log('🔴 ไฟล์ว่าง ไม่มีเดือนเลย'); return; }
+  months.sort(function(x,y){ return _periodOrd_(x.period)-_periodOrd_(y.period); });
+
+  var withItems = months.filter(function(m){ return (m.menu_items||[]).length; });
+  if(!withItems.length){
+    Logger.log('🔴 ทุกเดือนไม่มี menu_items ('+months.length+' เดือน) — ใบที่ดึงมาเป็นใบสรุปเดือน');
+    Logger.log('   ต้องมีใบ "SaleReport / รายงานสรุปยอดขายแยกตามหมวดสินค้า" ในเมล');
+    return;
+  }
+  var use = withItems.slice(-N);
+  if(use.length < N) Logger.log('⚠️ ขอ '+N+' เดือน มีรายเมนูแค่ '+use.length+' เดือน → ใช้เท่าที่มี');
+
+  // รวมทุกเดือนที่ใช้: ชื่อ → {qty, amount, cat, เดือนที่เจอ}
+  var agg = {}, grand = 0;
+  use.forEach(function(m){
+    (m.menu_items||[]).forEach(function(it){
+      var k = it.name || '(ไม่มีชื่อ)';
+      var e = agg[k] || (agg[k] = {qty:0, amount:0, cat:it.category||'-', months:0, last:null});
+      e.qty += (it.qty||0); e.amount += (it.amount||0); e.months++;
+      e.last = (it.qty||0) > 0 ? (it.amount||0)/(it.qty||0) : e.last;   // ราคาเดือนล่าสุดที่มีขาย
+      grand += (it.amount||0);
+    });
+  });
+  var rows = Object.keys(agg).map(function(k){
+    var e = agg[k];
+    return {name:k, cat:e.cat, qty:e.qty, amount:e.amount, months:e.months,
+            // ไม่มีจำนวนขาย = คิดราคาต่อหน่วยไม่ได้ → null (ห้ามโชว์ 0 แทนไม่รู้)
+            unit: e.qty > 0 ? e.amount/e.qty : null, last:e.last};
+  }).sort(function(a,b){ return b.amount - a.amount; });
+
+  Logger.log('💵 ราคาต่อหน่วยที่เก็บเงินได้จริง — '+use.length+' เดือน ('+
+             use.map(function(m){return m.period;}).join(' · ')+') · ยอดรวม ฿'+fmtT_(grand));
+  Logger.log('⚠️ นี่คือราคา "หลังส่วนลด" ที่เก็บได้จริง ไม่ใช่ราคาบนป้ายเมนู');
+  Logger.log('════════════════════════════════════════');
+  Logger.log('อันดับ | ชื่อเมนู | หมวด | ขาย(หน่วย) | ราคา/หน่วย | ยอดเงิน | %ยอดขาย | สะสม%');
+  var cum = 0, shown = 0, c80 = 0;
+  rows.forEach(function(r, i){
+    var pct = grand > 0 ? r.amount/grand*100 : 0;
+    cum += pct;
+    if(c80 === 0 && cum >= 80) c80 = i + 1;          // กี่เมนูแรกรวมกันได้ 80% ของยอดขาย
+    if(i < TOP){
+      shown++;
+      Logger.log('  '+(i+1)+'. '+r.name+' | '+r.cat+' | '+r.qty+' | '+
+                 (r.unit === null ? '—' : '฿'+r.unit.toFixed(2))+' | ฿'+fmtT_(r.amount)+' | '+
+                 pct.toFixed(1)+'% | '+cum.toFixed(1)+'%'+
+                 (r.months < use.length ? '  ⚠️ มีขายแค่ '+r.months+'/'+use.length+' เดือน' : ''));
+    }
+  });
+  Logger.log('════════════════════════════════════════');
+  if(rows.length > shown) Logger.log('(แสดง '+shown+' จาก '+rows.length+' เมนู — เรียงตามยอดเงิน · ที่เหลือยอดน้อยกว่านี้)');
+  if(c80) Logger.log('📌 เมนู '+c80+' อันดับแรก = 80% ของยอดขายทั้งหมด → ขยับราคาตรงนี้เท่านั้นที่มีผลจริง');
+  Logger.log('📌 ส่งทั้งก้อนนี้ให้ห้อง Code เพื่อวิเคราะห์ตั้งราคาใหม่');
+  Logger.log('🔴 ยังขาดอีกอย่างเดียวคือ "ต้นทุนต่อเมนู" — ไม่มีในข้อมูลชุดนี้');
+  Logger.log('   เสนอราคาใหม่โดยไม่รู้ต้นทุน = เดา · ให้ต้นทุนเฉพาะเมนูใน 80% แรกก็พอ');
+  Logger.log('   (ภาพรวมกำไรเครื่องดื่มรายเดือนดูได้จาก beverageWatch — แต่เป็นระดับหมวด ไม่ใช่รายเมนู)');
+}
+
 // ===== เติม "จำนวนบิล" ให้วันที่เก็บไว้แล้ว (OCR เฉพาะรายงานลูกค้า) — รันครั้งเดียว รันซ้ำได้ =====
 function backfillBills(){
   var threads=GmailApp.search('has:attachment filename:pdf newer_than:40d',0,80), cust={};
@@ -1054,9 +1126,18 @@ var _POS_MSG_CACHE_=null, _POS_ALT_CACHE_=null, _POS_CACHE_KEY_=null;
 
 // ช่วงวันที่จะค้นเมล — คิดจาก 'วันที่ขอกู้' ไม่ใช่ 'กี่วันย้อนหลังจากวันนี้'
 // เผื่อหน้า 3 วัน/หลัง 5 วัน เพราะเมลของวัน D เข้ามาวัน D+1 และคน export ย้อนหลังทีหลังได้
+// 🪤 เคสจริง 05/10/2569: เจ้าของบอก "เดือนที่แล้วเมลเข้าไม่ครบ ตอนนี้ส่งย้อนหลังมาครบแล้ว"
+//   กรอบค้นเดิมคือ (วันแรก−3) ถึง (วันสุดท้าย+5) ซึ่งเป็น **วันที่เมลเข้า** ไม่ใช่วันที่ของรายงาน
+//   → เมลที่ถูกส่งย้อนหลังทีหลัง (เช่น กู้ ก.ย. แต่เมลเพิ่งมาถึง 5 ต.ค.) **อยู่นอกกรอบ**
+//   รันไปก็ขึ้น '❌ ไม่พบเมลรายงาน POS' ทั้งที่เมลอยู่ในกล่องแล้ว = อ่านแล้วเข้าใจผิดว่าเมลยังไม่มา
+//   (ตระกูลเดียวกับกับดัก newer_than:90d ตอนกู้พฤษภาคม — กรอบค้นแคบเกินจนของที่มีอยู่หาไม่เจอ)
+// 📌 "เมลมาถึงเมื่อไหร่" คาดเดาไม่ได้ จึงต้องยืดท้ายกรอบถึง 'พรุ่งนี้' เสมอ
+//   (Gmail before: ไม่รวมวันนั้น → ต้องใช้พรุ่งนี้ ไม่งั้นเมลที่เข้าวันนี้จะหลุด)
 function _gmailWindow_(isos){
   var s=isos.slice().sort();
   var a=_shiftIso_(s[0],-3), b=_shiftIso_(s[s.length-1],5);
+  var tomorrow=_shiftIso_(Utilities.formatDate(new Date(),'GMT+7','yyyy-MM-dd'), 1);
+  if(b < tomorrow) b = tomorrow;        // เผื่อเมลส่งย้อนหลัง/มาถึงช้ากว่าวันที่ในรายงาน
   return {q:'has:attachment filename:pdf after:'+a.replace(/-/g,'/')+' before:'+b.replace(/-/g,'/'),
           key:a+'~'+b};
 }
@@ -1528,6 +1609,83 @@ function _ymOfPeriod_(period){
 //
 // 🪤 และ saisang_data.json ขาด 'พฤษภาคม 2569' หายทั้งเดือน — ของเดิมพิมพ์ทุกเดือนที่ 'มี'
 //    เดือนที่ไม่มีจึงไม่มีบรรทัด = มองไม่เห็น (ยอดรวมทั้งปีขาดไป ~2.2 ล้านโดยไม่มีใครรู้)
+// คำนวณ "วันที่ขาด" จาก pos_daily.json — **ที่เดียวในระบบ**
+// 📌 ทั้งรายงาน (debugDaily) และตัวกู้ (fillMissingDays) ต้องใช้ตัวนี้ร่วมกัน
+//   ถ้าแยกกันคำนวณ วันหนึ่งมันจะไม่ตรงกัน แล้วปุ่มกู้จะไปกู้คนละวันกับที่รายงานบอก
+// คืน {rows:[{ym, have, miss:[], closed:[], minD}], all:[วันที่ขาดทั้งหมด], first}
+function _missingDays_(daily){
+  daily = daily || loadDaily_();
+  var dates=daily.map(function(d){return d.date||'';}).filter(function(x){return x;}).sort();
+  if(!dates.length) return {rows:[], all:[], first:null};
+  var firstDate=dates[0], today=new Date();
+  var byYm={}; dates.forEach(function(dt){ var k=dt.slice(0,7); (byYm[k]=byYm[k]||{})[dt]=true; });
+  var rows=[], all=[];
+  Object.keys(byYm).sort().forEach(function(ym){
+    var have=byYm[ym], y=parseInt(ym.slice(0,4),10), mo=parseInt(ym.slice(5,7),10);
+    var lastDay=new Date(y,mo,0).getDate();
+    // รายงาน POS ของวัน D เข้าเมลตอน ~00:3x ของวัน D+1 → 'วันนี้' ยังไม่มีข้อมูลเป็นเรื่องปกติ
+    var maxD=(today.getFullYear()===y && (today.getMonth()+1)===mo)?today.getDate()-1:lastDay;
+    // เดือนแรกสุดอาจเริ่มเก็บกลางเดือน — วันก่อนวันแรกที่มีข้อมูล ไม่ใช่ 'ขาด' (กันเตือนหลอก)
+    var minD=(ym===firstDate.slice(0,7))?parseInt(firstDate.slice(8,10),10):1;
+    var miss=[], closed=[];
+    for(var d2=minD;d2<=maxD;d2++){ var k=ym+'-'+('0'+d2).slice(-2);
+      if(have[k]) continue;
+      if(CLOSED_DAYS.indexOf(k)>=0) closed.push(k); else miss.push(k);
+    }
+    rows.push({ym:ym, have:Object.keys(have).length, miss:miss, closed:closed, minD:minD});
+    miss.forEach(function(k){all.push(k);});
+  });
+  return {rows:rows, all:all, first:firstDate};
+}
+
+
+// ===== 🔘 ปุ่มเดียวจบ: หาวันที่ขาดเอง → กู้ → สร้างข้อมูลเดือนใหม่ =====
+// ทำไมต้องมี (5 ต.ค. 69): เจ้าของบอก "ยากไป น่าจะมีปุ่มให้รันเพิ่มวันที่ขาดเลย"
+//   ของเดิมต้อง: รัน debugDaily → ก๊อปวันที่ขาด → **แก้ลิสต์ DATES ในโค้ดเอง** → รัน → รัน rebuildNow
+//   ขั้นที่เจ็บคือ "แก้โค้ดเอง" — พิมพ์ผิดตัวเดียวก็กู้ผิดวัน
+// ✅ ตัวนี้: เลือกฟังก์ชัน → กด ▷ → จบ · **รันซ้ำได้เรื่อยๆ** วันที่กู้แล้วจะไม่ถูกนับเป็นวันขาดอีก
+//   ชนโควตา OCR / ใกล้ครบ 6 นาที → หยุดเอง แล้วบอกให้กดซ้ำ (ไม่ต้องจำว่าค้างวันไหน)
+function fillMissingDays(){
+  _RUN_START_MS = Date.now();
+  var before=_missingDays_();
+  if(!before.all.length){
+    Logger.log('✅ ไม่มีวันที่ขาด — ไม่ต้องกู้อะไร');
+    before.rows.forEach(function(r){ Logger.log('   • '+r.ym+': มี '+r.have+' วัน ครบ'); });
+    return;
+  }
+  Logger.log('🔎 เจอวันที่ขาด '+before.all.length+' วัน → '+before.all.join(', '));
+  Logger.log('   (ถ้าวันไหนคือวันร้านหยุด ให้ใส่ใน CLOSED_DAYS แทน แล้วกดใหม่ — ตอนนี้มี '+CLOSED_DAYS.length+' วัน)');
+  Logger.log('─────────────────────────────');
+
+  var done=0, left=[], stopped='';
+  for(var i=0;i<before.all.length;i++){
+    var iso=before.all[i];
+    if(stopped){ left.push(iso); continue; }
+    // กันโดนตัดกลางคันที่ 6 นาที — เหลือน้อยกว่า 60 วิ หยุดเองดีกว่าถูกฆ่ากลางทาง
+    if(_waitBudgetLeft_() < 60){ stopped='เวลารันใกล้ครบ 6 นาที'; left.push(iso); continue; }
+    Logger.log('───── '+(i+1)+'/'+before.all.length+'  กู้ '+iso+' ─────');
+    try { _importPosOneDate_(iso, before.all); done++; }
+    catch(e){
+      Logger.log('❌ '+iso+' พัง: '+e);
+      if(/rate limit|quota/i.test(String(e))){ stopped='โควตา OCR หมดช่วงนี้'; left.push(iso); }
+    }
+  }
+
+  Logger.log('─────────────────────────────');
+  if(done){
+    Logger.log('🔄 สร้างข้อมูลเดือนใหม่ให้ dashboard...');
+    try { rebuildNow(); } catch(e){ Logger.log('⚠️ rebuildNow พัง: '+e+' — กู้วันสำเร็จแล้ว กด rebuildNow เองอีกที'); }
+  }
+  var after=_missingDays_();
+  Logger.log('📊 สรุป: กู้สำเร็จ '+done+' วัน · เหลือขาดอีก '+after.all.length+' วัน'+
+             (after.all.length?' → '+after.all.join(', '):' ✅ ครบแล้ว'));
+  if(stopped) Logger.log('⛔ หยุดก่อนเพราะ'+stopped+' — พักสัก 1 ชม. แล้วกด fillMissingDays ซ้ำได้เลย '+
+                         '(มันจำเองว่าเหลือวันไหน ไม่ต้องแก้อะไร)');
+  else if(after.all.length) Logger.log('⚠️ ยังเหลือวันที่กู้ไม่ได้ — เลื่อนอ่าน log ข้างบนหา ❌ ของวันนั้น '+
+                                       '(ถ้าขึ้น "ไม่พบเมลรายงาน POS" = เมลวันนั้นยังไม่เข้า หรือเป็นวันร้านหยุด)');
+}
+
+
 function debugDaily(){
   var daily=loadDaily_();
   var byP={}; daily.forEach(function(d){byP[d.period]=(byP[d.period]||0)+1;});
@@ -1535,33 +1693,17 @@ function debugDaily(){
   Object.keys(byP).forEach(function(p){Logger.log('   • '+p+' = '+byP[p]+' วัน');});
 
   if(daily.length){
-    var dates=daily.map(function(d){return d.date||'';}).filter(function(x){return x;}).sort();
-    var firstDate=dates[0], today=new Date();
-    // จัดวันเข้ากลุ่มตามเดือน แล้วตรวจ 'ทุกเดือน' ไม่ใช่เดือนล่าสุดเดือนเดียว
-    var byYm={}; dates.forEach(function(dt){ var k=dt.slice(0,7); (byYm[k]=byYm[k]||{})[dt]=true; });
-    var yms=Object.keys(byYm).sort();
-    Logger.log('🔎 ตรวจวันที่ขาด ทุกเดือนที่มีข้อมูล ('+yms.length+' เดือน):');
-    var allMiss=[];
-    yms.forEach(function(ym){
-      var have=byYm[ym], y=parseInt(ym.slice(0,4),10), mo=parseInt(ym.slice(5,7),10);
-      var lastDay=new Date(y,mo,0).getDate();
-      // รายงาน POS ของวัน D เข้าเมลตอน ~00:3x ของวัน D+1 → 'วันนี้' ยังไม่มีข้อมูลเป็นเรื่องปกติ
-      var maxD=(today.getFullYear()===y && (today.getMonth()+1)===mo)?today.getDate()-1:lastDay;
-      // เดือนแรกสุดอาจเริ่มเก็บกลางเดือน — วันก่อนวันแรกที่มีข้อมูล ไม่ใช่ 'ขาด' (กันเตือนหลอก)
-      var minD=(ym===firstDate.slice(0,7))?parseInt(firstDate.slice(8,10),10):1;
-      var miss=[], closed=[];
-      for(var d2=minD;d2<=maxD;d2++){ var k=ym+'-'+('0'+d2).slice(-2);
-        if(have[k]) continue;
-        if(CLOSED_DAYS.indexOf(k)>=0) closed.push(k); else miss.push(k);
-      }
-      Logger.log('   • '+ym+': มี '+Object.keys(have).length+' วัน · ขาด '+miss.length+' วัน'+
-                 (miss.length?' → '+miss.join(', '):' ✅ ครบ')+
-                 (closed.length?'  (ไม่นับวันร้านหยุด '+closed.length+' วัน: '+closed.join(', ')+')':'')+
-                 (minD>1?'  (เริ่มเก็บวันที่ '+minD+')':''));
-      miss.forEach(function(k){allMiss.push(k);});
+    var info=_missingDays_(daily);     // ใช้ตัวคำนวณตัวเดียวกับ fillMissingDays (ห้ามคิดแยก)
+    Logger.log('🔎 ตรวจวันที่ขาด ทุกเดือนที่มีข้อมูล ('+info.rows.length+' เดือน):');
+    info.rows.forEach(function(r){
+      Logger.log('   • '+r.ym+': มี '+r.have+' วัน · ขาด '+r.miss.length+' วัน'+
+                 (r.miss.length?' → '+r.miss.join(', '):' ✅ ครบ')+
+                 (r.closed.length?'  (ไม่นับวันร้านหยุด '+r.closed.length+' วัน: '+r.closed.join(', ')+')':'')+
+                 (r.minD>1?'  (เริ่มเก็บวันที่ '+r.minD+')':''));
     });
-    if(allMiss.length) Logger.log('   👉 กู้ด้วย importPosByDate() (ใส่วันในลิสต์ DATES) หรือ backfillPos() แล้วปิดท้าย rebuildNow()'+
-                                  '\n   ℹ️ ถ้าวันไหนคือวันร้านหยุด ให้ใส่ใน CLOSED_DAYS แทนการไปไล่กู้ (ตอนนี้มี '+CLOSED_DAYS.length+' วัน)');
+    if(info.all.length) Logger.log('   👉 กดปุ่มเดียวจบ: เลือกฟังก์ชัน fillMissingDays แล้วกด ▷ '+
+                                   '(หาวันที่ขาดเอง → กู้ → rebuildNow ให้ครบ · รันซ้ำได้)'+
+                                   '\n   ℹ️ ถ้าวันไหนคือวันร้านหยุด ให้ใส่ใน CLOSED_DAYS แทนการไปไล่กู้ (ตอนนี้มี '+CLOSED_DAYS.length+' วัน)');
     else Logger.log('   ✅ ไม่มีวันขาดในทุกเดือนที่เก็บไว้');
   }
 
