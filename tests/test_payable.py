@@ -1395,6 +1395,117 @@ class TestResvMergeFragments(unittest.TestCase):
         self.assertEqual(app._resv_merge_text(self.GID, self.U1, "คุนนาต"), "คุนนาต")
 
 
+class TestThaiParticleDoesNotKillSignals(unittest.TestCase):
+    """⛔ ห้ามปิดท้ายคำไทยด้วย \\b — \\b ต้องมีรอยต่อ 'อักขระคำ ↔ ไม่ใช่อักขระคำ'
+
+    เคสจริง 7 ต.ค. 69 กลุ่ม Staff 18:14:
+      บอทถาม  "1) กี่ท่านครับ?"
+      พนักงาน "10ท่านค่ะ บอดดด"
+      บอท     เงียบสนิท — ไม่ตอบ ไม่บันทึก จองของ 8/10 10 ที่ ค้างเป็นร่างเปล่า
+    'ท่าน' กับ 'ค่ะ' เป็นอักษรไทยทั้งคู่ → ไม่มีรอยต่อ → \\b ไม่แมตช์ → 0 สัญญาณ
+    → _resv_not_an_answer ตัดทิ้งเงียบ · และ 'ที่' ลงท้ายด้วยวรรณยุกต์ (Mn) จึงไม่เคยแมตช์เลย"""
+
+    def test_particle_glued_to_unit_still_counts(self):
+        for t in ("10ท่านค่ะ บอดดด", "10ท่านครับ", "10คนค่ะ", "4 คนครับ", "2ท่านนะ", "10ที่ค่ะ"):
+            self.assertGreaterEqual(app._resv_signal_hits(t), 1, t)
+
+    def test_unit_ending_in_tone_mark_counts(self):
+        """'ที่' ลงท้ายด้วยวรรณยุกต์ — ของเดิมไม่เคยแมตช์แม้ไม่มีคำลงท้าย"""
+        for t in ("10ที่", "10ที่.", "10ที่นั่ง"):
+            self.assertGreaterEqual(app._resv_signal_hits(t), 1, t)
+
+    def test_answer_to_followup_is_not_dropped(self):
+        """ด่านที่ทำให้เงียบจริงๆ — มีร่างค้างแล้วคำตอบถูกตีว่า 'ไม่ใช่คำตอบ'"""
+        self.assertFalse(app._resv_not_an_answer({"asked": ["people"]}, "10ท่านค่ะ บอดดด"))
+        self.assertFalse(app._resv_not_an_answer({"asked": ["people"]}, "4 คนครับ"))
+
+    def test_real_message_people_is_trusted(self):
+        """'10ที่.' คือจำนวนคน — ของเดิมอ่านไม่ออก เลยถามซ้ำสิ่งที่พนักงานพิมพ์มาแล้ว"""
+        orig = "จองโต๊ะB11-B16\nวันที่8/10\n10ที่. คุณบอส\nมา18:00น."
+        self.assertTrue(app._people_is_trustworthy(orig))
+        self.assertGreaterEqual(app._resv_signal_hits(orig), 2)
+
+    def test_thai_word_after_thi_is_not_a_headcount(self):
+        """ทิศกลับ: 'ที่' ที่ตามด้วยอักษรไทย = คำอื่น ห้ามนับเป็นจำนวนคน"""
+        for t in ("5 ที่ร้าน", "ไป 2 ที่ไหน", "ส่งที่บ้าน"):
+            self.assertFalse(app._people_is_trustworthy(t), t)
+
+    def test_people_guard_still_rejects_table_numbers(self):
+        """ทิศกลับสำคัญ: ด่านเดิม (เคส 24/08/26) ต้องไม่พังเป็น 'รับหมด'"""
+        for t in ("@All 29/8 จองโต๊ะ L 1 2 3 12 คุณแอน มา 1 ทุ่ม",
+                  "วันที่ 8/10 จองโต๊ะ", "โต๊ะที่ 5"):
+            self.assertFalse(app._people_is_trustworthy(t), t)
+
+
+class TestFollowupAnswerIsNotSwallowed(unittest.TestCase):
+    """end-to-end เคสจริง 7 ต.ค. 69: บอทถาม 'กี่ท่าน' → พนักงานตอบ → บอทต้องไม่เงียบ
+
+    ของเดิมตัดทิ้งที่ _resv_not_an_answer ก่อนเรียก AI ด้วยซ้ำ — ไม่มี log ให้คนเห็น
+    ไม่มีข้อความตอบกลับ จองค้างเป็นร่างเปล่าแล้วหมดอายุไปเอง = จองหายเงียบเต็มรูปแบบ"""
+
+    GID = "Gresvfollow"
+
+    class _Ev:
+        reply_token = "tok"
+        class message:
+            id = "mid-follow"
+        class source:
+            group_id = "Gresvfollow"
+            user_id = "Upoy"
+            type = "group"
+
+    def setUp(self):
+        self._bak = (app.extract_reservation, app._reply_with_mention, app.get_display_name,
+                     app.RESV_GROUPS, app.BAR_GROUP_ID, app.STAFF_GROUP_ID,
+                     app.line_bot_api.reply_message, app.line_bot_api.push_message)
+        self.replies, self.cards = [], []
+        app._reply_with_mention = lambda ev, t: self.replies.append(t)
+        app.get_display_name = lambda src: "PY'Poy"
+        app.RESV_GROUPS = [self.GID]
+        app.BAR_GROUP_ID = self.GID
+        app.STAFF_GROUP_ID = self.GID
+        app.line_bot_api.reply_message = lambda tok, msgs: self.cards.append(msgs)
+        app.line_bot_api.push_message = lambda gid, msgs: self.cards.append(msgs)
+        app._resv_draft_clear(self.GID)
+        self._clear()
+
+    def tearDown(self):
+        (app.extract_reservation, app._reply_with_mention, app.get_display_name,
+         app.RESV_GROUPS, app.BAR_GROUP_ID, app.STAFF_GROUP_ID,
+         app.line_bot_api.reply_message, app.line_bot_api.push_message) = self._bak
+        app._resv_draft_clear(self.GID)
+        self._clear()
+
+    def _clear(self):
+        with app._db() as conn:
+            conn.execute("DELETE FROM reservations WHERE origin_group_id=?", (self.GID,))
+            conn.commit()
+
+    def _rows(self):
+        with app._db() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM reservations WHERE origin_group_id=?", (self.GID,)).fetchall()]
+
+    def test_answer_with_thai_particle_is_handled(self):
+        d = datetime.now(app.TZ).date() + timedelta(days=1)
+        asked_text = f"จองโต๊ะB11-B16\nวันที่{d.day}/{d.month}\nคุณบอส\nมา18:00น."
+        app._resv_draft_set(self.GID, asked_text, 1, asked=["people"],
+                            last_ask="1) กี่ท่านครับ?")
+        app.extract_reservation = lambda t: {
+            "is_reservation": True, "is_advance": True, "customer": "บอส",
+            "people": "10 ท่าน", "table": "B11-B16", "time_hhmm": "18:00",
+            "resv_date": d.isoformat()}
+        self._Ev.message.id = f"mid-{uuid.uuid4().hex}"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            handled = app.handle_reservation_text(self._Ev(), "10ท่านค่ะ บอดดด", self.GID)
+        self.assertTrue(handled, f"ห้ามเงียบ — บอทต้องรับคำตอบนี้\nlog: {buf.getvalue()[-600:]}")
+        rows = self._rows()
+        self.assertEqual(len(rows), 1, f"ต้องบันทึกจองได้ (ตอบกลับ: {self.replies})")
+        self.assertEqual(rows[0]["resv_date"], d.isoformat())
+        self.assertTrue(self.cards, "ต้องมีการ์ดจองออกไป")
+
+
 class TestResvFalsePositiveGuards(unittest.TestCase):
     """กันบอทตีข้อความ 'เรื่องขายของ/จ่ายเงิน' เป็นการจอง
 
