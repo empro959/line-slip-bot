@@ -2161,6 +2161,107 @@ function setupDailyTrigger(){
   ScriptApp.newTrigger('sendWeeklyAlert').timeBased().onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(9).nearMinute(0).create(); // สรุปรายสัปดาห์ จันทร์ 9 โมง
   Logger.log('✅ ตั้งเวลา: ดึง POS ตี 1–5 (ลองซ้ำจนสำเร็จ) · สรุปรายสัปดาห์ จันทร์ 9 โมง');
 }
+
+// ===== 🩺 ปุ่มเดียว: บอกว่าทำไม POS ไม่ลง + กู้วันที่ขาด + ตั้งตัวซ่อมอัตโนมัติ =====
+// ทำไมต้องมี (10-11 ต.ค. 69): เจ้าของแจ้ง "เมื่อคืนอีเมลสรุปยอดเข้าแล้ว แต่บอทแจ้งว่ายอด POS ไม่มี"
+//   บอทขึ้น: ⚠️ ไม่เจอยอด POS ของวันที่ 2026-10-09 ในระบบ — เทียบไม่ได้
+//
+// 🔍 ไล่โค้ดแล้วตัดออกได้ 1 ข้อ: `payDays = b.days.map(...)` ใส่ **ทุกวัน** ลง payment_days
+//    แม้ใบ BalanceCashDrawer อ่านไม่ได้ (payments={}) วันนั้นก็ยังมีแถว
+//    → posday จะคืน cash/transfer/card = 0 ไม่ใช่ day:null
+//    แปลว่า "ไม่เจอยอด POS" = **วันนั้นไม่มีใน pos_daily.json จริงๆ** = รอบนำเข้าไม่สำเร็จ
+//    (ไม่ใช่แค่อ่านใบยอดเงินไม่ออก)
+//
+// ⚠️ ใบ Close Shift ของ 9/10 ปิดกะตอน 10/10 00:41 พิมพ์ 00:56 → อีเมลออกราวตี 1
+//    trigger ตั้งไว้ ตี 1-5 (5 รอบ) ซึ่งควรจะทัน — เหลือ 3 ทางที่ยังเป็นไปได้ ต้องดูของจริง:
+//    (1) ชนโควตา OCR  (2) ด่าน LAST_IMPORTED_EMAIL_MS กันเอาไว้  (3) หาอีเมลไม่เจอ
+//    ตัวนี้พิมพ์ทั้งสามอย่างออกมาให้เห็นพร้อมกัน จะได้ไม่ต้องเดาอีก
+function fixPosNightly(){
+  Logger.log('🩺 ตรวจเส้นนำเข้า POS รายคืน');
+  Logger.log('═════════════════════════════');
+
+  // ── 1) trigger ที่ตั้งไว้จริง ──
+  // (Apps Script ไม่เปิดให้อ่าน 'ชั่วโมง' ของ trigger — ดูได้แค่ว่ามีกี่ตัว ชื่ออะไร)
+  var byFn={};
+  ScriptApp.getProjectTriggers().forEach(function(t){
+    var h=t.getHandlerFunction(); byFn[h]=(byFn[h]||0)+1;
+  });
+  Logger.log('⏰ trigger ที่มีอยู่:');
+  if(!Object.keys(byFn).length) Logger.log('   🔴 ไม่มี trigger เลย — นี่คือสาเหตุ (กด setupDailyTrigger)');
+  Object.keys(byFn).forEach(function(h){ Logger.log('   • '+h+' × '+byFn[h]); });
+  if(!byFn['importPosReports']) Logger.log('   🔴 ไม่มี importPosReports — POS จะไม่ลงเองเลย (กด setupDailyTrigger)');
+  else if(byFn['importPosReports']<5) Logger.log('   ⚠️ importPosReports มีแค่ '+byFn['importPosReports']+' ตัว (ปกติ 5 ตัว ตี 1-5)');
+
+  // ── 2) ด่านกันนำเข้าซ้ำ vs อีเมลใบใหม่ที่สุด ──
+  var props=PropertiesService.getScriptProperties();
+  var lastMs=Number(props.getProperty('LAST_IMPORTED_EMAIL_MS')||0);
+  Logger.log('📌 อีเมลใบล่าสุดที่นำเข้าไปแล้ว: '+(lastMs?new Date(lastMs):'(ยังไม่เคย)'));
+  var s=findLatestPdf_('SaleReport');
+  if(!s) Logger.log('🔴 หาไฟล์ SaleReport ในเมลไม่เจอเลย (กรอบค้น newer_than:35d, 40 เธรด)');
+  else {
+    Logger.log('📧 SaleReport ใบใหม่ที่สุดในเมล: "'+s.name+'" (เข้ามา '+new Date(s.time)+')');
+    if(lastMs && s.time<=lastMs)
+      Logger.log('   ⛔ ใบนี้ถูกนำเข้าไปแล้ว → รอบถัดไปจะข้าม (ถ้ามีวันขาด ต้องใช้ fillMissingDays เท่านั้น)');
+    else
+      Logger.log('   ✅ ใบนี้ยังไม่ถูกนำเข้า → รอบ trigger ถัดไปจะหยิบไปทำ');
+  }
+
+  // ── 3) 7 วันล่าสุดมีครบไหม ──
+  var daily=loadDaily_(), have={};
+  daily.forEach(function(d){ if(d.date) have[d.date]=true; });
+  var today=new Date(), line=[];
+  for(var i=1;i<=7;i++){
+    var dt=new Date(today.getTime()-i*86400000);
+    var iso=Utilities.formatDate(dt,'GMT+7','yyyy-MM-dd');
+    line.push(iso.slice(5)+(have[iso]?' ✅':' ❌'));
+  }
+  Logger.log('📅 7 วันล่าสุดใน pos_daily.json: '+line.join('  '));
+  Logger.log('═════════════════════════════');
+
+  // ── 4) กู้วันที่ขาดเดี๋ยวนี้ ──
+  Logger.log('🔧 กู้วันที่ขาด...');
+  try { fillMissingDays(); }
+  catch(e){ Logger.log('❌ กู้ไม่สำเร็จรอบนี้: '+e); }
+
+  // ── 5) ตั้งตัวซ่อมอัตโนมัติทุกเช้า ──
+  Logger.log('═════════════════════════════');
+  setupDailyRepair();
+}
+
+
+// ===== 🛠️ ตัวซ่อมอัตโนมัติทุกเช้า — ถูกต้องไม่ว่าคืนนั้นพลาดเพราะอะไร =====
+// trigger ตี 1-5 แก้ได้แค่ "รอบนั้นยิงพลาด" แต่แก้ไม่ได้เลยถ้า **อีเมลมาหลังตี 5**
+// หรือชนโควตา OCR ทั้ง 5 รอบ — วันนั้นจะถูกข้ามถาวร เพราะคืนถัดไป
+// findLatestPdf_ จะเห็นแต่ใบใหม่กว่า ไม่มีใครย้อนกลับไปเก็บวันที่ตกหล่น
+// fillMissingDays มองจาก "วันไหนไม่มีในไฟล์" ไม่ได้มองจากอีเมล → เก็บตกได้ทุกกรณี
+var DAILY_REPAIR_FN = 'dailyRepair';
+
+function setupDailyRepair(){
+  var n=0;
+  ScriptApp.getProjectTriggers().forEach(function(t){
+    if(t.getHandlerFunction()===DAILY_REPAIR_FN){ ScriptApp.deleteTrigger(t); n++; }
+  });
+  ScriptApp.newTrigger(DAILY_REPAIR_FN).timeBased().atHour(7).nearMinute(0).everyDays(1).create();
+  Logger.log('🛠️ ตั้งตัวซ่อมอัตโนมัติแล้ว — ทุกเช้า ~7 โมง จะไล่เก็บวันที่ขาดให้เอง'+
+             (n?' (ลบตัวเก่า '+n+' ตัว)':''));
+  Logger.log('   เลือก 7 โมง เพราะพ้นช่วง trigger ปกติ (ตี 1-5) และพ้นเวลาที่อีเมลมาช้าแล้ว');
+}
+
+// ตัวที่ trigger เรียกทุกเช้า — ไม่ต้องกดเอง
+// 📌 จบแบบ "โยน error" ถ้ายังขาด เพื่อให้ Apps Script ส่งเมลแจ้งเจ้าของเอง
+//    (เงียบแล้วไม่มีใครรู้ = ปัญหาเดิมที่เพิ่งเจอ · log ที่ไม่มีคนเปิดอ่าน ไม่ต่างจากไม่มี log)
+function dailyRepair(){
+  var before=_missingDays_().all;
+  if(!before.length){ Logger.log('✅ ไม่มีวันที่ขาด'); return; }
+  Logger.log('🔧 ซ่อมประจำวัน — ขาด '+before.length+' วัน: '+before.join(', '));
+  try { fillMissingDays(); } catch(e){ Logger.log('❌ '+e); }
+  var left=_missingDays_().all;
+  if(!left.length){ Logger.log('✅ เก็บครบแล้ว'); return; }
+  throw new Error('ยังขาดข้อมูล POS ' + left.length + ' วัน: ' + left.join(', ') +
+                  ' — เปิด Apps Script > การดำเนินการ ดู log ว่าติดอะไร ' +
+                  '(ถ้าเป็นวันร้านหยุด ให้ใส่ใน CLOSED_DAYS)');
+}
+
 function testFetch() {
   var r = UrlFetchApp.fetch('https://www.google.com', {muteHttpExceptions:true});
   Logger.log('external_request OK: ' + r.getResponseCode());
