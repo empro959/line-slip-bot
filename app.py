@@ -4909,26 +4909,95 @@ def save_reservation(origin_group_id: str, requested_by: str, info: dict, raw_te
         return rid
 
 
+_TBL_CODE_PAIR = re.compile(r"([A-Za-z])\s*(\d{1,2})")
+
+
+def _resv_cust_key(s) -> str:
+    """ชื่อลูกค้าแบบตัดช่องว่าง — 'คุณ ฮัน' กับ 'คุณฮัน' คือคนเดียวกัน"""
+    return re.sub(r"\s+", "", str(s or "")).lower()
+
+
+def _resv_people_key(s) -> str:
+    """จำนวนคนเอาเฉพาะตัวเลข — '7 ท่าน' · '7ท่าน' · '7 คน' → '7'  ·  '5-6 คน' → '5-6'"""
+    nums = re.findall(r"\d+", str(s or ""))
+    return "-".join(nums) if nums else re.sub(r"\s+", "", str(s or "")).lower()
+
+
+def _resv_table_key(s) -> str:
+    """โต๊ะ/โซน → 'ชุดรหัสโต๊ะ' ที่เทียบกันได้ ไม่ขึ้นกับวิธีพิมพ์
+
+    'โซน A9 โต๊ะ A10'  → 'A10,A9'
+    'โซน A โต๊ะ 9-10'  → 'A10,A9'   ← ชุดเดียวกัน (เลขลอยๆ ยืมตัวอักษรจาก 'โซน X')
+    """
+    t = str(s or "")
+    if not t.strip():
+        return ""
+    zm = re.search(r"โซน\s*([A-Za-z])", t)
+    zone = (zm.group(1) if zm else "").upper()
+    codes = {f"{m.group(1).upper()}{int(m.group(2))}" for m in _TBL_CODE_PAIR.finditer(t)}
+    for n in re.findall(r"\d{1,2}", _TBL_CODE_PAIR.sub(" ", t)):   # เลขที่ไม่ได้ติดตัวอักษร
+        codes.add(f"{zone}{int(n)}" if zone else str(int(n)))
+    if not codes:                       # ไม่มีเลขเลย ('โซน A') → เทียบด้วยข้อความที่ถอดคำนำหน้าแล้ว
+        return re.sub(r"โซน|โต๊ะ|\s+", "", t).lower()
+    return ",".join(sorted(codes))
+
+
+def _resv_time_key(s) -> str:
+    """ดึง HH:MM จากข้อความอะไรก็ได้ — '19:00' · '19.00' · 'วันนี้ 19:00' → '19:00'"""
+    m = re.search(r"(\d{1,2})[:.](\d{2})", str(s or ""))
+    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else ""
+
+
 def _find_dup_reservation(info) -> dict:
     """หาจอง 'เนื้อหาเดียวกัน' ที่ยังไม่ถูกยกเลิก (กันบันทึกซ้ำเมื่อพิมพ์จองเดิมใหม่หลายรอบ)
-    match: ลูกค้า + จำนวนคน + โต๊ะ/โซน + วันที่จอง (โต๊ะเดิม-วันเดิม-ลูกค้าเดิม มักคือจองเดียวกัน)
-    คืน dict ของจองเดิม หรือ None"""
-    cust = (info.get("customer") or "").strip()
+    match: ลูกค้า + จำนวนคน + โต๊ะ/โซน + เวลา + วันที่จอง — เทียบแบบ 'ถอดวิธีพิมพ์ออกก่อน'
+    คืน dict ของจองเดิม หรือ None
+
+    🪤 เคสจริง 12 ต.ค. 69 — เจ้าของแจ้งว่า "ขาดการจับจองซ้ำ":
+      ⏳ #87 คุณฮัน 7 ท่าน | 12/10 19:00 | โซน A9 โต๊ะ A10
+      ✅ #88 คุณฮัน 7ท่าน  | 12/10 19:00 | โซน A โต๊ะ 9-10
+    ใบเดียวกันชัดเจน แต่ของเดิมเทียบ `people=?` และ `table_no=?` **แบบตรงตัวเป๊ะใน SQL**
+      '7 ท่าน' ≠ '7ท่าน'  (ต่างกันแค่ช่องว่าง)
+      'โซน A9 โต๊ะ A10' ≠ 'โซน A โต๊ะ 9-10'  (คนละวิธีเขียนโต๊ะเดียวกัน)
+    → หลุดด่าน บันทึกซ้ำ → โต๊ะถูกกันไว้ 2 ใบ · พนักงานเห็น 2 รายการแล้วไม่รู้ว่าอันไหนจริง
+    📌 ตระกูลเดียวกับ §3.39: **สตริงภาษาไทยจากคนพิมพ์ ห้ามเทียบตรงตัว** ต้องถอดวิธีพิมพ์ออกก่อน
+
+    ⚖️ เพิ่ม 'เวลา' เข้าไปในการเทียบด้วย — ของเดิมไม่เคยเทียบเวลาเลย
+    ทั้งที่ข้อความที่บอทตอบเขียนเองว่า "ถ้าตั้งใจจองเพิ่มจริง ให้ระบุโต๊ะหรือ**เวลา**ให้ต่างจากเดิม"
+    = คำแนะนำนั้นไม่เป็นจริง · ลูกค้าเดิมจองโต๊ะเดิมสองรอบ (18:00 กับ 21:00) จะถูกตีเป็นซ้ำ
+    แล้ว **รอบที่สองหายเงียบ** ทั้งที่เป็นจองจริง"""
+    cust = _resv_cust_key(info.get("customer"))
     if not cust:
         return None   # ไม่มีชื่อลูกค้า → ตัดสินไม่ได้ว่าซ้ำ ปล่อยผ่าน
     rd = _sane_resv_date(info.get("resv_date")) or datetime.now(TZ).date().isoformat()
+    want_people = _resv_people_key(info.get("people"))
+    want_table  = _resv_table_key(info.get("table"))
+    want_time   = _resv_time_key(info.get("time_hhmm"))
     try:
         with _db() as conn:
-            row = conn.execute(
+            rows = [dict(r) for r in conn.execute(
                 "SELECT * FROM reservations WHERE status IN ('PENDING','CONFIRMED') "
-                "AND customer=? AND COALESCE(resv_date,?)=? "
-                "AND COALESCE(people,'')=? AND COALESCE(table_no,'')=? "
-                "ORDER BY id DESC LIMIT 1",
-                (cust, rd, rd, info.get("people") or "", info.get("table") or "")).fetchone()
-        return dict(row) if row else None
+                "AND COALESCE(resv_date,?)=? ORDER BY id DESC", (rd, rd)).fetchall()]
     except Exception as e:
         print(f"[resv] เช็คจองซ้ำไม่ได้: {e}", flush=True)
         return None
+    # กรองในไพธอน ไม่ใช่ใน SQL — ต้อง normalize ก่อนเทียบ ซึ่ง SQL ทำให้ไม่ได้
+    # (วันเดียวมีจองไม่กี่สิบใบ ไม่ใช่ภาระ)
+    for r in rows:
+        if _resv_cust_key(r.get("customer")) != cust:
+            continue
+        if _resv_people_key(r.get("people")) != want_people:
+            continue
+        if _resv_table_key(r.get("table_no")) != want_table:
+            continue
+        # ⚠️ เวลาใช้ 'แยกใบ' ได้เฉพาะเมื่อรู้ทั้งสองข้าง — ข้างใดข้างหนึ่งว่าง = 'ไม่รู้' ไม่ใช่ 'คนละเวลา'
+        # resv_datetime เก็บจาก info['datetime'] ซึ่งพรอมป์ตระบุว่า 'ถ้ามี' → ว่างได้จริง
+        # ถ้าเทียบตายตัวจะกลายเป็น 'ไม่รู้เวลา = คนละใบ' → ด่านกันซ้ำพังหนักกว่าเดิม (กติกา 0 ≠ ไม่รู้)
+        t_old = _resv_time_key(r.get("resv_datetime"))
+        if t_old and want_time and t_old != want_time:
+            continue
+        return r
+    return None
 
 
 def _valid_ymd(s) -> bool:

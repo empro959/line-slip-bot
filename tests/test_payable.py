@@ -3539,6 +3539,101 @@ class TestSlipDatetimeSanity(unittest.TestCase):
         self.assertEqual(app._sane_slip_dt(d), d)
 
 
+class TestResvDupNormalized(unittest.TestCase):
+    """จองซ้ำต้องจับได้แม้พิมพ์คนละแบบ — สตริงไทยจากคนพิมพ์ ห้ามเทียบตรงตัว
+
+    เคสจริง 12 ต.ค. 69 (เจ้าของแจ้ง "ขาดการจับจองซ้ำ"):
+      ⏳ #87 คุณฮัน 7 ท่าน | 12/10 19:00 | โซน A9 โต๊ะ A10
+      ✅ #88 คุณฮัน 7ท่าน  | 12/10 19:00 | โซน A โต๊ะ 9-10
+    ใบเดียวกัน แต่ของเดิมเทียบ people/table_no ตรงตัวใน SQL → หลุดด่าน โต๊ะถูกกันไว้ 2 ใบ"""
+
+    GID = "Gresvdupnorm"
+
+    def setUp(self):
+        self._clear()
+
+    def tearDown(self):
+        self._clear()
+
+    def _clear(self):
+        with app._db() as conn:
+            conn.execute("DELETE FROM reservations WHERE origin_group_id=?", (self.GID,))
+            conn.commit()
+
+    def _today(self):
+        return datetime.now(app.TZ).date().isoformat()
+
+    def _save(self, **kw):
+        info = {"customer": "คุณฮัน", "people": "7 ท่าน", "table": "โซน A9 โต๊ะ A10",
+                "time_hhmm": "19:00", "datetime": "วันนี้ 19:00", "resv_date": self._today()}
+        info.update(kw)
+        return app.save_reservation(self.GID, "Doi", info, "จอง", self.GID)
+
+    def test_real_case_87_vs_88(self):
+        rid = self._save()
+        dup = app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7ท่าน", "table": "โซน A โต๊ะ 9-10",
+             "time_hhmm": "19:00", "resv_date": self._today()})
+        self.assertIsNotNone(dup, "ต้องจับได้ว่าเป็นใบเดียวกัน")
+        self.assertEqual(dup["id"], rid)
+
+    def test_space_in_name_and_people(self):
+        rid = self._save(customer="คุณ ฮัน", people="7ท่าน")
+        dup = app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7 คน", "table": "โซน A9 โต๊ะ A10",
+             "time_hhmm": "19:00", "resv_date": self._today()})
+        self.assertIsNotNone(dup)
+        self.assertEqual(dup["id"], rid)
+
+    def test_different_tables_are_not_duplicates(self):
+        """ทิศกลับ: โต๊ะไม่เหมือนกันต้องไม่ถูกตีเป็นซ้ำ (จองจริงจะหายเงียบ)"""
+        self._save(table="โซน A โต๊ะ 9")
+        self.assertIsNone(app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7 ท่าน", "table": "โซน A โต๊ะ 9-10",
+             "time_hhmm": "19:00", "resv_date": self._today()}))
+
+    def test_different_people_count_is_not_duplicate(self):
+        self._save(people="7 ท่าน")
+        self.assertIsNone(app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "8 ท่าน", "table": "โซน A9 โต๊ะ A10",
+             "time_hhmm": "19:00", "resv_date": self._today()}))
+
+    def test_second_seating_same_table_is_not_duplicate(self):
+        """ลูกค้าเดิม โต๊ะเดิม วันเดิม แต่คนละรอบเวลา = จองจริง 2 ใบ ห้ามกลืนใบที่สอง
+
+        ของเดิมไม่เคยเทียบเวลาเลย ทั้งที่ข้อความบอทเขียนเองว่า
+        'ถ้าตั้งใจจองเพิ่มจริง ให้ระบุโต๊ะหรือเวลาให้ต่างจากเดิม'"""
+        self._save(time_hhmm="18:00", datetime="วันนี้ 18:00")
+        self.assertIsNone(app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7 ท่าน", "table": "โซน A9 โต๊ะ A10",
+             "time_hhmm": "21:00", "resv_date": self._today()}))
+
+    def test_unknown_time_must_not_break_the_guard(self):
+        """🪤 resv_datetime เก็บจาก info['datetime'] ซึ่ง AI อาจไม่ส่งมา → ว่างได้จริง
+        'ไม่รู้เวลา' ต้องไม่ถูกอ่านว่า 'คนละเวลา' ไม่งั้นด่านพังหนักกว่าเดิม (กติกา 0 ≠ ไม่รู้)"""
+        rid = self._save(datetime=None)
+        dup = app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7 ท่าน", "table": "โซน A9 โต๊ะ A10",
+             "time_hhmm": "19:00", "resv_date": self._today()})
+        self.assertIsNotNone(dup, "ใบเก่าไม่มีเวลา → ต้องยังจับซ้ำได้")
+        self.assertEqual(dup["id"], rid)
+
+    def test_cancelled_booking_is_not_a_duplicate(self):
+        """ทิศกลับ: ยกเลิกไปแล้วต้องจองเนื้อหาเดิมใหม่ได้"""
+        rid = self._save()
+        app.cancel_reservation(rid, "Doi")
+        self.assertIsNone(app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7 ท่าน", "table": "โซน A9 โต๊ะ A10",
+             "time_hhmm": "19:00", "resv_date": self._today()}))
+
+    def test_other_day_is_not_a_duplicate(self):
+        self._save()
+        other = (datetime.now(app.TZ).date() + timedelta(days=1)).isoformat()
+        self.assertIsNone(app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7 ท่าน", "table": "โซน A9 โต๊ะ A10",
+             "time_hhmm": "19:00", "resv_date": other}))
+
+
 class TestDupAlertWording(unittest.TestCase):
     """'ส่งซ้ำ' ไม่ใช่ 'ปลอม' — พาดหัวต้องตรงกับสิ่งที่พิสูจน์ได้
 
