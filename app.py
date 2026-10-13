@@ -83,6 +83,12 @@ WEBHOOK_FORWARD_URLS = [u.strip() for u in os.environ.get("WEBHOOK_FORWARD_URLS"
 # ปลายทางอาจเป็น Apps Script ซึ่ง cold start ได้หลายวินาที — ให้เวลาพอสมควร
 # (ยิงใน thread แยกอยู่แล้ว รอนานไม่กระทบการตอบ LINE)
 WEBHOOK_FORWARD_TIMEOUT = float(os.environ.get("WEBHOOK_FORWARD_TIMEOUT", "10"))
+# "สัญญาณชีพขาเข้า" — ยิง event เปล่าผ่านเส้นทาง fan-out เดิมวันละครั้ง (ดีฟอลต์ 00:00)
+# ทำไมต้องมี (ห้องคอนเทนต์ 13/10/69): ขาเข้าคือ "คนพิมพ์" ไม่ใช่เครื่อง — เงียบ 3–4 วันเป็นเรื่องปกติ
+# (อ./พฤ. ร้านเงียบ) ปลายทางจึงตั้งเตือน "ขาเข้าเงียบเกิน 24 ชม." ไม่ได้ เพราะจะร้องเกือบทุกสัปดาห์
+# ทั้งที่ไม่มีอะไรเสีย → สามเดือนก็ไม่มีใครเชื่อ ซึ่งแย่กว่าไม่มีสัญญาณ (นึกว่ามีคนเฝ้าอยู่)
+# มี canary วันละครั้ง = ขาเข้าไม่มีทางเงียบเกิน 24 ชม. โดยธรรมชาติ → เตือนที่ 25 ชม. ไม่ false alarm
+INBOUND_CANARY_HOUR = int(os.environ.get("INBOUND_CANARY_HOUR", "0"))
 RECON_MIN_DIFF = float(os.environ.get("RECON_MIN_DIFF", "1"))  # ต่างเกินกี่บาทถึงเตือน (กัน rounding)
 # วันที่ในสมุดย้อนหลังเกินกี่วัน ถึงติดธง 'อาจอ่านเลขเดือนผิด' ในข้อความเตือน
 RECON_OLD_WARN_DAYS = int(os.environ.get("RECON_OLD_WARN_DAYS", "7"))
@@ -4511,6 +4517,7 @@ def _report_backup_loop():
             maybe_send_resv_summary()
             maybe_send_daily_report()
             maybe_send_payable_summary()
+            maybe_send_inbound_canary()
             _payable_flush_all_pending()
         except Exception as e:
             print(f"[report] backup loop error: {e}", flush=True)
@@ -5538,6 +5545,24 @@ def _handle_secondary_callback(body: str, signature: str) -> bool:
     return False
 
 
+# Apps Script ตั้ง HTTP status code ไม่ได้ — ContentService คืน 200 เสมอแม้ตอนปฏิเสธ
+# ด่าน BRIDGE_KEY ของ bridge จึงตอบ {"status":"denied"} มาพร้อม HTTP 200
+# ถ้าเราดูแต่ status_code → คีย์ผิดทั้งวันจะอ่านเป็น "ส่งสำเร็จ" = เงียบสนิทตลอดกาล
+_DENIED_RE = re.compile(r"""["']status["']\s*:\s*["'](?:denied|unauthorized|forbidden)["']""", re.I)
+
+
+def _forward_denied(text: str) -> bool:
+    """ปลายทางตอบ 200 แต่ body บอกว่าปฏิเสธ (ด่านคีย์ไม่ผ่าน) ไหม — ดูแค่ต้น body พอ"""
+    return bool(_DENIED_RE.search((text or "")[:300]))
+
+
+def _log_url(url: str) -> str:
+    """ตัด query string ออกก่อนลง log — URL fan-out มีคีย์ลับต่อท้ายได้ (?k=BRIDGE_KEY ที่ใช้ปิด
+    ประตูขาเข้าของ bridge) และ log ของ Render ไม่ใช่ที่เก็บความลับ
+    เดิมใช้ url[:60] ซึ่ง 'บังเอิญ' ตัดก่อนถึง query string ของ Apps Script — บังเอิญไม่ใช่การกัน"""
+    return (str(url or "").split("?", 1)[0])[:80]
+
+
 def _forward_webhook(raw: bytes, signature: str):
     """ส่ง event ดิบต่อให้ระบบอื่นที่ใช้ OA เดียวกัน — ต้องส่ง body ดิบ + ลายเซ็นเดิม
     ปลายทางจึงตรวจ signature ผ่าน · พังที่ปลายทางต้องไม่กระทบบอทร้าน จึงกลืน error ทั้งหมด
@@ -5548,9 +5573,107 @@ def _forward_webhook(raw: bytes, signature: str):
                               headers={"Content-Type": "application/json",
                                        "X-Line-Signature": signature})
             if r.status_code >= 400:
-                print(f"[forward] {url[:60]} → HTTP {r.status_code}", flush=True)
+                print(f"[forward] {_log_url(url)} → HTTP {r.status_code}", flush=True)
+            elif _forward_denied(r.text):
+                print(f"[forward] 🔴 {_log_url(url)} ปฏิเสธใบนี้ (HTTP 200 แต่ body = denied) "
+                      f"— คีย์ ?k= ท้าย WEBHOOK_FORWARD_URLS ไม่ตรงกับ BRIDGE_KEY ที่ bridge", flush=True)
         except Exception as e:
-            print(f"[forward] {url[:60]} ไม่สำเร็จ: {str(e)[:120]}", flush=True)
+            print(f"[forward] {_log_url(url)} ไม่สำเร็จ: {str(e)[:120]}", flush=True)
+
+
+# จำในหน่วยความจำก่อนแตะ DB — /health ถูก ping ทุก 5 นาที และเช็คนี้อยู่ *ก่อน* ด่านเงียบลึก
+# ถ้าเช็ค DB ทุกครั้งจะปลุก Neon ตลอดคืน (ผิดเจตนาของช่วงเงียบลึก) · รีสตาร์ทแล้วค่อยถาม DB รอบเดียว
+_inbound_canary_date = ""
+
+
+def _canary_body() -> bytes:
+    """body ของ canary — events ว่าง (ปลายทางวนลูป events = no-op ปลอดภัย)
+    ใส่ _canary ไว้ให้ปลายทางแยกออกว่าอันนี้มาจากเครื่อง ไม่ใช่คนพิมพ์ (นับ inbound_ok แยกกันได้)"""
+    return json.dumps({"events": [], "_canary": {"from": "line-slip-bot",
+                                                 "sent_at": datetime.now(TZ).isoformat(timespec="seconds")}},
+                      ensure_ascii=False).encode("utf-8")
+
+
+_last_canary_warn_ts = 0.0
+
+
+def _canary_alarm(today: str, denied: int, total: int):
+    """canary ไปไม่ถึงปลายทางเลย = ขาเข้าของระบบคอนเทนต์ตาย (บอทร้านไม่กระทบ — Render เป็นทางเข้า)
+
+    ทำไมต้อง DM: log ของ Render ไม่มีใครเปิดอ่านทุกวัน · และถ้าเราเงียบ
+    ปลายทางจะเห็นแค่ 'ไม่มีใครยิงอะไรเข้ามา' ซึ่งแยกไม่ออกจาก 'สัปดาห์นี้ไม่มีใครพิมพ์'
+    จำกัด 1 ครั้ง/30 นาที (แพตเทิร์นเดียวกับ _check_memory) เพราะ /health ถูก ping ทุก 5 นาที"""
+    global _last_canary_warn_ts
+    why = (f"ถูกปฏิเสธ {denied}/{total} ปลายทาง (คีย์ ?k= ไม่ตรงกับ BRIDGE_KEY ที่ bridge)"
+           if denied else f"ไม่มีปลายทางใดรับเลย ({total} ปลายทาง)")
+    print(f"[canary] 🔴 {today} {why} — จะลองใหม่รอบ ping หน้า", flush=True)
+    if time.time() - _last_canary_warn_ts < 1800:
+        return
+    _last_canary_warn_ts = time.time()
+    if not ADMIN_USER_ID:
+        return
+    try:
+        _push(ADMIN_USER_ID, TextSendMessage(
+            text=f"🔴 [SYSTEM] สัญญาณชีพขาเข้าส่งไม่ถึง bridge\n{why}\n"
+                 "ผลคือ: บอทคอนเทนต์ไม่ได้รับ event (บอทร้าน/สลิป/จอง ไม่กระทบ)\n"
+                 "เช็ค: คีย์ท้าย WEBHOOK_FORWARD_URLS ที่ Render ตรงกับ BRIDGE_KEY ที่ bridge ไหม"))
+    except Exception:
+        pass
+
+
+def maybe_send_inbound_canary():
+    """ยิง event สังเคราะห์วันละครั้งผ่านเส้นทาง fan-out เดิม (LINE→/callback→WEBHOOK_FORWARD_URLS)
+
+    เซ็นด้วย LINE_CHANNEL_SECRET เองเหมือนที่ LINE เซ็น — ทำไมยังต้องเซ็นถึงแม้ปลายทางไม่ตรวจ:
+      1) ส่ง body หน้าตาเหมือน LINE ทุกอย่าง → ปลายทางเปลี่ยนมาตรวจวันไหน canary ไม่พังตามไปด้วย
+      2) ปลายทางอื่นใน WEBHOOK_FORWARD_URLS ในอนาคตอาจตรวจ (เราคุมแค่ว่าเราส่งถูก)
+    🔴 ของจริง (ห้องคอนเทนต์อ่านไฟล์ bridge ทั้งไฟล์ 13/10/69): doPost ของ bridge
+    *ไม่ตรวจลายเซ็นเลยสักบรรทัด* — _secret() ถูกเรียกที่เดียวใน forwardToRender ซึ่งตายแล้ว
+    เพราะ STANDALONE = true (5 ก.ย.) · Apps Script อ่าน HTTP header ไม่ได้ จึงตรวจแบบ LINE ไม่ได้ถาวร
+    → ประตูขาเข้าของ bridge ปิดด้วย BRIDGE_KEY ใน query string แทน (?k=... ต่อท้าย URL fan-out)
+    ซึ่ง canary ได้ไปด้วยอัตโนมัติเพราะอ่าน WEBHOOK_FORWARD_URLS ตัวเดียวกัน — ไม่ต้องแก้โค้ดนี้
+    ไม่ตั้ง WEBHOOK_FORWARD_URLS = ไม่ยิงอะไรเลย · ยิงไม่ผ่าน = ไม่จดวันที่ → ping รอบหน้าลองใหม่"""
+    global _inbound_canary_date
+    if not WEBHOOK_FORWARD_URLS:
+        return
+    now = datetime.now(TZ)
+    if now.hour < INBOUND_CANARY_HOUR:
+        return
+    today = now.date().isoformat()
+    if _inbound_canary_date == today:
+        return
+    if _get_meta("last_inbound_canary_date") == today:
+        _inbound_canary_date = today
+        return
+    if not LINE_SECRET:
+        # เงียบคือศัตรูตัวจริง: ไม่มี secret = เซ็นไม่ได้ = ปลายทางตีตก ต้องบอกเหตุผลไว้ใน log
+        print("[canary] ข้าม — ไม่มี LINE_CHANNEL_SECRET จึงเซ็น signature ไม่ได้", flush=True)
+        return
+    raw = _canary_body()
+    sig = base64.b64encode(hmac.new(LINE_SECRET.encode("utf-8"), raw, hashlib.sha256).digest()).decode("utf-8")
+    ok = denied = 0
+    for url in WEBHOOK_FORWARD_URLS:
+        try:
+            r = requests.post(url, data=raw, timeout=WEBHOOK_FORWARD_TIMEOUT,
+                              headers={"Content-Type": "application/json", "X-Line-Signature": sig})
+            if r.status_code >= 400:
+                print(f"[canary] {_log_url(url)} → HTTP {r.status_code} (ยิงไม่ผ่าน)", flush=True)
+            elif _forward_denied(r.text):
+                # ปฏิเสธมาเป็น HTTP 200 — ห้ามนับว่าสำเร็จ ไม่งั้น canary จะรายงานเขียวทั้งที่ประตูปิดใส่เรา
+                denied += 1
+                print(f"[canary] 🔴 {_log_url(url)} ปฏิเสธ (HTTP 200 แต่ body = denied) "
+                      f"— คีย์ ?k= ไม่ตรงกับ BRIDGE_KEY", flush=True)
+            else:
+                ok += 1
+                print(f"[canary] {_log_url(url)} → HTTP {r.status_code}", flush=True)
+        except Exception as e:
+            print(f"[canary] {_log_url(url)} ไม่สำเร็จ: {str(e)[:120]}", flush=True)
+    if ok == 0:
+        _canary_alarm(today, denied, len(WEBHOOK_FORWARD_URLS))
+        return
+    _inbound_canary_date = today
+    _set_meta("last_inbound_canary_date", today)
+    print(f"[canary] done {today} ({ok}/{len(WEBHOOK_FORWARD_URLS)} ปลายทาง)", flush=True)
 
 
 @app.route("/callback", methods=["POST"])
@@ -6822,6 +6945,12 @@ def handle_postback(event):
 
 @app.route("/health", methods=["GET"])
 def health():
+    # สัญญาณชีพขาเข้า — เช็ค *ก่อน* ด่านเงียบลึก เพราะถ้าเจ้าของเลื่อน QUIET_* มาคลุมชั่วโมง canary
+    # มันจะหยุดยิงเงียบๆ แล้วปลายทางจะร้องว่า "ขาเข้าตาย" ทั้งที่บอทปกติดี (ด่านจำในหน่วยความจำ ไม่แตะ DB)
+    try:
+        maybe_send_inbound_canary()
+    except Exception as e:
+        print(f"[canary] health-trigger error: {e}", flush=True)
     # ช่วงเงียบลึก (ดึก–เช้า) → ตอบเบาๆ ไม่แตะ DB/รายงาน เพื่อปล่อยให้ Neon หลับ ประหยัด compute
     if _in_deep_quiet() and not _is_report_window():
         return {"status": "ok", "quiet": True}

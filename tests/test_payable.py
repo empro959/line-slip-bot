@@ -576,9 +576,10 @@ class TestWebhookForward(unittest.TestCase):
     def tearDown(self):
         app.WEBHOOK_FORWARD_URLS[:] = self._orig
 
-    def _fake_post(self, ok=True, boom=False):
+    def _fake_post(self, ok=True, boom=False, body=""):
         class _R:
             status_code = 200 if ok else 500
+            text = body
         def _post(url, data=None, timeout=None, headers=None):
             self.calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
             if boom:
@@ -621,6 +622,49 @@ class TestWebhookForward(unittest.TestCase):
             app.requests.post = orig
         self.assertEqual([c["url"] for c in self.calls], ["https://a.test/h", "https://b.test/h"])
 
+    def test_denied_with_http_200_must_be_loud(self):
+        """Apps Script ตั้ง HTTP status ไม่ได้ — ด่าน BRIDGE_KEY ปฏิเสธมาเป็น 200 + body denied
+
+        ถ้าดูแต่ status_code → คีย์ผิดทั้งวันอ่านเป็น 'ส่งสำเร็จ' = เงียบสนิทตลอดกาล"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        orig = app.requests.post
+        app.requests.post = self._fake_post(body='{"status":"denied"}')
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                app._forward_webhook(b"{}", "SIG")
+        finally:
+            app.requests.post = orig
+        self.assertIn("denied", buf.getvalue())
+        self.assertIn("BRIDGE_KEY", buf.getvalue(), "log ต้องบอกวิธีแก้ ไม่ใช่แค่ว่าพัง")
+
+    def test_normal_200_stays_quiet(self):
+        """ผ่านปกติต้องไม่ตะโกน (ไม่งั้น log ท่วมแล้วไม่มีใครอ่านตอนมีปัญหาจริง)"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        orig = app.requests.post
+        app.requests.post = self._fake_post(body='{"status":"ok"}')
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                app._forward_webhook(b"{}", "SIG")
+        finally:
+            app.requests.post = orig
+        self.assertNotIn("🔴", buf.getvalue())
+
+    def test_secret_in_url_never_reaches_the_log(self):
+        """URL fan-out มีคีย์ลับต่อท้ายได้ (?k=BRIDGE_KEY) — log ของ Render ไม่ใช่ที่เก็บความลับ"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://script.google.com/macros/s/AKfycbX/exec?src=render&k=KEYLEAK"]
+        orig = app.requests.post
+        app.requests.post = self._fake_post(ok=False)     # HTTP 500 → เข้าเส้น print
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                app._forward_webhook(b"{}", "SIG")
+        finally:
+            app.requests.post = orig
+        self.assertIn("KEYLEAK", self.calls[0]["url"], "คีย์ต้องถึงปลายทาง")
+        self.assertNotIn("KEYLEAK", buf.getvalue(), "คีย์หลุดลง log")
+
     def test_no_env_means_no_traffic(self):
         """ไม่ตั้ง env = ต้องไม่ยิงเน็ตออกเลย (ดีฟอลต์ต้องปลอดภัย)"""
         app.WEBHOOK_FORWARD_URLS[:] = []
@@ -630,6 +674,188 @@ class TestWebhookForward(unittest.TestCase):
             app._forward_webhook(b"{}", "SIG")
         finally:
             app.requests.post = orig
+        self.assertEqual(self.calls, [])
+
+
+class TestInboundCanary(unittest.TestCase):
+    """สัญญาณชีพขาเข้า — ยิง event เปล่าวันละครั้งผ่านเส้นทาง fan-out เดิม
+
+    ทำไมต้องมี (ห้องคอนเทนต์ 13/10/69): ขาเข้าคือ 'คนพิมพ์' เงียบ 3–4 วันเป็นเรื่องปกติ
+    ปลายทางจึงตั้งเตือน 'เงียบเกิน 24 ชม.' ไม่ได้ — จะร้องเกือบทุกสัปดาห์ทั้งที่ไม่มีอะไรเสีย
+    canary วันละครั้งทำให้เตือนที่ 25 ชม. ได้โดยไม่ false alarm
+    กฎเหล็ก: ลายเซ็นต้องถูกจริง (ปลายทางตรวจ) · วันละครั้ง · ไม่ตั้ง env = ไม่ยิง · ยิงพลาดต้องลองใหม่"""
+
+    def setUp(self):
+        self._orig_urls = app.WEBHOOK_FORWARD_URLS[:]
+        self._orig_hour = app.INBOUND_CANARY_HOUR
+        self._orig_secret = app.LINE_SECRET
+        self._orig_post = app.requests.post
+        self._orig_admin = app.ADMIN_USER_ID
+        app._inbound_canary_date = ""
+        app._del_meta("last_inbound_canary_date")
+        app.INBOUND_CANARY_HOUR = 0
+        self.calls = []
+
+    def tearDown(self):
+        app.WEBHOOK_FORWARD_URLS[:] = self._orig_urls
+        app.INBOUND_CANARY_HOUR = self._orig_hour
+        app.LINE_SECRET = self._orig_secret
+        app.requests.post = self._orig_post
+        app.ADMIN_USER_ID = self._orig_admin        # ห้ามให้ค่าหลุดไปเทสต์อื่น
+        app._last_canary_warn_ts = 0.0
+        app._inbound_canary_date = ""
+        app._del_meta("last_inbound_canary_date")
+
+    def _fake_post(self, status=200, boom=False, body=""):
+        class _R:
+            status_code = status
+            text = body
+        def _post(url, data=None, timeout=None, headers=None):
+            self.calls.append({"url": url, "data": data, "headers": headers})
+            if boom:
+                raise RuntimeError("ปลายทางล่ม")
+            return _R()
+        return _post
+
+    def _run(self, **kw):
+        app.requests.post = self._fake_post(**kw)
+        with contextlib.redirect_stdout(io.StringIO()):
+            app.maybe_send_inbound_canary()
+
+    def test_signature_matches_what_line_would_send(self):
+        """ลายเซ็นต้องตรวจผ่านด้วยสูตรเดียวกับที่ LINE เซ็น — ไม่ตรง = ปลายทางตีตกทุกวันแบบเงียบ"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        app.LINE_SECRET = "secret-abc"
+        self._run()
+        self.assertEqual(len(self.calls), 1)
+        c = self.calls[0]
+        self.assertTrue(app._sig_ok("secret-abc", c["data"].decode("utf-8"),
+                                    c["headers"]["X-Line-Signature"]),
+                        "ปลายทางตรวจลายเซ็นด้วย _sig_ok เหมือนกัน — ต้องผ่าน")
+        self.assertEqual(c["headers"]["Content-Type"], "application/json")
+
+    def test_body_has_empty_events_and_canary_marker(self):
+        """events ว่าง = ปลายทางวนลูปแล้ว no-op (ปลอดภัย) · _canary ให้เขาแยกจาก 'คนพิมพ์' ได้"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        app.LINE_SECRET = "s"
+        self._run()
+        body = json.loads(self.calls[0]["data"].decode("utf-8"))
+        self.assertEqual(body["events"], [])
+        self.assertEqual(body["_canary"]["from"], "line-slip-bot")
+        self.assertTrue(body["_canary"]["sent_at"])
+
+    def test_sent_once_per_day(self):
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        app.LINE_SECRET = "s"
+        self._run()
+        self._run()
+        self._run()
+        self.assertEqual(len(self.calls), 1, "ping ทุก 5 นาที ต้องไม่ยิงซ้ำ")
+        self.assertEqual(app._get_meta("last_inbound_canary_date"),
+                         datetime.now(app.TZ).date().isoformat())
+
+    def test_restart_does_not_resend(self):
+        """รีสตาร์ท (deploy) ตัวจำในหน่วยความจำหาย — ต้องถาม DB แล้วรู้ว่าส่งไปแล้ว"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        app.LINE_SECRET = "s"
+        self._run()
+        app._inbound_canary_date = ""          # จำลองรีสตาร์ท
+        self._run()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_no_env_means_no_traffic(self):
+        app.WEBHOOK_FORWARD_URLS[:] = []
+        app.LINE_SECRET = "s"
+        self._run()
+        self.assertEqual(self.calls, [])
+
+    def test_no_secret_skips_loudly(self):
+        """ไม่มี secret = เซ็นไม่ได้ = ปลายทางตีตก — ต้องไม่ยิง และต้องมีเหตุผลใน log"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        app.LINE_SECRET = None
+        app.requests.post = self._fake_post()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app.maybe_send_inbound_canary()
+        self.assertEqual(self.calls, [])
+        self.assertIn("LINE_CHANNEL_SECRET", buf.getvalue())
+
+    def test_endpoint_down_must_not_raise_and_retries_next_ping(self):
+        """ปลายทางล่มต้องไม่เด้งขึ้น /health · และต้องไม่จดว่าส่งแล้ว (ไม่งั้นวันนั้นไม่มี canary เลย)"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://dead.test/exec"]
+        app.LINE_SECRET = "s"
+        self._run(boom=True)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIsNone(app._get_meta("last_inbound_canary_date"))
+        self._run()                            # ping รอบหน้า ปลายทางฟื้น → ต้องยิงใหม่
+        self.assertEqual(len(self.calls), 2)
+        self.assertIsNotNone(app._get_meta("last_inbound_canary_date"))
+
+    def test_denied_http_200_is_not_success(self):
+        """ประตูปิดใส่เรา แต่ตอบ 200 — canary ห้ามรายงานเขียว ไม่งั้นจุดบอดกลับมาที่เดิม"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        app.LINE_SECRET = "s"
+        app._last_canary_warn_ts = 0.0
+        pushed = []
+        orig_push = app._push
+        app._push = lambda to, msg, **kw: pushed.append((to, getattr(msg, "text", "")))
+        app.ADMIN_USER_ID = app.ADMIN_USER_ID or "Uadmin-test"
+        try:
+            self._run(body='{"status":"denied"}')
+        finally:
+            app._push = orig_push
+        self.assertIsNone(app._get_meta("last_inbound_canary_date"), "ห้ามจดว่าส่งแล้ว")
+        self.assertEqual(len(pushed), 1, "ต้อง DM เตือนแอดมิน — log ของ Render ไม่มีใครเปิดอ่านทุกวัน")
+        self.assertIn("BRIDGE_KEY", pushed[0][1])
+
+    def test_admin_warning_is_throttled(self):
+        """/health ถูก ping ทุก 5 นาที — เตือนทุกรอบ = สแปมเจ้าของจนปิดการแจ้งเตือน"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        app.LINE_SECRET = "s"
+        app._last_canary_warn_ts = 0.0
+        pushed = []
+        orig_push = app._push
+        app._push = lambda to, msg, **kw: pushed.append(to)
+        app.ADMIN_USER_ID = app.ADMIN_USER_ID or "Uadmin-test"
+        try:
+            self._run(body='{"status":"denied"}')
+            self._run(body='{"status":"denied"}')
+            self._run(body='{"status":"denied"}')
+        finally:
+            app._push = orig_push
+        self.assertEqual(len(pushed), 1)
+
+    def test_http_error_counts_as_failure(self):
+        """HTTP 500 = ปลายทางรับไม่ได้จริง ห้ามนับว่าสำเร็จ (ไม่งั้นเงียบทั้งวันโดยคิดว่าส่งแล้ว)"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        app.LINE_SECRET = "s"
+        self._run(status=500)
+        self.assertIsNone(app._get_meta("last_inbound_canary_date"))
+
+    def test_bridge_key_in_url_reaches_bridge_but_not_the_log(self):
+        """ประตูขาเข้าของ bridge ปิดด้วย ?k=BRIDGE_KEY ต่อท้าย URL fan-out (Apps Script อ่าน header ไม่ได้)
+
+        ต้องได้สองอย่างพร้อมกัน: คีย์ต้อง *ถึง* ปลายทาง (ไม่งั้นถูกปฏิเสธทุกใบ)
+        และคีย์ต้อง *ไม่โผล่ใน log* (log ของ Render ไม่ใช่ที่เก็บความลับ)"""
+        url = "https://script.google.com/macros/s/AKfycbTEST/exec?src=render&k=KEYLEAK"
+        app.WEBHOOK_FORWARD_URLS[:] = [url]
+        app.LINE_SECRET = "s"
+        app.requests.post = self._fake_post()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app.maybe_send_inbound_canary()
+        self.assertEqual(self.calls[0]["url"], url, "คีย์ต้องถึง bridge ครบ")
+        self.assertNotIn("KEYLEAK", buf.getvalue(), "คีย์หลุดลง log")
+        self.assertNotIn("k=", buf.getvalue())
+
+    def test_hour_gate(self):
+        """ตั้งชั่วโมงไว้ข้างหน้า = ยังไม่ถึงเวลา ต้องไม่ยิง"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        app.LINE_SECRET = "s"
+        app.INBOUND_CANARY_HOUR = 23 if datetime.now(app.TZ).hour < 23 else 0
+        if app.INBOUND_CANARY_HOUR == 0:
+            self.skipTest("ตอนนี้ 23:xx — ด่านชั่วโมงทดสอบไม่ได้")
+        self._run()
         self.assertEqual(self.calls, [])
 
 
