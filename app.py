@@ -5545,6 +5545,13 @@ def _handle_secondary_callback(body: str, signature: str) -> bool:
     return False
 
 
+def _log_url(url: str) -> str:
+    """ตัด query string ออกก่อนลง log — URL fan-out มีคีย์ลับต่อท้ายได้ (?k=BRIDGE_KEY ที่ใช้ปิด
+    ประตูขาเข้าของ bridge) และ log ของ Render ไม่ใช่ที่เก็บความลับ
+    เดิมใช้ url[:60] ซึ่ง 'บังเอิญ' ตัดก่อนถึง query string ของ Apps Script — บังเอิญไม่ใช่การกัน"""
+    return (str(url or "").split("?", 1)[0])[:80]
+
+
 def _forward_webhook(raw: bytes, signature: str):
     """ส่ง event ดิบต่อให้ระบบอื่นที่ใช้ OA เดียวกัน — ต้องส่ง body ดิบ + ลายเซ็นเดิม
     ปลายทางจึงตรวจ signature ผ่าน · พังที่ปลายทางต้องไม่กระทบบอทร้าน จึงกลืน error ทั้งหมด
@@ -5555,9 +5562,9 @@ def _forward_webhook(raw: bytes, signature: str):
                               headers={"Content-Type": "application/json",
                                        "X-Line-Signature": signature})
             if r.status_code >= 400:
-                print(f"[forward] {url[:60]} → HTTP {r.status_code}", flush=True)
+                print(f"[forward] {_log_url(url)} → HTTP {r.status_code}", flush=True)
         except Exception as e:
-            print(f"[forward] {url[:60]} ไม่สำเร็จ: {str(e)[:120]}", flush=True)
+            print(f"[forward] {_log_url(url)} ไม่สำเร็จ: {str(e)[:120]}", flush=True)
 
 
 # จำในหน่วยความจำก่อนแตะ DB — /health ถูก ping ทุก 5 นาที และเช็คนี้อยู่ *ก่อน* ด่านเงียบลึก
@@ -5576,8 +5583,14 @@ def _canary_body() -> bytes:
 def maybe_send_inbound_canary():
     """ยิง event สังเคราะห์วันละครั้งผ่านเส้นทาง fan-out เดิม (LINE→/callback→WEBHOOK_FORWARD_URLS)
 
-    เซ็นด้วย LINE_CHANNEL_SECRET เองเหมือนที่ LINE เซ็น → ปลายทางตรวจลายเซ็นผ่านตามปกติ
-    (bridge ยังตรวจลายเซ็นอยู่จริง — ยืนยัน 13/10/69 จากโค้ด _secret() ของเขา ไม่ใช่จากเอกสารเราเอง)
+    เซ็นด้วย LINE_CHANNEL_SECRET เองเหมือนที่ LINE เซ็น — ทำไมยังต้องเซ็นถึงแม้ปลายทางไม่ตรวจ:
+      1) ส่ง body หน้าตาเหมือน LINE ทุกอย่าง → ปลายทางเปลี่ยนมาตรวจวันไหน canary ไม่พังตามไปด้วย
+      2) ปลายทางอื่นใน WEBHOOK_FORWARD_URLS ในอนาคตอาจตรวจ (เราคุมแค่ว่าเราส่งถูก)
+    🔴 ของจริง (ห้องคอนเทนต์อ่านไฟล์ bridge ทั้งไฟล์ 13/10/69): doPost ของ bridge
+    *ไม่ตรวจลายเซ็นเลยสักบรรทัด* — _secret() ถูกเรียกที่เดียวใน forwardToRender ซึ่งตายแล้ว
+    เพราะ STANDALONE = true (5 ก.ย.) · Apps Script อ่าน HTTP header ไม่ได้ จึงตรวจแบบ LINE ไม่ได้ถาวร
+    → ประตูขาเข้าของ bridge ปิดด้วย BRIDGE_KEY ใน query string แทน (?k=... ต่อท้าย URL fan-out)
+    ซึ่ง canary ได้ไปด้วยอัตโนมัติเพราะอ่าน WEBHOOK_FORWARD_URLS ตัวเดียวกัน — ไม่ต้องแก้โค้ดนี้
     ไม่ตั้ง WEBHOOK_FORWARD_URLS = ไม่ยิงอะไรเลย · ยิงไม่ผ่าน = ไม่จดวันที่ → ping รอบหน้าลองใหม่"""
     global _inbound_canary_date
     if not WEBHOOK_FORWARD_URLS:
@@ -5604,11 +5617,11 @@ def maybe_send_inbound_canary():
                               headers={"Content-Type": "application/json", "X-Line-Signature": sig})
             if r.status_code < 400:
                 ok += 1
-                print(f"[canary] {url[:60]} → HTTP {r.status_code}", flush=True)
+                print(f"[canary] {_log_url(url)} → HTTP {r.status_code}", flush=True)
             else:
-                print(f"[canary] {url[:60]} → HTTP {r.status_code} (ยิงไม่ผ่าน)", flush=True)
+                print(f"[canary] {_log_url(url)} → HTTP {r.status_code} (ยิงไม่ผ่าน)", flush=True)
         except Exception as e:
-            print(f"[canary] {url[:60]} ไม่สำเร็จ: {str(e)[:120]}", flush=True)
+            print(f"[canary] {_log_url(url)} ไม่สำเร็จ: {str(e)[:120]}", flush=True)
     if ok == 0:
         print(f"[canary] ⚠️ {today} ไม่มีปลายทางใดรับเลย — จะลองใหม่รอบ ping หน้า", flush=True)
         return

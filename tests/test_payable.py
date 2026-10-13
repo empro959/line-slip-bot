@@ -621,6 +621,20 @@ class TestWebhookForward(unittest.TestCase):
             app.requests.post = orig
         self.assertEqual([c["url"] for c in self.calls], ["https://a.test/h", "https://b.test/h"])
 
+    def test_secret_in_url_never_reaches_the_log(self):
+        """URL fan-out มีคีย์ลับต่อท้ายได้ (?k=BRIDGE_KEY) — log ของ Render ไม่ใช่ที่เก็บความลับ"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://script.google.com/macros/s/AKfycbX/exec?src=render&k=KEYLEAK"]
+        orig = app.requests.post
+        app.requests.post = self._fake_post(ok=False)     # HTTP 500 → เข้าเส้น print
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                app._forward_webhook(b"{}", "SIG")
+        finally:
+            app.requests.post = orig
+        self.assertIn("KEYLEAK", self.calls[0]["url"], "คีย์ต้องถึงปลายทาง")
+        self.assertNotIn("KEYLEAK", buf.getvalue(), "คีย์หลุดลง log")
+
     def test_no_env_means_no_traffic(self):
         """ไม่ตั้ง env = ต้องไม่ยิงเน็ตออกเลย (ดีฟอลต์ต้องปลอดภัย)"""
         app.WEBHOOK_FORWARD_URLS[:] = []
@@ -749,6 +763,22 @@ class TestInboundCanary(unittest.TestCase):
         app.LINE_SECRET = "s"
         self._run(status=500)
         self.assertIsNone(app._get_meta("last_inbound_canary_date"))
+
+    def test_bridge_key_in_url_reaches_bridge_but_not_the_log(self):
+        """ประตูขาเข้าของ bridge ปิดด้วย ?k=BRIDGE_KEY ต่อท้าย URL fan-out (Apps Script อ่าน header ไม่ได้)
+
+        ต้องได้สองอย่างพร้อมกัน: คีย์ต้อง *ถึง* ปลายทาง (ไม่งั้นถูกปฏิเสธทุกใบ)
+        และคีย์ต้อง *ไม่โผล่ใน log* (log ของ Render ไม่ใช่ที่เก็บความลับ)"""
+        url = "https://script.google.com/macros/s/AKfycbTEST/exec?src=render&k=KEYLEAK"
+        app.WEBHOOK_FORWARD_URLS[:] = [url]
+        app.LINE_SECRET = "s"
+        app.requests.post = self._fake_post()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            app.maybe_send_inbound_canary()
+        self.assertEqual(self.calls[0]["url"], url, "คีย์ต้องถึง bridge ครบ")
+        self.assertNotIn("KEYLEAK", buf.getvalue(), "คีย์หลุดลง log")
+        self.assertNotIn("k=", buf.getvalue())
 
     def test_hour_gate(self):
         """ตั้งชั่วโมงไว้ข้างหน้า = ยังไม่ถึงเวลา ต้องไม่ยิง"""
