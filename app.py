@@ -5545,6 +5545,17 @@ def _handle_secondary_callback(body: str, signature: str) -> bool:
     return False
 
 
+# Apps Script ตั้ง HTTP status code ไม่ได้ — ContentService คืน 200 เสมอแม้ตอนปฏิเสธ
+# ด่าน BRIDGE_KEY ของ bridge จึงตอบ {"status":"denied"} มาพร้อม HTTP 200
+# ถ้าเราดูแต่ status_code → คีย์ผิดทั้งวันจะอ่านเป็น "ส่งสำเร็จ" = เงียบสนิทตลอดกาล
+_DENIED_RE = re.compile(r"""["']status["']\s*:\s*["'](?:denied|unauthorized|forbidden)["']""", re.I)
+
+
+def _forward_denied(text: str) -> bool:
+    """ปลายทางตอบ 200 แต่ body บอกว่าปฏิเสธ (ด่านคีย์ไม่ผ่าน) ไหม — ดูแค่ต้น body พอ"""
+    return bool(_DENIED_RE.search((text or "")[:300]))
+
+
 def _log_url(url: str) -> str:
     """ตัด query string ออกก่อนลง log — URL fan-out มีคีย์ลับต่อท้ายได้ (?k=BRIDGE_KEY ที่ใช้ปิด
     ประตูขาเข้าของ bridge) และ log ของ Render ไม่ใช่ที่เก็บความลับ
@@ -5563,6 +5574,9 @@ def _forward_webhook(raw: bytes, signature: str):
                                        "X-Line-Signature": signature})
             if r.status_code >= 400:
                 print(f"[forward] {_log_url(url)} → HTTP {r.status_code}", flush=True)
+            elif _forward_denied(r.text):
+                print(f"[forward] 🔴 {_log_url(url)} ปฏิเสธใบนี้ (HTTP 200 แต่ body = denied) "
+                      f"— คีย์ ?k= ท้าย WEBHOOK_FORWARD_URLS ไม่ตรงกับ BRIDGE_KEY ที่ bridge", flush=True)
         except Exception as e:
             print(f"[forward] {_log_url(url)} ไม่สำเร็จ: {str(e)[:120]}", flush=True)
 
@@ -5578,6 +5592,33 @@ def _canary_body() -> bytes:
     return json.dumps({"events": [], "_canary": {"from": "line-slip-bot",
                                                  "sent_at": datetime.now(TZ).isoformat(timespec="seconds")}},
                       ensure_ascii=False).encode("utf-8")
+
+
+_last_canary_warn_ts = 0.0
+
+
+def _canary_alarm(today: str, denied: int, total: int):
+    """canary ไปไม่ถึงปลายทางเลย = ขาเข้าของระบบคอนเทนต์ตาย (บอทร้านไม่กระทบ — Render เป็นทางเข้า)
+
+    ทำไมต้อง DM: log ของ Render ไม่มีใครเปิดอ่านทุกวัน · และถ้าเราเงียบ
+    ปลายทางจะเห็นแค่ 'ไม่มีใครยิงอะไรเข้ามา' ซึ่งแยกไม่ออกจาก 'สัปดาห์นี้ไม่มีใครพิมพ์'
+    จำกัด 1 ครั้ง/30 นาที (แพตเทิร์นเดียวกับ _check_memory) เพราะ /health ถูก ping ทุก 5 นาที"""
+    global _last_canary_warn_ts
+    why = (f"ถูกปฏิเสธ {denied}/{total} ปลายทาง (คีย์ ?k= ไม่ตรงกับ BRIDGE_KEY ที่ bridge)"
+           if denied else f"ไม่มีปลายทางใดรับเลย ({total} ปลายทาง)")
+    print(f"[canary] 🔴 {today} {why} — จะลองใหม่รอบ ping หน้า", flush=True)
+    if time.time() - _last_canary_warn_ts < 1800:
+        return
+    _last_canary_warn_ts = time.time()
+    if not ADMIN_USER_ID:
+        return
+    try:
+        _push(ADMIN_USER_ID, TextSendMessage(
+            text=f"🔴 [SYSTEM] สัญญาณชีพขาเข้าส่งไม่ถึง bridge\n{why}\n"
+                 "ผลคือ: บอทคอนเทนต์ไม่ได้รับ event (บอทร้าน/สลิป/จอง ไม่กระทบ)\n"
+                 "เช็ค: คีย์ท้าย WEBHOOK_FORWARD_URLS ที่ Render ตรงกับ BRIDGE_KEY ที่ bridge ไหม"))
+    except Exception:
+        pass
 
 
 def maybe_send_inbound_canary():
@@ -5610,20 +5651,25 @@ def maybe_send_inbound_canary():
         return
     raw = _canary_body()
     sig = base64.b64encode(hmac.new(LINE_SECRET.encode("utf-8"), raw, hashlib.sha256).digest()).decode("utf-8")
-    ok = 0
+    ok = denied = 0
     for url in WEBHOOK_FORWARD_URLS:
         try:
             r = requests.post(url, data=raw, timeout=WEBHOOK_FORWARD_TIMEOUT,
                               headers={"Content-Type": "application/json", "X-Line-Signature": sig})
-            if r.status_code < 400:
+            if r.status_code >= 400:
+                print(f"[canary] {_log_url(url)} → HTTP {r.status_code} (ยิงไม่ผ่าน)", flush=True)
+            elif _forward_denied(r.text):
+                # ปฏิเสธมาเป็น HTTP 200 — ห้ามนับว่าสำเร็จ ไม่งั้น canary จะรายงานเขียวทั้งที่ประตูปิดใส่เรา
+                denied += 1
+                print(f"[canary] 🔴 {_log_url(url)} ปฏิเสธ (HTTP 200 แต่ body = denied) "
+                      f"— คีย์ ?k= ไม่ตรงกับ BRIDGE_KEY", flush=True)
+            else:
                 ok += 1
                 print(f"[canary] {_log_url(url)} → HTTP {r.status_code}", flush=True)
-            else:
-                print(f"[canary] {_log_url(url)} → HTTP {r.status_code} (ยิงไม่ผ่าน)", flush=True)
         except Exception as e:
             print(f"[canary] {_log_url(url)} ไม่สำเร็จ: {str(e)[:120]}", flush=True)
     if ok == 0:
-        print(f"[canary] ⚠️ {today} ไม่มีปลายทางใดรับเลย — จะลองใหม่รอบ ping หน้า", flush=True)
+        _canary_alarm(today, denied, len(WEBHOOK_FORWARD_URLS))
         return
     _inbound_canary_date = today
     _set_meta("last_inbound_canary_date", today)

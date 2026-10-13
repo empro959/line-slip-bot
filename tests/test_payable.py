@@ -576,9 +576,10 @@ class TestWebhookForward(unittest.TestCase):
     def tearDown(self):
         app.WEBHOOK_FORWARD_URLS[:] = self._orig
 
-    def _fake_post(self, ok=True, boom=False):
+    def _fake_post(self, ok=True, boom=False, body=""):
         class _R:
             status_code = 200 if ok else 500
+            text = body
         def _post(url, data=None, timeout=None, headers=None):
             self.calls.append({"url": url, "data": data, "headers": headers, "timeout": timeout})
             if boom:
@@ -621,6 +622,35 @@ class TestWebhookForward(unittest.TestCase):
             app.requests.post = orig
         self.assertEqual([c["url"] for c in self.calls], ["https://a.test/h", "https://b.test/h"])
 
+    def test_denied_with_http_200_must_be_loud(self):
+        """Apps Script ตั้ง HTTP status ไม่ได้ — ด่าน BRIDGE_KEY ปฏิเสธมาเป็น 200 + body denied
+
+        ถ้าดูแต่ status_code → คีย์ผิดทั้งวันอ่านเป็น 'ส่งสำเร็จ' = เงียบสนิทตลอดกาล"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        orig = app.requests.post
+        app.requests.post = self._fake_post(body='{"status":"denied"}')
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                app._forward_webhook(b"{}", "SIG")
+        finally:
+            app.requests.post = orig
+        self.assertIn("denied", buf.getvalue())
+        self.assertIn("BRIDGE_KEY", buf.getvalue(), "log ต้องบอกวิธีแก้ ไม่ใช่แค่ว่าพัง")
+
+    def test_normal_200_stays_quiet(self):
+        """ผ่านปกติต้องไม่ตะโกน (ไม่งั้น log ท่วมแล้วไม่มีใครอ่านตอนมีปัญหาจริง)"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        orig = app.requests.post
+        app.requests.post = self._fake_post(body='{"status":"ok"}')
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                app._forward_webhook(b"{}", "SIG")
+        finally:
+            app.requests.post = orig
+        self.assertNotIn("🔴", buf.getvalue())
+
     def test_secret_in_url_never_reaches_the_log(self):
         """URL fan-out มีคีย์ลับต่อท้ายได้ (?k=BRIDGE_KEY) — log ของ Render ไม่ใช่ที่เก็บความลับ"""
         app.WEBHOOK_FORWARD_URLS[:] = ["https://script.google.com/macros/s/AKfycbX/exec?src=render&k=KEYLEAK"]
@@ -660,6 +690,7 @@ class TestInboundCanary(unittest.TestCase):
         self._orig_hour = app.INBOUND_CANARY_HOUR
         self._orig_secret = app.LINE_SECRET
         self._orig_post = app.requests.post
+        self._orig_admin = app.ADMIN_USER_ID
         app._inbound_canary_date = ""
         app._del_meta("last_inbound_canary_date")
         app.INBOUND_CANARY_HOUR = 0
@@ -670,12 +701,15 @@ class TestInboundCanary(unittest.TestCase):
         app.INBOUND_CANARY_HOUR = self._orig_hour
         app.LINE_SECRET = self._orig_secret
         app.requests.post = self._orig_post
+        app.ADMIN_USER_ID = self._orig_admin        # ห้ามให้ค่าหลุดไปเทสต์อื่น
+        app._last_canary_warn_ts = 0.0
         app._inbound_canary_date = ""
         app._del_meta("last_inbound_canary_date")
 
-    def _fake_post(self, status=200, boom=False):
+    def _fake_post(self, status=200, boom=False, body=""):
         class _R:
             status_code = status
+            text = body
         def _post(url, data=None, timeout=None, headers=None):
             self.calls.append({"url": url, "data": data, "headers": headers})
             if boom:
@@ -756,6 +790,40 @@ class TestInboundCanary(unittest.TestCase):
         self._run()                            # ping รอบหน้า ปลายทางฟื้น → ต้องยิงใหม่
         self.assertEqual(len(self.calls), 2)
         self.assertIsNotNone(app._get_meta("last_inbound_canary_date"))
+
+    def test_denied_http_200_is_not_success(self):
+        """ประตูปิดใส่เรา แต่ตอบ 200 — canary ห้ามรายงานเขียว ไม่งั้นจุดบอดกลับมาที่เดิม"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        app.LINE_SECRET = "s"
+        app._last_canary_warn_ts = 0.0
+        pushed = []
+        orig_push = app._push
+        app._push = lambda to, msg, **kw: pushed.append((to, getattr(msg, "text", "")))
+        app.ADMIN_USER_ID = app.ADMIN_USER_ID or "Uadmin-test"
+        try:
+            self._run(body='{"status":"denied"}')
+        finally:
+            app._push = orig_push
+        self.assertIsNone(app._get_meta("last_inbound_canary_date"), "ห้ามจดว่าส่งแล้ว")
+        self.assertEqual(len(pushed), 1, "ต้อง DM เตือนแอดมิน — log ของ Render ไม่มีใครเปิดอ่านทุกวัน")
+        self.assertIn("BRIDGE_KEY", pushed[0][1])
+
+    def test_admin_warning_is_throttled(self):
+        """/health ถูก ping ทุก 5 นาที — เตือนทุกรอบ = สแปมเจ้าของจนปิดการแจ้งเตือน"""
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        app.LINE_SECRET = "s"
+        app._last_canary_warn_ts = 0.0
+        pushed = []
+        orig_push = app._push
+        app._push = lambda to, msg, **kw: pushed.append(to)
+        app.ADMIN_USER_ID = app.ADMIN_USER_ID or "Uadmin-test"
+        try:
+            self._run(body='{"status":"denied"}')
+            self._run(body='{"status":"denied"}')
+            self._run(body='{"status":"denied"}')
+        finally:
+            app._push = orig_push
+        self.assertEqual(len(pushed), 1)
 
     def test_http_error_counts_as_failure(self):
         """HTTP 500 = ปลายทางรับไม่ได้จริง ห้ามนับว่าสำเร็จ (ไม่งั้นเงียบทั้งวันโดยคิดว่าส่งแล้ว)"""
