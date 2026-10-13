@@ -1395,6 +1395,79 @@ class TestResvMergeFragments(unittest.TestCase):
         self.assertEqual(app._resv_merge_text(self.GID, self.U1, "คุนนาต"), "คุนนาต")
 
 
+class TestThaiCommandParticles(unittest.TestCase):
+    """คำสั่งที่พนักงานพิมพ์มีคำลงท้ายติดมา ต้องยังใช้ได้
+
+    13 ต.ค. 69 — ไล่กวาดทั้งตระกูลตามที่เจ้าของสั่ง หลัง §3.39 (`\\b`) และ §3.41 (`=`)
+    คำสั่งทุกตัวเทียบ 'ทั้งข้อความแบบตรงตัว' · `text.strip()` กันช่องว่างได้แล้ว
+    แต่กันคำลงท้ายไม่ได้ → 'สรุปครับ' แล้วบอทเงียบ พนักงานคิดว่าบอทเสีย"""
+
+    # คำสั่งจริงทุกตัวในตัวแจกคำสั่ง — ห้ามถูก _cmd_key กัดกินแม้แต่ตัวเดียว
+    REAL_COMMANDS = (
+        "help", "คำสั่ง", "ช่วยเหลือ", "เมนู", "menu", "คำสั่งบอท",
+        "คู่มือ", "วิธีใช้", "manual", "คู่มือการใช้งาน",
+        "โควต้า", "quota", "โควตา", "push",
+        "ล้างทั้งหมด", "ล้างกลุ่มนี้", "ล้างข้อมูลทั้งหมด", "รีเซ็ตทั้งหมด",
+        "ปิดสลิป", "ปิดเช็คสลิป", "ไม่เช็คสลิป", "ปิดระบบสลิป",
+        "เปิดสลิป", "เปิดเช็คสลิป", "เปิดระบบสลิป",
+        "กลุ่มนี้รับสลิป", "ตั้งกลุ่มสลิป", "เปิดเฉพาะกลุ่มนี้", "เฉพาะกลุ่มนี้รับสลิป",
+        "ล้างกลุ่มสลิป", "รีเซ็ตกลุ่มสลิป", "ยกเลิกกลุ่มสลิป",
+        "เก็บครบแล้ว", "เก็บเงินครบ", "เก็บเงินครบแล้ว", "ปิดยอด", "เคลียร์ยอด",
+        "เคลียยอด", "รีเซ็ตยอด",
+        "ยอดสะสม", "ยอดทริป", "สรุปบิล", "ยอดบิล", "บิลสลิป", "กระทบยอด",
+        "สรุป", "รายงาน", "report", "summary",
+        "ปิดรายงาน", "ปิดรายงานสลิป", "งดรายงาน", "ไม่เอารายงาน", "ปิดสรุป",
+        "เปิดรายงาน", "เปิดรายงานสลิป", "เอารายงาน", "เปิดสรุป",
+        "ดูที่ข้าม", "รายการข้าม", "ใบที่ข้าม", "สรุปข้าม", "ที่ข้าม",
+        "รายงานเมื่อวาน", "test report",
+        "ล้างวันนี้", "รีเซ็ตวันนี้", "ล้างสลิปวันนี้", "รีเซ็ต",
+    )
+
+    def test_no_real_command_is_mangled(self):
+        """ทิศกลับที่สำคัญที่สุด: ถ้าเผลอใส่คำลงท้ายที่ชนกับคำสั่ง คำสั่งนั้นจะตายเงียบ
+        เทสต์นี้ยึงไว้ว่าทุกคำสั่งที่มีอยู่จริงต้องผ่าน _cmd_key ออกมาเหมือนเดิม"""
+        for c in self.REAL_COMMANDS:
+            self.assertEqual(app._cmd_key(c), c.lower(), f"คำสั่ง {c!r} ถูกตัดทิ้ง")
+
+    def test_particles_are_stripped(self):
+        for raw, want in (("สรุปครับ", "สรุป"), ("สรุป ค่ะ", "สรุป"), ("ปิดยอดนะ", "ปิดยอด"),
+                          ("ยอดสะสมคะ", "ยอดสะสม"), ("ปิดยอดน่ะ", "ปิดยอด"),
+                          ("สรุปคร้าบ", "สรุป"), ("สรุปครับ.", "สรุป"), ("สรุปนะครับ", "สรุป")):
+            self.assertEqual(app._cmd_key(raw), want, raw)
+
+    def test_longest_particle_first(self):
+        """🪤 regex alternation หยิบตัวแรกที่แมตช์ — ถ้า 'ครับ' มาก่อน 'ครับผม'
+        จะเหลือ 'ผม' ค้าง แล้วด่านที่ยึดท้ายข้อความจะไม่แมตช์"""
+        self.assertEqual(app._cmd_key("รีเซ็ตครับผม"), "รีเซ็ต")
+
+    def test_plain_command_unchanged(self):
+        self.assertEqual(app._cmd_key("สรุป"), "สรุป")
+        self.assertEqual(app._cmd_key("  สรุป  "), "สรุป")
+
+
+class TestResvCancelCommand(unittest.TestCase):
+    """'ยกเลิกจอง 87 ครับ' ต้องใช้ได้ — ของเดิมยึดท้ายข้อความด้วย \\s*$ เท่านั้น
+
+    มีคำลงท้ายติดมา = ไม่แมตช์ แล้ว **ไม่ทำอะไรเลย เงียบสนิท** พนักงานคิดว่ายกเลิกแล้ว
+    ผลคือจองค้างอยู่ · โต๊ะถูกกันไว้ · บอทไปย้ำเตือนซ้ำ"""
+
+    def _id(self, t):
+        m = app._RESV_CANCEL_RE.match(t)
+        return m.group(1) if m else None
+
+    def test_with_particles(self):
+        for t in ("ยกเลิกจอง 87", "ยกเลิกจอง 87 ครับ", "ยกเลิก #87 นะครับ", "ยกเลิก 87",
+                  "ยกเลิกการจอง 87 ค่ะ", "ยกเลิกจอง87", "ยกเลิกจอง 87 ครับผม"):
+            self.assertEqual(self._id(t), "87", t)
+
+    def test_extra_words_must_not_match(self):
+        """ทิศกลับ: มีคำสั่งอื่นต่อท้าย = ทำครึ่งๆ แย่กว่าไม่ทำ → ต้องไม่แมตช์
+
+        'ยกเลิกจอง 87 แล้วจองใหม่' ถ้าแมตช์จะยกเลิกให้แล้วทิ้งส่วน 'จองใหม่' ไปเงียบๆ"""
+        for t in ("ยกเลิกจอง 87 แล้วจองใหม่", "ยกเลิกจอง 87 88", "ยกเลิกจอง"):
+            self.assertIsNone(self._id(t), t)
+
+
 class TestThaiParticleDoesNotKillSignals(unittest.TestCase):
     """⛔ ห้ามปิดท้ายคำไทยด้วย \\b — \\b ต้องมีรอยต่อ 'อักขระคำ ↔ ไม่ใช่อักขระคำ'
 
@@ -3537,6 +3610,101 @@ class TestSlipDatetimeSanity(unittest.TestCase):
     def test_รูปแบบวันเดียวไม่มีเวลา_ยังรับ(self):
         d = datetime.now(app.TZ).date().isoformat()
         self.assertEqual(app._sane_slip_dt(d), d)
+
+
+class TestResvDupNormalized(unittest.TestCase):
+    """จองซ้ำต้องจับได้แม้พิมพ์คนละแบบ — สตริงไทยจากคนพิมพ์ ห้ามเทียบตรงตัว
+
+    เคสจริง 12 ต.ค. 69 (เจ้าของแจ้ง "ขาดการจับจองซ้ำ"):
+      ⏳ #87 คุณฮัน 7 ท่าน | 12/10 19:00 | โซน A9 โต๊ะ A10
+      ✅ #88 คุณฮัน 7ท่าน  | 12/10 19:00 | โซน A โต๊ะ 9-10
+    ใบเดียวกัน แต่ของเดิมเทียบ people/table_no ตรงตัวใน SQL → หลุดด่าน โต๊ะถูกกันไว้ 2 ใบ"""
+
+    GID = "Gresvdupnorm"
+
+    def setUp(self):
+        self._clear()
+
+    def tearDown(self):
+        self._clear()
+
+    def _clear(self):
+        with app._db() as conn:
+            conn.execute("DELETE FROM reservations WHERE origin_group_id=?", (self.GID,))
+            conn.commit()
+
+    def _today(self):
+        return datetime.now(app.TZ).date().isoformat()
+
+    def _save(self, **kw):
+        info = {"customer": "คุณฮัน", "people": "7 ท่าน", "table": "โซน A9 โต๊ะ A10",
+                "time_hhmm": "19:00", "datetime": "วันนี้ 19:00", "resv_date": self._today()}
+        info.update(kw)
+        return app.save_reservation(self.GID, "Doi", info, "จอง", self.GID)
+
+    def test_real_case_87_vs_88(self):
+        rid = self._save()
+        dup = app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7ท่าน", "table": "โซน A โต๊ะ 9-10",
+             "time_hhmm": "19:00", "resv_date": self._today()})
+        self.assertIsNotNone(dup, "ต้องจับได้ว่าเป็นใบเดียวกัน")
+        self.assertEqual(dup["id"], rid)
+
+    def test_space_in_name_and_people(self):
+        rid = self._save(customer="คุณ ฮัน", people="7ท่าน")
+        dup = app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7 คน", "table": "โซน A9 โต๊ะ A10",
+             "time_hhmm": "19:00", "resv_date": self._today()})
+        self.assertIsNotNone(dup)
+        self.assertEqual(dup["id"], rid)
+
+    def test_different_tables_are_not_duplicates(self):
+        """ทิศกลับ: โต๊ะไม่เหมือนกันต้องไม่ถูกตีเป็นซ้ำ (จองจริงจะหายเงียบ)"""
+        self._save(table="โซน A โต๊ะ 9")
+        self.assertIsNone(app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7 ท่าน", "table": "โซน A โต๊ะ 9-10",
+             "time_hhmm": "19:00", "resv_date": self._today()}))
+
+    def test_different_people_count_is_not_duplicate(self):
+        self._save(people="7 ท่าน")
+        self.assertIsNone(app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "8 ท่าน", "table": "โซน A9 โต๊ะ A10",
+             "time_hhmm": "19:00", "resv_date": self._today()}))
+
+    def test_second_seating_same_table_is_not_duplicate(self):
+        """ลูกค้าเดิม โต๊ะเดิม วันเดิม แต่คนละรอบเวลา = จองจริง 2 ใบ ห้ามกลืนใบที่สอง
+
+        ของเดิมไม่เคยเทียบเวลาเลย ทั้งที่ข้อความบอทเขียนเองว่า
+        'ถ้าตั้งใจจองเพิ่มจริง ให้ระบุโต๊ะหรือเวลาให้ต่างจากเดิม'"""
+        self._save(time_hhmm="18:00", datetime="วันนี้ 18:00")
+        self.assertIsNone(app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7 ท่าน", "table": "โซน A9 โต๊ะ A10",
+             "time_hhmm": "21:00", "resv_date": self._today()}))
+
+    def test_unknown_time_must_not_break_the_guard(self):
+        """🪤 resv_datetime เก็บจาก info['datetime'] ซึ่ง AI อาจไม่ส่งมา → ว่างได้จริง
+        'ไม่รู้เวลา' ต้องไม่ถูกอ่านว่า 'คนละเวลา' ไม่งั้นด่านพังหนักกว่าเดิม (กติกา 0 ≠ ไม่รู้)"""
+        rid = self._save(datetime=None)
+        dup = app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7 ท่าน", "table": "โซน A9 โต๊ะ A10",
+             "time_hhmm": "19:00", "resv_date": self._today()})
+        self.assertIsNotNone(dup, "ใบเก่าไม่มีเวลา → ต้องยังจับซ้ำได้")
+        self.assertEqual(dup["id"], rid)
+
+    def test_cancelled_booking_is_not_a_duplicate(self):
+        """ทิศกลับ: ยกเลิกไปแล้วต้องจองเนื้อหาเดิมใหม่ได้"""
+        rid = self._save()
+        app.cancel_reservation(rid, "Doi")
+        self.assertIsNone(app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7 ท่าน", "table": "โซน A9 โต๊ะ A10",
+             "time_hhmm": "19:00", "resv_date": self._today()}))
+
+    def test_other_day_is_not_a_duplicate(self):
+        self._save()
+        other = (datetime.now(app.TZ).date() + timedelta(days=1)).isoformat()
+        self.assertIsNone(app._find_dup_reservation(
+            {"customer": "คุณฮัน", "people": "7 ท่าน", "table": "โซน A9 โต๊ะ A10",
+             "time_hhmm": "19:00", "resv_date": other}))
 
 
 class TestDupAlertWording(unittest.TestCase):

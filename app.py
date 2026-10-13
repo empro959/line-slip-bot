@@ -2279,7 +2279,9 @@ def _dining_reset(event, group_id: str):
 
 
 # คำลงท้ายไทยที่พนักงานพิมพ์ติดกับคำหน้าเสมอ ('10ท่านค่ะ') — ต้องยอมให้ตามหลังหน่วยนับได้
-_TH_PARTICLE = r"(?:ค่ะ|ค่า|คะ|ครับ|คับ|คร้าบ|ครัช|นะ|น่ะ|จ้า|จ้ะ|จ๊ะ)"
+# ⚠️ เรียง 'ตัวยาวก่อน' เสมอ — regex alternation หยิบตัวแรกที่แมตช์
+#    ถ้า 'ครับ' มาก่อน 'ครับผม' จะเหลือ 'ผม' ค้าง แล้วด่านที่ยึดท้ายข้อความจะไม่แมตช์
+_TH_PARTICLE = r"(?:ครับผม|คร้าบ|ครับ|ครัช|ค่ะ|ค่า|คะ|คับ|น่ะ|นะ|จ้า|จ้ะ|จ๊ะ)"
 
 # 🪤 'เลข + หน่วยนับคน' — แหล่งเดียว ใช้ทั้งตัวนับสัญญาณจอง (_RESV_SIGNALS) และด่าน
 #    _people_is_trustworthy · ห้ามเขียนแยกสองที่ เดี๋ยวแก้ที่หนึ่งลืมอีกที่
@@ -4909,26 +4911,116 @@ def save_reservation(origin_group_id: str, requested_by: str, info: dict, raw_te
         return rid
 
 
+_TBL_CODE_PAIR = re.compile(r"([A-Za-z])\s*(\d{1,2})")
+
+
+def _cmd_key(text: str) -> str:
+    """คำสั่งที่พนักงานพิมพ์มักมีคำลงท้ายติดมา ('สรุปครับ' · 'ปิดยอดนะ') — ถอดออกก่อนเทียบ
+
+    🪤 เคสจริง 13 ต.ค. 69 (ไล่กวาดทั้งตระกูลตามที่เจ้าของสั่ง หลัง §3.39/§3.41):
+    คำสั่งทุกตัวเทียบ 'ทั้งข้อความแบบตรงตัว' — `text.strip()` กันช่องว่างได้แล้ว
+    แต่กันคำลงท้ายไม่ได้ → พิมพ์ 'สรุปครับ' แล้วบอทเงียบ พนักงานคิดว่าบอทเสีย
+    (ตระกูลเดียวกับ §3.39/§3.41: โค้ดคาดหวังว่าคนจะพิมพ์รูปแบบเดียว ซึ่งไม่จริง)
+
+    ⚠️ ใช้เฉพาะตอนเทียบ 'คำสั่งทั้งข้อความ' เท่านั้น — ไม่เอาไปแตะข้อความจอง/สลิป/บิล
+    เพราะคำลงท้ายในนั้นเป็นเนื้อหา ('10ท่านค่ะ' ต้องเหลือ 'ค่ะ' ไว้ให้ตัวนับสัญญาณอ่าน)"""
+    t = (text or "").strip().lower()
+    return re.sub(r"(?:\s*" + _TH_PARTICLE + r")+[\s.!]*$", "", t).strip()
+
+
+# 'ยกเลิกจอง 87 ครับ' ต้องใช้ได้ — ของเดิมยึดท้ายข้อความด้วย \s*$ เท่านั้น
+# → มีคำลงท้ายติดมาก็ไม่แมตช์ แล้ว **ไม่ทำอะไรเลย เงียบสนิท** (พนักงานคิดว่ายกเลิกแล้ว)
+# เป็นคำสั่งที่กระทบของจริง: จองค้างอยู่ โต๊ะถูกกันไว้ บอทไปย้ำเตือนซ้ำ
+_RESV_CANCEL_RE = re.compile(
+    r"^\s*ยกเลิก\s*(?:การ)?(?:จอง)?\s*#?\s*(\d+)(?:\s*" + _TH_PARTICLE + r")*[\s.!]*$")
+
+
+def _resv_cust_key(s) -> str:
+    """ชื่อลูกค้าแบบตัดช่องว่าง — 'คุณ ฮัน' กับ 'คุณฮัน' คือคนเดียวกัน"""
+    return re.sub(r"\s+", "", str(s or "")).lower()
+
+
+def _resv_people_key(s) -> str:
+    """จำนวนคนเอาเฉพาะตัวเลข — '7 ท่าน' · '7ท่าน' · '7 คน' → '7'  ·  '5-6 คน' → '5-6'"""
+    nums = re.findall(r"\d+", str(s or ""))
+    return "-".join(nums) if nums else re.sub(r"\s+", "", str(s or "")).lower()
+
+
+def _resv_table_key(s) -> str:
+    """โต๊ะ/โซน → 'ชุดรหัสโต๊ะ' ที่เทียบกันได้ ไม่ขึ้นกับวิธีพิมพ์
+
+    'โซน A9 โต๊ะ A10'  → 'A10,A9'
+    'โซน A โต๊ะ 9-10'  → 'A10,A9'   ← ชุดเดียวกัน (เลขลอยๆ ยืมตัวอักษรจาก 'โซน X')
+    """
+    t = str(s or "")
+    if not t.strip():
+        return ""
+    zm = re.search(r"โซน\s*([A-Za-z])", t)
+    zone = (zm.group(1) if zm else "").upper()
+    codes = {f"{m.group(1).upper()}{int(m.group(2))}" for m in _TBL_CODE_PAIR.finditer(t)}
+    for n in re.findall(r"\d{1,2}", _TBL_CODE_PAIR.sub(" ", t)):   # เลขที่ไม่ได้ติดตัวอักษร
+        codes.add(f"{zone}{int(n)}" if zone else str(int(n)))
+    if not codes:                       # ไม่มีเลขเลย ('โซน A') → เทียบด้วยข้อความที่ถอดคำนำหน้าแล้ว
+        return re.sub(r"โซน|โต๊ะ|\s+", "", t).lower()
+    return ",".join(sorted(codes))
+
+
+def _resv_time_key(s) -> str:
+    """ดึง HH:MM จากข้อความอะไรก็ได้ — '19:00' · '19.00' · 'วันนี้ 19:00' → '19:00'"""
+    m = re.search(r"(\d{1,2})[:.](\d{2})", str(s or ""))
+    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else ""
+
+
 def _find_dup_reservation(info) -> dict:
     """หาจอง 'เนื้อหาเดียวกัน' ที่ยังไม่ถูกยกเลิก (กันบันทึกซ้ำเมื่อพิมพ์จองเดิมใหม่หลายรอบ)
-    match: ลูกค้า + จำนวนคน + โต๊ะ/โซน + วันที่จอง (โต๊ะเดิม-วันเดิม-ลูกค้าเดิม มักคือจองเดียวกัน)
-    คืน dict ของจองเดิม หรือ None"""
-    cust = (info.get("customer") or "").strip()
+    match: ลูกค้า + จำนวนคน + โต๊ะ/โซน + เวลา + วันที่จอง — เทียบแบบ 'ถอดวิธีพิมพ์ออกก่อน'
+    คืน dict ของจองเดิม หรือ None
+
+    🪤 เคสจริง 12 ต.ค. 69 — เจ้าของแจ้งว่า "ขาดการจับจองซ้ำ":
+      ⏳ #87 คุณฮัน 7 ท่าน | 12/10 19:00 | โซน A9 โต๊ะ A10
+      ✅ #88 คุณฮัน 7ท่าน  | 12/10 19:00 | โซน A โต๊ะ 9-10
+    ใบเดียวกันชัดเจน แต่ของเดิมเทียบ `people=?` และ `table_no=?` **แบบตรงตัวเป๊ะใน SQL**
+      '7 ท่าน' ≠ '7ท่าน'  (ต่างกันแค่ช่องว่าง)
+      'โซน A9 โต๊ะ A10' ≠ 'โซน A โต๊ะ 9-10'  (คนละวิธีเขียนโต๊ะเดียวกัน)
+    → หลุดด่าน บันทึกซ้ำ → โต๊ะถูกกันไว้ 2 ใบ · พนักงานเห็น 2 รายการแล้วไม่รู้ว่าอันไหนจริง
+    📌 ตระกูลเดียวกับ §3.39: **สตริงภาษาไทยจากคนพิมพ์ ห้ามเทียบตรงตัว** ต้องถอดวิธีพิมพ์ออกก่อน
+
+    ⚖️ เพิ่ม 'เวลา' เข้าไปในการเทียบด้วย — ของเดิมไม่เคยเทียบเวลาเลย
+    ทั้งที่ข้อความที่บอทตอบเขียนเองว่า "ถ้าตั้งใจจองเพิ่มจริง ให้ระบุโต๊ะหรือ**เวลา**ให้ต่างจากเดิม"
+    = คำแนะนำนั้นไม่เป็นจริง · ลูกค้าเดิมจองโต๊ะเดิมสองรอบ (18:00 กับ 21:00) จะถูกตีเป็นซ้ำ
+    แล้ว **รอบที่สองหายเงียบ** ทั้งที่เป็นจองจริง"""
+    cust = _resv_cust_key(info.get("customer"))
     if not cust:
         return None   # ไม่มีชื่อลูกค้า → ตัดสินไม่ได้ว่าซ้ำ ปล่อยผ่าน
     rd = _sane_resv_date(info.get("resv_date")) or datetime.now(TZ).date().isoformat()
+    want_people = _resv_people_key(info.get("people"))
+    want_table  = _resv_table_key(info.get("table"))
+    want_time   = _resv_time_key(info.get("time_hhmm"))
     try:
         with _db() as conn:
-            row = conn.execute(
+            rows = [dict(r) for r in conn.execute(
                 "SELECT * FROM reservations WHERE status IN ('PENDING','CONFIRMED') "
-                "AND customer=? AND COALESCE(resv_date,?)=? "
-                "AND COALESCE(people,'')=? AND COALESCE(table_no,'')=? "
-                "ORDER BY id DESC LIMIT 1",
-                (cust, rd, rd, info.get("people") or "", info.get("table") or "")).fetchone()
-        return dict(row) if row else None
+                "AND COALESCE(resv_date,?)=? ORDER BY id DESC", (rd, rd)).fetchall()]
     except Exception as e:
         print(f"[resv] เช็คจองซ้ำไม่ได้: {e}", flush=True)
         return None
+    # กรองในไพธอน ไม่ใช่ใน SQL — ต้อง normalize ก่อนเทียบ ซึ่ง SQL ทำให้ไม่ได้
+    # (วันเดียวมีจองไม่กี่สิบใบ ไม่ใช่ภาระ)
+    for r in rows:
+        if _resv_cust_key(r.get("customer")) != cust:
+            continue
+        if _resv_people_key(r.get("people")) != want_people:
+            continue
+        if _resv_table_key(r.get("table_no")) != want_table:
+            continue
+        # ⚠️ เวลาใช้ 'แยกใบ' ได้เฉพาะเมื่อรู้ทั้งสองข้าง — ข้างใดข้างหนึ่งว่าง = 'ไม่รู้' ไม่ใช่ 'คนละเวลา'
+        # resv_datetime เก็บจาก info['datetime'] ซึ่งพรอมป์ตระบุว่า 'ถ้ามี' → ว่างได้จริง
+        # ถ้าเทียบตายตัวจะกลายเป็น 'ไม่รู้เวลา = คนละใบ' → ด่านกันซ้ำพังหนักกว่าเดิม (กติกา 0 ≠ ไม่รู้)
+        t_old = _resv_time_key(r.get("resv_datetime"))
+        if t_old and want_time and t_old != want_time:
+            continue
+        return r
+    return None
 
 
 def _valid_ymd(s) -> bool:
@@ -6285,6 +6377,7 @@ def handle_join(event):
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     text     = event.message.text.strip()
+    _cmd     = _cmd_key(text)      # ใช้เทียบ 'คำสั่งทั้งข้อความ' เท่านั้น (ถอดคำลงท้ายแล้ว)
     group_id = getattr(event.source, "group_id", event.source.user_id)
     print(f"[GROUP_ID] source_type={event.source.type} id={group_id} text={text}", flush=True)
     if group_id in IGNORE_GROUPS:
@@ -6296,11 +6389,11 @@ def handle_text(event):
         return
     _clear_group_left(group_id)   # มีข้อความเข้ามา = บอทยังอยู่ในกลุ่ม → ปลดมาร์ค left ถ้าเคยติด (self-heal)
     # เมนูคำสั่ง
-    if text.lower() in ("help", "คำสั่ง", "ช่วยเหลือ", "เมนู", "menu", "คำสั่งบอท"):
+    if _cmd in ("help", "คำสั่ง", "ช่วยเหลือ", "เมนู", "menu", "คำสั่งบอท"):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_help(group_id)))
         return
     # คู่มือใช้งานแบบย่อ
-    if text.lower() in ("คู่มือ", "วิธีใช้", "manual", "คู่มือการใช้งาน"):
+    if _cmd in ("คู่มือ", "วิธีใช้", "manual", "คู่มือการใช้งาน"):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_manual(group_id)))
         return
     # พิมพ์ "groupid" → บอทตอบ Group ID + บทบาทของกลุ่มนี้ (ไว้เช็ก/ตั้งค่า env)
@@ -6325,7 +6418,7 @@ def handle_text(event):
             text=f"🆔 Group ID:\n{group_id}\n─────────────────\n" + "\n".join(roles)))
         return
     # เช็คโควต้า push ที่ใช้ไปเดือนนี้ (แยกราย OA) — ไว้ดูว่าใกล้เต็ม/สลับ OA แล้วหรือยัง
-    if text.lower() in ("โควต้า", "quota", "โควตา", "push"):
+    if _cmd in ("โควต้า", "quota", "โควตา", "push"):
         mon = datetime.now(TZ).strftime("%Y-%m")
         lines = [f"📈 โควต้า push เดือน {mon} (ลิมิต {PUSH_FREE_LIMIT}/OA)"]
         total = 0
@@ -6399,7 +6492,7 @@ def handle_text(event):
             text=build_resv_summary(None, "📋 สรุปการจองทั้งร้าน (วันนี้ + ล่วงหน้า)", upcoming=True)))
         return
     # ยกเลิกจอง #X — "ยกเลิกจอง 38", "ยกเลิก #38", "ยกเลิกการจอง 38" → status=CANCELLED (หยุดย้ำเตือน+ตัดจากสรุป)
-    _mcx = re.match(r"^\s*ยกเลิก\s*(?:การ)?(?:จอง)?\s*#?\s*(\d+)\s*$", text)
+    _mcx = _RESV_CANCEL_RE.match(text)
     if _mcx:
         _rid = int(_mcx.group(1))
         _rr = get_reservation(_rid)
@@ -6415,11 +6508,11 @@ def handle_text(event):
                      "(หยุดย้ำเตือน + ตัดออกจากสรุปแล้ว)"))
         return
     # ล้างข้อมูลทั้งหมดของกลุ่มนี้ (สลิป+จอง ทุกวัน) — เตรียมเลิกใช้/รีเซ็ตกลุ่ม (มีปุ่มยืนยัน)
-    if text.lower() in ("ล้างทั้งหมด", "ล้างกลุ่มนี้", "ล้างข้อมูลทั้งหมด", "รีเซ็ตทั้งหมด"):
+    if _cmd in ("ล้างทั้งหมด", "ล้างกลุ่มนี้", "ล้างข้อมูลทั้งหมด", "รีเซ็ตทั้งหมด"):
         send_reset_all_confirm(event, group_id)
         return
     # เปิด/ปิด 'ระบบสลิปทั้งหมด' ของกลุ่มนี้ (ไม่เช็ค/ไม่เตือน/ไม่รายงาน) — วางนอกบล็อก _slip_enabled เพื่อให้ 'เปิดสลิป' ได้แม้ปิดอยู่
-    if text in ("ปิดสลิป", "ปิดเช็คสลิป", "ไม่เช็คสลิป", "ปิดระบบสลิป"):
+    if _cmd in ("ปิดสลิป", "ปิดเช็คสลิป", "ไม่เช็คสลิป", "ปิดระบบสลิป"):
         _set_meta(f"slipoff:{group_id}", "1")
         _del_meta(f"noreport:{group_id}")   # ปิดสลิปครอบคลุมรายงานอยู่แล้ว
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
@@ -6427,13 +6520,13 @@ def handle_text(event):
                  "(ฟีเจอร์อื่น เช่น การจอง ยังใช้ได้ปกติ)\n"
                  "• เปิดใหม่พิมพ์ 'เปิดสลิป'"))
         return
-    if text in ("เปิดสลิป", "เปิดเช็คสลิป", "เปิดระบบสลิป"):
+    if _cmd in ("เปิดสลิป", "เปิดเช็คสลิป", "เปิดระบบสลิป"):
         _del_meta(f"slipoff:{group_id}")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text="✅ เปิดระบบสลิปของกลุ่มนี้แล้ว — กลับมาเช็ค/เตือน/รายงานสลิปตามปกติ"))
         return
     # ตั้ง 'เฉพาะกลุ่มนี้' เป็นกลุ่มรับสลิป → กลุ่มอื่นทั้งหมดเงียบสลิปทันที (พิมพ์ครั้งเดียวในกลุ่มจริง)
-    if text in ("กลุ่มนี้รับสลิป", "ตั้งกลุ่มสลิป", "เปิดเฉพาะกลุ่มนี้", "เฉพาะกลุ่มนี้รับสลิป", "ตั้งกลุ่มนี้เป็นกลุ่มสลิป"):
+    if _cmd in ("กลุ่มนี้รับสลิป", "ตั้งกลุ่มสลิป", "เปิดเฉพาะกลุ่มนี้", "เฉพาะกลุ่มนี้รับสลิป", "ตั้งกลุ่มนี้เป็นกลุ่มสลิป"):
         allow = _slip_allow()
         if group_id not in allow:
             allow.append(group_id)
@@ -6445,7 +6538,7 @@ def handle_text(event):
                  "🔕 ทุกกลุ่มอื่นที่ไม่ได้ตั้ง = ไม่เช็ก/ไม่รายงานสลิปทั้งหมด (รวมกลุ่มใหม่ในอนาคต)\n"
                  "• ถ้าตั้งผิด พิมพ์ 'ล้างกลุ่มสลิป' เพื่อกลับค่าเริ่มต้น"))
         return
-    if text in ("ล้างกลุ่มสลิป", "รีเซ็ตกลุ่มสลิป", "ยกเลิกกลุ่มสลิป"):
+    if _cmd in ("ล้างกลุ่มสลิป", "รีเซ็ตกลุ่มสลิป", "ยกเลิกกลุ่มสลิป"):
         _del_meta("slip_allow")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text="↩️ ล้างรายการ 'กลุ่มรับสลิป' แล้ว — กลับไปใช้ค่าตั้งต้น (ตาม env SLIP_GROUPS)"))
@@ -6454,36 +6547,36 @@ def handle_text(event):
     if _slip_enabled(group_id):
         # กระทบบิล-สลิป (เฉพาะ DINING_GROUPS): ยืนยันเก็บครบ=รีเซ็ตยอด / ดูยอดสะสม
         if _dining_enabled(group_id):
-            if text in ("เก็บครบแล้ว", "เก็บเงินครบ", "เก็บเงินครบแล้ว", "ปิดยอด", "เคลียร์ยอด", "เคลียยอด", "รีเซ็ตยอด"):
+            if _cmd in ("เก็บครบแล้ว", "เก็บเงินครบ", "เก็บเงินครบแล้ว", "ปิดยอด", "เคลียร์ยอด", "เคลียยอด", "รีเซ็ตยอด"):
                 _dining_reset(event, group_id)
                 return
-            if text in ("ยอดสะสม", "ยอดทริป", "สรุปบิล", "ยอดบิล", "บิลสลิป", "กระทบยอด"):
+            if _cmd in ("ยอดสะสม", "ยอดทริป", "สรุปบิล", "ยอดบิล", "บิลสลิป", "กระทบยอด"):
                 # สรุปยอด + การ์ดปุ่ม 'เก็บครบแล้ว' (พนักงานดูยอดแล้วกดปิดได้เลย)
                 line_bot_api.reply_message(event.reply_token, [
                     TextSendMessage(text=build_dining_summary(group_id)),
                     _dining_confirm_card(),
                 ])
                 return
-        if text.lower() in ("สรุป", "รายงาน", "report", "summary"):
+        if _cmd in ("สรุป", "รายงาน", "report", "summary"):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_daily_report(group_id)))
             return
 
         # เปิด/ปิด 'รายงานสรุปประจำวัน' ของกลุ่มนี้ (ยังเช็คสลิป + ใช้คำสั่ง 'สรุป' ได้ปกติ)
-        if text in ("ปิดรายงาน", "ปิดรายงานสลิป", "งดรายงาน", "ไม่เอารายงาน", "ปิดสรุป"):
+        if _cmd in ("ปิดรายงาน", "ปิดรายงานสลิป", "งดรายงาน", "ไม่เอารายงาน", "ปิดสรุป"):
             _set_meta(f"noreport:{group_id}", "1")
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
                 text="🔕 ปิดรายงานสรุปประจำวัน (00:30) ของกลุ่มนี้แล้ว\n"
                      "• ยังเช็คสลิป/เตือนปกติ + พิมพ์ 'สรุป' ดูเองได้\n"
                      "• เปิดใหม่พิมพ์ 'เปิดรายงาน'"))
             return
-        if text in ("เปิดรายงาน", "เปิดรายงานสลิป", "เอารายงาน", "เปิดสรุป"):
+        if _cmd in ("เปิดรายงาน", "เปิดรายงานสลิป", "เอารายงาน", "เปิดสรุป"):
             _del_meta(f"noreport:{group_id}")
             line_bot_api.reply_message(event.reply_token, TextSendMessage(
                 text="🔔 เปิดรายงานสรุปประจำวัน (00:30) ของกลุ่มนี้แล้ว"))
             return
 
         # ดูใบที่ถูกข้าม 'ไม่ใช่รายรับ' (โชว์ยอด+ปลายทาง) — เช็กว่าโดนกรองทิ้งเป็นเงินร้านจริงไหม
-        if text.lower() in ("ดูที่ข้าม", "รายการข้าม", "ใบที่ข้าม", "สรุปข้าม", "ที่ข้าม"):
+        if _cmd in ("ดูที่ข้าม", "รายการข้าม", "ใบที่ข้าม", "สรุปข้าม", "ที่ข้าม"):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_skipped_list(group_id)))
             return
         # กู้รูปที่อ่านไม่ออกของวันนั้น (ดีฟอลต์ = เมื่อวาน) แล้วบันทึกใบที่อ่านได้ให้เอง
@@ -6536,7 +6629,7 @@ def handle_text(event):
 
         # push 'รายงานเมื่อวาน' เข้า 'กลุ่มนี้' เดี๋ยวนี้ (ต่างจาก 'ทดสอบรายงาน' ที่ยิงไปปลายทาง redirect)
         # ใช้เช็คว่า push เข้ากลุ่มนี้ได้ไหม + ดูรายงานเมื่อวานซ้ำ
-        if text.lower() in ("รายงานเมื่อวาน", "test report"):
+        if _cmd in ("รายงานเมื่อวาน", "test report"):
             yesterday = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
             try:
                 _push(group_id, TextSendMessage(text=build_daily_report(group_id, yesterday)))
@@ -6590,7 +6683,7 @@ def handle_text(event):
             return
 
         # คำสั่งลบสลิป (กรณีส่งผิด/ซ้ำ)
-        if text in ("ล้างวันนี้", "รีเซ็ตวันนี้", "ล้างสลิปวันนี้", "รีเซ็ต"):
+        if _cmd in ("ล้างวันนี้", "รีเซ็ตวันนี้", "ล้างสลิปวันนี้", "รีเซ็ต"):
             send_reset_confirm(event, group_id)
             return
         if text.startswith("ลบ"):
