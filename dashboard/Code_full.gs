@@ -64,10 +64,60 @@ function doGet(e) {
   return json_({ ok: true, exists: true, data: JSON.parse(content || 'null'), updatedAt: file.getLastUpdated().getTime() });
 }
 
+// ── ด่านคีย์ขาเขียนของแดชบอร์ด (§3.47) ────────────────────────────────────
+// 🔴 ก่อนมีด่านนี้: ใครรู้ URL /exec ก็ POST เขียนทับ saisang_data.json ทั้งปีได้
+//    ไม่มีคีย์ ไม่เช็คต้นทาง ไม่มี log ว่าใครเขียน — คลาสเดียวกับที่ห้องคอนเทนต์
+//    เจอใน bridge แต่หนักกว่าเพราะนี่คือตัวเลขเงิน
+// ⚠️ ด่านนี้ไม่กระทบการนำเข้าอัตโนมัติเลยสักนิด — writeMonths_/writeMonth_
+//    เขียนไฟล์ Drive ตรงๆ ไม่ผ่าน HTTP · ด่านคุมแค่ "บันทึกด้วยมือจากหน้า dashboard"
+// 📌 คีย์อยู่ใน body ไม่ใช่ query string → GET ไม่ต้องแก้ และไม่ชนกับการต่อ '?action='
+//    ของหน้าเว็บ (SYNC_URL+'?action=load') ซึ่งถ้าใส่คีย์ใน URL จะได้ '?k=..?action=..' พัง
+var DASH_KEY_PROP = 'DASH_KEY';
+
+/** สร้างคีย์ขาเขียน — รันครั้งเดียว */
+function makeDashKey() {
+  var key = Utilities.getUuid().replace(/-/g, '');
+  PropertiesService.getScriptProperties().setProperty(DASH_KEY_PROP, key);
+  Logger.log('✅ DASH_KEY = ' + key);
+  Logger.log('→ เปิดหน้า dashboard กดปุ่ม ☁️ : ช่องแรก = URL เดิม (กด OK ผ่านไป) · ช่องที่สอง = วางคีย์นี้');
+  Logger.log('⚠️ ห้ามวางคีย์นี้ลงไฟล์ในกล่องกลาง/รีโป/แชท — ก๊อปใส่หน้า dashboard เท่านั้น');
+}
+
+/** ดูว่าตั้งคีย์แล้วหรือยัง โดยไม่โชว์ค่าเต็ม */
+function showDashKeyStatus() {
+  var k = PropertiesService.getScriptProperties().getProperty(DASH_KEY_PROP) || '';
+  Logger.log(k ? ('✅ ตั้งแล้ว · ยาว ' + k.length + ' ตัว · ขึ้นต้น ' + k.substring(0, 4) + '…')
+               : '🔴 ยังไม่ได้ตั้ง — การบันทึกด้วยมือจากหน้า dashboard จะถูกปฏิเสธทั้งหมด '
+                 + '(การนำเข้าอัตโนมัติไม่กระทบ) · รัน makeDashKey() หนึ่งครั้ง');
+}
+
 function doPost(e) {
   try {
     const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
-    const payload = JSON.stringify(body.data);
+
+    // 🔴 ตั้งใจให้ "ไม่มีคีย์ = ปฏิเสธ" ไม่ใช่ "ผ่านหมด" — fail-safe ด้านที่ถูกเมื่อมีคนลืมตั้งค่า
+    const KEY = PropertiesService.getScriptProperties().getProperty(DASH_KEY_PROP) || '';
+    if (!KEY || !body || body.k !== KEY) {
+      console.warn('ปฏิเสธคำขอเขียน saisang_data.json: ' + (KEY ? 'คีย์ไม่ถูกต้อง' : 'ยังไม่ได้ตั้ง DASH_KEY'));
+      return json_({ ok: false, status: 'denied',
+        error: KEY ? 'คีย์ไม่ถูกต้อง — กดปุ่ม ☁️ ในหน้า dashboard แล้ววางคีย์ใหม่'
+                   : 'ยังไม่ได้ตั้ง DASH_KEY ที่ Apps Script — รัน makeDashKey() หนึ่งครั้ง' });
+    }
+
+    // 🪤 บั๊กแฝงที่เจอตอนทำด่านนี้: เดิมเขียน JSON.stringify(body.data) ตรงๆ
+    //    body ที่ไม่มี data → JSON.stringify(undefined) = undefined
+    //    → setContent(undefined) เขียนคำว่า "undefined" ทับข้อมูลการเงินทั้งปี
+    //    ไฟล์นี้เป็น array ของเดือนเสมอ (ดู writeMonth_/doGet) → ไม่ใช่ array = ไม่รับ
+    if (!Array.isArray(body.data)) {
+      console.warn('ปฏิเสธคำขอเขียน: data ไม่ใช่ array (ได้ ' + (typeof body.data) + ')');
+      return json_({ ok: false, status: 'bad_payload',
+        error: 'รูปแบบข้อมูลไม่ถูกต้อง (ต้องเป็น array ของเดือน) — ไม่ได้เขียนอะไรลงไฟล์' });
+    }
+    if (!body.data.length) {
+      // ลบทุกเดือน = การเขียนแบบทำลายล้าง · ผ่านด่านคีย์แล้วถือว่าเจ้าของสั่งเอง แต่ต้องมีร่องรอย
+      console.warn('⚠️ เขียนทับด้วย array ว่าง = ลบทุกเดือนออกจาก ' + FILE_NAME);
+    }
+    const payload = JSON.stringify(body.data);   // เก็บแค่ data — คีย์ไม่ถูกเขียนลงไฟล์
     let file = getFile_();
     if (file) file.setContent(payload);
     else file = getFolder_().createFile(FILE_NAME, payload, 'application/json');

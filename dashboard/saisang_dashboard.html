@@ -565,6 +565,7 @@ let activeM=0,charts={},pg=1,PG=25,filtRecs=[],activeCat='all';
 // บนหน้าจอแล้ววาง URL (จะจำไว้ใน localStorage ของอุปกรณ์นั้น) — ดูวิธีสร้างใน GOOGLE_DRIVE_SETUP.md
 const SYNC_URL_DEFAULT='<<ใส่ Apps Script /exec URL ตรงนี้ หรือตั้งผ่านปุ่ม ☁️ ตั้งค่า Drive>>';
 let SYNC_URL=localStorage.getItem('saisang_sync_url')||SYNC_URL_DEFAULT;
+let DASH_KEY=localStorage.getItem('saisang_dash_key')||'';  // คีย์ขาเขียน (§3.47) เก็บต่อเบราว์เซอร์ ไม่ส่งไปที่อื่นนอกจาก Apps Script ของเราเอง
 let lastSyncStamp=0, syncTimer=null, saveDebounce=null, isSaving=false;
 
 function setSyncBadge(state){
@@ -580,7 +581,16 @@ function setupSync(){
   if(u && !/\/exec$/.test(u)){toast('ลิงก์ควรลงท้ายด้วย /exec');return;}
   SYNC_URL=u;
   if(u)localStorage.setItem('saisang_sync_url',u); else localStorage.removeItem('saisang_sync_url');
-  if(u){toast('ตั้งค่า Drive แล้ว — กำลังเชื่อมต่อ…');startSync();}
+  if(u){
+    // คีย์ขาเขียน — ไม่มีคีย์ก็ยังอ่านข้อมูลได้ แต่บันทึกไม่ได้ (ตั้งใจ: ด่านอยู่ที่ขาเขียนเท่านั้น)
+    const kk=prompt('วางคีย์บันทึก (DASH_KEY)\n\nเอามาจาก: Apps Script → รันฟังก์ชัน makeDashKey() ครั้งเดียว → ก๊อปจาก log\n\nเว้นว่าง = อ่านได้แต่บันทึกไม่ได้', DASH_KEY||'');
+    if(kk!==null){
+      DASH_KEY=kk.trim();
+      if(DASH_KEY)localStorage.setItem('saisang_dash_key',DASH_KEY); else localStorage.removeItem('saisang_dash_key');
+    }
+    toast(DASH_KEY?'ตั้งค่า Drive แล้ว — กำลังเชื่อมต่อ…':'ตั้งค่า Drive แล้ว (ยังไม่มีคีย์ = บันทึกไม่ได้)');
+    startSync();
+  }
   else{stopSync();setSyncBadge('off');toast('ปิดการซิงค์ Drive แล้ว');}
 }
 
@@ -629,13 +639,20 @@ function saveToDrive(silent){
   fetch(SYNC_URL,{
     method:'POST',
     headers:{'Content-Type':'text/plain;charset=utf-8'}, // simple request เลี่ยง CORS preflight ของ Apps Script
-    body:JSON.stringify({action:'save',data:months})
+    body:JSON.stringify({action:'save',k:DASH_KEY,data:months})   // k = คีย์ขาเขียน (§3.47)
   })
     .then(r=>r.json())
     .then(d=>{
       isSaving=false;
       if(d&&d.ok){ lastSyncStamp=d.updatedAt||Date.now(); setSyncBadge('ok'); if(!silent)toast('บันทึกขึ้น Drive แล้ว ✓'); }
-      else { setSyncBadge('err'); if(!silent)toast('บันทึกไม่สำเร็จ'); }
+      else {
+        setSyncBadge('err');
+        // ถูกด่านคีย์ปฏิเสธ/ข้อมูลผิดรูป → ต้องบอกเหตุผลจริง ไม่ใช่ 'บันทึกไม่สำเร็จ' ลอยๆ
+        // (เงียบหรือคลุมเครือ = เจ้าของนึกว่าเน็ตมีปัญหา แล้วกดซ้ำไปเรื่อยๆ)
+        const why=(d&&d.error)?d.error:'บันทึกไม่สำเร็จ';
+        if(!silent)toast(why);
+        if(d&&d.status==='denied')console.warn('[sync] ถูกปฏิเสธ: '+why);
+      }
     })
     .catch(err=>{ isSaving=false; setSyncBadge('err'); if(!silent)toast('บันทึกไม่สำเร็จ: '+err.message); });
 }
