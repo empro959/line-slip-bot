@@ -399,9 +399,47 @@ function parseBalanceTotal_(text){
 /** ตรวจว่า parseBalanceTotal_ ใช้ได้กับข้อความจริงจาก OCR ไหม — อ่านอย่างเดียว ไม่เขียนอะไร
  *  รันหลัง paste ครั้งแรก เพื่อรู้ว่า QA จะได้เกณฑ์แน่น (เทียบในใบ) หรือเกณฑ์หยาบ (เปอร์เซ็นต์) */
 function qaCheckPayTotal(){
+  // 🪤 บทเรียน 21 ต.ค. 17:59: เรียก pdfToText_ ตรงๆ = เผาโควตา OCR ทิ้งเพื่อแค่ "ตรวจสอบ"
+  //   และเมื่อชนโควตา (อาการชั่วคราว รู้จักแล้ว §3.40) มันโยน stack trace แดงใส่เจ้าของ
+  //   แทนที่จะบอกว่า "รออีก 5 นาทีแล้วกดใหม่"
+  // ✅ ถ้ามีวันที่นำเข้าหลังแพตช์แล้ว → ตอบจากไฟล์ได้เลย ไม่ใช้โควตาเลยสักครั้ง
+  var withTot=[];
+  loadDaily_().forEach(function(d){
+    if(!(d.pay_total===undefined || d.pay_total===null)) withTot.push(d);
+  });
+  if(withTot.length){
+    withTot.sort(function(a,b){ return a.date<b.date?1:-1; });
+    Logger.log('✅ มีวันที่เก็บยอดรวมในใบแล้ว '+withTot.length+' วัน — ตอบจากไฟล์ ไม่ต้องใช้โควตา OCR');
+    var bad=0;
+    withTot.slice(0,10).forEach(function(d){
+      var sum=0; Object.keys(d.payments||{}).forEach(function(k){ sum+=Number(d.payments[k]||0); });
+      var df=sum-Number(d.pay_total);
+      if(Math.abs(df)>QA_PAY_TOTAL_TOL) bad++;
+      Logger.log('   '+d.date+'  ผลบวกวิธีชำระ '+Math.round(sum).toLocaleString()+
+                 ' vs ยอดรวมในใบ '+Math.round(d.pay_total).toLocaleString()+
+                 '  → ต่าง '+df.toFixed(2)+(Math.abs(df)>QA_PAY_TOTAL_TOL?'  🔴':'  ✅'));
+    });
+    Logger.log(bad? ('🔴 มี '+bad+' วันที่ไม่ตรง — รัน qaPosDataAll() ดูรายละเอียด')
+                  : '✅ ตรงทุกวันที่ตรวจ — QA ใช้เกณฑ์แน่น (±'+QA_PAY_TOTAL_TOL+' บาท) ได้แล้ว');
+    return {ok:true, fromFile:true, days:withTot.length, bad:bad};
+  }
+
+  Logger.log('ยังไม่มีวันไหนเก็บยอดรวมในใบ (ข้อมูลทั้งหมดนำเข้าก่อนแพตช์)');
+  Logger.log('→ ต้อง OCR ใบจริง 1 ใบเพื่อทดสอบ · ถ้าไม่อยากใช้โควตา รอให้การนำเข้าคืนนี้ทำงานแล้วค่อยกดใหม่');
   var b=findLatestPdf_('BalanceCashDrawer');
   if(!b){ Logger.log('❌ ไม่พบใบ BalanceCashDrawer ในเมล 35 วันล่าสุด'); return null; }
-  var txt=pdfToText_(b.blob);
+  var txt;
+  try { txt=pdfToText_(b.blob); }
+  catch(e){
+    // โควตา OCR เป็นอาการชั่วคราว คลายในระดับนาที (§3.40) — ห้ามปล่อยเป็น stack trace
+    if(/rate limit|quota/i.test(String(e))){
+      Logger.log('⏳ โควตา OCR ไม่ว่างตอนนี้ (อาการชั่วคราว คลายในไม่กี่นาที)');
+      Logger.log('   → รออีก ~5 นาทีแล้วกด qaCheckPayTotal ใหม่ · หรือรอการนำเข้าคืนนี้แล้วกดพรุ่งนี้ (จะไม่ใช้โควตาเลย)');
+      return {ok:false, reason:'ocr_quota'};
+    }
+    Logger.log('❌ อ่านใบไม่สำเร็จ: '+e);
+    return {ok:false, reason:'read_failed'};
+  }
   var tot=parseBalanceTotal_(txt), pm=parseBalance_(txt);
   var sum=0; Object.keys(pm).forEach(function(k){ sum+=Number(pm[k]||0); });
   Logger.log('ใบที่ใช้ทดสอบ: '+b.name);
@@ -1692,6 +1730,77 @@ function _missingDays_(daily){
 }
 
 
+// ══════════════════════════════════════════════════════════════════════════
+//  "วันที่มาไม่ครบ" — คนละโรคกับ "วันที่หายไป"  (§3.46)
+//  🪤 QA เจอ 21 ต.ค.: 14/09 มียอดขาย 34,926 แต่ไม่มีวิธีชำระเลยสักช่อง
+//     _missingDays_ สร้างรายการ "วันที่มี" จาก d.date เท่านั้น → นับว่า 14/09 'มีแล้ว'
+//     → dailyRepair/startFillLoop **ไม่แตะวันนั้นตลอดกาล** เพราะมันหา 'วันที่หายไป'
+//     ไม่ได้หา 'วันที่มาไม่ครบ' · ตัวซ่อมมีรูที่ตัวมันเองปิดไม่ได้
+//  ⚠️ ไม่นับ expenses=null เป็น 'ไม่ครบ' — นั่นตั้งใจ (ใบ Payout ครอบหลายวัน ใช้ไม่ได้)
+//     กู้ใหม่ก็ยัง null เหมือนเดิม = วนเปล่าทุกวันตลอดไป
+//  ⚠️ จำกัดจำนวนครั้งที่พยายาม — ถ้าใบ BalanceCashDrawer ของวันนั้นไม่มีในเมลจริงๆ
+//     กู้กี่รอบก็ไม่ได้ · ปล่อยให้เตือนทุกเช้าตลอดไป = ไม่มีใครเชื่ออีก (บทเรียน §3.43)
+//     เกินโควตาแล้ว → เลิกพยายาม แต่ QA ยังถือรายการไว้เป็น 🟠 ไม่หายไปเงียบๆ
+// ══════════════════════════════════════════════════════════════════════════
+var NOPAY_TRY_PROP  = 'POS_NOPAY_TRIES';
+var NOPAY_MAX_TRIES = 3;
+
+function _nopayTries_(){
+  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty(NOPAY_TRY_PROP)||'{}')||{}; }
+  catch(e){ return {}; }
+}
+function _nopaySetTries_(o){
+  PropertiesService.getScriptProperties().setProperty(NOPAY_TRY_PROP, JSON.stringify(o||{}));
+}
+
+/** คืน {todo:[วันที่ยังควรลองกู้], gaveup:[วันที่ลองครบโควตาแล้วยังไม่ครบ]} */
+function _incompleteDays_(daily){
+  daily = daily || loadDaily_();
+  var tries=_nopayTries_(), todo=[], gaveup=[];
+  daily.forEach(function(d){
+    var dt=d.date||''; if(!dt) return;
+    var sales=(d.sales||[]).reduce(function(a,c){return a+Number(c.amount||0);},0);
+    var hasPay=Object.keys(d.payments||{}).length>0;
+    if(sales>0 && !hasPay){
+      if((tries[dt]||0)>=NOPAY_MAX_TRIES) gaveup.push(dt); else todo.push(dt);
+    }
+  });
+  return {todo:todo.sort(), gaveup:gaveup.sort()};
+}
+
+/** ลองกู้ "วันที่มาไม่ครบ" — นับครั้งที่พยายาม · ครบแล้วล้างตัวนับ
+ *  คืน {done, still, gaveup} · ไม่ throw (ผู้เรียกตัดสินว่าจะ throw ไหม) */
+function _fillIncompleteDays_(){
+  var inc=_incompleteDays_();
+  if(!inc.todo.length && !inc.gaveup.length) return {done:0, still:[], gaveup:[]};
+  if(inc.gaveup.length)
+    Logger.log('🟠 วันที่มาไม่ครบและเลิกพยายามแล้ว ('+NOPAY_MAX_TRIES+' ครั้ง): '+inc.gaveup.join(', ')+
+               ' — ใบ BalanceCashDrawer ของวันนั้นน่าจะไม่มีในเมล ต้องใช้ตาคน (QA ยังถือรายการไว้)');
+  if(!inc.todo.length) return {done:0, still:[], gaveup:inc.gaveup};
+
+  Logger.log('🔎 วันที่ "มีแต่ยอดขาย ไม่มีวิธีชำระ" '+inc.todo.length+' วัน → '+inc.todo.join(', '));
+  var tries=_nopayTries_(), done=0;
+  for(var i=0;i<inc.todo.length;i++){
+    var iso=inc.todo[i];
+    if(_waitBudgetLeft_() < 60){ Logger.log('   ⏳ เวลารันใกล้ครบ 6 นาที — หยุดก่อน กดซ้ำได้'); break; }
+    tries[iso]=(tries[iso]||0)+1;
+    Logger.log('───── กู้วันที่มาไม่ครบ '+iso+' (ครั้งที่ '+tries[iso]+'/'+NOPAY_MAX_TRIES+') ─────');
+    try { _importPosOneDate_(iso, inc.todo); }
+    catch(e){ Logger.log('❌ '+iso+' พัง: '+e); }
+  }
+  _nopaySetTries_(tries);
+
+  // เช็คผลจริงจากไฟล์ ไม่ใช่เชื่อว่าเรียกแล้วต้องสำเร็จ
+  var after=_incompleteDays_();
+  var stillSet={}; after.todo.concat(after.gaveup).forEach(function(x){stillSet[x]=true;});
+  inc.todo.forEach(function(iso){
+    if(!stillSet[iso]){ done++; delete tries[iso]; Logger.log('✅ '+iso+' ครบแล้ว'); }
+  });
+  _nopaySetTries_(tries);
+  if(done) writeMonths_(rebuildMonths_(loadDaily_(), fetchSlipMap_()));
+  return {done:done, still:after.todo, gaveup:after.gaveup};
+}
+
 // ===== 🔘 ปุ่มเดียวจบ: หาวันที่ขาดเอง → กู้ → สร้างข้อมูลเดือนใหม่ =====
 // ทำไมต้องมี (5 ต.ค. 69): เจ้าของบอก "ยากไป น่าจะมีปุ่มให้รันเพิ่มวันที่ขาดเลย"
 //   ของเดิมต้อง: รัน debugDaily → ก๊อปวันที่ขาด → **แก้ลิสต์ DATES ในโค้ดเอง** → รัน → รัน rebuildNow
@@ -1737,6 +1846,8 @@ function fillMissingDays(){
                          '\n   💡 ไม่อยากมานั่งกดเอง: กด startFillLoop ครั้งเดียว มันจะลองเองทุกชั่วโมงจนครบ แล้วปิดตัวเอง');
   else if(after.all.length) Logger.log('⚠️ ยังเหลือวันที่กู้ไม่ได้ — เลื่อนอ่าน log ข้างบนหา ❌ ของวันนั้น '+
                                        '(ถ้าขึ้น "ไม่พบเมลรายงาน POS" = เมลวันนั้นยังไม่เข้า หรือเป็นวันร้านหยุด)');
+  // "ปุ่มเดียวจบ" ต้องจบทั้งสองโรค — วันหายไป และวันมาไม่ครบ (§3.46)
+  try { _fillIncompleteDays_(); } catch(e){ Logger.log('⚠️ ซ่อมวันที่มาไม่ครบพัง: '+e); }
 }
 
 
@@ -2305,12 +2416,36 @@ function setupDailyRepair(){
 //    (เงียบแล้วไม่มีใครรู้ = ปัญหาเดิมที่เพิ่งเจอ · log ที่ไม่มีคนเปิดอ่าน ไม่ต่างจากไม่มี log)
 function dailyRepair(){
   var before=_missingDays_().all;
-  if(!before.length){ Logger.log('✅ ไม่มีวันที่ขาด'); return; }
-  Logger.log('🔧 ซ่อมประจำวัน — ขาด '+before.length+' วัน: '+before.join(', '));
-  try { fillMissingDays(); } catch(e){ Logger.log('❌ '+e); }
+  var inc0=_incompleteDays_();
+  if(inc0.gaveup.length)
+    Logger.log('🟠 วันที่มาไม่ครบและเลิกพยายามแล้ว: '+inc0.gaveup.join(', ')+
+               ' — ต้องใช้ตาคน (ไม่เตือนซ้ำทุกเช้า · QA ยังถือรายการไว้เป็น 🟠)');
+  if(!before.length && !inc0.todo.length){
+    Logger.log('✅ ไม่มีวันที่ขาด และไม่มีวันที่มาไม่ครบ');
+    return;                       // 🔴 มีแต่ของที่เลิกพยายามแล้ว = ไม่ throw (เตือนทุกวันเรื่องที่เครื่องแก้ไม่ได้ = ไม่มีใครเชื่ออีก)
+  }
+  if(before.length){
+    Logger.log('🔧 ซ่อมประจำวัน — ขาด '+before.length+' วัน: '+before.join(', '));
+    try { fillMissingDays(); } catch(e){ Logger.log('❌ '+e); }
+  }
+  var inc1={still:inc0.todo, gaveup:inc0.gaveup};
+  if(inc0.todo.length){
+    // fillMissingDays ข้างบนเรียก _fillIncompleteDays_ ไปแล้วถ้ามีวันขาด — เรียกอีกรอบไม่เสียหาย
+    // (ตัวมันเช็คจากไฟล์จริงทุกครั้ง · ครบแล้วจะไม่มีอะไรให้ทำ)
+    Logger.log('🔧 ซ่อมวันที่มาไม่ครบ '+inc0.todo.length+' วัน');
+    try { var r=_fillIncompleteDays_(); inc1={still:r.still||[], gaveup:r.gaveup||[]}; }
+    catch(e){ Logger.log('❌ ซ่อมวันที่มาไม่ครบพัง: '+e); }
+  }
   var left=_missingDays_().all;
-  if(!left.length){ Logger.log('✅ เก็บครบแล้ว'); return; }
-  throw new Error('ยังขาดข้อมูล POS ' + left.length + ' วัน: ' + left.join(', ') +
+  if(!left.length && !inc1.still.length){
+    Logger.log('✅ เก็บครบแล้ว');
+    if(inc1.gaveup.length) Logger.log('🟠 ยังเหลือวันที่เลิกพยายามแล้ว: '+inc1.gaveup.join(', '));
+    return;
+  }
+  var why=[];
+  if(left.length) why.push('ขาดข้อมูล POS '+left.length+' วัน: '+left.join(', '));
+  if(inc1.still.length) why.push('วันที่มีแต่ยอดขาย ไม่มีวิธีชำระ '+inc1.still.length+' วัน: '+inc1.still.join(', '));
+  throw new Error(why.join(' · ') +
                   ' — เปิด Apps Script > การดำเนินการ ดู log ว่าติดอะไร ' +
                   '(ถ้าเป็นวันร้านหยุด ให้ใส่ใน CLOSED_DAYS)');
 }
@@ -2353,8 +2488,14 @@ function _qaDaySales_(d){
 
 /** ตรวจทั้งชุด → คืน array ของ {level,code,date,msg} · level: 'แดง' = ผิดแน่/ข้อมูลหาย · 'เหลือง' = ต้องให้คนดู
  *  ไม่แตะ Drive ไม่แตะ Gmail — รับ data เข้ามาเฉยๆ จึงเทสต์ด้วย node ได้ทั้งหมด */
+var _qaGaveUpSet_={};
+
 function qaFindings_(daily, months){
   daily=daily||[]; months=months||[];
+  // อ่านรายการ "วันที่ตัวซ่อมเลิกพยายามแล้ว" ครั้งเดียว — QA อ่านอย่างเดียว ไม่เขียน
+  _qaGaveUpSet_={};
+  try { (_incompleteDays_(daily).gaveup||[]).forEach(function(x){ _qaGaveUpSet_[x]=true; }); }
+  catch(e){ _qaGaveUpSet_={}; }
   var f=[], add=function(level,code,date,msg){ f.push({level:level,code:code,date:date||'',msg:msg}); };
 
   // ───────── จุด 4 + 3 : ตรวจรายวันจาก pos_daily.json ─────────
@@ -2382,8 +2523,14 @@ function qaFindings_(daily, months){
     if(!keys.length){
       // ยอดขายรู้แล้วแต่ไม่มีวิธีชำระ → action=posday คืน day:null → บอทบอก "ไม่มียอด POS"
       // ทั้งที่ยอดขายอยู่ในระบบแล้ว (อาการเดียวกับเคส 9/10 ที่เจ้าของแจ้ง)
-      if(sales>0) add('แดง','NO_PAY',dt,'มียอดขาย '+Math.round(sales).toLocaleString()+' แต่ไม่มีวิธีชำระเลย '+
-                                        '→ บอทจะรายงานว่า "ไม่มียอด POS" ทั้งที่ข้อมูลมีอยู่');
+      if(sales>0){
+        // เลิกพยายามกู้แล้ว = เครื่องแก้ไม่ได้ ต้องใช้ตาคน → 🟠 (รายงานไว้ ไม่ส่งเมลทุกเช้า)
+        // ยังไม่เลิก = ตัวซ่อมควรเก็บได้คืนนี้ → 🔴 ให้มีเมลเตือน
+        var gaveup = (_qaGaveUpSet_||{})[dt] === true;
+        add(gaveup?'เหลือง':'แดง','NO_PAY',dt,'มียอดขาย '+Math.round(sales).toLocaleString()+' แต่ไม่มีวิธีชำระเลย '+
+            '→ บอทจะรายงานว่า "ไม่มียอด POS" ทั้งที่ข้อมูลมีอยู่'+
+            (gaveup?(' · ลองกู้ครบ '+NOPAY_MAX_TRIES+' ครั้งแล้วไม่สำเร็จ — ใบ BalanceCashDrawer ของวันนั้นน่าจะไม่มีในเมล ต้องใช้ตาคน'):''));
+      }
     } else {
       // จุด 4: ตรวจทานในใบเดียวกัน
       var pay=_qaSum_(pm);   // ⚠️ ทุกช่อง ไม่ใช่แค่ช่องที่รู้จัก — เงินคือเงินไม่ว่าป้ายจะเขียนว่าอะไร
