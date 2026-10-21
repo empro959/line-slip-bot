@@ -2346,6 +2346,23 @@ function qaFindings_(daily, months){
     (m.payment_days||[]).forEach(function(p){ inMonthPay[p.date]=m.period; });
     (m.daily_totals||[]).forEach(function(t){ inMonthTot[t.date]=m.period; });
 
+    // 🪤 เดือนที่นำเข้าจากใบ "รายเดือน" (buildMonth_/writeMonth_ — เช่น ม.ค.-มิ.ย. 69 ที่อัปมือ)
+    //   ไม่มี daily_totals/payment_days โดยธรรมชาติ และ writeMonths_ ตั้งใจคงไว้ไม่ทับ
+    //   ฟ้องว่า 'ผลบวกรายวัน 0' = เตือนหลอก 11 เรื่องรวดในการกวาดรอบแรก (เจอจริง 21 ต.ค.)
+    //   → ไม่มีรายวันเลย = บอกเฉยๆ ว่าตรวจรายวันไม่ได้ · มีบางส่วนแล้วไม่ตรง = ของจริง
+    var hasDays=((m.daily_totals||[]).length>0)||((m.payment_days||[]).length>0);
+    if(!hasDays){
+      add('เหลือง','MONTH_NO_DAYS',m.period,'มาจากใบรายเดือน (ไม่มีข้อมูลรายวัน) → ตรวจทาน "รวมเดือน vs รายวัน" ไม่ได้');
+    }
+    // ชื่อช่องชำระเงินระดับเดือนที่ไม่ถูกแปลงด้วย PAY_MAP → เงินไปนอนใต้ป้ายที่ไม่มีใครอ่าน
+    (m.payment_methods||[]).forEach(function(x){
+      if(QA_PAY_KEYS.indexOf(x.method)<0)
+        add(Number(x.amount||0)?'แดง':'เหลือง','PAY_KEY_MONTH',m.period,
+            'ช่องชำระเงิน "'+x.method+'" = '+Math.round(x.amount||0).toLocaleString()+
+            ' ไม่ได้ถูกแปลงเป็นชื่อไทยด้วย PAY_MAP → โค้ดที่อ่าน "เงินโอน" ของเดือนนี้จะได้ 0');
+    });
+    if(!hasDays) return;   // เดือนรายเดือน — เช็ครายวันข้างล่างใช้ไม่ได้
+
     // ยอดรวมเดือน ต้องเท่าผลบวกรายวัน (คนละทางคำนวณในฟังก์ชันเดียวกัน — ต่างกันคือรวมเพี้ยน)
     var sumDays=(m.daily_totals||[]).reduce(function(a,t){ return a+Number(t.sales||0); },0);
     if(Math.abs(Number(m.total_sales||0)-sumDays)>QA_ROLLUP_TOL)
@@ -2380,19 +2397,34 @@ function qaFindings_(daily, months){
   return f;
 }
 
-function _qaReport_(f){
+function _qaBaht_(msg){
+  // ดึงยอดเงินก้อนแรกในข้อความออกมารวม (ใช้สรุปว่า 'ทั้งกองนี้เป็นเงินเท่าไหร่')
+  var m=String(msg||'').match(/(\d[\d,]*)/);
+  return m?Number(m[1].replace(/,/g,'')):0;
+}
+
+/** รายงานแบบ "รวมกลุ่มตามรหัส" — 108 บรรทัดที่พูดเรื่องเดียวกันคือ log ที่ไม่มีใครอ่าน
+ *  showAll=true → กางทุกรายการ (ใช้ตอนกวาดรอบแรก) · ปกติโชว์ตัวอย่างกลุ่มละไม่กี่รายการ */
+function _qaReport_(f, showAll){
   var red=f.filter(function(x){return x.level==='แดง';});
   var yel=f.filter(function(x){return x.level==='เหลือง';});
   Logger.log('🔎 QA ข้อมูล POS — 🔴 '+red.length+' เรื่อง · 🟠 '+yel.length+' เรื่อง');
   [['🔴',red],['🟠',yel]].forEach(function(g){
-    g[1].slice(0,QA_MAX_SHOW).forEach(function(x){ Logger.log('  '+g[0]+' ['+x.code+'] '+(x.date||'-')+' — '+x.msg); });
-    if(g[1].length>QA_MAX_SHOW) Logger.log('  '+g[0]+' ...อีก '+(g[1].length-QA_MAX_SHOW)+' รายการ (ดูด้วย qaPosData())');
+    var by={}, order=[];
+    g[1].forEach(function(x){ if(!by[x.code]){by[x.code]=[]; order.push(x.code);} by[x.code].push(x); });
+    order.forEach(function(code){
+      var arr=by[code], baht=arr.reduce(function(a,x){return a+_qaBaht_(x.msg);},0);
+      Logger.log('  '+g[0]+' ['+code+'] '+arr.length+' รายการ'+(baht?(' · รวม ~'+baht.toLocaleString()+' บาท'):''));
+      var show=showAll?arr.length:Math.min(arr.length, code==='HIDDEN_PAY'?2:QA_MAX_SHOW);
+      arr.slice(0,show).forEach(function(x){ Logger.log('        '+(x.date||'-')+' — '+x.msg); });
+      if(arr.length>show) Logger.log('        ...อีก '+(arr.length-show)+' รายการ (กาง: qaPosDataAll())');
+    });
   });
   return {red:red, yellow:yel};
 }
 
 /** ปุ่มกดตรวจเอง — รันเมื่อไหร่ก็ได้ ไม่แก้ข้อมูลอะไรเลย */
-function qaPosData(){
+function qaPosData(showAll){
   var daily=loadDaily_();
   var f0=getFile_();
   var months=[];
@@ -2403,7 +2435,42 @@ function qaPosData(){
     Logger.log('⚠️ ไม่มีข้อมูลให้ตรวจเลย — เช็คว่าอยู่บัญชี saiyangsoi และโฟลเดอร์ "'+FOLDER_NAME+'" ถูกต้อง');
     return {red:[], yellow:[]};
   }
-  return _qaReport_(qaFindings_(daily, months));
+  return _qaReport_(qaFindings_(daily, months), showAll);
+}
+
+/** กางทุกรายการ — ใช้ตอนกวาดรอบแรก/ตามเรื่องแดงให้ครบ */
+function qaPosDataAll(){ return qaPosData(true); }
+
+/** เจาะดูวันเดียวว่าตัวเลขมาจากไหน — เรื่องเงินห้ามเดา ต้องเห็นของจริงก่อนตัดสิน
+ *  ใช้ตอน PAY_SUM ฟ้องว่าบวกลบไม่ลงตัว แล้วต้องรู้ว่าช่องไหนเพี้ยน
+ *  วิธีใช้: แก้บรรทัด QA_DAY ด้านล่างเป็นวันที่ต้องการ แล้วกดรัน qaDayRun */
+var QA_DAY='2026-10-11';
+function qaDayRun(){ return qaDay(QA_DAY); }
+function qaDay(iso){
+  var d=null; loadDaily_().forEach(function(x){ if(x.date===iso) d=x; });
+  if(!d){ Logger.log('❌ ไม่มีวันที่ '+iso+' ใน pos_daily.json'); return null; }
+  Logger.log('📅 '+iso+'  (งวด '+(d.period||'-')+')');
+  var pm=d.payments||{}, pay=0;
+  Logger.log('— วิธีชำระเงิน —');
+  Object.keys(pm).forEach(function(k){ pay+=Number(pm[k]||0);
+    Logger.log('   '+k+' = '+Number(pm[k]||0).toLocaleString()); });
+  Logger.log('   รวมวิธีชำระ = '+Math.round(pay).toLocaleString());
+  var sales=0;
+  Logger.log('— ยอดขายรายหมวด —');
+  (d.sales||[]).forEach(function(c){ sales+=Number(c.amount||0);
+    Logger.log('   '+c.category+' = '+Number(c.amount||0).toLocaleString()); });
+  Logger.log('   รวมยอดขาย = '+Math.round(sales).toLocaleString());
+  Logger.log('— ส่วนต่าง —');
+  Logger.log('   วิธีชำระ − ยอดขาย = '+Math.round(pay-sales).toLocaleString()+
+             ' (เกณฑ์ที่ยอมรับ '+QA_PAY_TOL+' บาท)');
+  var v=d.voids||{};
+  Logger.log('— ตัวเลขที่อาจอธิบายส่วนต่างได้ (ยกเลิก/ลบ/คืน/ส่วนลด) —');
+  Logger.log('   ยกเลิก '+Number(v.cancelled||0).toLocaleString()+
+             ' · ลบ '+Number(v.deleted||0).toLocaleString()+
+             ' · คืน '+Number(v.returns||0).toLocaleString()+
+             ' · ส่วนลด '+Number(v.discount||0).toLocaleString());
+  Logger.log('   จำนวนบิล '+(d.bills||0));
+  return {date:iso, pay:pay, sales:sales, diff:pay-sales, payments:pm, voids:v};
 }
 
 var QA_DAILY_FN='dailyQa';

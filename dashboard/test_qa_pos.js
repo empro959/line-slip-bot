@@ -180,5 +180,63 @@ console.log('19) ไม่มีข้อมูลเลย → บอกให�
   chk('ไม่มีแดง', r.red.length===0);
   chk('เตือนว่าไม่มีข้อมูล', logs.join('').indexOf('ไม่มีข้อมูลให้ตรวจ')>=0); }
 
+// ───── เคสจริงจากการกวาดรอบแรก 21 ต.ค. (pos_daily 110 วัน · saisang_data 10 เดือน) ─────
+// เดือน ม.ค.-มิ.ย. 69 นำเข้าจากใบ "รายเดือน" (buildMonth_) → ไม่มี daily_totals/payment_days
+// QA รอบแรกฟ้องแดง 11 เรื่องว่า 'ผลบวกรายวัน 0' = เตือนหลอก ต้องไม่เกิดอีก
+const MONTH_MAY=()=>({period:'พฤษภาคม 2569',total_sales:2376243,
+  payment_methods:[{method:'Prompay',amount:2005407},{method:'เงินสด',amount:309065},
+                   {method:'บัตรเครดิต',amount:40845},{method:'ค้างชำระ',amount:33919},{method:'อื่นๆ',amount:17113}]});
+
+console.log('20) เดือนที่มาจากใบรายเดือน → ห้ามฟ้อง MONTH_SUM/PAY_ROLLUP (เตือนหลอก 21 ต.ค.)');
+{ const c=ctxFor({}); const f=c.qaFindings_([],[MONTH_MAY()]);
+  chk('ไม่ฟ้อง MONTH_SUM', codes(f).indexOf('MONTH_SUM')<0,
+      (f.find(x=>x.code==='MONTH_SUM')||{}).msg);
+  chk('ไม่ฟ้อง PAY_ROLLUP', codes(f).indexOf('PAY_ROLLUP')<0,
+      (f.find(x=>x.code==='PAY_ROLLUP')||{}).msg);
+  chk('บอกเหตุผลเป็นเหลือง', lv(f,'MONTH_NO_DAYS')==='เหลือง', lv(f,'MONTH_NO_DAYS')); }
+
+console.log('21) เคสจริง พ.ค. 69: ช่อง "Prompay" ไม่ถูกแปลงเป็น "เงินโอน" → แดง');
+{ const c=ctxFor({}); const f=c.qaFindings_([],[MONTH_MAY()]);
+  chk('มี PAY_KEY_MONTH', codes(f).indexOf('PAY_KEY_MONTH')>=0);
+  chk('เป็นแดง', lv(f,'PAY_KEY_MONTH')==='แดง', lv(f,'PAY_KEY_MONTH'));
+  const m=(f.find(x=>x.code==='PAY_KEY_MONTH')||{}).msg||'';
+  chk('บอกยอด 2,005,407', m.indexOf('2,005,407')>=0, m);
+  chk('บอกผลกระทบว่าอ่าน "เงินโอน" จะได้ 0', m.indexOf('เงินโอน')>=0 && m.indexOf('0')>=0);
+  chk('ช่องชื่อไทยอื่นไม่ถูกฟ้อง', f.filter(x=>x.code==='PAY_KEY_MONTH').length===1); }
+
+console.log('22) ทิศกลับของข้อ 20: เดือนที่มีรายวันแล้วรวมไม่ตรง → ยังต้องฟ้องแดง');
+{ const c=ctxFor({}); const m=MONTH_813(); m.total_sales=99999;
+  const f=c.qaFindings_([DAY_813],[m]);
+  chk('ยังฟ้อง MONTH_SUM', codes(f).indexOf('MONTH_SUM')>=0);
+  chk('ไม่ติดป้าย MONTH_NO_DAYS', codes(f).indexOf('MONTH_NO_DAYS')<0); }
+
+console.log('23) รายงานต้องรวมกลุ่ม — 108 บรรทัดเรื่องเดียวกันคือ log ที่ไม่มีใครอ่าน');
+{ logs=[];
+  const days=[], pays=[], tots=[];
+  for(let i=1;i<=30;i++){ const dt='2026-09-'+String(i).padStart(2,'0');
+    const pm={'เงินสด':1000,'ค้างชำระ':100};
+    days.push({date:dt,period:'กันยายน 2569',payments:pm,sales:[{category:'ส้มตำ',amount:1100}]});
+    pays.push({date:dt,payments:pm}); tots.push({date:dt,sales:1100}); }
+  const c=ctxFor({daily:days,months:[{period:'กันยายน 2569',total_sales:33000,
+    payment_methods:[{method:'เงินสด',amount:30000},{method:'ค้างชำระ',amount:3000}],
+    payment_days:pays,daily_totals:tots}]});
+  c.qaPosData();
+  const out=logs.join('\n');
+  chk('มีบรรทัดหัวกลุ่มบอกจำนวน', out.indexOf('[HIDDEN_PAY] 30 รายการ')>=0, out.slice(0,300));
+  chk('หัวกลุ่มบอกยอดรวมเป็นบาท', /\[HIDDEN_PAY\] 30 รายการ · รวม ~3,000 บาท/.test(out));
+  chk('ไม่กางทั้ง 30 บรรทัด', out.split('ในช่องค้างชำระ/อื่นๆ').length-1 <= 3,
+      String(out.split('ในช่องค้างชำระ/อื่นๆ').length-1));
+  logs=[]; c.qaPosDataAll();
+  chk('qaPosDataAll กางครบ 30', logs.join('\n').split('ในช่องค้างชำระ/อื่นๆ').length-1 === 30); }
+
+console.log('24) qaDay: เจาะดูวันเดียว — เรื่องเงินห้ามเดา ต้องเห็นของจริง');
+{ logs=[]; const c=ctxFor({daily:[DAY_813]});
+  const r=c.qaDay('2026-08-13');
+  chk('คืนส่วนต่างถูก (103,636 − 103,636.50 = −0.50)', Math.abs(r.diff+0.5)<0.001, String(r.diff));
+  chk('โชว์ทุกช่องชำระเงิน', logs.join('').indexOf('ค้างชำระ')>=0);
+  chk('โชว์ยอดขายรายหมวด', logs.join('').indexOf('ส้มตำ')>=0);
+  chk('โชว์ตัวเลขที่อาจอธิบายส่วนต่าง', logs.join('').indexOf('ส่วนลด')>=0);
+  logs=[]; chk('ไม่มีวันนั้น → บอกชัด ไม่ throw', c.qaDay('2026-01-01')===null && logs.join('').indexOf('ไม่มีวันที่')>=0); }
+
 console.log(fails?('\n🔴 ไม่ผ่าน '+fails+' เช็ค'):'\n🟢 ผ่านทุกเคส');
 process.exit(fails?1:0);
