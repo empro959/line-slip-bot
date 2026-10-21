@@ -2266,3 +2266,165 @@ function testFetch() {
   var r = UrlFetchApp.fetch('https://www.google.com', {muteHttpExceptions:true});
   Logger.log('external_request OK: ' + r.getResponseCode());
 }
+
+
+// ==========================================================================
+//  QA ตรวจความถูกต้องของข้อมูล POS  (จุด 2-4 ของแผน QA · §3.45)
+//  🔴 อ่านอย่างเดียว ห้ามเขียนข้อมูลเด็ดขาด — ตัวตรวจที่แก้ของที่ตรวจเองไม่ใช่ตัวตรวจ
+//  ตรวจได้โดย "ไม่ต้องมีอีเมล" ทั้ง 3 จุด:
+//    จุด 4  ใบต้องบวกลบกันเองได้         → จับ OCR อ่านเลขเพี้ยนโดยไม่ต้องมีแหล่งที่สอง
+//    จุด 3  ข้อมูลที่บอทเห็น vs ที่มีจริง  → จับการจับคู่ช่องเงิน/วันที่บอทมองไม่เห็น
+//    จุด 2  pos_daily.json ↔ saisang_data.json → จับ rebuildMonths_ รวมเดือนเพี้ยน/ทำวันหาย
+// ==========================================================================
+
+var QA_PAY_TOL   = 5;        // ผลรวมวิธีชำระ vs ยอดขาย ต่างได้ไม่เกินกี่บาท (ปัดเศษรายหมวดจริงอยู่ที่ 0.50)
+var QA_ROLLUP_TOL= 0.5;      // ยอดรวมเดือน vs ผลบวกรายวัน — คนละทางคำนวณ ต่างได้แค่ปัดทศนิยม
+var QA_MAX_SHOW  = 12;       // โชว์กี่รายการใน log (ที่เหลือบอกเป็นจำนวน) — log ยาวเกินคือ log ที่ไม่มีใครอ่าน
+var QA_PAY_KEYS  = ['เงินสด','เงินโอน','บัตรเครดิต','ค้างชำระ','อื่นๆ'];
+var QA_BOT_KEYS  = ['เงินสด','เงินโอน','บัตรเครดิต'];   // 3 ช่องเดียวที่ action=posday ส่งให้บอท
+
+function _qaSum_(o, keys){
+  var t=0; (keys||Object.keys(o||{})).forEach(function(k){ t+=Number((o||{})[k]||0); }); return t;
+}
+function _qaDaySales_(d){
+  return (d.sales||[]).reduce(function(a,c){ return a+Number(c.amount||0); }, 0);
+}
+
+/** ตรวจทั้งชุด → คืน array ของ {level,code,date,msg} · level: 'แดง' = ผิดแน่/ข้อมูลหาย · 'เหลือง' = ต้องให้คนดู
+ *  ไม่แตะ Drive ไม่แตะ Gmail — รับ data เข้ามาเฉยๆ จึงเทสต์ด้วย node ได้ทั้งหมด */
+function qaFindings_(daily, months){
+  daily=daily||[]; months=months||[];
+  var f=[], add=function(level,code,date,msg){ f.push({level:level,code:code,date:date||'',msg:msg}); };
+
+  // ───────── จุด 4 + 3 : ตรวจรายวันจาก pos_daily.json ─────────
+  var seen={};
+  daily.forEach(function(d){
+    var dt=d.date||'(ไม่มีวันที่)';
+    if(seen[dt]) add('แดง','DUP_DAY',dt,'วันนี้มีซ้ำใน pos_daily.json → rebuildMonths_ จะบวกซ้ำทั้งวัน');
+    seen[dt]=true;
+
+    var pm=d.payments||{}, keys=Object.keys(pm);
+    var sales=_qaDaySales_(d);
+
+    // ชื่อช่องแปลกปลอม = ตัวแกะ/OCR เพี้ยน → เงินไปนอนในช่องที่ action=posday ไม่ส่งให้บอท
+    // และโผล่เป็นแถววิธีชำระเงินปลอมบนแดชบอร์ด · มีเงินติดอยู่ = แดง (ของใหม่ที่ไม่ควรมี)
+    // ต่างจาก HIDDEN_PAY ข้างล่างที่เป็นช่องรู้จักและมีทุกวัน = ช่องว่างเชิงดีไซน์ ไม่ใช่ของพัง
+    keys.forEach(function(k){
+      if(QA_PAY_KEYS.indexOf(k)<0){
+        var amt=Number(pm[k]||0);
+        add(amt?'แดง':'เหลือง','PAY_KEY',dt,'มีช่องชำระเงินที่ไม่รู้จัก: "'+k+'" = '+Math.round(amt).toLocaleString()+
+            (amt?' → เงินก้อนนี้บอทไม่เห็น และโผล่เป็นวิธีชำระเงินปลอมบนแดชบอร์ด':' (ยอด 0 ไม่มีเงินติดอยู่)'));
+      }
+      if(Number(pm[k]||0)<0) add('แดง','PAY_NEG',dt,'ช่อง "'+k+'" ติดลบ ('+pm[k]+') — ช่อง "รับ" ติดลบไม่ได้');
+    });
+
+    if(!keys.length){
+      // ยอดขายรู้แล้วแต่ไม่มีวิธีชำระ → action=posday คืน day:null → บอทบอก "ไม่มียอด POS"
+      // ทั้งที่ยอดขายอยู่ในระบบแล้ว (อาการเดียวกับเคส 9/10 ที่เจ้าของแจ้ง)
+      if(sales>0) add('แดง','NO_PAY',dt,'มียอดขาย '+Math.round(sales).toLocaleString()+' แต่ไม่มีวิธีชำระเลย '+
+                                        '→ บอทจะรายงานว่า "ไม่มียอด POS" ทั้งที่ข้อมูลมีอยู่');
+    } else {
+      // จุด 4: ผลรวมวิธีชำระ ต้องเท่ายอดขายทั้งวัน (ต่างได้แค่ปัดเศษ)
+      var pay=_qaSum_(pm), diff=pay-sales;   // ⚠️ ทุกช่อง ไม่ใช่แค่ช่องที่รู้จัก — เงินคือเงินไม่ว่าป้ายจะเขียนว่าอะไร
+                                            // ชื่อช่องผิดเป็นงานของ PAY_KEY · เช็คนี้ตอบแค่ "เอกสารบวกลบกันเองลงตัวไหม"
+      if(sales>0 && Math.abs(diff)>QA_PAY_TOL)
+        add('แดง','PAY_SUM',dt,'ใบบวกลบกันเองไม่ลงตัว: วิธีชำระรวม '+Math.round(pay).toLocaleString()+
+                               ' ≠ ยอดขาย '+Math.round(sales).toLocaleString()+
+                               ' (ต่าง '+Math.round(diff).toLocaleString()+') — น่าจะอ่านเลขผิดอย่างน้อย 1 ช่อง');
+      // จุด 3: เงินที่อยู่ในช่องที่บอท "ไม่เคยเอาไปเทียบ"
+      var hidden=_qaSum_(pm, ['ค้างชำระ','อื่นๆ']);
+      if(hidden>0) add('เหลือง','HIDDEN_PAY',dt,'มีเงิน '+Math.round(hidden).toLocaleString()+
+                                                ' ในช่องค้างชำระ/อื่นๆ ที่ action=posday ไม่ส่งให้บอท → การเทียบสมุดจดมือไม่ครบยอดนี้');
+    }
+    if(d.period && _ymOfPeriod_(d.period) && String(dt).slice(0,7)!==_ymOfPeriod_(d.period))
+      add('แดง','PERIOD_MISMATCH',dt,'วันที่กับงวดไม่ตรงกัน (งวด "'+d.period+'") → ยอดไปโผล่ผิดเดือนบนแดชบอร์ด');
+  });
+
+  // ───────── จุด 2 : pos_daily.json ↔ saisang_data.json ─────────
+  var inMonthPay={}, inMonthTot={};
+  months.forEach(function(m){
+    (m.payment_days||[]).forEach(function(p){ inMonthPay[p.date]=m.period; });
+    (m.daily_totals||[]).forEach(function(t){ inMonthTot[t.date]=m.period; });
+
+    // ยอดรวมเดือน ต้องเท่าผลบวกรายวัน (คนละทางคำนวณในฟังก์ชันเดียวกัน — ต่างกันคือรวมเพี้ยน)
+    var sumDays=(m.daily_totals||[]).reduce(function(a,t){ return a+Number(t.sales||0); },0);
+    if(Math.abs(Number(m.total_sales||0)-sumDays)>QA_ROLLUP_TOL)
+      add('แดง','MONTH_SUM',m.period,'ยอดขายรวมเดือน '+Math.round(m.total_sales||0).toLocaleString()+
+                                     ' ≠ ผลบวกรายวัน '+Math.round(sumDays).toLocaleString());
+
+    // payment_methods (รวมเดือน) ต้องเท่าผลบวก payment_days รายวัน ทีละช่อง
+    var byM={}; (m.payment_methods||[]).forEach(function(x){ byM[x.method]=Number(x.amount||0); });
+    var acc={}; (m.payment_days||[]).forEach(function(p){
+      Object.keys(p.payments||{}).forEach(function(k){ acc[k]=(acc[k]||0)+Number(p.payments[k]||0); }); });
+    var allK={}; Object.keys(byM).forEach(function(k){allK[k]=1;}); Object.keys(acc).forEach(function(k){allK[k]=1;});
+    Object.keys(allK).forEach(function(k){
+      if(Math.abs((byM[k]||0)-(acc[k]||0))>QA_ROLLUP_TOL)
+        add('แดง','PAY_ROLLUP',m.period,'ช่อง "'+k+'" รวมเดือน '+Math.round(byM[k]||0).toLocaleString()+
+                                        ' ≠ ผลบวกรายวัน '+Math.round(acc[k]||0).toLocaleString());
+    });
+  });
+
+  Object.keys(seen).forEach(function(dt){
+    if(!inMonthPay[dt] && !inMonthTot[dt])
+      add('แดง','LOST_DAY',dt,'มีใน pos_daily.json แต่หายไปจาก saisang_data.json → แดชบอร์ดกับบอทมองไม่เห็นวันนี้');
+    else if(!inMonthTot[dt])
+      add('แดง','NO_SALES',dt,'ไม่มีใน daily_totals → action=posday จะคืน sales=0 ซึ่งอ่านว่า "ขายได้ 0" ไม่ใช่ "ไม่รู้"');
+    else if(!inMonthPay[dt])
+      add('แดง','NO_PAYDAY',dt,'ไม่มีใน payment_days → action=posday คืน day:null บอทเทียบยอดไม่ได้');
+  });
+  Object.keys(inMonthPay).forEach(function(dt){
+    if(!seen[dt]) add('เหลือง','ORPHAN_DAY',dt,'อยู่ใน saisang_data.json แต่ไม่มีใน pos_daily.json แล้ว (ข้อมูลค้างจากรอบก่อน)');
+  });
+
+  f.sort(function(a,b){ return (a.date<b.date?1:(a.date>b.date?-1:0)); });   // วันล่าสุดก่อน
+  return f;
+}
+
+function _qaReport_(f){
+  var red=f.filter(function(x){return x.level==='แดง';});
+  var yel=f.filter(function(x){return x.level==='เหลือง';});
+  Logger.log('🔎 QA ข้อมูล POS — 🔴 '+red.length+' เรื่อง · 🟠 '+yel.length+' เรื่อง');
+  [['🔴',red],['🟠',yel]].forEach(function(g){
+    g[1].slice(0,QA_MAX_SHOW).forEach(function(x){ Logger.log('  '+g[0]+' ['+x.code+'] '+(x.date||'-')+' — '+x.msg); });
+    if(g[1].length>QA_MAX_SHOW) Logger.log('  '+g[0]+' ...อีก '+(g[1].length-QA_MAX_SHOW)+' รายการ (ดูด้วย qaPosData())');
+  });
+  return {red:red, yellow:yel};
+}
+
+/** ปุ่มกดตรวจเอง — รันเมื่อไหร่ก็ได้ ไม่แก้ข้อมูลอะไรเลย */
+function qaPosData(){
+  var daily=loadDaily_();
+  var f0=getFile_();
+  var months=[];
+  if(f0){ try{ months=JSON.parse(f0.getBlob().getDataAsString('UTF-8'))||[]; }catch(e){ months=[]; } }
+  if(!Array.isArray(months)) months=[];
+  Logger.log('ข้อมูลที่ตรวจ: pos_daily '+daily.length+' วัน · saisang_data '+months.length+' เดือน');
+  if(!daily.length && !months.length){
+    Logger.log('⚠️ ไม่มีข้อมูลให้ตรวจเลย — เช็คว่าอยู่บัญชี saiyangsoi และโฟลเดอร์ "'+FOLDER_NAME+'" ถูกต้อง');
+    return {red:[], yellow:[]};
+  }
+  return _qaReport_(qaFindings_(daily, months));
+}
+
+var QA_DAILY_FN='dailyQa';
+
+/** ตรวจทุกเช้า — เจอ 🔴 แล้ว throw เพื่อให้ Apps Script ส่งเมลแจ้งเจ้าของเอง
+ *  (log ที่ไม่มีคนเปิดอ่าน ไม่ต่างจากไม่มี log — บทเรียนเดียวกับ dailyRepair §3.40)
+ *  🟠 ไม่ throw: มันคือ "ต้องให้คนดู" ไม่ใช่ "ผิดแน่" · เตือนทุกวันเรื่องที่ไม่ผิด = ไม่มีใครเชื่ออีก */
+function dailyQa(){
+  var r=qaPosData();
+  if(!r.red.length){ Logger.log('✅ QA ผ่าน ไม่มีเรื่องแดง'); return; }
+  var head=r.red.slice(0,5).map(function(x){ return x.date+' ['+x.code+']'; }).join(', ');
+  throw new Error('QA ข้อมูล POS เจอปัญหา '+r.red.length+' เรื่อง: '+head+
+                  (r.red.length>5?(' ...อีก '+(r.red.length-5)):'')+
+                  ' — เปิด Apps Script > การดำเนินการ แล้วรัน qaPosData() ดูรายละเอียด');
+}
+
+/** ตั้งตรวจทุกเช้า 08:00 (หลัง dailyRepair 07:00 เก็บวันที่ขาดเสร็จแล้ว) · กดซ้ำไม่ซ้อน */
+function setupDailyQa(){
+  ScriptApp.getProjectTriggers().forEach(function(t){
+    if(t.getHandlerFunction()===QA_DAILY_FN) ScriptApp.deleteTrigger(t);   // ลบแค่ตัวของตัวเอง
+  });
+  ScriptApp.newTrigger(QA_DAILY_FN).timeBased().atHour(8).nearMinute(10).everyDays(1).create();
+  Logger.log('✅ ตั้ง '+QA_DAILY_FN+' ทุกวัน ~08:10 แล้ว (เจอเรื่องแดงจะมีเมลเข้า)');
+}
