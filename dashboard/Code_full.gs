@@ -374,6 +374,54 @@ function parseBalance_(text){
   return out;
 }
 
+// ยอดรวมของ "บล็อกวิธีชำระ" ที่ใบพิมพ์ไว้เอง (บรรทัด Total / Paid on sale)
+// 🎯 นี่คือตัวที่ควรใช้เทียบกับผลบวกวิธีชำระ — เป็นการตรวจทาน "ในใบเดียวกัน" จริงๆ
+// parseBalance_ ตัด seg ที่ indexOf('Total') ทิ้ง → เลขก้อนนี้ถูกโยนทิ้งมาตลอด
+// ⚠️ คืน null ถ้าหาไม่เจอ ห้ามคืน 0 (0 = 'รับมา 0 บาท' ซึ่งไม่จริง — กฎ 0 ≠ ไม่รู้)
+function parseBalanceTotal_(text){
+  // 🔎 ยืนยันจากใบจริง BalanceCashDrawer_2026813 (ถอด text layer เอง):
+  //      70,118.00 Prompay · 402.00 ค้างชำระ · 22,323.00 เงินสด · 1,660.00 อื่นๆ
+  //      7,450.00 บัตรเครดิต · 1,683.00 อื่นๆ(ทชท) → "Total 103,636.00" = ผลบวกเป๊ะ
+  // 🪤 กับดัก 2 อัน:
+  //   1) 'Recorded Total' ในหัวตารางมีคำว่า Total — แต่ตามด้วย 'Sale Date' ไม่ใช่เลข
+  //      → บังคับให้ต้องมีเลขทศนิยม 2 ตำแหน่งต่อท้ายทันที จึงไม่ไปโดนหัวตาราง
+  //   2) ใบมี 2 บล็อกที่ลงท้ายด้วย Total — บล็อกแรก=เงินรับ บล็อกที่สอง=Payout (ติดลบ)
+  //      → เอาตัวแรก และทิ้งค่าที่ไม่เป็นบวก
+  // ⚠️ ยังไม่ได้ทดสอบกับ "ข้อความที่ออกจาก Drive OCR" ซึ่งจัดบรรทัดต่างจากที่เราถอดเอง
+  //    หาไม่เจอ = คืน null = QA ถอยไปใช้เกณฑ์เปอร์เซ็นต์ (ไม่พัง ไม่เตือนหลอก)
+  //    ตรวจของจริงด้วย qaCheckPayTotal()
+  var m=String(text||'').match(/\bTotal\b[\s\r\n]*(-?[\d,]+\.\d{2})/);
+  if(!m) return null;
+  var v=num_(m[1]);
+  return (v===null || v<=0) ? null : v;   // ติดลบ/ศูนย์ = ไปโดนบล็อก Payout → ถือว่าอ่านไม่ได้
+}
+
+/** ตรวจว่า parseBalanceTotal_ ใช้ได้กับข้อความจริงจาก OCR ไหม — อ่านอย่างเดียว ไม่เขียนอะไร
+ *  รันหลัง paste ครั้งแรก เพื่อรู้ว่า QA จะได้เกณฑ์แน่น (เทียบในใบ) หรือเกณฑ์หยาบ (เปอร์เซ็นต์) */
+function qaCheckPayTotal(){
+  var b=findLatestPdf_('BalanceCashDrawer');
+  if(!b){ Logger.log('❌ ไม่พบใบ BalanceCashDrawer ในเมล 35 วันล่าสุด'); return null; }
+  var txt=pdfToText_(b.blob);
+  var tot=parseBalanceTotal_(txt), pm=parseBalance_(txt);
+  var sum=0; Object.keys(pm).forEach(function(k){ sum+=Number(pm[k]||0); });
+  Logger.log('ใบที่ใช้ทดสอบ: '+b.name);
+  Logger.log('ช่องที่แกะได้: '+(Object.keys(pm).join(', ')||'(ไม่ได้เลย)'));
+  Logger.log('ผลบวกวิธีชำระ = '+Math.round(sum).toLocaleString());
+  if(tot===null){
+    Logger.log('🟠 parseBalanceTotal_ หาบรรทัด Total ไม่เจอในข้อความ OCR');
+    Logger.log('   → QA จะใช้เกณฑ์หยาบ (เปอร์เซ็นต์) ต่อไป ไม่พัง แต่ตรวจไม่แน่น');
+    Logger.log('   → ส่ง 40 บรรทัดท้ายของข้อความนี้ให้ห้อง Code ดูเพื่อปรับ regex:');
+    Logger.log(txt.slice(-1200));
+    return {ok:false, sum:sum, total:null};
+  }
+  Logger.log('ยอดรวมที่ใบพิมพ์ไว้ = '+Math.round(tot).toLocaleString());
+  var d=sum-tot;
+  Logger.log(Math.abs(d)<=QA_PAY_TOTAL_TOL
+    ? '✅ ตรงกัน (ต่าง '+d.toFixed(2)+') — QA จะใช้เกณฑ์แน่นได้ตั้งแต่ที่นำเข้าใหม่'
+    : '🔴 ไม่ตรงกัน ต่าง '+Math.round(d).toLocaleString()+' — แกะเลขผิดอย่างน้อย 1 ช่อง หรือจับบรรทัด Total ผิดบล็อก');
+  return {ok:true, sum:sum, total:tot, diff:d};
+}
+
 // แกะยอดขายแยกโซนจาก BalanceCashDrawer -> {โซน: ยอดรวม}
 function parseBalanceZones_(text){
   text=text.split('Net Sale')[0];  // เอาเฉพาะส่วนแยกโซน (ก่อนสรุป)
@@ -593,7 +641,8 @@ function importPosReports(){
   var payoutRangeIssue = _rangeWarn_(pt);
   var day={date:dd.key,period:dd.period,sales:parseSale_(st).cats,
     expenses: payoutRangeIssue ? null : parsePayout_(pt).records,
-    payments:pay,menu:parseSaleItems_(st),zones:zones,voids:parseVoids_(st),bills:bills,credit:credit};
+    payments:pay,pay_total:balText?parseBalanceTotal_(balText):null,
+    menu:parseSaleItems_(st),zones:zones,voids:parseVoids_(st),bills:bills,credit:credit};
   var daily=loadDaily_().filter(function(x){return x.date!==dd.key;}); // กันซ้ำ
   daily.push(day); saveDaily_(daily);
   writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));
@@ -651,7 +700,9 @@ function backfillPos(){
     var pm=bt?parseBalance_(bt):{}, zn=bt?parseBalanceZones_(bt):{};
     var bills=0, credit=[]; try{ if(cust[sufs[i]]){ var ct=pdfToText_(cust[sufs[i]].copyBlob()); bills=parseBills_(ct); credit=parseCustomerCredit_(ct); } }catch(e2){}  // จำนวนบิล + ค้างชำระรายลูกค้า
     daily=daily.filter(function(x){return x.date!==dd.key;});
-    daily.push({date:dd.key,period:dd.period,sales:parseSale_(st).cats,expenses:parsePayout_(pt).records,payments:pm,menu:parseSaleItems_(st),zones:zn,voids:parseVoids_(st),bills:bills,credit:credit});
+    daily.push({date:dd.key,period:dd.period,sales:parseSale_(st).cats,expenses:parsePayout_(pt).records,payments:pm,
+      pay_total:bt?parseBalanceTotal_(bt):null,
+      menu:parseSaleItems_(st),zones:zn,voids:parseVoids_(st),bills:bills,credit:credit});
     haveFull[dd.key]=true; added++; Logger.log('เก็บ '+dd.key);
   }
   saveDaily_(daily); writeMonths_(rebuildMonths_(daily, fetchSlipMap_()));
@@ -1259,7 +1310,9 @@ function _importPosOneDate_(iso, batch){
   // pt ไม่มีไฟล์เลย → คงของเดิมไว้ (keepE) เหมือนเดิม — คนละสถานการณ์กัน ห้ามปนกัน
   var day={date:dd.key, period:dd.period,
     sales:parseSale_(st).cats, expenses: pt ? (payoutRangeIssue ? null : parsePayout_(pt).records) : keepE,
-    payments:bt?parseBalance_(bt):keepP, menu:parseSaleItems_(st),
+    payments:bt?parseBalance_(bt):keepP,
+    pay_total: bt?parseBalanceTotal_(bt):(prev?prev.pay_total:null),   // ไม่มีใบใหม่ = คงของเดิม (เหมือน keepP)
+    menu:parseSaleItems_(st),
     zones:bt?parseBalanceZones_(bt):keepZ, voids:parseVoids_(st), bills:bills, credit:credit};
   var keptWarn=((pr.err&&prev?'\n   ♻️ ใบ Payout อ่านไม่ได้ → คงค่าใช้จ่ายเดิมไว้ (ไม่ทับด้วยศูนย์)':'')+
                 (br.err&&prev?'\n   ♻️ ใบ Balance อ่านไม่ได้ → คงวิธีชำระ/โซนเดิมไว้':'')+
@@ -2277,7 +2330,15 @@ function testFetch() {
 //    จุด 2  pos_daily.json ↔ saisang_data.json → จับ rebuildMonths_ รวมเดือนเพี้ยน/ทำวันหาย
 // ==========================================================================
 
-var QA_PAY_TOL   = 5;        // ผลรวมวิธีชำระ vs ยอดขาย ต่างได้ไม่เกินกี่บาท (ปัดเศษรายหมวดจริงอยู่ที่ 0.50)
+var QA_PAY_TOL   = 5;        // พื้นขั้นต่ำ — ต่างน้อยกว่านี้ไม่สนใจเลย (ปัดเศษรายหมวด)
+// 🪤 บทเรียน 21 ต.ค.: เดิมใช้แต่เกณฑ์บาท → ฟ้องแดง 18 วันจาก 110 วัน
+//   เจาะดู 10/11 แล้วพบว่าเลขทุกตัวสะอาด ทศนิยมครบ (52,797.8) ไม่ใช่ OCR เพี้ยน
+//   ต้นเหตุคือ "เทียบผิดคู่": วิธีชำระรวม = Paid on sale · ผลบวกหมวด = Total Sale By Group
+//   สองบรรทัดนี้ใบไม่ได้บังคับให้เท่ากัน ต่างด้วยปัดเศษบิล/ค่าบริการ/มัดจำ
+//   (ใบ 13 ส.ค. ต่าง 0.50 ก็เรื่องเดียวกัน) → ต่างระดับ 0.1-2% เป็นเรื่องปกติของเอกสาร
+// → ไม่มี pay_total: ใช้เปอร์เซ็นต์ตัด · มี pay_total: เทียบในใบเดียวกันได้ ใช้เกณฑ์แน่น
+var QA_PAY_PCT   = 0.025;    // ไม่มียอดรวมในใบ → ต่างเกิน 2.5% ของยอดขายถึงนับว่าผิดจริง
+var QA_PAY_TOTAL_TOL = 20;   // มียอดรวมในใบ → เทียบในใบเดียวกัน ต่างได้แค่ปัดเศษ
 var QA_ROLLUP_TOL= 0.5;      // ยอดรวมเดือน vs ผลบวกรายวัน — คนละทางคำนวณ ต่างได้แค่ปัดทศนิยม
 var QA_MAX_SHOW  = 12;       // โชว์กี่รายการใน log (ที่เหลือบอกเป็นจำนวน) — log ยาวเกินคือ log ที่ไม่มีใครอ่าน
 var QA_PAY_KEYS  = ['เงินสด','เงินโอน','บัตรเครดิต','ค้างชำระ','อื่นๆ'];
@@ -2324,13 +2385,31 @@ function qaFindings_(daily, months){
       if(sales>0) add('แดง','NO_PAY',dt,'มียอดขาย '+Math.round(sales).toLocaleString()+' แต่ไม่มีวิธีชำระเลย '+
                                         '→ บอทจะรายงานว่า "ไม่มียอด POS" ทั้งที่ข้อมูลมีอยู่');
     } else {
-      // จุด 4: ผลรวมวิธีชำระ ต้องเท่ายอดขายทั้งวัน (ต่างได้แค่ปัดเศษ)
-      var pay=_qaSum_(pm), diff=pay-sales;   // ⚠️ ทุกช่อง ไม่ใช่แค่ช่องที่รู้จัก — เงินคือเงินไม่ว่าป้ายจะเขียนว่าอะไร
-                                            // ชื่อช่องผิดเป็นงานของ PAY_KEY · เช็คนี้ตอบแค่ "เอกสารบวกลบกันเองลงตัวไหม"
-      if(sales>0 && Math.abs(diff)>QA_PAY_TOL)
-        add('แดง','PAY_SUM',dt,'ใบบวกลบกันเองไม่ลงตัว: วิธีชำระรวม '+Math.round(pay).toLocaleString()+
-                               ' ≠ ยอดขาย '+Math.round(sales).toLocaleString()+
-                               ' (ต่าง '+Math.round(diff).toLocaleString()+') — น่าจะอ่านเลขผิดอย่างน้อย 1 ช่อง');
+      // จุด 4: ตรวจทานในใบเดียวกัน
+      var pay=_qaSum_(pm);   // ⚠️ ทุกช่อง ไม่ใช่แค่ช่องที่รู้จัก — เงินคือเงินไม่ว่าป้ายจะเขียนว่าอะไร
+                             // ชื่อช่องผิดเป็นงานของ PAY_KEY
+      var ptot=(d.pay_total===undefined||d.pay_total===null)?null:Number(d.pay_total);
+      if(ptot!==null){
+        // ✅ ของจริง: เทียบผลบวกวิธีชำระกับ "ยอดรวมที่ใบพิมพ์ไว้เอง" — ต่างกัน = อ่านเลขผิดแน่
+        var dt2=pay-ptot;
+        if(Math.abs(dt2)>QA_PAY_TOTAL_TOL)
+          add('แดง','PAY_SUM',dt,'ผลบวกวิธีชำระ '+Math.round(pay).toLocaleString()+
+                                 ' ≠ ยอดรวมที่ใบพิมพ์ไว้ '+Math.round(ptot).toLocaleString()+
+                                 ' (ต่าง '+Math.round(dt2).toLocaleString()+') — ตรวจทานในใบเดียวกันไม่ผ่าน อ่านเลขผิดอย่างน้อย 1 ช่อง');
+      } else if(sales>0){
+        // ยังไม่มียอดรวมในใบ (ข้อมูลที่นำเข้าก่อน 21 ต.ค.) → เทียบกับผลบวกหมวดได้แบบหยาบเท่านั้น
+        var diff=pay-sales, pct=Math.abs(diff)/sales;
+        if(Math.abs(diff)>QA_PAY_TOL && pct>QA_PAY_PCT)
+          add('แดง','PAY_SUM',dt,'วิธีชำระรวม '+Math.round(pay).toLocaleString()+
+                                 ' vs ผลบวกหมวด '+Math.round(sales).toLocaleString()+
+                                 ' ต่าง '+Math.round(diff).toLocaleString()+' ('+(pct*100).toFixed(1)+'%) '+
+                                 '— มากเกินกว่าจะเป็นปัดเศษ/ค่าบริการ · เจาะดูด้วย qaDay(\''+dt+'\') ก่อนสรุป '+
+                                 '(ยังไม่ฟันธงสาเหตุ: อาจลงผิดวัน · ลูกหนี้มาจ่าย · หมวดขาดหาย · อ่านเลขผิด)');
+        else if(Math.abs(diff)>QA_PAY_TOL)
+          add('เหลือง','PAY_SUM_SMALL',dt,'วิธีชำระรวมต่างจากผลบวกหมวด '+Math.round(diff).toLocaleString()+
+                                 ' ('+(pct*100).toFixed(1)+'%) — อธิบายได้ด้วยปัดเศษบิล/ค่าบริการ/มัดจำ '+
+                                 'ที่ตัวแกะยังไม่เก็บ (ยอดรวมในใบจะเก็บตั้งแต่ที่นำเข้าใหม่)');
+      }
       // จุด 3: เงินที่อยู่ในช่องที่บอท "ไม่เคยเอาไปเทียบ"
       var hidden=_qaSum_(pm, ['ค้างชำระ','อื่นๆ']);
       if(hidden>0) add('เหลือง','HIDDEN_PAY',dt,'มีเงิน '+Math.round(hidden).toLocaleString()+

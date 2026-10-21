@@ -238,5 +238,106 @@ console.log('24) qaDay: เจาะดูวันเดียว — เรื
   chk('โชว์ตัวเลขที่อาจอธิบายส่วนต่าง', logs.join('').indexOf('ส่วนลด')>=0);
   logs=[]; chk('ไม่มีวันนั้น → บอกชัด ไม่ throw', c.qaDay('2026-01-01')===null && logs.join('').indexOf('ไม่มีวันที่')>=0); }
 
+// ───── ข้อความจริงจากใบ BalanceCashDrawer_2026813.PDF (ถอด text layer เอง ไม่ได้พิมพ์ขึ้นมา) ─────
+const BAL_813=[
+ 'Type Of Payment','Recorded Total','Sale Date','Zone',      // ← หัวตาราง มีคำว่า Total เป็นกับดัก
+ 'Description','Type of Payment','Amount',
+ '70,118.00','Prompay','402.00','ค้างชำระ','22,323.00','เงินสด',
+ '1,660.00','อื่นๆ','7,450.00','บัตรเครดิต','Unknown','1,683.00','อื่นๆ','ทชท',
+ 'Total','103,636.00',                                        // ← ตัวที่ต้องการ
+ 'Description','Type of Payment','Amount','Payout','-73,830.90','เงินสด',
+ 'Total','-73,830.90'                                         // ← บล็อก Payout ห้ามหยิบ
+].join('\n');
+
+console.log('25) parseBalanceTotal_ กับข้อความจริง → ต้องได้ 103,636 (ไม่ใช่หัวตาราง ไม่ใช่ Payout)');
+{ const c=ctxFor({});
+  chk('ได้ 103,636', c.parseBalanceTotal_(BAL_813)===103636, String(c.parseBalanceTotal_(BAL_813)));
+  // ผลบวกเลขวิธีชำระในใบจริง: 70,118 + 402 + 22,323 + 1,660 + 7,450 + 1,683 = 103,636.00
+  chk('เท่าผลบวกเลขในใบจริง', 70118+402+22323+1660+7450+1683===103636);
+  // 🪤 บทเรียน 21 ต.ค.: parseBalance_ คืน {} กับ fixture นี้ เพราะมันต้องมีหัวตาราง
+  //   เรียงแบบ 'Type of Payment Description Amount' ซึ่ง "ข้อความที่เราถอด text layer เอง"
+  //   ไม่ได้เรียงอย่างนั้น (ใบจริงเรียง Description → Type of Payment → Amount)
+  //   = ข้อความจาก Drive OCR ≠ ข้อความที่เราถอดเอง → เอา fixture นี้ไปทดสอบ parseBalance_ ไม่ได้
+  //   ⚖️ แต่ parseBalanceTotal_ ไม่พึ่งหัวตารางเลย จึงทนทั้งสองแบบ — เทสต์ข้อนี้ยึงคุณสมบัตินั้นไว้
+  chk('parseBalanceTotal_ ไม่พึ่งหัวตาราง (ตัดหัวออกก็ยังได้)',
+      c.parseBalanceTotal_('อะไรก็ได้\nTotal\n103,636.00')===103636);
+  chk('parseBalance_ ต้องมีหัวตาราง — บันทึกพฤติกรรมจริงไว้ ไม่ใช่เทสต์ว่าพัง',
+      Object.keys(c.parseBalance_(BAL_813)).length===0); }
+
+console.log('26) กับดักหัวตาราง "Recorded Total" ต้องไม่ถูกหยิบ (ตามด้วยคำ ไม่ใช่เลข)');
+{ const c=ctxFor({});
+  chk('ไม่คืนค่าจากหัวตาราง', c.parseBalanceTotal_('Recorded Total\nSale Date\nZone')===null); }
+
+console.log('27) มีแต่บล็อก Payout (ติดลบ) → ต้องคืน null ไม่ใช่เลขติดลบ');
+{ const c=ctxFor({});
+  chk('คืน null', c.parseBalanceTotal_('Payout\n-73,830.90\nเงินสด\nTotal\n-73,830.90')===null,
+      String(c.parseBalanceTotal_('Payout\n-73,830.90\nเงินสด\nTotal\n-73,830.90'))); }
+
+console.log('28) หาไม่เจอ → null ไม่ใช่ 0 (กฎ 0 ≠ ไม่รู้)');
+{ const c=ctxFor({});
+  chk('คืน null', c.parseBalanceTotal_('อะไรก็ไม่รู้ ไม่มี Total')===null);
+  chk('ข้อความว่าง → null', c.parseBalanceTotal_('')===null); }
+
+console.log('29) มี pay_total และตรงกัน → ต้องไม่ฟ้องอะไร');
+{ const c=ctxFor({});
+  const d=JSON.parse(JSON.stringify(DAY_813)); d.pay_total=103636;
+  const f=c.qaFindings_([d],[MONTH_813()]);
+  chk('ไม่มี PAY_SUM', codes(f).indexOf('PAY_SUM')<0, (f.find(x=>x.code==='PAY_SUM')||{}).msg);
+  chk('ไม่มี PAY_SUM_SMALL', codes(f).indexOf('PAY_SUM_SMALL')<0); }
+
+console.log('30) มี pay_total แต่ไม่ตรง → แดง และบอกว่าเทียบกับยอดที่ใบพิมพ์ไว้');
+{ const c=ctxFor({});
+  const d=JSON.parse(JSON.stringify(DAY_813)); d.pay_total=100000;
+  const f=c.qaFindings_([d],[MONTH_813()]);
+  chk('เป็นแดง', lv(f,'PAY_SUM')==='แดง');
+  chk('อ้างยอดที่ใบพิมพ์ไว้', ((f.find(x=>x.code==='PAY_SUM')||{}).msg||'').indexOf('ใบพิมพ์ไว้')>=0); }
+
+console.log('31) เคสจริง 10/11 (ต่าง 107 = 0.2%) → เหลือง ไม่ใช่แดง — อธิบายได้ด้วยปัดเศษ/ค่าบริการ');
+{ const c=ctxFor({});
+  const d={date:'2026-10-11',period:'ตุลาคม 2569',
+    payments:{'เงินโอน':45283,'ค้างชำระ':546,'เงินสด':6816,'อื่นๆ':260},
+    sales:[{category:'12.เครื่องดื่ม',amount:32573.3},{category:'อาหารญี่ปุ่น',amount:5776},
+           {category:'2.เมนูย่าง/ทอด',amount:3490.2},{category:'7.เมนูไส้',amount:2598.1},
+           {category:'3.เมนูยำ',amount:1882.2},{category:'10.อาหารจานเดียว',amount:1352.5},
+           {category:'6.ของกินบ้านเฮา',amount:1319},{category:'4.เมนูผัด',amount:1272},
+           {category:'1.ส้มตำ',amount:1072.5},{category:'5.เมนูต้ม',amount:975},
+           {category:'8.เมนูเนื้อ',amount:457},{category:'11.เมนูอื่นๆ',amount:30}]};
+  const f=c.qaFindings_([d],[{period:'ตุลาคม 2569',total_sales:52797.8,
+    payment_methods:[{method:'เงินโอน',amount:45283},{method:'ค้างชำระ',amount:546},
+                     {method:'เงินสด',amount:6816},{method:'อื่นๆ',amount:260}],
+    payment_days:[{date:'2026-10-11',payments:d.payments}],daily_totals:[{date:'2026-10-11',sales:52797.8}]}]);
+  chk('ไม่ฟ้องแดง', codes(f).indexOf('PAY_SUM')<0, (f.find(x=>x.code==='PAY_SUM')||{}).msg);
+  chk('ฟ้องเหลืองแทน', lv(f,'PAY_SUM_SMALL')==='เหลือง');
+  chk('บอกเหตุที่อธิบายได้', ((f.find(x=>x.code==='PAY_SUM_SMALL')||{}).msg||'').indexOf('ปัดเศษ')>=0); }
+
+console.log('32) เคสจริง 16/07 (ต่าง 16,238 = 21%) → ยังต้องแดง และ "ห้ามฟันธงสาเหตุ"');
+{ const c=ctxFor({});
+  const d={date:'2026-07-16',period:'กรกฎาคม 2569',
+    payments:{'เงินโอน':70000,'เงินสด':11362,'ค้างชำระ':11291},     // รวม 92,653
+    sales:[{category:'รวม',amount:76415}]};
+  const f=c.qaFindings_([d],[{period:'กรกฎาคม 2569',total_sales:76415,
+    payment_methods:[{method:'เงินโอน',amount:70000},{method:'เงินสด',amount:11362},{method:'ค้างชำระ',amount:11291}],
+    payment_days:[{date:'2026-07-16',payments:d.payments}],daily_totals:[{date:'2026-07-16',sales:76415}]}]);
+  const m=(f.find(x=>x.code==='PAY_SUM')||{}).msg||'';
+  chk('เป็นแดง', lv(f,'PAY_SUM')==='แดง', lv(f,'PAY_SUM'));
+  chk('บอกเปอร์เซ็นต์', m.indexOf('21.2%')>=0, m);
+  chk('ห้ามฟันธงสาเหตุ', m.indexOf('ยังไม่ฟันธงสาเหตุ')>=0, m);
+  chk('ชี้วิธีเจาะต่อด้วย qaDay', m.indexOf("qaDay('2026-07-16')")>=0, m);
+  chk('ไม่มีคำว่า "น่าจะอ่านเลขผิด" แบบฟันธง', m.indexOf('น่าจะอ่านเลขผิดอย่างน้อย')<0, m); }
+
+console.log('33) 18 วันที่เคยแดง — เกณฑ์ใหม่ต้องเหลือแค่กองที่ผิดจริง');
+{ const c=ctxFor({});
+  const real=[[107,52798],[969,70174],[657,65886],[1067,86672],[1156,103194],[649,64326],
+              [1295,57220],[787,58337],[643,63543],[60,96819],[1570,93527],[-811,91466],
+              [-2402,71440],[-7435,97262],[-509,60139],[16238,76415],[-2932,38772],[-180,73918]];
+  let red=0, yel=0;
+  real.forEach((r,i)=>{ const diff=r[0], sales=r[1];
+    const dt='2026-01-'+String(i+1).padStart(2,'0');
+    const d={date:dt,payments:{'เงินสด':sales+diff},sales:[{category:'ร',amount:sales}]};
+    const f=c.qaFindings_([d],[]).filter(x=>x.code==='PAY_SUM'||x.code==='PAY_SUM_SMALL');
+    f.forEach(x=>{ if(x.level==='แดง') red++; else yel++; }); });
+  chk('แดงเหลือ 4 วัน (16,238 · -7,435 · -2,932 · -2,402)', red===4, 'แดง='+red+' เหลือง='+yel);
+  chk('ที่เหลือ 14 วันเป็นเหลือง', yel===14, 'เหลือง='+yel); }
+
 console.log(fails?('\n🔴 ไม่ผ่าน '+fails+' เช็ค'):'\n🟢 ผ่านทุกเคส');
 process.exit(fails?1:0);
