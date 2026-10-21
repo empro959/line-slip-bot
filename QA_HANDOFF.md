@@ -10,7 +10,8 @@
 
 | ห้าม | เหตุผล |
 |---|---|
-| ❌ **ห้าม merge · ห้าม push เข้า `main`** | ทุก push รีสตาร์ทบอทจริงที่ร้านใช้อยู่ (~1 นาที) |
+| ❌ **ห้าม merge · ห้าม push เข้า `main`** | ทุก push เข้า `main` รีสตาร์ทบอทจริงที่ร้านใช้อยู่ (~1 นาที) |
+| ✅ **push เข้า branch `qa-reports` ได้ — ที่เดียวเท่านั้น** | `.github/workflows/render-deploy.yml` เขียนว่า `on: push: branches: [main]` → branch อื่น **ไม่ trigger deploy เลย** บอทไม่รีสตาร์ท |
 | ❌ **ห้ามแก้ข้อมูลเงินทุกชนิด** | `pos_daily.json` · `saisang_data.json` · DB · ไม่ว่าจะมั่นใจแค่ไหน |
 | ❌ **ห้ามรันฟังก์ชันที่เขียนข้อมูลใน Apps Script** | `writeMonth_` · `writeMonths_` · `saveDaily_` · `importPos*` · `backfill*` · `dropPosMonth_` · `fixSlipUrl` · `make*Key` |
 | ❌ **ห้ามขอหรือรับค่า secret/token/คีย์ ในแชท** | เจ้าของตั้งเองในที่ที่มันอยู่ · QA ไม่ต้องเห็นค่า |
@@ -131,7 +132,26 @@ gh api repos/empro959/line-slip-bot/actions/runs --jq '.workflow_runs[0:3]|.[]|{
 
 ## 4. รายงาน — เขียนที่ไหน เขียนอะไร
 
-**ที่เก็บ:** โฟลเดอร์ Drive ชื่อ **`QA-บอทไส้ย่าง`** (ไม่มีให้สร้าง) · ไฟล์ชื่อ `QA-YYYY-MM-DD.md`
+**ที่เก็บหลัก: branch `qa-reports` ในรีโปนี้** → ไฟล์ `reports/QA-YYYY-MM-DD.md`
+
+```bash
+cd /home/user/line-slip-bot
+git fetch origin qa-reports 2>/dev/null && git checkout -B qa-reports origin/qa-reports \
+  || git checkout -B qa-reports      # ยังไม่มี branch = รอบแรก สร้างใหม่
+mkdir -p reports && <เขียนไฟล์>
+git add reports && git commit -m "QA <วันที่>" && git push -u origin qa-reports
+git checkout main                   # กลับมา main ทุกครั้ง อย่าทิ้งค้างไว้
+```
+
+**ทำไมใช้ branch ไม่ใช่ Drive:**
+- ✅ ไม่ต้องพึ่ง connector — ห้อง QA ที่ยิงจาก Routine **อาจไม่มี Google Drive/Gmail ติดมา**
+- ✅ `last_sha` รอบก่อนอ่านได้ด้วย git ธรรมดา = **ความจำข้ามวันที่เชื่อถือได้**
+- ✅ มีประวัติย้อนหลัง diff ได้ · ✅ **ไม่ trigger deploy** (workflow ยิงเฉพาะ `main`)
+- 🔴 **ห้าม merge `qa-reports` เข้า `main` เด็ดขาด**
+
+ถ้า**มี** Google Drive connector ติดมาด้วย → ก๊อปไฟล์เดียวกันไปวางที่โฟลเดอร์ `QA-บอทไส้ย่าง` ด้วย (ของแถม ไม่ใช่ที่เก็บหลัก)
+ถ้า**ไม่มี** connector เลย → เขียนลง branch อย่างเดียว **และบอกในสรุปว่าไม่มี connector** อย่าเงียบ
+
 เขียน**ทุกวันแม้ไม่มีอะไรเจอ** — ไฟล์ที่มีทุกวันคือสัญญาณชีพของ QA เอง
 (ถ้าไม่เขียนเลยตอนไม่มีอะไร → "QA เงียบ" แยกไม่ออกจาก "QA ตาย" ซึ่งเป็นจุดบอดที่ห้องนี้เพิ่งปิดไป)
 
@@ -153,6 +173,11 @@ deploy run ล่าสุด: #104 success
 
 **แจ้งเตือนเจ้าของเฉพาะเมื่อมี 🔴** — มีแต่ 🟠/✅ ให้เขียนไฟล์เงียบๆ
 (เตือนทุกวันเรื่องที่ไม่ผิด = สามเดือนไม่มีใครเชื่อ)
+
+และอ่าน `last_sha` รอบก่อนจากไฟล์ล่าสุดใน `qa-reports`:
+```bash
+git show origin/qa-reports:reports/$(git ls-tree --name-only origin/qa-reports reports/ | sort | tail -1 | xargs basename) 2>/dev/null | head -5
+```
 
 ---
 
