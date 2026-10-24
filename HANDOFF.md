@@ -1180,6 +1180,86 @@ GmailApp.search('has:attachment filename:pdf newer_than:90d', 0, 150)
 
 ---
 
+## 3.51 🔴 Gemini ล่มทั้งระบบ 1 วัน — Google ระงับบัญชี Cloud — 23-24 ต.ค. 2026
+
+### อาการ
+
+24 ต.ค. เจ้าของส่งบิลซื้อดวงใจ 13,370 เข้ากลุ่ม → บอทตอบ `403 PERMISSION_DENIED`
+**ทุกเส้นทางที่ใช้ Gemini ตายพร้อมกัน**: สลิปลูกค้า · เอกสารเจ้าหนี้ · สมุดจดมือ · จองโต๊ะ
+(`extract failed`) · ส่วนที่ไม่ใช้ AI — คำสั่งพิมพ์มือ ยอดค้าง รายงาน — ยังปกติทุกอย่าง
+
+```
+Permission denied: Consumer 'api_key:AIza…' has been suspended.
+reason: CONSUMER_SUSPENDED · consumer: projects/943401373824
+service: generativelanguage.googleapis.com
+```
+
+และในกล่อง `saiyangsoi@gmail.com` มีเมลจาก Google ลงวันที่ 23 ต.ค.:
+**"การเข้าถึงแพลตฟอร์ม Google Cloud ถูกจำกัด"**
+
+### สิ่งที่ตัดออกไปแล้ว (อย่าไปไล่ซ้ำ)
+
+| สมมติฐาน | ผล |
+|---|---|
+| คีย์หลุดจากรีโปนี้ | ❌ กวาด working tree + **1,459 ออบเจกต์ในประวัติทุก branch** ด้วยค่าคีย์จริง — ไม่พบ · โค้ดอ่านคีย์จาก env ที่ `app.py:31`/`:254` เท่านั้น ไม่เคย print |
+| หลุดจาก `saiyangsoi-sketch/Line-Slip-Bot` | ❌ **repo นั้นไม่มีอยู่จริง** — บัญชีมีจริง (id `313954293`) แต่ไม่มี repo สาธารณะเลยสักอัน · ค้นทั้ง GitHub คำว่า "saiyangsoi" = 0 repo · **ความเชื่อที่จดกันมา 5 สัปดาห์ผิด** |
+| บิลลิ่ง/จ่ายเงินไม่ผ่าน | ❌ บัญชีจ่ายเงินปกติ ใช้ 228.90 บาท จากเพดาน 8,398.13 · เครดิต 1,000 ยังไม่หมดอายุ |
+| ถูกยิงจนผิดปกติ (abuse) | ⚠️ ไม่น่าใช่ — ยอดใช้ไม่พุ่งเลย |
+
+**ต้นเหตุจริงยังไม่รู้** · เมลบอกแค่ "ละเมิดนโยบาย" ซึ่งกว้างเกินจะแก้อะไรได้
+สัญญาณชี้ไปทาง **ขอยืนยันตัวตน** มากกว่าแบนเพราะละเมิด (ปุ่มในเมลคือ "ยืนยันตอนนี้"
+และพูดถึงการดาวน์โหลดข้อมูล) — ยื่นอุทธรณ์แล้ว 24 ต.ค. รอ ~2 วันทำการ
+
+### วงความเสียหาย — GCP เท่านั้น
+
+```
+❌ GCP API (generativelanguage) · console.cloud.google.com
+✅ Gmail · Drive · Apps Script · bridge · ระบบนำเข้า POS · แดชบอร์ด
+```
+
+จับได้เร็วเพราะ **Gmail ยังเข้าได้** → รู้ทันทีว่าไม่ใช่บัญชีโดนล็อกทั้งใบ
+และพิสูจน์ bridge ด้วยการพิมพ์คำสั่งตัวหนังสือล้วนในกลุ่ม (ไม่ใช้ Gemini) แล้วบอทตอบ
+
+### ✅ ตัวที่กู้ได้จริง — คีย์จากบัญชี Google อีกใบ
+
+สร้างคีย์ใหม่ที่ `aistudio.google.com/apikey` ด้วย **`empro959@gmail.com`** (free tier
+ไม่ต้องผูกบัตร) → ใส่ env `GEMINI_API_KEY` ที่ Render → **ใช้ได้ทันที ไม่ต้องรอ Google เลย**
+
+> 📌 **บทเรียนที่แพงที่สุดของวันนี้: ชั้น AI ทั้งหมดแขวนอยู่กับบัญชี Google ใบเดียว**
+> วันนี้กู้ได้ใน 3 นาทีเพราะมีอีกบัญชีอยู่แล้ว ถ้าไม่มี = ร้านไม่มี AI ไปอีกหลายวัน
+
+**เมื่อ Google คืนบัญชีเดิม: อย่าสลับคีย์กลับ** · ใช้คีย์ใหม่ต่อ และเข้าไปลบคีย์เก่าทิ้ง
+
+### ⚠️ ผลข้างเคียงที่ต้องเฝ้า
+
+- ตอนนี้บอทใช้ **free tier** — `gemini-2.5-flash` ราว 250 ครั้ง/วัน · `gemini-2.5-pro` น้อยกว่ามาก
+- **สมุดจดมือ** (`app.py:897`) ยิง Pro ตรงๆ ไม่ผ่าน Flash → เป็นเส้นทางที่จะตันก่อนเพื่อน
+- ตันเมื่อไหร่ ใส่ env `GEMINI_MODEL_RETRY=gemini-2.5-flash` (แลกกับลายมือแม่นน้อยลง)
+
+### 🔴 กฎที่เราละเมิดเอง: ค่า secret หลุดเข้าแชท
+
+เจ้าของวาง log เต็มจาก Render มาในแชทเพื่อให้ช่วยอ่าน — **ใน log มีค่า API key เต็ม**
+ขัดกับกติกา "ห้ามส่งค่า secret มาในแชทนี้" และทำให้คีย์นั้น**ใช้ต่อไม่ได้ถาวร** ต่อให้ปลดระงับได้
+
+> 📌 **ขอ log ต้องบอกให้ปิดค่าก่อนเสมอ** — ครั้งนี้เราขอ "log เต็ม" โดยไม่เตือนเรื่องนี้เลย
+> ที่จริงต้องการแค่บรรทัด `reason:` กับ `consumer:` ซึ่งไม่มีค่าคีย์อยู่ด้วยซ้ำ
+
+### ข้อความอุทธรณ์ที่ยื่นไป (ช่องจำกัด 500 ตัวอักษร)
+
+> Project 943401373824. Small family restaurant, Thailand. Runs an internal LINE
+> assistant reading our own payment slips, supplier invoices and table bookings via
+> the Gemini API. Not public, no resale, ~THB 229/month, paid account, no traffic spike.
+>
+> I audited my repository: no credential was ever committed. I did find an Apps Script
+> URL of mine was public and unauthenticated until 13 Oct; it is now secured and removed.
+>
+> Please tell me which policy was breached so I can fix the cause.
+
+ยื่นที่ `myaccount.google.com/restrictions/47/appeal` (เข้า console ไม่ได้แล้ว
+ทางนี้คือทางเดียวที่เหลือ) · ตอบกลับทางอีเมล
+
+---
+
 ## 3.50 🪤 หลงทางเพราะเอกสารตัวเอง + ด่าน forward ที่ตรวจทีหลัง — 24 ต.ค. 2026
 
 ### เรื่องที่ 1 — วางแผนย้าย webhook ที่ย้ายไปแล้ว 7 สัปดาห์
