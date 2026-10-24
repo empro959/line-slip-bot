@@ -653,7 +653,7 @@ class TestWebhookForward(unittest.TestCase):
 
     def test_secret_in_url_never_reaches_the_log(self):
         """URL fan-out มีคีย์ลับต่อท้ายได้ (?k=BRIDGE_KEY) — log ของ Render ไม่ใช่ที่เก็บความลับ"""
-        app.WEBHOOK_FORWARD_URLS[:] = ["https://script.google.com/macros/s/AKfycbX/exec?src=render&k=KEYLEAK"]
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://script.google.com/macros/s/AKfycbFAKE_TEST_DEPLOYMENT_ID/exec?src=render&k=KEYLEAK"]
         orig = app.requests.post
         app.requests.post = self._fake_post(ok=False)     # HTTP 500 → เข้าเส้น print
         buf = io.StringIO()
@@ -837,7 +837,7 @@ class TestInboundCanary(unittest.TestCase):
 
         ต้องได้สองอย่างพร้อมกัน: คีย์ต้อง *ถึง* ปลายทาง (ไม่งั้นถูกปฏิเสธทุกใบ)
         และคีย์ต้อง *ไม่โผล่ใน log* (log ของ Render ไม่ใช่ที่เก็บความลับ)"""
-        url = "https://script.google.com/macros/s/AKfycbTEST/exec?src=render&k=KEYLEAK"
+        url = "https://script.google.com/macros/s/AKfycbFAKE_TEST_DEPLOYMENT_ID/exec?src=render&k=KEYLEAK"
         app.WEBHOOK_FORWARD_URLS[:] = [url]
         app.LINE_SECRET = "s"
         app.requests.post = self._fake_post()
