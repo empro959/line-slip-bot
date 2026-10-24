@@ -277,7 +277,10 @@ LINE API ตอบ 200 · บอทยังไม่ถูกเตะออก
 > (ผมด่วนสรุปจากคำบอกเล่า ไม่ได้ขอดูหน้าจอก่อน — บทเรียนเดิมซ้ำรอบสอง)
 
 **ข้อเท็จจริงจากหน้าจอ (19 ส.ค. 15:42):**
-- Webhook URL = `https://script.google.com/macros/s/AKfycb24qjDXwJ7w23U5yMX2aDvGgCJO3SLEwQwb8ZfErUmy9DpI0V3SuXU62DKagtthi-yTEQ/exec`
+- Webhook URL = `https://script.google.com/macros/s/<DEPLOYMENT_ID>/exec`
+  🔴 **เคยเขียนเต็มไว้ตรงนี้ในรีโปสาธารณะ ตั้งแต่ 19 ส.ค. — ปิดบังแล้ว 21 ต.ค.**
+  ⚠️ **ปิดบังในไฟล์ไม่ได้แก้ปัญหา** — git history ยังมีค่าเต็มอยู่ ใครก็ย้อนดูได้
+  → ตัวที่แก้ได้จริงคือ `BRIDGE_KEY` (ดู `HANDOFF.md` §3.44) · **สมมติฐานที่ปลอดภัยคือมีคนรู้ URL นี้แล้ว**
 - Use webhook = เปิด ✅
 - **บอทร้านตอบปกติ** → bridge ตัวที่ LINE ยิงอยู่ **forward มา `iq8e` ถูกต้องแล้ว** (ไม่ได้ค้างที่ `65gt`)
 
