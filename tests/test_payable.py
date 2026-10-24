@@ -677,6 +677,41 @@ class TestWebhookForward(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+class TestPayableUnreadableMsg(unittest.TestCase):
+    """อ่านรูปเอกสารเจ้าหนี้ไม่สำเร็จ → ต้องแนะนำคำสั่งให้ครบทั้งสองทาง
+
+    ทำไมต้องมี (เคสจริง 24/10/69): เจ้าของส่ง **บิลซื้อ** ดวงใจ 13,370 เข้ากลุ่ม
+    Gemini ตอบ 403 → บอทตอบว่า "หรือพิมพ์ 'จ่าย <ยอด>' แทน"
+    ถ้าทำตาม ยอดค้างจะ **ลด** 13,370 แทนที่จะ **เพิ่ม** = เพี้ยน 26,740 และดูเหมือนบันทึกสำเร็จ
+    เส้นทางนี้รับทั้งบิลและสลิป และตอนอ่านไม่สำเร็จ *ไม่รู้* ว่าเป็นอันไหน → ห้ามเดาแทนคน"""
+
+    def test_offers_both_commands(self):
+        m = app._payable_unreadable_msg("ClientError: 403")
+        self.assertIn("'บิล <ยอด>'", m, "ขาดคำสั่งบันทึกบิลซื้อ — เคสที่ทำให้ยอดเพี้ยน")
+        self.assertIn("'จ่าย <ยอด>'", m)
+
+    def test_says_what_each_one_does(self):
+        """เลือกผิดต้องเห็นเองจากข้อความ ไม่ใช่รู้ตอนยอดเพี้ยนไปแล้ว"""
+        m = app._payable_unreadable_msg("x")
+        self.assertIn("เพิ่มยอดค้าง", m)
+        self.assertIn("ลดยอดค้าง", m)
+        # 'บิล' ต้องมาคู่กับ 'เพิ่ม' และ 'จ่าย' คู่กับ 'ลด' — ไม่ใช่สลับกัน
+        bill_line = [l for l in m.split("\n") if "'บิล <ยอด>'" in l][0]
+        pay_line  = [l for l in m.split("\n") if "'จ่าย <ยอด>'" in l][0]
+        self.assertIn("เพิ่มยอดค้าง", bill_line, bill_line)
+        self.assertIn("ลดยอดค้าง", pay_line, pay_line)
+
+    def test_keeps_reason_and_backdate_hint(self):
+        m = app._payable_unreadable_msg("ClientError: 403 PERMISSION_DENIED")
+        self.assertIn("403 PERMISSION_DENIED", m, "ต้องคงเหตุผลไว้ — ไม่งั้นต้องไปขุด log")
+        self.assertIn("24/10", m, "ตัวอย่างลงย้อนวัน (บิลมักต้องลงวันที่บนใบ ไม่ใช่วันนี้)")
+
+    def test_never_suggests_pay_alone(self):
+        """ทิศกลับ: ถ้าวันหลังมีใครตัดคำสั่งใดคำสั่งหนึ่งออก เทสต์ต้องแดงทันที"""
+        m = app._payable_unreadable_msg("x")
+        self.assertTrue(m.count("พิมพ์") >= 2, m)
+
+
 class TestInboundCanary(unittest.TestCase):
     """สัญญาณชีพขาเข้า — ยิง event เปล่าวันละครั้งผ่านเส้นทาง fan-out เดิม
 
@@ -2210,26 +2245,53 @@ class TestMemoSharedMonthDayList(unittest.TestCase):
     เคสจริง 23/08/26: โอน 20,297 โน้ต 'ไส้ (12/8 จ่ายที่ค้าง(22,23/8) รวม 3 บิล'
     เลข 22 ไม่มี '/เดือน' ของตัวเอง → ตัวอ่านมองไม่เห็น เหลือแค่ 12/8 กับ 23/8"""
 
+    # 🪤 เดิมฮาร์ดโค้ด "2026-08-xx"/"2026-07-23" ไว้ → **เน่าตามปฏิทิน**
+    #   24/10/69 ชุดทดสอบแดงขึ้นมาเองโดยไม่มีใครแก้โค้ด: 23/7 ห่างมา 93 วัน
+    #   เกิน PAYABLE_DATE_MAX_DAYS (90) → _dates_from_memo คืน [] อย่างถูกต้อง แต่เทสต์คาดค่าเก่า
+    #   และ "1,2,3/8" จะแดงตามมาอีกใน 6 วัน
+    #   ไฟล์นี้มี _d()/_dm() เขียนไว้กันเรื่องนี้ตั้งแต่ต้น (ดูหัวไฟล์) แต่กลุ่มนี้ไม่ได้ใช้
+    # 📌 กติกา: เทสต์ที่แดงเองตามเวลา ทำให้แยก "ของพังจริง" กับ "เทสต์เน่า" ไม่ออก
+    #   → วันที่ในเทสต์ต้องสัมพัทธ์กับวันนี้เสมอ ห้ามฮาร์ดโค้ด
+    #   เลือก 30-50 วันก่อน: อยู่ในกรอบ 90 วันตลอด และไม่ชนขอบ 'วันอนาคต'
+
+    @staticmethod
+    def _same_month_days(*days):
+        """คืน (iso ของแต่ละวัน, เลขเดือน) โดยยึดเดือนของ '45 วันก่อน' — อยู่ในกรอบ 90 วันเสมอ
+        และทุกวันอยู่เดือนเดียวกันแน่นอน (ตัวเลขที่ไกลสุดคือวันที่ 23 ซึ่งยัง 23-68 วันก่อนเสมอ)"""
+        from datetime import date as _date
+        ref = datetime.now(app.TZ).date() - timedelta(days=45)
+        return [_date(ref.year, ref.month, d).isoformat() for d in days], ref.month
+
     def test_real_memo_reads_all_three_dates(self):
-        got = app._dates_from_memo("ไส้ (12/8 จ่ายที่ค้าง(22,23/8) รวม 3 บิล")
-        self.assertEqual(got, ["2026-08-12", "2026-08-22", "2026-08-23"])
+        (d12, d22, d23), mo = self._same_month_days(12, 22, 23)
+        # '22' ไม่มี '/เดือน' ของตัวเอง → ต้องยืมเดือนจาก '23/<mo>' ที่ตามมา
+        memo = f"ไส้ (12/{mo} จ่ายที่ค้าง(22,23/{mo}) รวม 3 บิล"
+        self.assertEqual(app._dates_from_memo(memo), [d12, d22, d23], memo)
 
     def test_various_separators(self):
-        for memo in ("22,23/8", "22 และ 23/8", "22-23/8", "22 กับ 23/8"):
-            self.assertEqual(app._dates_from_memo(memo), ["2026-08-22", "2026-08-23"], memo)
+        (d22, d23), mo = self._same_month_days(22, 23)
+        for memo in (f"22,23/{mo}", f"22 และ 23/{mo}", f"22-23/{mo}", f"22 กับ 23/{mo}"):
+            self.assertEqual(app._dates_from_memo(memo), [d22, d23], memo)
 
     def test_three_days_sharing_a_month(self):
-        self.assertEqual(app._dates_from_memo("จ่าย 1,2,3/8"),
-                         ["2026-08-01", "2026-08-02", "2026-08-03"])
+        """1,2,3 ใช้เดือนร่วมกันตัวเดียว — ต้องกางครบ 3 วัน"""
+        (d1, d2, d3), mo = self._same_month_days(1, 2, 3)
+        self.assertEqual(app._dates_from_memo(f"จ่าย 1,2,3/{mo}"), [d1, d2, d3])
 
     def test_money_amount_is_not_mistaken_for_dates(self):
         """'1,200/8' เป็นตัวเลขเงิน ไม่ใช่รายการวันที่ — ห้ามกางเป็นวัน"""
         self.assertEqual(app._dates_from_memo("ค่าของ 1,200/8"), [])
 
     def test_plain_formats_unchanged(self):
-        self.assertEqual(app._dates_from_memo("ไส้ (23/7) ค้าง 7,993"), ["2026-07-23"])
-        self.assertEqual(app._dates_from_memo("จ่าย (19/8 และ 21/8) 2 บิล"),
-                         ["2026-08-19", "2026-08-21"])
+        one = _d(35)
+        self.assertEqual(app._dates_from_memo(f"ไส้ ({_dm(one)}) ค้าง 7,993"), [one])
+        a, b = _d(45), _d(43)
+        self.assertEqual(app._dates_from_memo(f"จ่าย ({_dm(a)} และ {_dm(b)}) 2 บิล"), sorted([a, b]))
+
+    def test_date_older_than_window_is_dropped(self):
+        """ทิศกลับ + คุมกรอบ: เก่าเกิน PAYABLE_DATE_MAX_DAYS ต้องถูกทิ้ง (นี่คือพฤติกรรมที่ทำให้เทสต์เก่าแดง)"""
+        old_day = _d(app.PAYABLE_DATE_MAX_DAYS + 5)
+        self.assertEqual(app._dates_from_memo(f"ไส้ ({_dm(old_day)}) ค้าง 1,000"), [])
 
 
 class TestDeleteLastNeedsConfirmOnRepeat(PayableTestCase):
