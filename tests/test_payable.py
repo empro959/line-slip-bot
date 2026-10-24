@@ -9,6 +9,9 @@
 วิธีรัน:  python3 -m unittest discover -s tests -v
 ไม่ต้องมี DB จริง/คีย์จริง — ใช้ SQLite ไฟล์ชั่วคราว และคีย์ปลอม (ไม่ยิงเน็ตออก)
 """
+import base64
+import hashlib
+import hmac
 import json
 import contextlib
 import io
@@ -710,6 +713,73 @@ class TestPayableUnreadableMsg(unittest.TestCase):
         """ทิศกลับ: ถ้าวันหลังมีใครตัดคำสั่งใดคำสั่งหนึ่งออก เทสต์ต้องแดงทันที"""
         m = app._payable_unreadable_msg("x")
         self.assertTrue(m.count("พิมพ์") >= 2, m)
+
+
+class TestForwardOnlyAfterSignature(unittest.TestCase):
+    """forward ต้องเกิด *หลัง* ลายเซ็นผ่านเท่านั้น
+
+    Render เป็นประตูหน้าของจริงตั้งแต่ 7 ก.ย. 69 (§3.15) — เดิม /callback ยิง forward
+    ทันทีก่อนตรวจลายเซ็น ใครรู้ URL /callback ก็สั่งให้บอทเรายิงขยะไปกวน bridge ได้
+    BRIDGE_KEY กันไม่ได้ เพราะมันกันแค่ไม่ให้ bridge *ทำตาม* — คนยิงคือเราเอง"""
+
+    def setUp(self):
+        self._urls   = app.WEBHOOK_FORWARD_URLS[:]
+        self._thread = app.threading.Thread
+        app.WEBHOOK_FORWARD_URLS[:] = ["https://bridge.test/exec"]
+        # ใช้ secret ตัวเดียวกับที่ handler ถือไว้ตั้งแต่ import — ตั้งใหม่ตรงนี้จะทำให้
+        # handler.handle() ปฏิเสธทุกใบ แล้วเทสต์จะเขียวเพราะเหตุผลผิด (ไม่ forward เพราะ 400 ไม่ใช่เพราะด่าน)
+        self.spawned = []
+        outer = self
+        class _FakeThread:            # ไม่ยิงจริง แค่จดว่าถูกสั่งให้ยิงไหม (กัน race ในเทสต์)
+            def __init__(self, target=None, args=(), daemon=None):
+                outer.spawned.append({"target": target, "args": args})
+            def start(self):
+                pass
+        app.threading.Thread = _FakeThread
+        self.client = app.app.test_client()
+
+    def tearDown(self):
+        app.WEBHOOK_FORWARD_URLS[:] = self._urls
+        app.threading.Thread = self._thread
+
+    def _sig(self, body: bytes) -> str:
+        return base64.b64encode(
+            hmac.new(app.LINE_SECRET.encode("utf-8"), body, hashlib.sha256).digest()).decode("utf-8")
+
+    def _post(self, body: bytes, signature: str):
+        return self.client.post("/callback", data=body,
+                                headers={"X-Line-Signature": signature,
+                                         "Content-Type": "application/json"})
+
+    def test_valid_signature_forwards(self):
+        body = b'{"events":[],"destination":"U0"}'
+        r = self._post(body, self._sig(body))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(self.spawned), 1, "ลายเซ็นถูก → ต้อง forward ให้ห้องคอนเทนต์ตามเดิม")
+        self.assertEqual(self.spawned[0]["args"][0], body, "ต้องส่ง body ดิบใบเดิม ไม่ใช่ที่แปลงแล้ว")
+
+    def test_bad_signature_must_not_forward(self):
+        """ของปลอมต้องไม่ถูกส่งต่อ — นี่คือทั้งหมดของแพตช์นี้"""
+        body = b'{"events":[],"destination":"U0"}'
+        r = self._post(body, "YmFkc2ln")          # base64 ถูกรูป แต่ไม่ตรง
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.spawned, [], "ลายเซ็นผิด → ห้าม forward แม้แต่ใบเดียว")
+
+    def test_non_ascii_signature_is_rejected_not_crash(self):
+        """🪤 hmac.compare_digest โยน TypeError ถ้า str มีอักขระนอก ASCII
+
+        signature มาจากข้างนอกทั้งดุ้น — ยิง header เป็นภาษาไทยมาก็ต้องได้ 400 ไม่ใช่ 500"""
+        body = b'{"events":[],"destination":"U0"}'
+        r = self._post(body, "ลายเซ็นมั่ว")
+        self.assertEqual(r.status_code, 400, "ลายเซ็นสกปรกต้องถูกปฏิเสธ ไม่ใช่ทำให้เซิร์ฟเวอร์พัง")
+        self.assertEqual(self.spawned, [], "และต้องไม่ forward")
+
+    def test_no_targets_configured_forwards_nothing(self):
+        app.WEBHOOK_FORWARD_URLS[:] = []
+        body = b'{"events":[],"destination":"U0"}'
+        r = self._post(body, self._sig(body))
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.spawned, [], "ไม่ตั้ง env = ไม่ยิงอะไรเลย")
 
 
 class TestInboundCanary(unittest.TestCase):
