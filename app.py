@@ -5520,7 +5520,13 @@ def _sig_ok(secret: str, body: str, signature: str) -> bool:
     if not secret:
         return False
     mac = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).digest()
-    return hmac.compare_digest(base64.b64encode(mac).decode("utf-8"), signature or "")
+    # 🪤 compare_digest โยน TypeError ถ้า str มีอักขระนอก ASCII — และ signature มาจากข้างนอก
+    #    ใครยิง header ลายเซ็นเป็นภาษาไทยมาก็ทำให้ /callback ตอบ 500 ได้ (เจอตอนเขียนเทสต์ 24 ต.ค.)
+    #    เทียบเป็น bytes แทน ข้อจำกัด ASCII หายไปทั้งข้อ · ยัง constant-time เหมือนเดิม
+    try:
+        return hmac.compare_digest(base64.b64encode(mac), (signature or "").encode("utf-8"))
+    except Exception:
+        return False
 
 
 def _handle_secondary_callback(body: str, signature: str) -> bool:
@@ -5695,7 +5701,11 @@ def maybe_send_inbound_canary():
 def callback():
     signature = request.headers["X-Line-Signature"]
     body = request.get_data(as_text=True)
-    if WEBHOOK_FORWARD_URLS:
+    # 🔒 ตรวจลายเซ็น *ก่อน* forward — Render เป็นประตูหน้าจริง (สลับทิศ 7 ก.ย. §3.15)
+    #    เดิม forward ทันทีโดยไม่ตรวจ → ใครรู้ URL /callback ก็สั่งให้เรายิงขยะไปกวน bridge ได้
+    #    (BRIDGE_KEY กันไม่ให้ bridge *ทำตาม* ได้ แต่กันไม่ให้ *ถูกยิง* ไม่ได้ — เราคือคนยิงเอง)
+    #    ตรวจตรงนี้ไม่ใช่รอผล handler.handle() เพราะ forward ต้องไม่ขึ้นกับว่าเราประมวลผลสำเร็จไหม
+    if WEBHOOK_FORWARD_URLS and _sig_ok(LINE_SECRET, body, signature):
         # แยกเธรด: LINE ต้องได้ 200 เร็ว ไม่งั้นมัน retry แล้วงานซ้ำ
         threading.Thread(target=_forward_webhook, args=(request.get_data(), signature),
                          daemon=True).start()
