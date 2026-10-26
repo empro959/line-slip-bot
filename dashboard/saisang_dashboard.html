@@ -892,12 +892,36 @@ function dlH(total){
     formatter:v=>'฿'+fmt(v)+'  '+(v/total*100).toFixed(1)+'%'};
 }
 
+// ── ป้ายตัวเลขบนแท่งเตี้ย ────────────────────────────────────────────────
+// 🪤 เคสจริง 25/10/69: กำไร 70,137 เทียบยอดขาย 1.7 ล้าน → แท่งสูงไม่กี่พิกเซล
+//    แต่ป้ายตั้งค่าให้เขียน 'ลงไปข้างในแท่ง' (anchor end + align start) เสมอ
+//    ป้าย 2 บรรทัดเลยล้นออกนอกแท่งไปทับชื่อแกน X ('กำไร/ขาดทุน') อ่านไม่ออกทั้งคู่
+//
+// วัด 'ความสูงแท่งเป็นพิกเซลจริง' ไม่ใช่สัดส่วนของค่า เพราะความสูงที่ป้ายต้องใช้
+// เป็นพิกเซล (ขนาดฟอนต์) ส่วนสัดส่วนของค่าเปลี่ยนไปตามแกนที่ Chart.js เลือกเอง
+// เตี้ยกว่านี้ = เขียนเหนือแท่งแทน · พื้นหลังแดชบอร์ดเข้ม ตัวอักษรขาวยังอ่านออก
+const DL_MIN_PX = 34;
+function dlOut_(ctx){
+  const sc = ctx.chart.scales.y;
+  if (!sc) return false;
+  const v = Number(ctx.dataset.data[ctx.dataIndex]);
+  if (!isFinite(v)) return false;
+  return Math.abs(sc.getPixelForValue(v) - sc.getPixelForValue(0)) < DL_MIN_PX;
+}
+// สีป้าย: อยู่ในแท่ง = ขาวบนสีแท่ง · ออกมานอกแท่ง = ต้องใช้สีตัวอักษรของธีม
+// (ขาวตายตัวจะจมหายไปกับพื้นการ์ดตอนสลับโหมดสว่าง — เจอตอนเรนเดอร์ทดสอบ 25/10/69)
+const dlColor = ctx => dlOut_(ctx)
+  ? (getComputedStyle(document.documentElement).getPropertyValue('--text').trim() || '#f3f3ff')
+  : '#fff';
+const dlAlign  = ctx => dlOut_(ctx) ? 'end' : 'start';
+const dlOffset = ctx => dlOut_(ctx) ? 4    : -2;
+
 function buildOV(m){
   dc('main');
   charts['main']=new Chart(el('ch-main'),{type:'bar',
     data:{labels:['ยอดขาย','ค่าใช้จ่าย','กำไร/ขาดทุน'],datasets:[{data:[m.total_sales,m.total_expenses,Math.abs(m.net_profit)],backgroundColor:['rgba(105,255,71,.8)','rgba(255,82,82,.8)',m.net_profit>=0?'rgba(255,215,64,.8)':'rgba(255,82,82,.5)'],borderRadius:8,borderSkipped:false}]},
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>' '+((c.dataIndex===2&&m.net_profit<0)?'-฿':'฿')+fmt(c.parsed.y)}},
-      datalabels:{color:'#fff',font:{size:12,weight:'bold',family:"'IBM Plex Mono',monospace"},anchor:'end',align:'start',offset:-2,textAlign:'center',formatter:(v,ctx)=>((ctx.dataIndex===2&&m.net_profit<0)?'-฿':'฿')+fmt(v)+'\n('+(v/m.total_sales*100).toFixed(1)+'%)'}},
+      datalabels:{color:dlColor,font:{size:12,weight:'bold',family:"'IBM Plex Mono',monospace"},anchor:'end',align:dlAlign,offset:dlOffset,clamp:true,textAlign:'center',formatter:(v,ctx)=>((ctx.dataIndex===2&&m.net_profit<0)?'-฿':'฿')+fmt(v)+'\n('+(v/m.total_sales*100).toFixed(1)+'%)'}},
     scales:{x:{grid:{display:false},ticks:{font:{size:13,weight:'600'}}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}
   });
   const top8e=m.expense_categories.slice(0,8),totE=top8e.reduce((a,c)=>a+c.amount,0);
@@ -1078,13 +1102,13 @@ function buildCmp(){
     <div class="cmpcard"><div class="cmplbl">กำไร/ขาดทุน<\/div><div class="cmpvals">${months.map(m=>`<div class="cmpv"><div class="mono" style="color:${m.net_profit>=0?'var(--green)':'var(--red)'}">${m.net_profit>=0?'+':''}฿${fmt(m.net_profit)}<\/div><div style="font-size:11px;color:var(--muted)">${m.shortLabel}<\/div><\/div>`).join('')}<\/div><\/div>
     <div class="cmpcard"><div class="cmplbl">Cost Ratio<\/div><div class="cmpvals">${months.map(m=>`<div class="cmpv"><div class="mono" style="color:var(--cyan)">${(m.total_expenses/m.total_sales*100).toFixed(1)}%<\/div><div style="font-size:11px;color:var(--muted)">${m.shortLabel}<\/div><\/div>`).join('')}<\/div><\/div>`;
   dc('cb');charts['cb']=new Chart(el('ch-cb'),{type:'bar',data:{labels:months.map(m=>m.shortLabel),datasets:[{label:'ยอดขาย',data:months.map(m=>m.total_sales),backgroundColor:'rgba(105,255,71,.75)',borderRadius:5},{label:'ค่าใช้จ่าย',data:months.map(m=>m.total_expenses),backgroundColor:'rgba(255,82,82,.75)',borderRadius:5},{label:'กำไร',data:months.map(m=>m.net_profit),backgroundColor:'rgba(255,215,64,.75)',borderRadius:5}]},
-    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{usePointStyle:true,padding:12,font:{size:11}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y)}},datalabels:{color:'#fff',font:{size:9,weight:'bold'},anchor:'end',align:'start',offset:-2,formatter:v=>'฿'+fmt(v)}},scales:{x:{grid:{display:false}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}});
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{usePointStyle:true,padding:12,font:{size:11}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y)}},datalabels:{color:dlColor,font:{size:9,weight:'bold'},anchor:'end',align:dlAlign,offset:dlOffset,clamp:true,formatter:v=>'฿'+fmt(v)}},scales:{x:{grid:{display:false}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}});
   dc('cc');const allC=[...new Set(months.flatMap(m=>m.expense_categories.map(c=>c.category)))].slice(0,8);
   charts['cc']=new Chart(el('ch-cc'),{type:'bar',data:{labels:allC,datasets:months.map((m,i)=>({label:m.shortLabel,data:allC.map(cat=>{const c=m.expense_categories.find(x=>x.category===cat);return c?c.amount:0;}),backgroundColor:i===0?'rgba(236,64,122,.75)':'rgba(0,229,255,.75)',borderRadius:4}))},
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{usePointStyle:true,padding:10,font:{size:10}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y)}},datalabels:{display:false}},scales:{x:{grid:{display:false},ticks:{font:{size:10}}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}});
   dc('cf');const fS=months.map(foodSalesExcl),rM=months.map(rawMatCost);
   charts['cf']=new Chart(el('ch-cf'),{type:'bar',data:{labels:months.map(m=>m.shortLabel),datasets:[{label:'ยอดขายอาหาร (ไม่รวมญี่ปุ่น/เครื่องดื่ม)',data:fS,backgroundColor:'rgba(105,255,71,.78)',borderRadius:5},{label:'ต้นทุนวัตถุดิบ',data:rM,backgroundColor:'rgba(255,215,64,.8)',borderRadius:5}]},
-    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{usePointStyle:true,padding:12,font:{size:11}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y),afterBody:it=>{const i=it[0].dataIndex,s=fS[i],r=rM[i];return s>0?'วัตถุดิบ ≈ '+(r/s*100).toFixed(1)+'% ของยอดขายอาหาร':'';}}},datalabels:{color:'#fff',font:{size:9,weight:'bold'},anchor:'end',align:'start',offset:-2,formatter:v=>'฿'+fmt(v)}},scales:{x:{grid:{display:false}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}});
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{usePointStyle:true,padding:12,font:{size:11}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y),afterBody:it=>{const i=it[0].dataIndex,s=fS[i],r=rM[i];return s>0?'วัตถุดิบ ≈ '+(r/s*100).toFixed(1)+'% ของยอดขายอาหาร':'';}}},datalabels:{color:dlColor,font:{size:9,weight:'bold'},anchor:'end',align:dlAlign,offset:dlOffset,clamp:true,formatter:v=>'฿'+fmt(v)}},scales:{x:{grid:{display:false}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}});
 }
 
 function buildAnn(){
@@ -1097,7 +1121,7 @@ function buildAnn(){
   const nb=el('ay-nb');nb.textContent=(tN>=0?'+':'')+((tN/tS)*100).toFixed(1)+'%';nb.className='kbadge '+(tN>=0?'bp':'bn');
   set('ay-r',(tE/tS*100).toFixed(1)+'%');set('ay-ms',sorted.length+' เดือน');
   dc('ab');charts['ab']=new Chart(el('ch-ab'),{type:'bar',data:{labels,datasets:[{label:'ยอดขาย',data:sales,backgroundColor:'rgba(105,255,71,.75)',borderRadius:5},{label:'ค่าใช้จ่าย',data:exps,backgroundColor:'rgba(255,82,82,.75)',borderRadius:5}]},
-    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{usePointStyle:true,padding:14,font:{size:12}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y)}},datalabels:{color:'#fff',font:{size:10,weight:'bold'},anchor:'end',align:'start',offset:-2,rotation:-45,formatter:v=>'฿'+fmt(v)}},scales:{x:{grid:{display:false},ticks:{font:{size:12}}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}});
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{usePointStyle:true,padding:14,font:{size:12}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y)}},datalabels:{color:dlColor,font:{size:10,weight:'bold'},anchor:'end',align:dlAlign,offset:dlOffset,clamp:true,rotation:-45,formatter:v=>'฿'+fmt(v)}},scales:{x:{grid:{display:false},ticks:{font:{size:12}}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}});
   dc('al');charts['al']=new Chart(el('ch-al'),{type:'line',data:{labels,datasets:[{label:'กำไร/ขาดทุน',data:profs,borderColor:'#ffd740',backgroundColor:ctx=>{const g=ctx.chart.ctx.createLinearGradient(0,0,0,240);g.addColorStop(0,'rgba(255,215,64,.2)');g.addColorStop(1,'rgba(255,215,64,0)');return g;},borderWidth:2.5,fill:true,tension:0.3,pointBackgroundColor:profs.map(v=>v>=0?'#69ff47':'#ff5252'),pointRadius:6}]},
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y)}},datalabels:{color:profs.map(v=>v>=0?'#69ff47':'#ff5252'),font:{size:10,weight:'bold'},anchor:'end',align:'top',offset:4,formatter:v=>(v>=0?'+':'')+'฿'+fmt(v)}},scales:{x:{grid:{display:false}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}});
   dc('ap');const accMap={};sorted.forEach(m=>{m.expense_categories.forEach(c=>{accMap[c.category]=(accMap[c.category]||0)+c.amount;});});
