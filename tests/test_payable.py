@@ -1910,6 +1910,63 @@ class TestFollowupAnswerIsNotSwallowed(unittest.TestCase):
         self.assertTrue(self.cards, "ต้องมีการ์ดจองออกไป")
 
 
+class TestResvTableNumberNotADate(unittest.TestCase):
+    """🪤 เคสจริง 26/10/69 จอง #109 — เจ้าของทักว่า "ลงวันที่ผิด" (ผิดไป 11 วัน)
+
+    ข้อความ: 'วันศุกร์ที่ 30 ... จองโต๊ะ โซน B 10/11 ทั้งหมด 20 ท่าน เข้าเวลา 6 โมงครึ่ง'
+    การ์ด:   'วันอังคาร 10 พ.ย. (อีก 15 วัน) 18:00'   ← ควรเป็น ศุกร์ 30 ต.ค. 18:30
+
+    `_resv_date_from_text` คว้า '10/11' ซึ่งเป็น **เลขโต๊ะ 10 กับ 11** มาเป็นวันที่
+    และตัวนี้ 'ชนะค่าของ AI เสมอ' จึงลากทั้งใบผิดตาม · 20 ท่านจะมาผิดวัน
+
+    วันที่ในเทสต์ชุดนี้สร้างจาก 'วันนี้' ทั้งหมด — กันเทสต์เน่าตามปฏิทิน (บทเรียน PR #176)"""
+
+    def _future(self, days=5):
+        d = (datetime.now(app.TZ) + timedelta(days=days)).date()
+        return d, app._TH_WD[d.weekday()]
+
+    def _pick(self, txt):
+        return app._resv_date_from_text(txt) or app._resv_day_only_from_text(txt)
+
+    def test_zone_table_numbers_must_not_become_the_date(self):
+        d, wd = self._future()
+        txt = f"วัน{wd}ที่ {d.day} คุณไอซ์ bni จองโต๊ะ โซน B 10/11 ทั้งหมด 20 ท่าน เข้าเวลา 6 โมงครึ่ง"
+        self.assertEqual(self._pick(txt), d.isoformat(),
+                         "ต้องยึด 'วันXที่ N' ไม่ใช่เลขโต๊ะ 10/11")
+
+    def test_slash_parser_skips_zone_code(self):
+        """ไม่มีคำบอกวันเลย ก็ยังห้ามเอาเลขโต๊ะหลังรหัสโซนมาเป็นวันที่"""
+        self.assertIsNone(app._resv_date_from_text("จองโต๊ะ โซน B 10/11 20 ท่าน"))
+        self.assertIsNone(app._resv_date_from_text("จอง A10/11 4 คน"))
+
+    def test_real_date_after_the_word_table_still_works(self):
+        """'จองโต๊ะ <วันที่>' คือวันที่จริง — ยามต้องดูที่ 'รหัสโซน' ไม่ใช่คำว่าโต๊ะ"""
+        d, _ = self._future(9)
+        self.assertEqual(app._resv_date_from_text(f"จองโต๊ะ {d.day}/{d.month} 4 คน"), d.isoformat())
+
+    def test_mention_prefix_still_works(self):
+        """🪤 ยามรอบแรกของผมกว้างไป: '@All ' ลงท้ายด้วยตัวอักษร เลยโดนมองเป็นรหัสโซน
+        ชุดเทสต์เดิมจับได้ทันที — เคสนี้ยึงไว้ไม่ให้พลาดซ้ำ"""
+        d, _ = self._future(1)
+        self.assertEqual(
+            app._resv_date_from_text(f"@All {d.day}/{d.month} จองโต๊ะ L 1 2 3 12 คุณแอน มา 1 ทุ่ม"),
+            d.isoformat())
+
+    def test_weekday_word_that_disagrees_is_not_trusted(self):
+        """บอกชื่อวันมาแต่ไม่ตรงกับเลขวัน = แยกไม่ออกว่าใครพลาด → ถอย ไม่ทับค่าของ AI
+        (ตัวแกะนี้ชนะ AI เสมอ จึงต้องถอยเมื่อไม่ชัด ไม่ใช่เลือกข้างแล้วมั่นใจผิด)"""
+        d, wd = self._future()
+        wrong = app._TH_WD[(d.weekday() + 2) % 7]
+        self.assertNotEqual(wrong, wd)
+        self.assertIsNone(app._resv_day_only_from_text(f"วัน{wrong}ที่ {d.day} จองโต๊ะ 4 คน"))
+
+    def test_plain_day_only_unchanged(self):
+        """'วันที่ N' แบบไม่มีชื่อวัน ต้องทำงานเหมือนเดิมทุกประการ"""
+        d, _ = self._future(6)
+        self.assertEqual(app._resv_day_only_from_text(f"จองโต๊ะ วันที่ {d.day} 4 คน เวลา 17.00 น."),
+                         d.isoformat())
+
+
 class TestResvFalsePositiveGuards(unittest.TestCase):
     """กันบอทตีข้อความ 'เรื่องขายของ/จ่ายเงิน' เป็นการจอง
 
