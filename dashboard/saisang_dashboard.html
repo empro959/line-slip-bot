@@ -564,9 +564,45 @@ let activeM=0,charts={},pg=1,PG=25,filtRecs=[],activeCat='all';
 // วาง URL ของ Apps Script Web App (ลงท้าย /exec) ตรงนี้ก็ได้ หรือกดปุ่ม "☁️ ตั้งค่า Drive"
 // บนหน้าจอแล้ววาง URL (จะจำไว้ใน localStorage ของอุปกรณ์นั้น) — ดูวิธีสร้างใน GOOGLE_DRIVE_SETUP.md
 const SYNC_URL_DEFAULT='<<ใส่ Apps Script /exec URL ตรงนี้ หรือตั้งผ่านปุ่ม ☁️ ตั้งค่า Drive>>';
-let SYNC_URL=localStorage.getItem('saisang_sync_url')||SYNC_URL_DEFAULT;
+// 🪤 SYNC_URL_DEFAULT เป็นสตริง "ไม่ว่าง" → if(!SYNC_URL) ไม่เคยเป็นจริง
+//    เครื่องที่ยังไม่ตั้งค่าจึงยิง fetch ไปที่ข้อความ placeholder แล้วขึ้น '⚠️ ออฟไลน์'
+//    แทนที่จะบอกว่า 'ยังไม่ได้ตั้งค่า' — คนอ่านแยกไม่ออกว่าเน็ตล่มหรือยังไม่ได้ตั้ง
+const _isPlaceholder=u=>!u||/^<</.test(u);
+let SYNC_URL=localStorage.getItem('saisang_sync_url')||'';
+if(_isPlaceholder(SYNC_URL)) SYNC_URL=_isPlaceholder(SYNC_URL_DEFAULT)?'':SYNC_URL_DEFAULT;
 let DASH_KEY=localStorage.getItem('saisang_dash_key')||'';  // คีย์ขาเขียน (§3.47) เก็บต่อเบราว์เซอร์ ไม่ส่งไปที่อื่นนอกจาก Apps Script ของเราเอง
 let lastSyncStamp=0, syncTimer=null, saveDebounce=null, isSaving=false;
+
+// ── ลิงก์ตั้งค่าครั้งเดียว ────────────────────────────────────────────────
+// เปิด  <หน้าแดชบอร์ด>#s=<URL>|<คีย์>  หนึ่งครั้งบนเครื่องนั้น → จำลง localStorage
+// แล้ว **ลบ hash ทิ้งจากแถบที่อยู่ทันที** คีย์จะไม่ค้างใน URL / ประวัติการเข้าชม
+// หลังจากนั้นเปิดลิงก์เปล่าๆ ก็ซิงค์เองเลย ไม่ต้องกดอะไรอีก
+//
+// ⚠️ ทำไมไม่ฝังคีย์ไว้ในไฟล์เลย: หน้านี้อยู่บนเว็บสาธารณะและอยู่ในรีโปสาธารณะ
+//    ฝังแล้ว = ใครเปิดลิงก์เจอก็เขียนทับข้อมูลการเงินทั้งปีได้ (ซึ่งคือรูที่ §3.47 ปิดไป)
+function applySetupHash(){
+  const h=location.hash||'';
+  const m=h.match(/^#s=(.+)$/);
+  if(!m) return false;
+  let raw=''; try{ raw=decodeURIComponent(m[1]); }catch(e){ raw=m[1]; }
+  const [u,k]=raw.split('|');
+  const uu=(u||'').trim(), kk=(k||'').trim();
+  // ลบ hash ก่อนทำอย่างอื่นเสมอ — ถึงค่าจะใช้ไม่ได้ ก็ต้องไม่ทิ้งคีย์ไว้ในแถบที่อยู่
+  try{ history.replaceState(null,'',location.pathname+location.search); }catch(e){ location.hash=''; }
+  if(!/\/exec$/.test(uu)){ toast('ลิงก์ตั้งค่าไม่ถูกต้อง (ต้องลงท้าย /exec)'); return false; }
+  SYNC_URL=uu; localStorage.setItem('saisang_sync_url',uu);
+  if(kk){ DASH_KEY=kk; localStorage.setItem('saisang_dash_key',kk); }
+  toast('ตั้งค่าซิงค์ให้เครื่องนี้แล้ว — ครั้งต่อไปเปิดได้เลย');
+  return true;
+}
+
+function copySetupLink(){
+  if(!SYNC_URL){ toast('ยังไม่ได้ตั้งค่าซิงค์'); return; }
+  const link=location.origin+location.pathname+'#s='+encodeURIComponent(SYNC_URL+'|'+DASH_KEY);
+  const done=()=>toast('คัดลอกลิงก์ตั้งค่าแล้ว — เปิดลิงก์นี้บนเครื่องอื่นครั้งเดียว');
+  try{ navigator.clipboard.writeText(link).then(done,()=>prompt('คัดลอกลิงก์นี้',link)); }
+  catch(e){ prompt('คัดลอกลิงก์นี้',link); }
+}
 
 function setSyncBadge(state){
   const b=el('sync-status'); if(!b)return;
@@ -575,15 +611,31 @@ function setSyncBadge(state){
 }
 
 function setupSync(){
-  const url=prompt('วางลิงก์ Google Apps Script Web App (ลงท้ายด้วย /exec)\n\nวิธีสร้างดูในไฟล์ GOOGLE_DRIVE_SETUP.md\n\nเว้นว่างแล้วกด OK เพื่อปิดการซิงค์',SYNC_URL||'');
+  // ตั้งค่าไว้แล้ว → ไม่ถามซ้ำ ให้เลือกเอาว่าจะทำอะไร (เปิดหน้าเฉยๆ ไม่มีอะไรเด้งอยู่แล้ว)
+  if(SYNC_URL){
+    const pick=prompt('ซิงค์ Drive เปิดอยู่ '+(DASH_KEY?'✅ (บันทึกได้)':'🟡 (อ่านได้ บันทึกไม่ได้)')+
+      '\n\nพิมพ์เลขแล้วกด OK\n'+
+      '1 = คัดลอกลิงก์ตั้งค่า (เปิดบนเครื่องอื่นครั้งเดียว แล้วใช้ได้เลย)\n'+
+      '2 = เปลี่ยนลิงก์/คีย์\n'+
+      '3 = ปิดการซิงค์เครื่องนี้','1');
+    if(pick===null)return;
+    const c=pick.trim();
+    if(c==='1'){ copySetupLink(); return; }
+    if(c==='3'){ SYNC_URL=''; DASH_KEY='';
+      localStorage.removeItem('saisang_sync_url'); localStorage.removeItem('saisang_dash_key');
+      stopSync(); setSyncBadge('off'); toast('ปิดการซิงค์ Drive แล้ว'); return; }
+    if(c!=='2'){ return; }
+  }
+  const url=prompt('วางลิงก์ Google Apps Script Web App (ลงท้ายด้วย /exec)\n\nวางพร้อมคีย์ในบรรทัดเดียวก็ได้:  <URL>|<คีย์>\n\nเว้นว่างแล้วกด OK เพื่อปิดการซิงค์',SYNC_URL||'');
   if(url===null)return;
-  const u=url.trim();
+  let u=url.trim(), pastedKey=null;
+  if(u.includes('|')){ const [a,b]=u.split('|'); u=(a||'').trim(); pastedKey=(b||'').trim(); }
   if(u && !/\/exec$/.test(u)){toast('ลิงก์ควรลงท้ายด้วย /exec');return;}
   SYNC_URL=u;
   if(u)localStorage.setItem('saisang_sync_url',u); else localStorage.removeItem('saisang_sync_url');
   if(u){
     // คีย์ขาเขียน — ไม่มีคีย์ก็ยังอ่านข้อมูลได้ แต่บันทึกไม่ได้ (ตั้งใจ: ด่านอยู่ที่ขาเขียนเท่านั้น)
-    const kk=prompt('วางคีย์บันทึก (DASH_KEY)\n\nเอามาจาก: Apps Script → รันฟังก์ชัน makeDashKey() ครั้งเดียว → ก๊อปจาก log\n\nเว้นว่าง = อ่านได้แต่บันทึกไม่ได้', DASH_KEY||'');
+    const kk=pastedKey!==null?pastedKey:prompt('วางคีย์บันทึก (DASH_KEY)\n\nเอามาจาก: Apps Script → รันฟังก์ชัน makeDashKey() ครั้งเดียว → ก๊อปจาก log\n\nเว้นว่าง = อ่านได้แต่บันทึกไม่ได้', DASH_KEY||'');
     if(kk!==null){
       DASH_KEY=kk.trim();
       if(DASH_KEY)localStorage.setItem('saisang_dash_key',DASH_KEY); else localStorage.removeItem('saisang_dash_key');
@@ -665,8 +717,13 @@ document.addEventListener('DOMContentLoaded',()=>{
   initUpload();
   renderTabs();
   loadMonth(0);
+  applySetupHash();   // ต้องมาก่อน startSync — ลิงก์ตั้งค่าตั้งค่าให้เสร็จแล้วค่อยเริ่มซิงค์
   startSync();
 });
+
+// วางลิงก์ตั้งค่าทับ 'ขณะหน้าเปิดค้างอยู่' = เปลี่ยนแค่ hash เบราว์เซอร์ไม่โหลดหน้าใหม่
+// → DOMContentLoaded ไม่ยิงซ้ำ ถ้าไม่ดักตรงนี้จะเหมือนกดแล้วไม่มีอะไรเกิดขึ้น
+window.addEventListener('hashchange',()=>{ if(applySetupHash()) startSync(); });
 
 // ═══ UPLOAD — label+for only ═══
 function initUpload(){
