@@ -229,6 +229,10 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;bac
   font-size:12.5px;color:var(--muted);display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center}
 .xbar b{color:var(--soft);font-family:var(--mono)}
 .xbar .xt{color:var(--bright);font-weight:600}
+.xbar.tbar{border-color:color-mix(in srgb,var(--cyan) 45%,var(--border))}
+.xbar .tn{color:var(--muted);font-size:11.5px;font-style:italic}
+.xbar .tok{color:var(--green);font-family:var(--mono);font-weight:700}
+.xbar .tbad{color:var(--red);font-family:var(--mono);font-weight:700}
 .fbar{border:1px solid var(--yellow);border-radius:12px;padding:11px 15px;margin-bottom:14px;font-size:12.5px;
   background:color-mix(in srgb,var(--yellow) 9%,transparent);color:var(--soft)}
 .fbar .fh{color:var(--yellow);font-weight:700;display:block;margin-bottom:5px}
@@ -389,6 +393,7 @@ tr:last-child td{border-bottom:none}
     <div class="kpi km anim d3"><div class="klbl">Cost Ratio</div><div class="kval" id="k-m">106.1%</div><div class="ksub">ค่าใช้จ่าย / ยอดขาย</div></div>
   </div>
   <div id="xfer-bar" class="xbar"></div>
+  <div id="tax-bar" class="xbar tbar"></div>
   <div id="flag-bar" class="fbar"></div>
   <div class="g2"><div class="card full anim">
     <div class="ctitle"><span class="cdot" style="background:var(--cyan)"></span>ค่าใช้จ่ายจริง แยก 5 กลุ่ม</div>
@@ -637,10 +642,24 @@ function mF(m){
     if (_isOtherUnlisted(c.category)) otherRows.push({ category:c.category, amount:a });
   });
   const sales = +(m && m.total_sales) || 0;
-  return { sales, exp, xfer, xferRows, otherRows, g,
-           profit: sales - exp,
+  const profit = sales - exp;
+
+  // ── ภาษีคงเหลือ (ประมาณ) ──
+  // ยอดขายบนหน้าจอรวม VAT 7% แล้ว → VAT ขาย = ยอดขาย x 7/107
+  // ใช้หมวด 'ค่าภาษี' เป็นตัวแทน "VAT ที่ยื่น/จ่ายแล้ว" ตามคำสั่งเจ้าของ (ไม่ใช้ VAT ซื้อ)
+  // ⚠️ เป็นตัวเลขกันเงิน ไม่ใช่บัญชีภาษีจริง · และ 'ค่าภาษี' ยังนับเป็นค่าใช้จ่ายใน
+  //    กลุ่ม 'บิลประจำเดือน' ตามเดิม — ก้อนนี้แยกต่างหาก ไม่ได้หักซ้ำจากกำไร
+  const taxRows = cats.filter(c => !_isXfer(c.category) && _has(c.category,'ค่าภาษี'))
+                      .map(c => ({ category:c.category, amount:+c.amount||0 }));
+  const taxPaid = taxRows.reduce((a,c) => a + c.amount, 0);
+  const vatOut  = Math.round(sales * 7 / 107);
+  const taxDue  = vatOut - taxPaid;
+
+  return { sales, exp, xfer, xferRows, otherRows, g, profit,
+           vatOut, taxPaid, taxRows, taxDue,
+           profitNet: profit - taxDue,
            cost:   sales > 0 ? exp / sales * 100 : 0,
-           margin: sales > 0 ? (sales - exp) / sales * 100 : 0 };
+           margin: sales > 0 ? profit / sales * 100 : 0 };
 }
 
 // หมวดค่าใช้จ่ายสำหรับ "แสดงผล" — ตัดโอน/ชำระหนี้ออก
@@ -1062,6 +1081,18 @@ function buildBreakdown(m){
       : '<span class="xt">🔁 โอน/ชำระหนี้</span><span>เดือนนี้ไม่มีรายการ</span>';
   }
 
+  const tb=el('tax-bar');
+  if(tb){
+    const net=r.profitNet;
+    tb.innerHTML =
+      '<span class="xt">🧾 กันไว้จ่ายภาษี (ประมาณ)</span>'+
+      '<span>VAT ขาย 7/107 <b>฿'+fmt(r.vatOut)+'</b></span>'+
+      '<span>− ค่าภาษีที่จ่าย <b>฿'+fmt(r.taxPaid)+'</b></span>'+
+      '<span>= ภาษีคงเหลือ <b>฿'+fmt(r.taxDue)+'</b></span>'+
+      '<span>กำไรหลังกันภาษี <span class="'+(net>=0?'tok':'tbad')+'">'+(net>=0?'+':'')+'฿'+fmt(net)+'</span></span>'+
+      '<span class="tn">ตัวเลขประมาณเพื่อกันเงิน ไม่ใช่บัญชีภาษี · ไม่ได้หักซ้ำจากกำไรด้านบน</span>';
+  }
+
   const gw=el('grp-wrap');
   if(gw){
     const mx=Math.max(...EXP_GROUPS.concat([{key:'other'}]).map(g=>r.g[g.key]),1);
@@ -1082,6 +1113,12 @@ function buildBreakdown(m){
     let h='';
     if(flags.length) h+='<span class="fh">🟡 รอเจ้าของยืนยัน — ยังไม่แก้ข้อมูลใดๆ</span>'+
       flags.map(x=>'<div class="fi">• '+x.category+'  ฿'+fmt(x.amount)+'  — '+x.note+'</div>').join('');
+    if(r.taxRows.length) h+=(h?'<div style="height:7px"></div>':'')+
+      '<span class="fh">🧾 ข้อสังเกตเรื่องภาษี — รอเจ้าของแยก</span>'+
+      '<div class="fi">• ใช้หมวด “ค่าภาษี” เป็นตัวแทน VAT ที่ยื่น/จ่ายแล้ว ตามที่สั่ง'+
+      (r.taxRows.length>1?' (พบ '+r.taxRows.length+' รายการ)':'')+'</div>'+
+      r.taxRows.map(x=>'<div class="fi">   – '+x.category+'  ฿'+fmt(x.amount)+'</div>').join('')+
+      '<div class="fi">• ถ้าในนี้มีภาษีอื่นปน (ภาษีป้าย/โรงเรือน/ภาษีหัก ณ ที่จ่าย) ตัวเลขภาษีคงเหลือจะต่ำกว่าจริง — บอกมาได้ เดี๋ยวแยกให้</div>';
     if(unlisted.length) h+=(h?'<div style="height:7px"></div>':'')+
       '<span class="fh">ℹ️ หมวดที่ยังไม่ได้จัดกลุ่มชัดเจน (นับรวมอยู่ใน “อื่นๆ” แล้ว)</span>'+
       unlisted.map(x=>'<div class="fi">• '+x.category+'  ฿'+fmt(x.amount)+'</div>').join('');

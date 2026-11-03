@@ -24,9 +24,9 @@ const OCT={ period:'ตุลาคม 2569', total_sales:2257907, expense_categ
   {category:'ก๋วยเตี๋ยว',           amount:60000},
   {category:'CEO',                 amount:50000},
   {category:'พีอาร์',               amount:24512},
-  {category:'ค่าเช่า(กย)',          amount:90000},
-  {category:'ค่าสาธารณูปโภค(กย)',   amount:55232},
-  {category:'ค่าภาษี',              amount:14000},
+  {category:'ค่าเช่า(กย)',          amount:75000},
+  {category:'ค่าสาธารณูปโภค(กย)',   amount:55850},
+  {category:'ค่าภาษี',              amount:28382},
   {category:'คชจ.ในร้าน',           amount:70000},
   {category:'ของสิ้นเปลือง',        amount:40000},
   {category:'BNI',                 amount:12450},
@@ -41,6 +41,14 @@ eq('ค่าใช้จ่ายจริง',      r.exp,    2133374);
 eq('กำไร',              r.profit,  124533);
 eq('โอน/ชำระหนี้ รวม',   r.xfer,    167171);
 chk('กำไร +5.5%',       r.margin.toFixed(1)==='5.5', 'ได้ '+r.margin.toFixed(1));
+
+console.log('\n▶ ภาษีคงเหลือ (ข้อ 3)');
+eq('VAT ขาย 7/107',      r.vatOut,    147714);
+eq('ค่าภาษีที่จ่าย',       r.taxPaid,    28382);
+eq('ภาษีคงเหลือ',        r.taxDue,    119332);
+eq('กำไรหลังกันภาษี',     r.profitNet,   5201);
+chk('ค่าภาษียังนับเป็นค่าใช้จ่ายในบิลประจำเดือน (ไม่หักซ้ำ)', r.g.bill===159232);
+chk('มีรายการค่าภาษีให้เจ้าของตรวจ', r.taxRows.length===1 && r.taxRows[0].amount===28382);
 
 console.log('\n▶ 5 กลุ่ม');
 eq('วัตถุดิบ',        r.g.raw,   414038);
