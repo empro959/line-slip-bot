@@ -225,6 +225,28 @@ body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;bac
 .kpi::after{content:'';position:absolute;top:-20px;right:-20px;width:70px;height:70px;border-radius:50%;opacity:.08}
 .kpi.ks::after{background:var(--green)}.kpi.ke::after{background:var(--red)}.kpi.kn::after{background:var(--yellow)}.kpi.km::after{background:var(--cyan)}
 .klbl{font-size:11px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+.xbar{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:11px 15px;margin-bottom:14px;
+  font-size:12.5px;color:var(--muted);display:flex;flex-wrap:wrap;gap:6px 18px;align-items:center}
+.xbar b{color:var(--soft);font-family:var(--mono)}
+.xbar .xt{color:var(--bright);font-weight:600}
+.xbar.tbar{border-color:color-mix(in srgb,var(--cyan) 45%,var(--border))}
+.xbar .tn{color:var(--muted);font-size:11.5px;font-style:italic}
+.xbar .tok{color:var(--green);font-family:var(--mono);font-weight:700}
+.xbar .tbad{color:var(--red);font-family:var(--mono);font-weight:700}
+.fbar{border:1px solid var(--yellow);border-radius:12px;padding:11px 15px;margin-bottom:14px;font-size:12.5px;
+  background:color-mix(in srgb,var(--yellow) 9%,transparent);color:var(--soft)}
+.fbar .fh{color:var(--yellow);font-weight:700;display:block;margin-bottom:5px}
+.fbar div.fi{font-family:var(--mono);font-size:12px;margin-top:3px}
+.grpwrap{display:flex;flex-direction:column;gap:9px;padding:4px 2px}
+.grow{display:grid;grid-template-columns:120px 1fr 110px 54px;gap:10px;align-items:center;font-size:12.5px}
+.grow .gl{color:var(--soft)}
+.grow .gt{height:9px;border-radius:5px;background:var(--bg3);overflow:hidden}
+.grow .gf{height:100%;border-radius:5px}
+.grow .ga{font-family:var(--mono);text-align:right;color:var(--bright)}
+.grow .gp{font-family:var(--mono);text-align:right;color:var(--muted);font-size:11.5px}
+.grow.gsum{border-top:1px solid var(--border);padding-top:8px;margin-top:3px}
+.grow.gsum .gl,.grow.gsum .ga{color:var(--bright);font-weight:700}
+@media(max-width:700px){.grow{grid-template-columns:96px 1fr 92px 46px;font-size:11.5px}}
 .kval{font-family:var(--mono);font-size:22px;font-weight:600;line-height:1;margin-bottom:4px}
 .kpi.ks .kval{color:var(--green)}.kpi.ke .kval{color:var(--red)}.kpi.kn .kval{color:var(--yellow)}.kpi.km .kval{color:var(--cyan)}
 .ksub{font-size:11px;color:var(--muted)}
@@ -366,10 +388,17 @@ tr:last-child td{border-bottom:none}
 <div id="view-overview" class="view on">
   <div class="krow">
     <div class="kpi ks anim"><div class="klbl">ยอดขายรวม (Inc.VAT)</div><div class="kval" id="k-s">฿2,359,244</div><div class="ksub" id="k-ss">14 หมวดสินค้า</div></div>
-    <div class="kpi ke anim d1"><div class="klbl">ค่าใช้จ่ายรวม</div><div class="kval" id="k-e">฿2,503,002</div><div class="ksub" id="k-es">19 หมวดค่าใช้จ่าย</div></div>
+    <div class="kpi ke anim d1"><div class="klbl">ค่าใช้จ่ายรวม (ไม่รวมโอน/ชำระหนี้)</div><div class="kval" id="k-e">฿2,503,002</div><div class="ksub" id="k-es">19 หมวดค่าใช้จ่าย</div></div>
     <div class="kpi kn anim d2"><div class="klbl">กำไร / ขาดทุนสุทธิ</div><div class="kval" id="k-n" style="color: var(--red);">฿-143,758</div><div class="ksub" id="k-ns">ขาดทุน</div><div class="kbadge bn" id="k-nb">-6.1%</div></div>
     <div class="kpi km anim d3"><div class="klbl">Cost Ratio</div><div class="kval" id="k-m">106.1%</div><div class="ksub">ค่าใช้จ่าย / ยอดขาย</div></div>
   </div>
+  <div id="xfer-bar" class="xbar"></div>
+  <div id="tax-bar" class="xbar tbar"></div>
+  <div id="flag-bar" class="fbar"></div>
+  <div class="g2"><div class="card full anim">
+    <div class="ctitle"><span class="cdot" style="background:var(--cyan)"></span>ค่าใช้จ่ายจริง แยก 5 กลุ่ม</div>
+    <div id="grp-wrap" class="grpwrap"></div>
+  </div></div>
   <div class="g2"><div class="card full anim">
     <div class="ctitle"><span class="cdot" style="background:var(--pink)"></span>ยอดขาย vs ค่าใช้จ่าย vs กำไร</div>
     <div class="ch mid"><canvas id="ch-main" style="box-sizing: border-box; display: block; height: 200px; width: 1354px;" width="1354" height="200"></canvas></div>
@@ -418,7 +447,7 @@ tr:last-child td{border-bottom:none}
 <!-- SALES -->
 <div id="view-sales" class="view">
   <div class="krow">
-    <div class="kpi ks anim"><div class="klbl">ยอดขายรวม</div><div class="kval" id="sv-t">฿2,359,244</div><div class="ksub">รวมทุกหมวด</div></div>
+    <div class="kpi ks anim"><div class="klbl">ยอดขายรวม (Inc.VAT)</div><div class="kval" id="sv-t">฿2,359,244</div><div class="ksub">รวมทุกหมวด</div></div>
     <div class="kpi km anim d1"><div class="klbl">ยอดขายสูงสุด</div><div class="kval" id="sv-top">฿1,408,188</div><div class="ksub" id="sv-tc">12.เครื่องดื่ม</div></div>
     <div class="kpi anim d2"><div class="klbl">หมวดสินค้า</div><div class="kval" id="sv-c" style="color:var(--purple)">14</div><div class="ksub">categories</div></div>
     <div class="kpi anim d3"><div class="klbl">VAT (7%)</div><div class="kval" id="sv-v" style="color:var(--pink)">฿154,169</div><div class="ksub">ภาษีมูลค่าเพิ่ม</div></div>
@@ -488,7 +517,7 @@ tr:last-child td{border-bottom:none}
 <div id="view-annual" class="view">
   <div class="seclbl">สรุปรายรับ-รายจ่ายรายปี</div>
   <div class="krow">
-    <div class="kpi ks anim"><div class="klbl">ยอดขายรวมทั้งปี</div><div class="kval" id="ay-s">—</div><div class="ksub" id="ay-ss">—</div></div>
+    <div class="kpi ks anim"><div class="klbl">ยอดขายรวมทั้งปี (Inc.VAT)</div><div class="kval" id="ay-s">—</div><div class="ksub" id="ay-ss">—</div></div>
     <div class="kpi ke anim d1"><div class="klbl">ค่าใช้จ่ายรวมทั้งปี</div><div class="kval" id="ay-e">—</div><div class="ksub" id="ay-es">—</div></div>
     <div class="kpi kn anim d2"><div class="klbl">กำไร/ขาดทุนสะสม</div><div class="kval" id="ay-n">—</div><div class="ksub" id="ay-ns">—</div><div class="kbadge" id="ay-nb"></div></div>
     <div class="kpi km anim d3"><div class="klbl">Cost Ratio เฉลี่ย</div><div class="kval" id="ay-r">—</div><div class="ksub" id="ay-ms">—</div></div>
@@ -560,13 +589,152 @@ let months=Object.values(RAWDATA).sort((a,b)=>pOrd(a.period)-pOrd(b.period));
 months=months.map(m=>({...m,shortLabel:sLabel(m.period)}));
 let activeM=0,charts={},pg=1,PG=25,filtRecs=[],activeCat='all';
 
+// ═══ กำไรจริงของร้าน + สรุป 5 กลุ่ม (คำสั่งเจ้าของ 3 พ.ย. 2569) ═══
+// "เก็บออมร้านญี่ปุ่น" = เงินกันไว้/โอน · "ชำระหนี้" = การคืนเงิน (รวม E&M)
+// ทั้งสองอย่าง **ไม่ใช่ต้นทุนร้าน** — เดิมถูกนับรวมเป็นค่าใช้จ่าย ทำให้โชว์ขาดทุนทั้งที่กำไรเป็นบวก
+//
+// 📌 คิดสดทุกครั้งที่แสดงผล ไม่เขียนทับ total_expenses / net_profit ที่เก็บไว้ เพราะ:
+//    1) คำสั่งเจ้าของ: ห้ามแก้ข้อมูลดิบ
+//    2) เดือนเก่าที่บันทึกไปแล้วได้ตัวเลขใหม่ทันทีโดยไม่ต้องอัปโหลด Excel ซ้ำ
+//    3) months ถูกส่งขึ้น Drive ทั้งก้อน — ถ้าแปะฟิลด์ใหม่เข้าไปจะกลายเป็นการแก้ข้อมูลดิบ
+const XFER_CATS = ['เก็บออมร้านญี่ปุ่น', 'ชำระหนี้'];
+
+// 4 กลุ่มที่จับด้วยชื่อ + 'อื่นๆ' ที่เป็นถังรับส่วนที่เหลือทั้งหมด
+// ทำไม 'อื่นๆ' ต้องเป็นถังรับที่เหลือ ไม่ใช่รายชื่อตายตัว:
+//   เกณฑ์ของเจ้าของบวก 5 กลุ่มแล้วต้องเท่ากับค่าใช้จ่ายจริงพอดี (414,038+683,142+754,512+159,232+122,450
+//   = 2,133,374) แปลว่าทุกบาทต้องอยู่ในกลุ่มใดกลุ่มหนึ่งเสมอ · ถ้าใช้รายชื่อตายตัว หมวดใหม่ที่
+//   โผล่มาทีหลังจะตกหล่นออกจากทั้ง 5 กลุ่มแล้วยอดไม่บรรจบ โดยไม่มีอะไรฟ้อง
+const EXP_GROUPS = [
+  { key:'raw',   label:'วัตถุดิบ',      match:['วัตถุดิบ'] },
+  { key:'drink', label:'เครื่องดื่ม',    match:['เครื่องดื่ม'] },
+  { key:'labor', label:'ค่าแรง',        match:['พนักงานหน้าร้าน','ครัว','นักร้อง','ก๋วยเตี๋ยว','CEO','พีอาร์'] },
+  { key:'bill',  label:'บิลประจำเดือน',  match:['ค่าเช่า','ค่าสาธารณูปโภค','ค่าภาษี'] },
+];
+const OTHER_KNOWN = ['คชจ.ในร้าน','ของสิ้นเปลือง','BNI','อื่นๆ'];   // ตั้งใจให้อยู่ 'อื่นๆ'
+
+// 🪤 ชื่อจริงในไฟล์ไม่ตรงกับชื่อย่อในใบสั่งงาน — 'ครัว' ของจริงคือ 'พนักงานครัว'
+//    และ 'ก๋วยเตี๋ยว' คือ 'พนง.ก๋วยเตี๋ยว' → ถ้าจับแบบ "ขึ้นต้นด้วย" จะหลุดทั้งคู่ (838,862 + 89,150)
+//    จึงต้องจับแบบ "มีคำนี้อยู่ข้างใน" · และยังรองรับหางวงเล็บ เช่น 'ค่าเช่า(กย)' ไปด้วยในตัว
+const _nrm = t => String(t||'').replace(/\s+/g,'').toLowerCase();
+const _has = (c,w) => _nrm(c).indexOf(_nrm(w)) >= 0;
+const _isXfer = c => XFER_CATS.some(x => _has(c,x));
+function _groupOf(c){
+  for(const g of EXP_GROUPS) if(g.match.some(m=>_has(c,m))) return g.key;
+  return 'other';                       // ที่เหลือทั้งหมดลง 'อื่นๆ' — ยอดบรรจบเสมอ
+}
+// หมวดที่ตกมาอยู่ 'อื่นๆ' โดยไม่ได้อยู่ในรายชื่อที่ตั้งใจ → ไม่ได้ผิด แต่ควรให้เจ้าของเห็น
+const _isOtherUnlisted = c => _groupOf(c)==='other' && !OTHER_KNOWN.some(k=>_has(c,k));
+
+// เดือนไทยในวงเล็บ เช่น 'ค่าเช่า(กย)' = บิลของเดือนกันยาฯ ที่มาจ่ายเดือนนี้ (ปกติ)
+const _TH_MO_ABBR = ['มค','กพ','มีค','เมย','พค','มิย','กค','สค','กย','ตค','พย','ธค'];
+
+// ผลคำนวณทั้งหมดของเดือนหนึ่ง — ฟังก์ชันบริสุทธิ์ ไม่แตะ m
+function mF(m){
+  const cats = (m && m.expense_categories) || [];
+  const g = { raw:0, drink:0, labor:0, bill:0, other:0 };
+  let exp = 0, xfer = 0;
+  const xferRows = [], otherRows = [];
+  cats.forEach(c => {
+    const a = +c.amount || 0;
+    if (_isXfer(c.category)) { xfer += a; xferRows.push({ category:c.category, amount:a }); return; }
+    exp += a;
+    g[_groupOf(c.category)] += a;
+    if (_isOtherUnlisted(c.category)) otherRows.push({ category:c.category, amount:a });
+  });
+  const sales = +(m && m.total_sales) || 0;
+  const profit = sales - exp;
+
+  // ── ภาษีคงเหลือ (ประมาณ) ──
+  // ยอดขายบนหน้าจอรวม VAT 7% แล้ว → VAT ขาย = ยอดขาย x 7/107
+  // ใช้หมวด 'ค่าภาษี' เป็นตัวแทน "VAT ที่ยื่น/จ่ายแล้ว" ตามคำสั่งเจ้าของ (ไม่ใช้ VAT ซื้อ)
+  // ⚠️ เป็นตัวเลขกันเงิน ไม่ใช่บัญชีภาษีจริง · และ 'ค่าภาษี' ยังนับเป็นค่าใช้จ่ายใน
+  //    กลุ่ม 'บิลประจำเดือน' ตามเดิม — ก้อนนี้แยกต่างหาก ไม่ได้หักซ้ำจากกำไร
+  const taxRows = cats.filter(c => !_isXfer(c.category) && _has(c.category,'ค่าภาษี'))
+                      .map(c => ({ category:c.category, amount:+c.amount||0 }));
+  const taxPaid = taxRows.reduce((a,c) => a + c.amount, 0);
+  const vatOut  = Math.round(sales * 7 / 107);
+  const taxDue  = vatOut - taxPaid;
+
+  return { sales, exp, xfer, xferRows, otherRows, g, profit,
+           vatOut, taxPaid, taxRows, taxDue,
+           profitNet: profit - taxDue,
+           cost:   sales > 0 ? exp / sales * 100 : 0,
+           margin: sales > 0 ? profit / sales * 100 : 0 };
+}
+
+// หมวดค่าใช้จ่ายสำหรับ "แสดงผล" — ตัดโอน/ชำระหนี้ออก
+// ทุกกราฟที่แจกแจงค่าใช้จ่ายต้องใช้ตัวนี้ ไม่งั้นผลรวมในกราฟจะไม่ตรงกับ 'ค่าใช้จ่ายจริง' ที่โชว์ข้างบน
+const eCatsOf = m => ((m && m.expense_categories) || []).filter(c => !_isXfer(c.category));
+
+// รายการที่ "เดือนในวงเล็บ" ห่างจากงวดเกิน 1 เดือน → น่าจะพิมพ์ผิด
+// ⛔ แค่ตั้งธงให้เจ้าของยืนยัน ห้ามแก้ข้อมูลเอง (คำสั่งเจ้าของ ข้อ 5)
+function mFlags(m){
+  const out = [];
+  if (!m) return out;
+  const pm = _periodMonth(m.period);
+  if (pm === null) return out;
+  ((m.expense_categories)||[]).forEach(c => {
+    const mm = String(c.category||'').match(/\(([^)]+)\)/);
+    if (!mm) return;
+    const i = _TH_MO_ABBR.indexOf(_nrm(mm[1]));
+    if (i < 0) return;
+    let gap = pm - i; if (gap < 0) gap += 12;          // ข้ามปี
+    if (gap > 1) out.push({ category:c.category, amount:+c.amount||0,
+                            note:'ระบุเดือน ' + mm[1] + ' แต่เป็นงวด ' + m.period + ' (ห่าง ' + gap + ' เดือน)' });
+  });
+  return out;
+}
+// เลขเดือน 0-11 จากชื่องวด เช่น 'ตุลาคม 2569'
+function _periodMonth(period){
+  const full = ['มกรา','กุมภา','มีนา','เมษา','พฤษภา','มิถุนา','กรกฎา','สิงหา','กันยา','ตุลา','พฤศจิกา','ธันวา'];
+  const n = _nrm(period);
+  for (let i = 0; i < full.length; i++) if (n.indexOf(_nrm(full[i])) >= 0) return i;
+  return null;
+}
+
 // ═══ GOOGLE DRIVE SYNC ═══
 // วาง URL ของ Apps Script Web App (ลงท้าย /exec) ตรงนี้ก็ได้ หรือกดปุ่ม "☁️ ตั้งค่า Drive"
 // บนหน้าจอแล้ววาง URL (จะจำไว้ใน localStorage ของอุปกรณ์นั้น) — ดูวิธีสร้างใน GOOGLE_DRIVE_SETUP.md
 const SYNC_URL_DEFAULT='<<ใส่ Apps Script /exec URL ตรงนี้ หรือตั้งผ่านปุ่ม ☁️ ตั้งค่า Drive>>';
-let SYNC_URL=localStorage.getItem('saisang_sync_url')||SYNC_URL_DEFAULT;
+// 🪤 SYNC_URL_DEFAULT เป็นสตริง "ไม่ว่าง" → if(!SYNC_URL) ไม่เคยเป็นจริง
+//    เครื่องที่ยังไม่ตั้งค่าจึงยิง fetch ไปที่ข้อความ placeholder แล้วขึ้น '⚠️ ออฟไลน์'
+//    แทนที่จะบอกว่า 'ยังไม่ได้ตั้งค่า' — คนอ่านแยกไม่ออกว่าเน็ตล่มหรือยังไม่ได้ตั้ง
+const _isPlaceholder=u=>!u||/^<</.test(u);
+let SYNC_URL=localStorage.getItem('saisang_sync_url')||'';
+if(_isPlaceholder(SYNC_URL)) SYNC_URL=_isPlaceholder(SYNC_URL_DEFAULT)?'':SYNC_URL_DEFAULT;
 let DASH_KEY=localStorage.getItem('saisang_dash_key')||'';  // คีย์ขาเขียน (§3.47) เก็บต่อเบราว์เซอร์ ไม่ส่งไปที่อื่นนอกจาก Apps Script ของเราเอง
 let lastSyncStamp=0, syncTimer=null, saveDebounce=null, isSaving=false;
+
+// ── ลิงก์ตั้งค่าครั้งเดียว ────────────────────────────────────────────────
+// เปิด  <หน้าแดชบอร์ด>#s=<URL>|<คีย์>  หนึ่งครั้งบนเครื่องนั้น → จำลง localStorage
+// แล้ว **ลบ hash ทิ้งจากแถบที่อยู่ทันที** คีย์จะไม่ค้างใน URL / ประวัติการเข้าชม
+// หลังจากนั้นเปิดลิงก์เปล่าๆ ก็ซิงค์เองเลย ไม่ต้องกดอะไรอีก
+//
+// ⚠️ ทำไมไม่ฝังคีย์ไว้ในไฟล์เลย: หน้านี้อยู่บนเว็บสาธารณะและอยู่ในรีโปสาธารณะ
+//    ฝังแล้ว = ใครเปิดลิงก์เจอก็เขียนทับข้อมูลการเงินทั้งปีได้ (ซึ่งคือรูที่ §3.47 ปิดไป)
+function applySetupHash(){
+  const h=location.hash||'';
+  const m=h.match(/^#s=(.+)$/);
+  if(!m) return false;
+  let raw=''; try{ raw=decodeURIComponent(m[1]); }catch(e){ raw=m[1]; }
+  const [u,k]=raw.split('|');
+  const uu=(u||'').trim(), kk=(k||'').trim();
+  // ลบ hash ก่อนทำอย่างอื่นเสมอ — ถึงค่าจะใช้ไม่ได้ ก็ต้องไม่ทิ้งคีย์ไว้ในแถบที่อยู่
+  try{ history.replaceState(null,'',location.pathname+location.search); }catch(e){ location.hash=''; }
+  if(!/\/exec$/.test(uu)){ toast('ลิงก์ตั้งค่าไม่ถูกต้อง (ต้องลงท้าย /exec)'); return false; }
+  SYNC_URL=uu; localStorage.setItem('saisang_sync_url',uu);
+  if(kk){ DASH_KEY=kk; localStorage.setItem('saisang_dash_key',kk); }
+  toast('ตั้งค่าซิงค์ให้เครื่องนี้แล้ว — ครั้งต่อไปเปิดได้เลย');
+  return true;
+}
+
+function copySetupLink(){
+  if(!SYNC_URL){ toast('ยังไม่ได้ตั้งค่าซิงค์'); return; }
+  const link=location.origin+location.pathname+'#s='+encodeURIComponent(SYNC_URL+'|'+DASH_KEY);
+  const done=()=>toast('คัดลอกลิงก์ตั้งค่าแล้ว — เปิดลิงก์นี้บนเครื่องอื่นครั้งเดียว');
+  try{ navigator.clipboard.writeText(link).then(done,()=>prompt('คัดลอกลิงก์นี้',link)); }
+  catch(e){ prompt('คัดลอกลิงก์นี้',link); }
+}
 
 function setSyncBadge(state){
   const b=el('sync-status'); if(!b)return;
@@ -575,15 +743,31 @@ function setSyncBadge(state){
 }
 
 function setupSync(){
-  const url=prompt('วางลิงก์ Google Apps Script Web App (ลงท้ายด้วย /exec)\n\nวิธีสร้างดูในไฟล์ GOOGLE_DRIVE_SETUP.md\n\nเว้นว่างแล้วกด OK เพื่อปิดการซิงค์',SYNC_URL||'');
+  // ตั้งค่าไว้แล้ว → ไม่ถามซ้ำ ให้เลือกเอาว่าจะทำอะไร (เปิดหน้าเฉยๆ ไม่มีอะไรเด้งอยู่แล้ว)
+  if(SYNC_URL){
+    const pick=prompt('ซิงค์ Drive เปิดอยู่ '+(DASH_KEY?'✅ (บันทึกได้)':'🟡 (อ่านได้ บันทึกไม่ได้)')+
+      '\n\nพิมพ์เลขแล้วกด OK\n'+
+      '1 = คัดลอกลิงก์ตั้งค่า (เปิดบนเครื่องอื่นครั้งเดียว แล้วใช้ได้เลย)\n'+
+      '2 = เปลี่ยนลิงก์/คีย์\n'+
+      '3 = ปิดการซิงค์เครื่องนี้','1');
+    if(pick===null)return;
+    const c=pick.trim();
+    if(c==='1'){ copySetupLink(); return; }
+    if(c==='3'){ SYNC_URL=''; DASH_KEY='';
+      localStorage.removeItem('saisang_sync_url'); localStorage.removeItem('saisang_dash_key');
+      stopSync(); setSyncBadge('off'); toast('ปิดการซิงค์ Drive แล้ว'); return; }
+    if(c!=='2'){ return; }
+  }
+  const url=prompt('วางลิงก์ Google Apps Script Web App (ลงท้ายด้วย /exec)\n\nวางพร้อมคีย์ในบรรทัดเดียวก็ได้:  <URL>|<คีย์>\n\nเว้นว่างแล้วกด OK เพื่อปิดการซิงค์',SYNC_URL||'');
   if(url===null)return;
-  const u=url.trim();
+  let u=url.trim(), pastedKey=null;
+  if(u.includes('|')){ const [a,b]=u.split('|'); u=(a||'').trim(); pastedKey=(b||'').trim(); }
   if(u && !/\/exec$/.test(u)){toast('ลิงก์ควรลงท้ายด้วย /exec');return;}
   SYNC_URL=u;
   if(u)localStorage.setItem('saisang_sync_url',u); else localStorage.removeItem('saisang_sync_url');
   if(u){
     // คีย์ขาเขียน — ไม่มีคีย์ก็ยังอ่านข้อมูลได้ แต่บันทึกไม่ได้ (ตั้งใจ: ด่านอยู่ที่ขาเขียนเท่านั้น)
-    const kk=prompt('วางคีย์บันทึก (DASH_KEY)\n\nเอามาจาก: Apps Script → รันฟังก์ชัน makeDashKey() ครั้งเดียว → ก๊อปจาก log\n\nเว้นว่าง = อ่านได้แต่บันทึกไม่ได้', DASH_KEY||'');
+    const kk=pastedKey!==null?pastedKey:prompt('วางคีย์บันทึก (DASH_KEY)\n\nเอามาจาก: Apps Script → รันฟังก์ชัน makeDashKey() ครั้งเดียว → ก๊อปจาก log\n\nเว้นว่าง = อ่านได้แต่บันทึกไม่ได้', DASH_KEY||'');
     if(kk!==null){
       DASH_KEY=kk.trim();
       if(DASH_KEY)localStorage.setItem('saisang_dash_key',DASH_KEY); else localStorage.removeItem('saisang_dash_key');
@@ -665,8 +849,13 @@ document.addEventListener('DOMContentLoaded',()=>{
   initUpload();
   renderTabs();
   loadMonth(0);
+  applySetupHash();   // ต้องมาก่อน startSync — ลิงก์ตั้งค่าตั้งค่าให้เสร็จแล้วค่อยเริ่มซิงค์
   startSync();
 });
+
+// วางลิงก์ตั้งค่าทับ 'ขณะหน้าเปิดค้างอยู่' = เปลี่ยนแค่ hash เบราว์เซอร์ไม่โหลดหน้าใหม่
+// → DOMContentLoaded ไม่ยิงซ้ำ ถ้าไม่ดักตรงนี้จะเหมือนกดแล้วไม่มีอะไรเกิดขึ้น
+window.addEventListener('hashchange',()=>{ if(applySetupHash()) startSync(); });
 
 // ═══ UPLOAD — label+for only ═══
 function initUpload(){
@@ -865,18 +1054,78 @@ function loadMonth(idx){
 // ═══ KPIs ═══
 function buildKPIs(m){
   set('k-s','฿'+fmt(m.total_sales));set('k-ss',m.sales_categories.length+' หมวดสินค้า');
-  set('k-e','฿'+fmt(m.total_expenses));set('k-es',m.expense_categories.length+' หมวดค่าใช้จ่าย');
-  const n=m.net_profit;
+  set('k-e','฿'+fmt(mF(m).exp));set('k-es',eCatsOf(m).length+' หมวดค่าใช้จ่าย');
+  const n=mF(m).profit;
   set('k-n',(n>=0?'+':'')+'฿'+fmt(n));el('k-n').style.color=n>=0?'var(--green)':'var(--red)';
   set('k-ns',n>=0?'กำไรสุทธิ':'ขาดทุน');
   const nb=el('k-nb');nb.textContent=(n>=0?'+':'')+((n/m.total_sales)*100).toFixed(1)+'%';nb.className='kbadge '+(n>=0?'bp':'bn');
-  set('k-m',(m.total_expenses/m.total_sales*100).toFixed(1)+'%');
+  set('k-m',(mF(m).exp/m.total_sales*100).toFixed(1)+'%');
   set('sv-t','฿'+fmt(m.total_sales));
   const ts=m.sales_categories[0];
   if(ts){set('sv-top','฿'+fmt(ts.amount));set('sv-tc',ts.category);}
   set('sv-c',m.sales_categories.length);
   set('sv-v','฿'+fmt(m.sales_categories.reduce((a,c)=>a+(c.vat||0),0)));
+  buildBreakdown(m);
 }
+// แถบ "โอน/ชำระหนี้" + การ์ด 5 กลุ่ม + ธงรอเจ้าของยืนยัน (คำสั่งเจ้าของ 3 พ.ย. 2569)
+const GRP_COLOR={raw:'var(--green)',drink:'var(--cyan)',labor:'var(--yellow)',bill:'var(--pink)',other:'var(--purple)'};
+function buildBreakdown(m){
+  const r=mF(m);
+
+  const xb=el('xfer-bar');
+  if(xb){
+    const parts=r.xferRows.map(x=>x.category+' <b>฿'+fmt(x.amount)+'</b>');
+    xb.innerHTML = r.xfer>0
+      ? '<span class="xt">🔁 โอน/ชำระหนี้ — ไม่ใช่ต้นทุนร้าน</span>'+parts.map(p=>'<span>'+p+'</span>').join('')+
+        '<span>รวม <b>฿'+fmt(r.xfer)+'</b></span>'
+      : '<span class="xt">🔁 โอน/ชำระหนี้</span><span>เดือนนี้ไม่มีรายการ</span>';
+  }
+
+  const tb=el('tax-bar');
+  if(tb){
+    const net=r.profitNet;
+    tb.innerHTML =
+      '<span class="xt">🧾 กันไว้จ่ายภาษี (ประมาณ)</span>'+
+      '<span>VAT ขาย 7/107 <b>฿'+fmt(r.vatOut)+'</b></span>'+
+      '<span>− ค่าภาษีที่จ่าย <b>฿'+fmt(r.taxPaid)+'</b></span>'+
+      '<span>= ภาษีคงเหลือ <b>฿'+fmt(r.taxDue)+'</b></span>'+
+      '<span>กำไรหลังกันภาษี <span class="'+(net>=0?'tok':'tbad')+'">'+(net>=0?'+':'')+'฿'+fmt(net)+'</span></span>'+
+      '<span class="tn">ตัวเลขประมาณเพื่อกันเงิน ไม่ใช่บัญชีภาษี · ไม่ได้หักซ้ำจากกำไรด้านบน</span>';
+  }
+
+  const gw=el('grp-wrap');
+  if(gw){
+    const mx=Math.max(...EXP_GROUPS.concat([{key:'other'}]).map(g=>r.g[g.key]),1);
+    const rows=EXP_GROUPS.concat([{key:'other',label:'อื่นๆ'}]).map(g=>{
+      const a=r.g[g.key], pc=r.exp>0?a/r.exp*100:0;
+      return '<div class="grow"><div class="gl">'+g.label+'</div>'+
+        '<div class="gt"><div class="gf" style="width:'+(a/mx*100).toFixed(1)+'%;background:'+GRP_COLOR[g.key]+'"></div></div>'+
+        '<div class="ga">฿'+fmt(a)+'</div><div class="gp">'+pc.toFixed(1)+'%</div></div>';
+    }).join('');
+    gw.innerHTML = rows +
+      '<div class="grow gsum"><div class="gl">ค่าใช้จ่ายจริง</div><div></div>'+
+      '<div class="ga">฿'+fmt(r.exp)+'</div><div class="gp">100%</div></div>';
+  }
+
+  const fb=el('flag-bar');
+  if(fb){
+    const flags=mFlags(m), unlisted=r.otherRows;
+    let h='';
+    if(flags.length) h+='<span class="fh">🟡 รอเจ้าของยืนยัน — ยังไม่แก้ข้อมูลใดๆ</span>'+
+      flags.map(x=>'<div class="fi">• '+x.category+'  ฿'+fmt(x.amount)+'  — '+x.note+'</div>').join('');
+    if(r.taxRows.length) h+=(h?'<div style="height:7px"></div>':'')+
+      '<span class="fh">🧾 ข้อสังเกตเรื่องภาษี — รอเจ้าของแยก</span>'+
+      '<div class="fi">• ใช้หมวด “ค่าภาษี” เป็นตัวแทน VAT ที่ยื่น/จ่ายแล้ว ตามที่สั่ง'+
+      (r.taxRows.length>1?' (พบ '+r.taxRows.length+' รายการ)':'')+'</div>'+
+      r.taxRows.map(x=>'<div class="fi">   – '+x.category+'  ฿'+fmt(x.amount)+'</div>').join('')+
+      '<div class="fi">• ถ้าในนี้มีภาษีอื่นปน (ภาษีป้าย/โรงเรือน/ภาษีหัก ณ ที่จ่าย) ตัวเลขภาษีคงเหลือจะต่ำกว่าจริง — บอกมาได้ เดี๋ยวแยกให้</div>';
+    if(unlisted.length) h+=(h?'<div style="height:7px"></div>':'')+
+      '<span class="fh">ℹ️ หมวดที่ยังไม่ได้จัดกลุ่มชัดเจน (นับรวมอยู่ใน “อื่นๆ” แล้ว)</span>'+
+      unlisted.map(x=>'<div class="fi">• '+x.category+'  ฿'+fmt(x.amount)+'</div>').join('');
+    fb.innerHTML=h; fb.style.display=h?'':'none';
+  }
+}
+
 function el(id){return document.getElementById(id);}
 function set(id,v){const e=el(id);if(e)e.textContent=v;}
 
@@ -919,12 +1168,12 @@ const dlOffset = ctx => dlOut_(ctx) ? 4    : -2;
 function buildOV(m){
   dc('main');
   charts['main']=new Chart(el('ch-main'),{type:'bar',
-    data:{labels:['ยอดขาย','ค่าใช้จ่าย','กำไร/ขาดทุน'],datasets:[{data:[m.total_sales,m.total_expenses,Math.abs(m.net_profit)],backgroundColor:['rgba(105,255,71,.8)','rgba(255,82,82,.8)',m.net_profit>=0?'rgba(255,215,64,.8)':'rgba(255,82,82,.5)'],borderRadius:8,borderSkipped:false}]},
-    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>' '+((c.dataIndex===2&&m.net_profit<0)?'-฿':'฿')+fmt(c.parsed.y)}},
-      datalabels:{color:dlColor,font:{size:12,weight:'bold',family:"'IBM Plex Mono',monospace"},anchor:'end',align:dlAlign,offset:dlOffset,clamp:true,textAlign:'center',formatter:(v,ctx)=>((ctx.dataIndex===2&&m.net_profit<0)?'-฿':'฿')+fmt(v)+'\n('+(v/m.total_sales*100).toFixed(1)+'%)'}},
+    data:{labels:['ยอดขาย','ค่าใช้จ่าย','กำไร/ขาดทุน'],datasets:[{data:[m.total_sales,mF(m).exp,Math.abs(mF(m).profit)],backgroundColor:['rgba(105,255,71,.8)','rgba(255,82,82,.8)',mF(m).profit>=0?'rgba(255,215,64,.8)':'rgba(255,82,82,.5)'],borderRadius:8,borderSkipped:false}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>' '+((c.dataIndex===2&&mF(m).profit<0)?'-฿':'฿')+fmt(c.parsed.y)}},
+      datalabels:{color:dlColor,font:{size:12,weight:'bold',family:"'IBM Plex Mono',monospace"},anchor:'end',align:dlAlign,offset:dlOffset,clamp:true,textAlign:'center',formatter:(v,ctx)=>((ctx.dataIndex===2&&mF(m).profit<0)?'-฿':'฿')+fmt(v)+'\n('+(v/m.total_sales*100).toFixed(1)+'%)'}},
     scales:{x:{grid:{display:false},ticks:{font:{size:13,weight:'600'}}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}
   });
-  const top8e=m.expense_categories.slice(0,8),totE=top8e.reduce((a,c)=>a+c.amount,0);
+  const top8e=eCatsOf(m).slice(0,8),totE=top8e.reduce((a,c)=>a+c.amount,0);
   dc('ed');charts['ed']=new Chart(el('ch-ed'),{type:'doughnut',data:{labels:top8e.map(c=>c.category),datasets:[{data:top8e.map(c=>c.amount),backgroundColor:PAL.slice(0,8),borderWidth:0,hoverOffset:8}]},
     options:{responsive:true,maintainAspectRatio:false,cutout:'62%',plugins:{legend:{position:'right',labels:{boxWidth:9,padding:9,font:{size:10}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed)}},datalabels:dlD(totE)}}});
   const top8s=m.sales_categories.slice(0,8),totS=top8s.reduce((a,c)=>a+c.amount,0);
@@ -1059,7 +1308,7 @@ function buildWeekdayProfit(m){
   });
 }
 function buildEX(m){
-  const cats=m.expense_categories,totE=cats.reduce((a,c)=>a+c.amount,0),maxA=cats[0]?.amount||1;
+  const cats=eCatsOf(m),totE=cats.reduce((a,c)=>a+c.amount,0),maxA=cats[0]?.amount||1;
   dc('ep');charts['ep']=new Chart(el('ch-ep'),{type:'pie',data:{labels:cats.map(c=>c.category),datasets:[{data:cats.map(c=>c.amount),backgroundColor:PAL.slice(0,cats.length),borderWidth:0,hoverOffset:8}]},
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'right',labels:{boxWidth:9,padding:8,font:{size:10}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed)}},datalabels:dlD(totE)}}});
   el('exp-rank').innerHTML=cats.map((c,i)=>`<div class="rankitem"><div class="rname" title="${c.category}" style="color:${PAL[i%PAL.length]}">${c.category}<\/div><div class="rtrack"><div class="rfill" style="width:${c.amount/maxA*100}%;background:${PAL[i%PAL.length]}"><\/div><\/div><div class="ramt" style="color:${PAL[i%PAL.length]}">฿${fmt(c.amount)}<br><span style="color:var(--muted);font-size:11px">${(c.amount/totE*100).toFixed(1)}%<\/span><\/div><\/div>`).join('');
@@ -1098,13 +1347,13 @@ function buildCmp(){
   if(months.length<2){el('cmp-kpis').innerHTML='<div class="empty" style="grid-column:1/-1"><div class="empty-ico">📊<\/div><div class="empty-h">ต้องมี 2 เดือนขึ้นไป<\/div><div class="empty-p">อัพโหลดเดือนอื่นเพื่อเปรียบเทียบ<\/div><\/div>';return;}
   el('cmp-kpis').innerHTML=`
     <div class="cmpcard"><div class="cmplbl">ยอดขายรวม<\/div><div class="cmpvals">${months.map(m=>`<div class="cmpv"><div class="mono green">฿${fmt(m.total_sales)}<\/div><div style="font-size:11px;color:var(--muted)">${m.shortLabel}<\/div><\/div>`).join('')}<\/div><\/div>
-    <div class="cmpcard"><div class="cmplbl">ค่าใช้จ่ายรวม<\/div><div class="cmpvals">${months.map(m=>`<div class="cmpv"><div class="mono red">฿${fmt(m.total_expenses)}<\/div><div style="font-size:11px;color:var(--muted)">${m.shortLabel}<\/div><\/div>`).join('')}<\/div><\/div>
-    <div class="cmpcard"><div class="cmplbl">กำไร/ขาดทุน<\/div><div class="cmpvals">${months.map(m=>`<div class="cmpv"><div class="mono" style="color:${m.net_profit>=0?'var(--green)':'var(--red)'}">${m.net_profit>=0?'+':''}฿${fmt(m.net_profit)}<\/div><div style="font-size:11px;color:var(--muted)">${m.shortLabel}<\/div><\/div>`).join('')}<\/div><\/div>
-    <div class="cmpcard"><div class="cmplbl">Cost Ratio<\/div><div class="cmpvals">${months.map(m=>`<div class="cmpv"><div class="mono" style="color:var(--cyan)">${(m.total_expenses/m.total_sales*100).toFixed(1)}%<\/div><div style="font-size:11px;color:var(--muted)">${m.shortLabel}<\/div><\/div>`).join('')}<\/div><\/div>`;
-  dc('cb');charts['cb']=new Chart(el('ch-cb'),{type:'bar',data:{labels:months.map(m=>m.shortLabel),datasets:[{label:'ยอดขาย',data:months.map(m=>m.total_sales),backgroundColor:'rgba(105,255,71,.75)',borderRadius:5},{label:'ค่าใช้จ่าย',data:months.map(m=>m.total_expenses),backgroundColor:'rgba(255,82,82,.75)',borderRadius:5},{label:'กำไร',data:months.map(m=>m.net_profit),backgroundColor:'rgba(255,215,64,.75)',borderRadius:5}]},
+    <div class="cmpcard"><div class="cmplbl">ค่าใช้จ่ายรวม<\/div><div class="cmpvals">${months.map(m=>`<div class="cmpv"><div class="mono red">฿${fmt(mF(m).exp)}<\/div><div style="font-size:11px;color:var(--muted)">${m.shortLabel}<\/div><\/div>`).join('')}<\/div><\/div>
+    <div class="cmpcard"><div class="cmplbl">กำไร/ขาดทุน<\/div><div class="cmpvals">${months.map(m=>`<div class="cmpv"><div class="mono" style="color:${mF(m).profit>=0?'var(--green)':'var(--red)'}">${mF(m).profit>=0?'+':''}฿${fmt(mF(m).profit)}<\/div><div style="font-size:11px;color:var(--muted)">${m.shortLabel}<\/div><\/div>`).join('')}<\/div><\/div>
+    <div class="cmpcard"><div class="cmplbl">Cost Ratio<\/div><div class="cmpvals">${months.map(m=>`<div class="cmpv"><div class="mono" style="color:var(--cyan)">${(mF(m).exp/m.total_sales*100).toFixed(1)}%<\/div><div style="font-size:11px;color:var(--muted)">${m.shortLabel}<\/div><\/div>`).join('')}<\/div><\/div>`;
+  dc('cb');charts['cb']=new Chart(el('ch-cb'),{type:'bar',data:{labels:months.map(m=>m.shortLabel),datasets:[{label:'ยอดขาย',data:months.map(m=>m.total_sales),backgroundColor:'rgba(105,255,71,.75)',borderRadius:5},{label:'ค่าใช้จ่าย',data:months.map(m=>mF(m).exp),backgroundColor:'rgba(255,82,82,.75)',borderRadius:5},{label:'กำไร',data:months.map(m=>mF(m).profit),backgroundColor:'rgba(255,215,64,.75)',borderRadius:5}]},
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{usePointStyle:true,padding:12,font:{size:11}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y)}},datalabels:{color:dlColor,font:{size:9,weight:'bold'},anchor:'end',align:dlAlign,offset:dlOffset,clamp:true,formatter:v=>'฿'+fmt(v)}},scales:{x:{grid:{display:false}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}});
-  dc('cc');const allC=[...new Set(months.flatMap(m=>m.expense_categories.map(c=>c.category)))].slice(0,8);
-  charts['cc']=new Chart(el('ch-cc'),{type:'bar',data:{labels:allC,datasets:months.map((m,i)=>({label:m.shortLabel,data:allC.map(cat=>{const c=m.expense_categories.find(x=>x.category===cat);return c?c.amount:0;}),backgroundColor:i===0?'rgba(236,64,122,.75)':'rgba(0,229,255,.75)',borderRadius:4}))},
+  dc('cc');const allC=[...new Set(months.flatMap(m=>eCatsOf(m).map(c=>c.category)))].slice(0,8);
+  charts['cc']=new Chart(el('ch-cc'),{type:'bar',data:{labels:allC,datasets:months.map((m,i)=>({label:m.shortLabel,data:allC.map(cat=>{const c=eCatsOf(m).find(x=>x.category===cat);return c?c.amount:0;}),backgroundColor:i===0?'rgba(236,64,122,.75)':'rgba(0,229,255,.75)',borderRadius:4}))},
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{usePointStyle:true,padding:10,font:{size:10}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y)}},datalabels:{display:false}},scales:{x:{grid:{display:false},ticks:{font:{size:10}}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}});
   dc('cf');const fS=months.map(foodSalesExcl),rM=months.map(rawMatCost);
   charts['cf']=new Chart(el('ch-cf'),{type:'bar',data:{labels:months.map(m=>m.shortLabel),datasets:[{label:'ยอดขายอาหาร (ไม่รวมญี่ปุ่น/เครื่องดื่ม)',data:fS,backgroundColor:'rgba(105,255,71,.78)',borderRadius:5},{label:'ต้นทุนวัตถุดิบ',data:rM,backgroundColor:'rgba(255,215,64,.8)',borderRadius:5}]},
@@ -1113,7 +1362,7 @@ function buildCmp(){
 
 function buildAnn(){
   const sorted=[...months].sort((a,b)=>pOrd(a.period)-pOrd(b.period));
-  const labels=sorted.map(m=>m.shortLabel),sales=sorted.map(m=>m.total_sales),exps=sorted.map(m=>m.total_expenses),profs=sorted.map(m=>m.net_profit);
+  const labels=sorted.map(m=>m.shortLabel),sales=sorted.map(m=>m.total_sales),exps=sorted.map(m=>mF(m).exp),profs=sorted.map(m=>mF(m).profit);
   const tS=sales.reduce((a,v)=>a+v,0),tE=exps.reduce((a,v)=>a+v,0),tN=profs.reduce((a,v)=>a+v,0);
   set('ay-s','฿'+fmt(tS));set('ay-ss',sorted.length+' เดือน');set('ay-e','฿'+fmt(tE));set('ay-es',sorted.length+' เดือน');
   set('ay-n',(tN>=0?'+':'')+'฿'+fmt(tN));el('ay-n').style.color=tN>=0?'var(--green)':'var(--red)';
@@ -1124,13 +1373,13 @@ function buildAnn(){
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top',labels:{usePointStyle:true,padding:14,font:{size:12}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y)}},datalabels:{color:dlColor,font:{size:10,weight:'bold'},anchor:'end',align:dlAlign,offset:dlOffset,clamp:true,rotation:-45,formatter:v=>'฿'+fmt(v)}},scales:{x:{grid:{display:false},ticks:{font:{size:12}}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}});
   dc('al');charts['al']=new Chart(el('ch-al'),{type:'line',data:{labels,datasets:[{label:'กำไร/ขาดทุน',data:profs,borderColor:'#ffd740',backgroundColor:ctx=>{const g=ctx.chart.ctx.createLinearGradient(0,0,0,240);g.addColorStop(0,'rgba(255,215,64,.2)');g.addColorStop(1,'rgba(255,215,64,0)');return g;},borderWidth:2.5,fill:true,tension:0.3,pointBackgroundColor:profs.map(v=>v>=0?'#69ff47':'#ff5252'),pointRadius:6}]},
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed.y)}},datalabels:{color:profs.map(v=>v>=0?'#69ff47':'#ff5252'),font:{size:10,weight:'bold'},anchor:'end',align:'top',offset:4,formatter:v=>(v>=0?'+':'')+'฿'+fmt(v)}},scales:{x:{grid:{display:false}},y:{grid:{color:'rgba(255,255,255,.04)'},ticks:{callback:v=>'฿'+fmt(v)}}}}});
-  dc('ap');const accMap={};sorted.forEach(m=>{m.expense_categories.forEach(c=>{accMap[c.category]=(accMap[c.category]||0)+c.amount;});});
+  dc('ap');const accMap={};sorted.forEach(m=>{eCatsOf(m).forEach(c=>{accMap[c.category]=(accMap[c.category]||0)+c.amount;});});
   const acc=Object.entries(accMap).map(([c,a])=>({category:c,amount:a})).sort((a,b)=>b.amount-a.amount).slice(0,10);
   const totAcc=acc.reduce((a,c)=>a+c.amount,0);
   charts['ap']=new Chart(el('ch-ap'),{type:'doughnut',data:{labels:acc.map(c=>c.category),datasets:[{data:acc.map(c=>c.amount),backgroundColor:PAL.slice(0,10),borderWidth:0,hoverOffset:8}]},
     options:{responsive:true,maintainAspectRatio:false,cutout:'58%',plugins:{legend:{position:'right',labels:{boxWidth:9,padding:9,font:{size:10}}},tooltip:{callbacks:{label:c=>' ฿'+fmt(c.parsed)}},datalabels:dlD(totAcc)}}});
-  el('ann-tb').innerHTML=sorted.map((m,i)=>{const pc=m.net_profit>=0?'var(--green)':'var(--red)';
-    return`<tr><td style="font-weight:600;color:var(--bright)">${m.period}<\/td><td style="text-align:right;color:var(--green)" class="mono">฿${fmtD(m.total_sales)}<\/td><td style="text-align:right;color:var(--red)" class="mono">฿${fmtD(m.total_expenses)}<\/td><td style="text-align:right;color:${pc}" class="mono">${m.net_profit>=0?'+':''}฿${fmtD(m.net_profit)}<\/td><td style="text-align:right;color:var(--cyan)" class="mono">${(m.total_expenses/m.total_sales*100).toFixed(1)}%<\/td><\/tr>`;
+  el('ann-tb').innerHTML=sorted.map((m,i)=>{const pc=mF(m).profit>=0?'var(--green)':'var(--red)';
+    return`<tr><td style="font-weight:600;color:var(--bright)">${m.period}<\/td><td style="text-align:right;color:var(--green)" class="mono">฿${fmtD(m.total_sales)}<\/td><td style="text-align:right;color:var(--red)" class="mono">฿${fmtD(mF(m).exp)}<\/td><td style="text-align:right;color:${pc}" class="mono">${mF(m).profit>=0?'+':''}฿${fmtD(mF(m).profit)}<\/td><td style="text-align:right;color:var(--cyan)" class="mono">${(mF(m).exp/m.total_sales*100).toFixed(1)}%<\/td><\/tr>`;
   }).join('');
   const tp=tN>=0?'var(--green)':'var(--red)';
   el('ann-tf').innerHTML=`<tr style="font-weight:700"><td style="color:var(--yellow)">รวมทั้งหมด<\/td><td style="text-align:right;color:var(--green)" class="mono">฿${fmtD(tS)}<\/td><td style="text-align:right;color:var(--red)" class="mono">฿${fmtD(tE)}<\/td><td style="text-align:right;color:${tp}" class="mono">${tN>=0?'+':''}฿${fmtD(tN)}<\/td><td style="text-align:right;color:var(--cyan)" class="mono">${(tE/tS*100).toFixed(1)}%<\/td><\/tr>`;
@@ -1220,7 +1469,7 @@ function buildMenu(m){
 // ═══ HEALTH (KPI ต้นทุนสุขภาพร้าน) ═══
 function buildHealth(m){
   set('hl-period', m.period);
-  var sales=m.sales_categories||[], exp=m.expense_categories||[];
+  var sales=m.sales_categories||[], exp=eCatsOf(m);
   var sS=function(re){return sales.filter(function(c){return re.test(c.category);}).reduce(function(a,c){return a+c.amount;},0);};
   var sE=function(re){return exp.filter(function(c){return re.test(c.category);}).reduce(function(a,c){return a+c.amount;},0);};
   var totS=m.total_sales||0;
@@ -1230,13 +1479,13 @@ function buildHealth(m){
   var fcp= foodS>0? raw/foodS*100 : 0;
   var lbp= totS>0? labor/totS*100 : 0;
   var bevM=bevS-bevC, bevMp= bevS>0? bevM/bevS*100 : 0;
-  var crp= totS>0? m.total_expenses/totS*100 : 0;
+  var crp= totS>0? mF(m).exp/totS*100 : 0;
   function col(v,g,w,lowGood){ return lowGood ? (v<=g?'var(--green)':(v<=w?'var(--yellow)':'var(--red)')) : (v>=g?'var(--green)':(v>=w?'var(--yellow)':'var(--red)')); }
   var cards=[
     {t:'Food cost % (ต้นทุนอาหาร)', v:fcp.toFixed(1)+'%', s:'วัตถุดิบ ÷ ยอดขายอาหาร · เป้า ≤35%', c:col(fcp,35,40,true)},
     {t:'Labor % (ต้นทุนแรงงาน)', v:lbp.toFixed(1)+'%', s:'เงินเดือนพนักงาน ÷ ยอดขาย · เป้า ≤30%', c:col(lbp,30,35,true)},
     {t:'กำไรเครื่องดื่ม % (มาร์จิ้น)', v:bevMp.toFixed(1)+'%', s:'กำไร ฿'+fmt(bevM)+' (ขาย '+fmt(bevS)+' − ทุน '+fmt(bevC)+') · เป้า ≥60%', c:col(bevMp,60,40,false)},
-    {t:'Cost Ratio (จ่าย/ขาย)', v:crp.toFixed(1)+'%', s:'กำไรสุทธิ '+(m.net_profit>=0?'+':'')+'฿'+fmt(m.net_profit), c:col(crp,95,100,true)}
+    {t:'Cost Ratio (จ่าย/ขาย)', v:crp.toFixed(1)+'%', s:'กำไรสุทธิ '+(mF(m).profit>=0?'+':'')+'฿'+fmt(mF(m).profit), c:col(crp,95,100,true)}
   ];
   el('hl-cards').innerHTML=cards.map(function(k){
     return '<div class="kpi anim"><div class="klbl">'+k.t+'<\/div><div class="kval" style="color:'+k.c+'">'+k.v+'<\/div><div class="ksub">'+k.s+'<\/div><\/div>';
