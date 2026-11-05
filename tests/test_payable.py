@@ -18,6 +18,7 @@ import io
 import os
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from datetime import datetime, timedelta
@@ -4670,6 +4671,54 @@ class TestReconTransposedDigitsHint(unittest.TestCase):
 
     def test_ด่านเดิมยังทำงาน_เกินยอดขายรวม(self):
         self.assertIn("เกินยอดขายรวม", app._recon_misread_hint(90000, 5000, 64326))
+
+
+class TestReconWaitsUntilPosIsDue(unittest.TestCase):
+    """🪤 เคสจริง 5 พ.ย. 69 — เจ้าของทักว่า "ถึงตอนนี้แล้วก็ยังไม่เทียบให้"
+
+    ใบ POS ของวันที่ D เข้าเมลตี 0-1 ของวัน D+1 · importPosReports ลงตี 1-5
+    แต่เส้นตายเดิมคือ 3 ชม. นับจาก **ตอนส่งรูปสมุด**
+    → ส่งรูปตอนหัวค่ำ = หมดเวลาก่อนใบ POS จะออกหลายชั่วโมง แล้วคิวถูกลบทิ้ง
+      พร้อมข้อความ "ไม่เจอยอด POS — เทียบไม่ได้" = วันนั้นไม่มีทางถูกเทียบอีกเลย
+
+    วันที่ในชุดนี้สร้างจาก 'วันนี้' ทั้งหมด — กันเทสต์เน่าตามปฏิทิน"""
+
+    def _today(self):
+        return datetime.now(app.TZ).date()
+
+    def test_todays_ledger_waits_past_pos_arrival(self):
+        """สมุดของวันนี้ ต้องรอข้ามไปถึงเช้าวันรุ่งขึ้น ไม่ใช่แค่ 3 ชม."""
+        now = time.time()
+        dl  = app._recon_deadline(self._today().isoformat(), now)
+        self.assertGreater(dl, now + app.RECON_MAX_WAIT,
+                           "ต้องรอนานกว่าเดิม ไม่งั้นหมดเวลาก่อน POS มาถึง")
+        got = datetime.fromtimestamp(dl, app.TZ)
+        self.assertEqual(got.date(), self._today() + timedelta(days=1), "ต้องเป็นวันถัดไป")
+        self.assertEqual((got.hour, got.minute), (7, 30), "หลัง dailyRepair 07:00 ที่เก็บวันตกหล่น")
+
+    def test_evening_photo_still_waiting_when_pos_lands(self):
+        """เคสจริง: ถ่ายสมุดหัวค่ำ → ใบ POS เข้าตี 1 ของวันถัดไป
+
+        เส้นตายเดิมหมดไปแล้วตอนนั้น · เส้นตายใหม่ต้องยังไม่หมด"""
+        d     = self._today()
+        shot  = datetime(d.year, d.month, d.day, 20, 0, tzinfo=app.TZ).timestamp()   # ถ่าย 2 ทุ่ม
+        nxt   = d + timedelta(days=1)
+        lands = datetime(nxt.year, nxt.month, nxt.day, 1, 0, tzinfo=app.TZ).timestamp()  # POS เข้าตี 1
+        self.assertLess(shot + app.RECON_MAX_WAIT, lands, "ของเดิมหมดเวลาไปก่อนแล้ว (ต้นเหตุ)")
+        self.assertGreater(app._recon_deadline(d.isoformat(), shot), lands,
+                           "ของใหม่ต้องยังรออยู่ตอน POS เข้า")
+
+    def test_backdated_ledger_keeps_short_wait(self):
+        """สมุดย้อนหลัง — POS ควรอยู่ในระบบแล้ว ไม่ต้องรอข้ามวัน"""
+        now = time.time()
+        old = (self._today() - timedelta(days=3)).isoformat()
+        self.assertAlmostEqual(app._recon_deadline(old, now), now + app.RECON_MAX_WAIT, delta=1)
+
+    def test_bad_date_does_not_raise(self):
+        """วันที่เสีย = ไม่ล้ม ถอยไปใช้ค่าเดิม (ตัวนี้อยู่บนเส้นทางเงิน ห้ามโยน)"""
+        now = time.time()
+        for bad in ("", "ไม่ใช่วันที่", "2026-13-45", None):
+            self.assertAlmostEqual(app._recon_deadline(bad, now), now + app.RECON_MAX_WAIT, delta=1)
 
 
 class TestReconQueueKeepsUnknown(unittest.TestCase):

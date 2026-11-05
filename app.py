@@ -1126,6 +1126,28 @@ def _recon_pending_del(group_id, date_iso):
         print(f"[recon] ลบคิวไม่ได้ {date_iso}: {e}", flush=True)
 
 
+def _recon_deadline(date_iso: str, now: float) -> float:
+    """รอ POS ของวันนั้นได้ถึงเมื่อไหร่ (epoch)
+
+    🪤 เคสจริง 5 พ.ย. 69 — เจ้าของทักว่า "ถึงตอนนี้แล้วก็ยังไม่เทียบให้":
+      เดิมตั้งเส้นตาย `now + RECON_MAX_WAIT` คือ 3 ชม. นับจาก **ตอนส่งรูปสมุด**
+      แต่ใบ POS ของวันที่ D เข้าเมลตี 0-1 ของวัน D+1 และ importPosReports ลงตี 1-5
+      → ส่งรูปตอนหัวค่ำ = หมดเวลาก่อนใบ POS จะออกหลายชั่วโมง
+      แล้ว _recon_tick **ลบคิวทิ้ง** พร้อมขึ้น "ไม่เจอยอด POS — เทียบไม่ได้"
+      = ไม่มีอะไรรออยู่อีกเลย วันนั้นจะไม่ถูกเทียบตลอดไป ทั้งที่ข้อมูลมาถึงในอีกไม่กี่ ชม.
+
+    → รอถึง **07:30 ของวันถัดจากวันที่บนสมุด** (หลัง dailyRepair 07:00 ที่เก็บวันตกหล่น)
+      ถ้าเลยจุดนั้นมาแล้ว (สมุดย้อนหลัง) ใช้ 3 ชม. ตามเดิม เพราะ POS ควรอยู่ในระบบแล้ว
+      ไม่เดา ไม่เทียบข้ามวัน — แค่เลิกยอมแพ้ก่อนที่ข้อมูลจะมีโอกาสมาถึง"""
+    base = now + RECON_MAX_WAIT
+    try:
+        nxt = date.fromisoformat(date_iso) + timedelta(days=1)
+        due = datetime(nxt.year, nxt.month, nxt.day, 7, 30, tzinfo=TZ).timestamp()
+    except Exception:
+        return base
+    return max(base, due)
+
+
 def _recon_try_or_queue(group_id, date_iso, hw):
     """เข้าคิวเทียบยอดลง DB — 'ไม่ดึง POS สดตรงนี้' เพราะฟังก์ชันนี้รันในเวิร์กเกอร์สลิป (มีแค่ 2)
     ถ้าดึง POS สดจะบล็อกเวิร์กเกอร์นานตอนพีค → ให้เธรด recon เฉพาะ (_recon_scheduler_loop) ดึงมาเทียบแทน
@@ -1140,9 +1162,10 @@ def _recon_try_or_queue(group_id, date_iso, hw):
                 "cash=excluded.cash, transfer=excluded.transfer, card=excluded.card, "
                 "deadline_epoch=excluded.deadline_epoch, next_try_epoch=excluded.next_try_epoch",
                 (group_id, date_iso, hw["cash"], hw["transfer"], hw["card"],
-                 now, now + RECON_MAX_WAIT, now))   # next_try=now → เทียบรอบถัดไปทันที
+                 now, _recon_deadline(date_iso, now), now))   # next_try=now → เทียบรอบถัดไปทันที
             conn.commit()
-        print(f"[recon] {date_iso} เข้าคิวเทียบยอด — เธรด recon จะดึง POS มาเทียบให้ (จนถึง ~{RECON_MAX_WAIT/3600:.0f} ชม. ถ้ายังไม่เข้า)", flush=True)
+        _wait_h = (_recon_deadline(date_iso, now) - now) / 3600
+        print(f"[recon] {date_iso} เข้าคิวเทียบยอด — เธรด recon จะดึง POS มาเทียบให้ (รอได้ถึง ~{_wait_h:.1f} ชม.)", flush=True)
     except Exception as e:
         print(f"[recon] เข้าคิวไม่ได้ {date_iso}: {e}", flush=True)
 
@@ -1172,7 +1195,8 @@ def _recon_tick():
                 f"📓 อ่านสมุดจดมือ {d}\nสด {hw['cash']:,.0f} · โอน {hw['transfer']:,.0f}"
                 + (f" · บัตร {hw['card']:,.0f}" if hw['card'] else "")
                 + f"\n⚠️ ไม่เจอยอด POS ของวันที่ {d} ในระบบ — เทียบไม่ได้"
-                + "\n(ยังไม่ลง POS วันนี้ หรือวันไม่ตรงกัน — เช็กวันที่บนสมุด vs วันที่ POS)")))
+                + "\n(รอจนเลยเวลาที่ใบ POS ควรเข้าระบบแล้ว — เช็กวันที่บนสมุด vs วันที่ POS)"
+                + "\n👉 ถ้า POS เข้าทีหลัง ส่งรูปสมุดใบเดิมซ้ำได้เลย เดี๋ยวเทียบให้ใหม่")))
             _recon_pending_del(gid, d)
             print(f"[recon] {d} หมดเวลารอ POS ({RECON_MAX_WAIT/3600:.0f} ชม.) — ไม่เจอวันตรง เลิกรอ (ไม่เทียบข้ามวัน)", flush=True)
         else:
