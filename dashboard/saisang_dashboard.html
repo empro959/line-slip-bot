@@ -324,6 +324,8 @@ tr:last-child td{border-bottom:none}
 .anim{animation:up .35s ease both}
 .d1{animation-delay:.06s}.d2{animation-delay:.12s}.d3{animation-delay:.18s}
 </style>
+<!-- ค่าตั้งต้นของเว็บนี้ (ลิงก์ /exec) — ไม่มีไฟล์/ไม่ได้ตั้ง = ถอยไปถามเหมือนเดิม -->
+<script src="config.js"></script>
 </head>
 <body>
 <div class="loading" id="loading"><div class="spin"></div><div style="font-size:13px;color:var(--muted)">กำลังประมวลผล...</div></div>
@@ -695,7 +697,10 @@ function _periodMonth(period){
 // ═══ GOOGLE DRIVE SYNC ═══
 // วาง URL ของ Apps Script Web App (ลงท้าย /exec) ตรงนี้ก็ได้ หรือกดปุ่ม "☁️ ตั้งค่า Drive"
 // บนหน้าจอแล้ววาง URL (จะจำไว้ใน localStorage ของอุปกรณ์นั้น) — ดูวิธีสร้างใน GOOGLE_DRIVE_SETUP.md
-const SYNC_URL_DEFAULT='<<ใส่ Apps Script /exec URL ตรงนี้ หรือตั้งผ่านปุ่ม ☁️ ตั้งค่า Drive>>';
+// ค่าตั้งต้นมาจาก config.js หรือ Netlify Snippet Injection (window.SAISANG_SYNC_URL)
+// ตั้งไว้ = ทุกเครื่องเปิดเว็บแล้วเห็นข้อมูลเลย ไม่ต้องกรอก · ไม่ตั้ง = ถามเหมือนเดิม
+const SYNC_URL_DEFAULT=(typeof window!=='undefined' && window.SAISANG_SYNC_URL)
+  || '<<ใส่ Apps Script /exec URL ใน config.js หรือตั้งผ่านปุ่ม ☁️ ตั้งค่า Drive>>';
 // 🪤 SYNC_URL_DEFAULT เป็นสตริง "ไม่ว่าง" → if(!SYNC_URL) ไม่เคยเป็นจริง
 //    เครื่องที่ยังไม่ตั้งค่าจึงยิง fetch ไปที่ข้อความ placeholder แล้วขึ้น '⚠️ ออฟไลน์'
 //    แทนที่จะบอกว่า 'ยังไม่ได้ตั้งค่า' — คนอ่านแยกไม่ออกว่าเน็ตล่มหรือยังไม่ได้ตั้ง
