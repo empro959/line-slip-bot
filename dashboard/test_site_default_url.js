@@ -62,5 +62,12 @@ console.log('7) 🔴 config.js ในรีโปสาธารณะต้อ�
 console.log('8) 🔴 หน้า HTML ต้องโหลด config.js จริง ไม่งั้นตั้งค่าแล้วก็ไม่มีผล');
 chk('มี <script src="config.js">', /<script src="config\.js"><\/script>/.test(html));
 
+console.log('9) 🔴 เลขรุ่นต้องมีจริงและตรงกัน — เคยลากไฟล์เก่าทับแล้วไม่มีใครรู้');
+{ const m=html.match(/const BUILD='([^']+)';/);
+  chk('มีค่า BUILD ในไฟล์', !!m, 'ไม่เจอ');
+  chk('มีช่องโชว์บนหน้าจอ (#build-tag)', /id="build-tag"/.test(html));
+  chk('มีโค้ดเขียนเลขรุ่นลงช่องนั้น', /getElementById\('build-tag'\)/.test(html));
+  chk('กล่อง ☁️ โชว์เลขรุ่นด้วย', /_ver\s*\+\s*_cfg/.test(html)); }
+
 console.log(fails?('\n❌ ตก '+fails+' ข้อ'):'\n✅ ผ่านหมด');
 process.exit(fails?1:0);
