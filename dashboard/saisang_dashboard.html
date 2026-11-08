@@ -707,7 +707,7 @@ const SYNC_URL_DEFAULT=(typeof window!=='undefined' && window.SAISANG_SYNC_URL)
 // 🔴 เลขรุ่น — เคยเสียเวลาไล่ปัญหาเพราะดูไม่ออกว่าหน้าที่เปิดอยู่เป็นไฟล์ชุดไหน
 //    (8 พ.ย. 69: ลากไฟล์ชุดเก่าทับโดยไม่รู้ตัว ตัวเลขกำไรย้อนกลับไปเป็นของเดิม)
 //    ⚠️ ต้องบวกเลขนี้ทุกครั้งที่แก้ไฟล์นี้ ไม่งั้นมันโกหก
-const BUILD='2026-11-08b';
+const BUILD='2026-11-08c';
 try{ const _b=document.getElementById('build-tag'); if(_b) _b.textContent='v'+BUILD; }catch(e){}
 
 const _isPlaceholder=u=>!u||/^<</.test(u);
@@ -773,11 +773,12 @@ function setupSync(){
   //    ไม่มีธง = เว็บยังเป็นไฟล์ชุดเก่า · มีธงแต่ค่าว่าง = อัปแล้วแต่ยังไม่ได้ใส่ลิงก์
   const _cfg = (typeof window!=='undefined' && window.SAISANG_CONFIG_LOADED)
     ? (window.SAISANG_SYNC_URL
-        ? '✅ เว็บนี้ตั้งลิงก์ไว้แล้ว (ถ้ายังถาม แปลว่าเครื่องนี้เคยปิดการซิงค์ไว้เอง)\n\n'
+        ? '✅ เว็บนี้ตั้งลิงก์ไว้แล้ว — ใส่ไว้ให้ในช่องแล้ว\n   กด ตกลง = เปิดซิงค์คืน · ลบให้ว่างแล้วกด ตกลง = ปิดซิงค์\n\n'
         : '🟡 อัปไฟล์ชุดใหม่แล้ว แต่ยังไม่ได้ใส่ลิงก์ให้เว็บ\n   → ใส่ที่ Netlify (Snippet injection) หรือในไฟล์ config.js\n\n')
     : '🔴 เว็บนี้ยังเป็นไฟล์ชุดเก่า — ยังไม่ได้อัป zip ชุดใหม่ขึ้น Netlify\n\n';
   const _ver = 'ไฟล์รุ่น v'+BUILD+'\n\n';
-  const url=prompt(_ver+_cfg+'วางลิงก์ Google Apps Script Web App (ลงท้ายด้วย /exec)\n\nวางพร้อมคีย์ในบรรทัดเดียวก็ได้:  <URL>|<คีย์>\n\nเว้นว่างแล้วกด OK เพื่อปิดการซิงค์',SYNC_URL||'');
+  const url=prompt(_ver+_cfg+'วางลิงก์ Google Apps Script Web App (ลงท้ายด้วย /exec)\n\nวางพร้อมคีย์ในบรรทัดเดียวก็ได้:  <URL>|<คีย์>\n\nเว้นว่างแล้วกด OK เพื่อปิดการซิงค์',
+    SYNC_URL || (typeof window!=='undefined' && window.SAISANG_SYNC_URL) || '');
   if(url===null)return;
   let u=url.trim(), pastedKey=null;
   if(u.includes('|')){ const [a,b]=u.split('|'); u=(a||'').trim(); pastedKey=(b||'').trim(); }

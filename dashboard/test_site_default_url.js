@@ -69,5 +69,12 @@ console.log('9) 🔴 เลขรุ่นต้องมีจริงแล�
   chk('มีโค้ดเขียนเลขรุ่นลงช่องนั้น', /getElementById\('build-tag'\)/.test(html));
   chk('กล่อง ☁️ โชว์เลขรุ่นด้วย', /_ver\s*\+\s*_cfg/.test(html)); }
 
+console.log('10) 🔴 ช่องในกล่อง ☁️ ต้องถอยไปใช้ลิงก์ของเว็บ — ไม่ปล่อยว่าง');
+// 8 พ.ย. 69: เครื่องที่ปิดซิงค์ไว้เปิดกล่องมาเจอช่องว่าง เจ้าของกด ตกลง เพื่อปิดกล่อง
+// กลายเป็นสั่ง 'ปิดการซิงค์' ซ้ำอีกรอบ (เว้นว่าง + OK = ปิด)
+{ chk('ช่องมี fallback ไป window.SAISANG_SYNC_URL',
+      html.indexOf("SYNC_URL || (typeof window!=='undefined' && window.SAISANG_SYNC_URL) || ''") >= 0);
+  chk('บอกด้วยว่ากดตกลงแล้วจะเกิดอะไร', html.indexOf('กด ตกลง = เปิดซิงค์คืน')>=0); }
+
 console.log(fails?('\n❌ ตก '+fails+' ข้อ'):'\n✅ ผ่านหมด');
 process.exit(fails?1:0);
