@@ -10,4 +10,5 @@ slips.db
 
 # Env
 .env
-dashboard/dashboard_deploy.zip
+# ชุดไฟล์สำหรับลากขึ้น Netlify — สร้างใหม่ได้เสมอ ไม่เก็บในรีโป (ไฟล์ละ ~1MB)
+dashboard/dashboard_deploy*.zip
