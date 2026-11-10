@@ -2705,6 +2705,21 @@ def save_payable_bill(group_id: str, amount: float, note: str = None, doc_date: 
             if dup:
                 conn.execute("DELETE FROM payable_bills WHERE id=?", (dup["id"],))
                 print(f"[payable] ลบ 'ยกมา' ซ้ำ {amount:,.2f} วันที่ {doc_date} (มีบิลจริงแล้ว) group={group_id}", flush=True)
+        else:
+            # 🔴 กันซ้ำ 'อีกทาง' — ของเดิมกันเฉพาะตอนบิลจริงมาทีหลัง
+            #    ถ้า 'บิลจริงมาก่อน แล้วค่อยวางบล็อกยอดค้างทับ' ตัวกันเดิมไม่ทำงานเลย → ได้สองบรรทัด
+            #    เคสจริง 09/11/26: ยกมา 9,693 + บิลจริง 9,693 วันเดียวกัน → ยอดค้างเกินจริง 9,693
+            #    (เจ้าของยืนยัน 10/11/2569 ว่าวันนั้นมีของส่งใบเดียว)
+            real = conn.execute(
+                "SELECT id FROM payable_bills WHERE group_id=? AND doc_date=? "
+                "AND (note IS NULL OR note<>?) AND ABS(amount-?)<0.01 AND id<>? ORDER BY id LIMIT 1",
+                (group_id, doc_date, _PAYABLE_CARRY_NOTE, float(amount), rid)).fetchone()
+            if real:
+                conn.execute("DELETE FROM payable_bills WHERE id=?", (rid,))
+                print(f"[payable] ไม่ลง 'ยกมา' {amount:,.2f} วันที่ {doc_date} — มีบิลจริงยอดเดียวกันอยู่แล้ว "
+                      f"group={group_id}", flush=True)
+                conn.commit()
+                return real["id"]
         conn.commit()
     return rid
 
@@ -2748,10 +2763,18 @@ def _exact_combo(lines, target: float):
     return [lines[i] for i in hit] if hit else None
 
 
-def _payable_settle(group_id: str, pay_for_date, amount: float):
-    """ตัดยอดจ่ายเข้ากับ 'บรรทัดบิล/ค้าง' โดยตรง — ลำดับการเลือกใบ (เจ้าของตกลง 2026-08-13):
-      (1) ยอดค้างตรงเป๊ะ 'ในวันที่ที่โน้ตบนสลิป'  (2) ยอดค้างตรงเป๊ะ 'ทั้งบัญชี' เก่าสุดก่อน
+def _payable_settle(group_id: str, pay_for_date, amount: float,
+                    left_after: float = None, from_memo: bool = False):
+    """ตัดยอดจ่ายเข้ากับ 'บรรทัดบิล/ค้าง' โดยตรง — ลำดับการเลือกใบ (เจ้าของตกลง 2026-08-13
+      · เพิ่มข้อ (1c) และด่านกำกวม เจ้าของตกลง 2026-11-10):
+      (1) ยอดค้างตรงเป๊ะ 'ในวันที่ที่โน้ตบนสลิป'
+      (1c) โน้ตบอก 'ค้าง N' → ใบที่ 'ค้าง − จ่าย = N' พอดี  ← คนเขียนเอง ชัวร์กว่าทุกข้อที่เหลือ
+      (2) ยอดค้างตรงเป๊ะ 'ทั้งบัญชี' เก่าสุดก่อน — **ข้ามถ้าวันที่มาจากโน้ตคน** (from_memo)
       (3) ไม่มีใบยอดตรง → FIFO บิลของวันที่ที่โน้ตไว้ (ตัดบางส่วนได้)
+          ⚠️ เว้นแต่ 'เลือกไม่ได้' = มีบิลค้างมากกว่า 1 ใบที่ยอดค้างมากกว่ายอดจ่าย
+             (จ่ายก้อนนี้ลงใบไหนก็ได้ทั้งนั้น) → ไม่ตัดเลย ให้คนบอกว่าใบไหน
+
+    left_after = ยอดใน 'ค้าง N' บนโน้ต (เหลือค้างหลังจ่ายใบนี้) · from_memo = วันที่มาจากโน้ตคน ไม่ใช่ AI
     'ยอดตรงเป๊ะชนะวันที่' เพราะร้านจ่ายเป็นรายใบ — วันที่ที่ AI อ่านจากสลิปมักเป็นวันโอน ไม่ใช่วันของบิล
     จ่ายครบ = ลบบรรทัดนั้น, จ่ายบางส่วน = ลดยอดบรรทัดเหลือเท่าที่ค้าง (เรียงค้างยกมาก่อน แล้ว FIFO)
     คืน (allocated_total, [ข้อความสรุปบรรทัดที่ตัด], settle_note) — ส่วนที่ตัดได้จะถูกหักจาก amount ที่ลดยอดรวม กันนับซ้ำ
@@ -2790,6 +2813,21 @@ def _payable_settle(group_id: str, pay_for_date, amount: float):
             _ph = ",".join("?" * len(pay_dates))
             rows = conn.execute(_EXACT + f"AND doc_date IN ({_ph}) " + _EXACT_ORDER,
                                 (group_id, float(amount), *pay_dates, _PAYABLE_CARRY_NOTE)).fetchall()
+        if not rows and pay_dates and left_after is not None:
+            # (1c) โน้ตบอก 'ค้าง N' → ใบที่จ่ายก้อนนี้แล้วเหลือ N พอดี (คนเขียนเอง = ชัวร์สุด)
+            # เคสจริง 08/11/26: โอน 1,464 โน้ต 'ไส้ (8/11) ค้าง 10,000' · วันนั้นมี 15,705 กับ 11,464
+            #   11,464 − 1,464 = 10,000 ✅  ·  15,705 − 1,464 = 14,241 ✗  → ชี้ใบได้ไม่ต้องเดา
+            _ph = ",".join("?" * len(pay_dates))
+            rows = conn.execute(
+                "SELECT id, doc_date, amount, COALESCE(paid,0) paid FROM payable_bills "
+                f"WHERE group_id=? AND doc_date IN ({_ph}) "
+                "AND ABS((amount - COALESCE(paid,0)) - ? - ?)<0.01 "
+                "AND (amount - COALESCE(paid,0))>0.01 "
+                "ORDER BY CASE WHEN note=? THEN 0 ELSE 1 END, doc_date, id LIMIT 1",
+                (group_id, *pay_dates, float(amount), float(left_after), _PAYABLE_CARRY_NOTE)).fetchall()
+            if rows:
+                print(f"[payable] จับคู่จากโน้ต 'ค้าง {left_after:,.2f}' → บิล {rows[0]['doc_date']} "
+                      f"ยอด {float(rows[0]['amount']):,.2f}", flush=True)
         if not rows and len(pay_dates) >= 2:
             # (1b) โน้ตระบุหลายบิล → หาชุดที่ 'ยอดค้างรวมกันเท่ายอดโอนพอดี' ในวันที่ที่โน้ตไว้
             # เคสจริง 22/08/26: โอน 9,027 โน้ต '(19/8 และ 21/8) 2 บิล' = 5,939 + 3,088 พอดี
@@ -2806,8 +2844,11 @@ def _payable_settle(group_id: str, pay_for_date, amount: float):
                 rows = [r for r in cand if r["id"] in _ids]
                 print(f"[payable] จับคู่ชุดบิลตรงยอดพอดี {len(rows)} ใบ "
                       f"({', '.join(str(p[1]) for p in picked)}) = {amount:,.2f}", flush=True)
-        if not rows:
+        if not rows and not from_memo:
             # (2) ยอดตรงเป๊ะ 'ทั้งบัญชี' (เก่าสุดก่อน) — ชนะการตัดบางส่วนตามวันที่ที่โน้ตไว้
+            # 🔴 ข้ามข้อนี้เมื่อวันที่มาจาก 'โน้ตที่คนเขียนเอง' (from_memo) — คนบอกวันมาแล้ว
+            #    ห้ามข้ามวันไปจับใบอื่นที่ยอดบังเอิญตรง (เคสจริง 08/11/26: จ่าย 10,000 ของบิล 11,464
+            #    แต่บิล 13,102 เหลือค้าง 10,000 พอดี → ข้อนี้จะลากไปตัดผิดวันทั้งก้อน)
             # เคสจริง 12/08/26: จ่าย 2,867 = ค่าบิล 03/08 เป๊ะ แต่สลิปให้วันที่ 12/08 มา
             # ของเดิมจำกัดเฉพาะวันที่โน้ต → ไปตัดบางส่วนบิล 12/08 (15,091) ผิดใบ บิล 03/08 ค้างค้างอยู่
             rows = conn.execute(_EXACT + _EXACT_ORDER,
@@ -2820,6 +2861,17 @@ def _payable_settle(group_id: str, pay_for_date, amount: float):
                 f"WHERE group_id=? AND doc_date IN ({_ph}) AND (amount - COALESCE(paid,0))>0.01 "
                 "ORDER BY CASE WHEN note=? THEN 0 ELSE 1 END, doc_date, id",
                 (group_id, *pay_dates, _PAYABLE_CARRY_NOTE)).fetchall()
+            # 🔴 ด่านกำกวม (เจ้าของตกลง 2026-11-10) — 'เงินก้อนนี้ลงใบไหนก็ได้ทั้งนั้น' = ห้ามเดา
+            #    นิยาม: มีบิลค้างมากกว่า 1 ใบ ที่ยอดค้าง 'มากกว่า' ยอดจ่าย
+            #    เคสจริง 01/11/26: บิล 16,320 กับ 13,102 · จ่าย 3,102 → ลงได้ทั้งคู่ ของเดิม FIFO
+            #      ไปตัด 16,320 ผิดใบ (เจ้าของตั้งใจให้ 13,102 เหลือค้าง 10,000)
+            #    ⚠️ จ่ายที่ 'ล้นใบ' ไม่กำกวม เช่น บิล 1,000 + 2,000 จ่าย 1,500 → มีใบเดียวที่ค้างเกิน
+            #      1,500 จึงยัง FIFO ตามเดิม (กระจาย 1,000 + 500) — พฤติกรรมนี้ไม่เปลี่ยน
+            if len(rows) > 1 and sum(1 for r in rows
+                                     if float(r["amount"] or 0) - float(r["paid"] or 0) > float(amount) + 0.01) > 1:
+                print(f"[payable] ⚠️ เลือกไม่ได้: จ่าย {amount:,.2f} ลงได้หลายใบใน {','.join(pay_dates)} "
+                      f"— ไม่ตัดให้ รอคนชี้ใบ", flush=True)
+                rows = []
         for r in rows:
             if remaining <= 0.01:
                 break
@@ -2834,6 +2886,37 @@ def _payable_settle(group_id: str, pay_for_date, amount: float):
             settle_dates.append(fdate_short(r["doc_date"]))
         conn.commit()
     return allocated_total, settled, (",".join(settle_dates) or None)
+
+
+def _payable_ambiguous_bills(group_id: str, pay_for_date, amount: float) -> list:
+    """บิลค้างของ 'วันที่ที่โน้ตไว้' ที่ยอดค้างมากกว่ายอดจ่าย — คืนเมื่อมีมากกว่า 1 ใบ (= เลือกไม่ได้)
+
+    ใช้บอกคนว่า 'ทำไมไม่ตัดให้' — นิยามเดียวกับด่านกำกวมใน _payable_settle ข้อ (3) เป๊ะ
+    (ถ้าสองที่นี้ไม่ตรงกัน จะเกิดเคส 'ไม่ตัดให้แต่ก็ไม่บอกว่าทำไม' = เงียบ ซึ่งแย่กว่าตัดผิด)
+    คืน [] = ไม่กำกวม (ไม่ตัดเพราะเหตุอื่น เช่น วันนั้นไม่มีบิลค้างเลย)"""
+    dates = [pay_for_date] if isinstance(pay_for_date, str) else list(pay_for_date or [])
+    dates = [d for d in dates if d]
+    if not dates:
+        return []
+    _ph = ",".join("?" * len(dates))
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT id, doc_date, amount, COALESCE(paid,0) paid FROM payable_bills "
+            f"WHERE group_id=? AND doc_date IN ({_ph}) AND (amount - COALESCE(paid,0))>0.01 "
+            "ORDER BY doc_date, id", (group_id, *dates)).fetchall()
+    over = [r for r in rows if float(r["amount"] or 0) - float(r["paid"] or 0) > float(amount) + 0.01]
+    return over if (len(rows) > 1 and len(over) > 1) else []
+
+
+def _amb_dates(rows) -> list:
+    """วันที่ (ไม่ซ้ำ เรียงตามที่เจอ) ของบิลที่กำกวม — ไว้พิมพ์ในข้อความถาม"""
+    out = []
+    for r in rows:
+        d = r["doc_date"]
+        if d and d not in out:
+            out.append(d)
+    return out
+
 
 _MASKED_REF = re.compile(r"[x*]{3,}", re.I)
 
@@ -2952,7 +3035,9 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
             part = f"📥+{amt:,.2f}" + paid_tag(amt, paid);   running += amt - paid
         else:   # pay
             part = f"💸−{amt:,.2f}";                          running -= amt
-        if has_carry and not sep_added and kind != "carry":   # แถวแรกที่ไม่ใช่ยกมา → เส้นคั่น
+        # เส้นคั่นเฉพาะตอน 'เพิ่งผ่านบล็อกยกมามาจริงๆ' — ของเดิมเช็กแค่ว่ามียกมาอยู่ที่ไหนสักที่
+        # ทำให้การ์ดที่ยกมาอยู่กลาง/ท้ายได้เส้นคั่นซ้อนกับเส้นหัวการ์ด 2 เส้นติด (เจ้าของเห็น 10/11/69)
+        if has_carry and not sep_added and kind != "carry" and lines[-1] != bar:   # แถวแรกหลังยกมา → เส้นคั่น
             lines.append(bar); sep_added = True
         lines.append(f"{fdate(d)}  {part}")
     if with_total:   # กลุ่ม 2: โชว์เฉพาะ 'บรรทัดสุดท้าย' (ยอดค้างสะสมรวม) ไม่โชว์ยอดค้างรายบรรทัด
@@ -3237,6 +3322,28 @@ def _dates_from_memo(memo) -> list:
     return out
 
 
+def _left_from_memo(memo):
+    """แกะ 'ค้าง N' จากบันทึกช่วยจำ = ยอดที่ **เหลือค้างหลังจ่ายใบนี้แล้ว** → คืน float หรือ None
+
+    เคสจริง 08/11/26: โอน 1,464 โน้ต 'ไส้ (8/11) ค้าง 10,000'
+      วันนั้นมี 2 บิล (15,705 · 11,464) ไม่มีใบไหนยอดตรง 1,464 → ของเดิมปล่อยลอย ไม่ตัดใบไหนเลย
+      ทั้งที่โน้ตบอกคำตอบอยู่แล้ว: 11,464 − 1,464 = 10,000 พอดี (15,705 − 1,464 = 14,241 ไม่ใช่)
+    เคสจริง 01/11/26: โอน 3,102 ของบิล 13,102 (เหลือ 10,000) แต่บอทไป FIFO ตัดบิล 16,320 ผิดใบ
+
+    ⚠️ 'ค้าง 0' ถือว่าไม่มีข้อมูล (คืน None) — จ่ายครบมีทางอื่นจับอยู่แล้ว (ยอดตรงเป๊ะ)
+       และเลข 0 ในโน้ตมักเป็นคำพูดลอยๆ มากกว่ายอดจริง"""
+    if not memo or not isinstance(memo, str):
+        return None
+    m = re.search(r"ค้าง\s*([\d,]+(?:\.\d+)?)", memo)
+    if not m:
+        return None
+    try:
+        val = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    return val if val > 0.01 else None
+
+
 def _date_from_memo(memo) -> str:
     """วันแรกที่เจอในโน้ต (คงไว้ให้ที่เดิมเรียกได้) — คืน YYYY-MM-DD หรือ None"""
     ds = _dates_from_memo(memo)
@@ -3475,9 +3582,24 @@ def _process_payable_image(event, group_id: str):
                    f"ถ้าวันโอนจริงไม่ใช่ {_ddmmyy(_today)} → พิมพ์ 'ลบจ่าย {_ddmmyy(_today)} {amount:,.0f}' แล้วส่งสลิปใหม่",
                    force=True)
             doc_date = None
-        allocated, settled, settle_note = _payable_settle(acct, pay_for, amount)
+        _left = _left_from_memo(info.get("memo"))
+        allocated, settled, settle_note = _payable_settle(
+            acct, pay_for, amount, left_after=_left, from_memo=bool(_memo_dates))
         print(f"[payable] ✅ บันทึกจ่าย {amount:,.2f} ตัดให้บิล {pay_for or '-'} "
               f"ref={ref or '-'} group={group_id}", flush=True)
+        # 🔴 ตัดไม่ได้เพราะ 'เลือกไม่ได้' → ห้ามเงียบ ต้องถามว่าใบไหน (ไม่งั้นยอดลอยอยู่เฉยๆ
+        #    แล้วรายงานจะดูไม่ออกว่าบิลไหนยังค้าง — เคสจริง 01/11 กับ 08/11/26)
+        if allocated <= 0.01:
+            _amb = _payable_ambiguous_bills(acct, pay_for, amount)
+            if _amb:
+                _opts = "\n".join(
+                    f"   {chr(9312+i)} {float(b['amount']):,.2f}  (ค้าง {float(b['amount'])-float(b['paid']):,.2f})"
+                    for i, b in enumerate(_amb[:6]))
+                notify(f"❓ จ่าย {amount:,.2f} — บอทเลือกเองไม่ได้ว่าเป็นของบิลไหน\n"
+                       f"วันที่ {', '.join(_ddmmyy(d) for d in _amb_dates(_amb))} มีบิลค้างหลายใบ:\n{_opts}\n"
+                       f"👉 พิมพ์  ย้ายจ่าย {amount:,.0f} ไปบิล <ยอดบิล>\n"
+                       f"   หรือเขียนโน้ตบนสลิปว่า 'ค้าง <ยอดที่เหลือ>' ครั้งหน้า บอทจะชี้ใบเองได้เลย\n"
+                       f"✅ ยอดรวมค้างจ่ายถูกต้องแล้ว — ที่ยังไม่รู้คือ 'ใบไหน' เท่านั้น", force=True)
         save_payable_payment(acct, amount, sender=info.get("sender"),
                              # วันเวลาบนสลิปต้องผ่านด่านเดียวกับเส้นสลิปรายรับ (§3.25) ไม่งั้นปีเพี้ยนลง DB ได้
                              ref_number=ref, slip_dt=_sane_slip_dt(info.get("datetime")),
@@ -3861,6 +3983,86 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
     # (ลบใบล่าสุด "ของทั้งระบบ" ไม่ใช่ใบที่ต้องการของวันนั้น)
     # เคสจริง 30/08/26: วันเดียวมี 3 ใบ พิมพ์ 'ลบบิล 2/9 18795' แล้วบอทเงียบสนิท
     # เพราะคำสั่งรูปแบบนี้ไม่เคยมีอยู่จริง (มีแต่ 'ลบบิลล่าสุด' ตรงตัว กับ 'ลบวันที่' ที่ลบทั้งวัน)
+    # ย้ายเงินจ่ายไปเกาะบิลที่ถูกใบ — ซ่อมของที่ตัดผิดไปแล้ว โดยไม่ต้องแตะฐานข้อมูลด้วยมือ
+    #   ย้ายจ่าย 3102 ไปบิล 13102            (ยอดจ่าย → ยอดบิล)
+    #   ย้ายจ่าย 1/11 3102 ไปบิล 1/11 13102  (ระบุวันได้ทั้งสองฝั่ง ถ้ายอดซ้ำกันหลายใบ)
+    # 🔴 เจอมากกว่า 1 ความเป็นไปได้ = ไม่ทำ ให้คนระบุให้ชัด (กติกาเดียวกับ 'ลบจ่าย'/'ลบบิล')
+    if low.startswith("ย้ายจ่าย"):
+        rest = text[len("ย้ายจ่าย"):].strip()
+        if "ไปบิล" not in rest:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="❌ รูปแบบไม่ถูก เช่น:\n  ย้ายจ่าย 3102 ไปบิล 13102\n  ย้ายจ่าย 1/11 3102 ไปบิล 13102"))
+            return True
+        _lhs, _rhs = rest.split("ไปบิล", 1)
+
+        def _date_amt(part):
+            """แกะ '[วัน/เดือน] ยอด' → (doc_date|None, amount|None, err|None)"""
+            toks = part.strip().split()
+            if not toks:
+                return None, None, "ไม่มียอด"
+            d = None
+            if "/" in toks[0]:
+                d = _parse_thai_date(toks[0])
+                if d is None:
+                    return None, None, f"วันที่ไม่ถูก: {toks[0]}"
+                toks = toks[1:]
+            try:
+                return d, float(" ".join(toks).replace(",", "").replace("บาท", "").strip()), None
+            except ValueError:
+                return None, None, "ยอดไม่ถูก"
+
+        pd, pamt, perr = _date_amt(_lhs)
+        bd, bamt, berr = _date_amt(_rhs)
+        if perr or berr or not pamt or not bamt:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text=f"❌ {perr or berr or 'ยอดไม่ถูก'} — เช่น: ย้ายจ่าย 3102 ไปบิล 13102"))
+            return True
+        with _db() as conn:
+            _pq = "SELECT * FROM payable_payments WHERE group_id=? AND ABS(amount-?)<0.01"
+            _pa = [acct, pamt]
+            if pd:
+                _pq += " AND doc_date=?"; _pa.append(pd)
+            pays = conn.execute(_pq + " ORDER BY id", tuple(_pa)).fetchall()
+            _bq = ("SELECT * FROM payable_bills WHERE group_id=? AND ABS(amount-?)<0.01 "
+                   "AND (amount - COALESCE(paid,0))>0.01")
+            _ba = [acct, bamt]
+            if bd:
+                _bq += " AND doc_date=?"; _ba.append(bd)
+            bills = conn.execute(_bq + " ORDER BY id", tuple(_ba)).fetchall()
+            if not pays or not bills:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
+                    f"📭 ไม่พบ{'เงินจ่าย' if not pays else 'บิลที่ยังค้าง'}ยอด "
+                    f"{(pamt if not pays else bamt):,.2f} บาท — เช็คด้วย 'สรุปหนี้'")))
+                return True
+            if len(pays) > 1 or len(bills) > 1:
+                _w = "เงินจ่าย" if len(pays) > 1 else "บิลที่ยังค้าง"
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
+                    f"⚠️ พบ{_w}ยอดเดียวกัน {max(len(pays), len(bills))} รายการ — ย้ายเจาะจงไม่ได้\n"
+                    f"ระบุวันด้วย เช่น: ย้ายจ่าย 1/11 {pamt:,.0f} ไปบิล 1/11 {bamt:,.0f}")))
+                return True
+            pay, bill = pays[0], bills[0]
+            # คืนการจับคู่เดิมก่อน (ถ้าเคยตัดบิลอื่นไว้) แล้วค่อยเกาะใบใหม่ — ยอดรวมไม่ขยับทั้งสองขั้น
+            stuck = _payable_unlink(conn, acct, "payable_payments", pay)
+            conn.execute("UPDATE payable_payments SET allocated=0, settle_note=NULL WHERE id=?", (pay["id"],))
+            left = float(bill["amount"] or 0) - float(bill["paid"] or 0)
+            take = min(float(pay["amount"] or 0), left)
+            conn.execute("UPDATE payable_bills SET paid=COALESCE(paid,0)+? WHERE id=?", (take, bill["id"]))
+            try:
+                _dm = datetime.strptime(bill["doc_date"], "%Y-%m-%d").strftime("%d/%m")
+            except (ValueError, TypeError):
+                _dm = bill["doc_date"]
+            conn.execute("UPDATE payable_payments SET allocated=?, settle_note=? WHERE id=?",
+                         (take, _dm, pay["id"]))
+            conn.commit()
+        _rest = left - take
+        warn = (f"\n⚠️ คืนยอดที่จับคู่เดิมไม่ครบ {stuck:,.2f} บาท — สั่ง 'จัดยอดใหม่' ถ้ายอดดูไม่ถูก"
+                if stuck > 0.01 else "")
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=(
+            f"✅ ย้ายเงินจ่าย {pamt:,.2f} ไปเกาะบิล {_ddmmyy(bill['doc_date'])} ยอด {bamt:,.2f} แล้ว\n"
+            f"   บิลใบนี้{'จ่ายครบ' if _rest <= 0.01 else f'เหลือค้าง {_rest:,.2f}'}" + warn)))
+        _payable_push_summary(event, group_id, acct, cleanup=False)   # โชว์การ์ดที่แก้แล้วให้เห็นทันที
+        return True
+
     if low.startswith("ลบบิล"):
         rest = text[len("ลบบิล"):].strip()
         toks = rest.split()
@@ -3889,6 +4091,19 @@ def handle_payable_text(event, text: str, group_id: str) -> bool:
                     text=f"📭 ไม่พบบิลวันที่ {doc_date} ยอด {amt:,.2f} บาท — เช็คด้วย 'รายการบิล' หรือ 'สรุปหนี้'"))
                 return True
             if len(rows) > 1:
+                # 🟢 ยกเว้นเดียว: คู่ 'ยกมา 1 ใบ + บิลจริง 1 ใบ' = ตัวซ้ำที่รู้แน่ว่าต้องลบตัวไหน
+                #    (กติกาเดียวกับตัวกันซ้ำตอนลงบิล — ยกมาเป็นตัวแทนชั่วคราว บิลจริงคือของจริง)
+                #    เคสจริง 09/11/26: ยกมา 9,693 + บิลจริง 9,693 ค้างอยู่ในฐานตั้งแต่ก่อนมีตัวกันซ้ำ
+                _carry = [r for r in rows if r["note"] == _PAYABLE_CARRY_NOTE and float(r["paid"] or 0) <= 0.01]
+                _real  = [r for r in rows if r["note"] != _PAYABLE_CARRY_NOTE]
+                if len(rows) == 2 and len(_carry) == 1 and len(_real) == 1:
+                    conn.execute("DELETE FROM payable_bills WHERE id=?", (_carry[0]["id"],))
+                    conn.commit()
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                        text=(f"🗑️ ลบ 'ยอดค้างยกมา' ที่ซ้ำกับบิลจริง ({_ddmmyy(doc_date)} · {amt:,.2f} บาท) แล้ว\n"
+                              f"   บิลจริงใบนั้นยังอยู่ครบ\n─────────────────\n"
+                              f"💰 ค้างจ่ายสะสม: {_payable_outstanding(acct):,.2f} บาท")))
+                    return True
                 # วันที่+ยอดตรงกันมากกว่า 1 ใบ — ลบเจาะจงไม่ได้ปลอดภัย (กติกาเดียวกับ find_duplicate:
                 # เจอมากกว่า 1 ความเป็นไปได้ = ไม่ทำ ให้คนตัดสิน)
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(
