@@ -164,16 +164,22 @@ class TestPayableSettle(PayableTestCase):
         self.assertAlmostEqual(rows[1]["paid"], 500.0, places=2)    # ใบสองบางส่วน
 
     def test_carry_forward_line_settled_first(self):
-        """'ยอดค้างยกมา' ต้องถูกตัดก่อนบิลปกติที่ยอดเท่ากัน"""
-        day = _d(5)
-        app.save_payable_bill(ACCT, 900.0, note="รูป", doc_date=day)
-        app.save_payable_bill(ACCT, 900.0, note=app._PAYABLE_CARRY_NOTE, doc_date=day)
+        """'ยอดค้างยกมา' ต้องถูกตัดก่อนบิลปกติที่ยอดเท่ากัน
 
-        app._payable_settle(ACCT, day, 900.0)
+        ⚠️ เดิมเทสนี้วางยกมา+บิลจริง 'วันเดียวกัน ยอดเดียวกัน' ซึ่งตั้งแต่ 10/11/2569
+        นับเป็น 'ตัวซ้ำ' แล้ว (save_payable_bill ลบให้อัตโนมัติทั้งสองทิศทาง) — ฉากนั้นจึงตั้งไม่ได้อีก
+        เจตนาของเทสคือ 'ลำดับการตัด' ไม่ใช่ 'ยกมากับบิลจริงอยู่ร่วมวันได้' → ย้ายไปคนละวัน
+        ลำดับยังถูกทดสอบครบ เพราะ ORDER BY เอา note=ยกมา ขึ้นก่อนเสมอ ไม่ว่าวันไหน"""
+        carry_day, bill_day = _d(6), _d(5)
+        app.save_payable_bill(ACCT, 900.0, note="รูป", doc_date=bill_day)
+        app.save_payable_bill(ACCT, 900.0, note=app._PAYABLE_CARRY_NOTE, doc_date=carry_day)
 
-        rows = self.bills()
-        self.assertAlmostEqual(rows[0]["paid"], 0.0, places=2, msg="บิลปกติไม่ควรโดนก่อน")
-        self.assertAlmostEqual(rows[1]["paid"], 900.0, places=2, msg="ค้างยกมาต้องโดนตัดก่อน")
+        app._payable_settle(ACCT, [carry_day, bill_day], 900.0)
+
+        rows = {r["doc_date"]: r for r in self.bills()}   # คนละวัน → แยกด้วยวันที่ได้
+        self.assertEqual(len(rows), 2, "ยกมากับบิลจริงคนละวัน ต้องไม่ถูกกันซ้ำ")
+        self.assertAlmostEqual(rows[bill_day]["paid"], 0.0, places=2, msg="บิลปกติไม่ควรโดนก่อน")
+        self.assertAlmostEqual(rows[carry_day]["paid"], 900.0, places=2, msg="ค้างยกมาต้องโดนตัดก่อน")
 
     def test_overpay_allocates_only_what_exists(self):
         """จ่ายเกินยอดบิล — จัดสรรได้แค่เท่าที่มีบิลรองรับ ส่วนเกินไม่หายไปไหน (ไปลดยอดค้างรวม)"""
@@ -5027,3 +5033,339 @@ class TestMemoDaylistDoesNotEatMonth(unittest.TestCase):
             da, db = _dm(_d(a)), _dm(_d(b))
             got = app._dates_from_memo(f"จ่าย ({da} และ {db}) 2 บิล")
             self.assertEqual(got, [_d(a), _d(b)], f"โน้ต ({da} และ {db}) ต้องได้ครบ 2 วัน")
+
+
+class TestPayableMatchByNote(PayableTestCase):
+    """🔴 จับคู่ 'จ่าย'↔'บิล' เมื่อวันหนึ่งมีหลายบิล (เจ้าของแจ้ง 10/11/2569)
+
+    เคสจริงสองใบที่บอทตัดผิด/ไม่ตัด:
+      01/11/26  บิล 16,320 · 13,102   จ่าย 3,102  → เจ้าของตั้งใจให้ 13,102 (เหลือค้าง 10,000)
+                ของเดิม FIFO ไปตัด 16,320 ผิดใบ
+      08/11/26  บิล 15,705 · 11,464   จ่าย 1,464  โน้ต 'ไส้ (8/11) ค้าง 10,000'
+                ของเดิมหาใบยอดตรง 1,464 ไม่เจอ → ปล่อยลอย ไม่ตัดใบไหนเลย
+    """
+
+    def _bills_by_amount(self):
+        return {round(float(r["amount"]), 2): r for r in self.bills()}
+
+    # ── ตัวอ่าน 'ค้าง N' ───────────────────────────────────────────────
+    def test_left_from_memo_reads_real_note(self):
+        self.assertAlmostEqual(app._left_from_memo("ไส้ (8/11) ค้าง 10,000"), 10000.0, places=2)
+        self.assertAlmostEqual(app._left_from_memo("ค้าง 1,464.50"), 1464.50, places=2)
+
+    def test_left_from_memo_none_when_absent_or_zero(self):
+        self.assertIsNone(app._left_from_memo("ไส้ (8/11)"))
+        self.assertIsNone(app._left_from_memo(None))
+        self.assertIsNone(app._left_from_memo("ค้าง 0"), "ค้าง 0 = ไม่มีข้อมูล ไม่ใช่ยอดจริง")
+
+    # ── เคสจริง 08/11: โน้ตชี้ใบได้ ───────────────────────────────────
+    def test_note_left_amount_picks_the_right_bill(self):
+        """โน้ต 'ค้าง 10,000' → 11,464 − 1,464 = 10,000 พอดี (15,705 ไม่ใช่)"""
+        day = _d(2)
+        app.save_payable_bill(ACCT, 15705.0, note="รูป", doc_date=day)
+        app.save_payable_bill(ACCT, 11464.0, note="รูป", doc_date=day)
+
+        allocated, settled, note = app._payable_settle(
+            ACCT, day, 1464.0, left_after=10000.0, from_memo=True)
+
+        b = self._bills_by_amount()
+        self.assertAlmostEqual(allocated, 1464.0, places=2)
+        self.assertAlmostEqual(b[11464.0]["paid"], 1464.0, places=2, msg="ต้องตัดใบ 11,464")
+        self.assertAlmostEqual(b[15705.0]["paid"], 0.0, places=2, msg="ใบ 15,705 ห้ามโดนแตะ")
+
+    def test_note_left_amount_survives_next_day_slip_date(self):
+        """สลิปโอนหลังเที่ยงคืน → วันบนสลิปเป็นวันถัดไป แต่โน้ตบอกวันบิล ต้องตัดถูกใบเหมือนเดิม
+        (เจ้าของ: 'ยอด 1464 มันคือของวันที่ 8 ตามบันทึก แต่ดันมาลงวันที่ 9')"""
+        bill_day = _d(2)
+        app.save_payable_bill(ACCT, 15705.0, note="รูป", doc_date=bill_day)
+        app.save_payable_bill(ACCT, 11464.0, note="รูป", doc_date=bill_day)
+
+        # pay_for มาจากโน้ต (วันบิล) ไม่ใช่วันโอนบนสลิป
+        allocated, _, _ = app._payable_settle(ACCT, bill_day, 1464.0,
+                                              left_after=10000.0, from_memo=True)
+
+        self.assertAlmostEqual(allocated, 1464.0, places=2)
+        self.assertAlmostEqual(self._bills_by_amount()[11464.0]["paid"], 1464.0, places=2)
+
+    # ── เคสจริง 01/11: ไม่มีโน้ต → ห้ามเดา ต้องถาม ────────────────────
+    def test_two_bills_no_hint_is_not_guessed(self):
+        """จ่าย 3,102 ลงได้ทั้งบิล 16,320 และ 13,102 → ห้ามตัดเอง (ของเดิม FIFO ตัด 16,320 ผิด)"""
+        day = _d(9)
+        app.save_payable_bill(ACCT, 16320.0, note="รูป", doc_date=day)
+        app.save_payable_bill(ACCT, 13102.0, note="รูป", doc_date=day)
+
+        allocated, settled, note = app._payable_settle(ACCT, day, 3102.0, from_memo=True)
+
+        b = self._bills_by_amount()
+        self.assertAlmostEqual(allocated, 0.0, places=2, msg="กำกวม = ต้องไม่ตัดใบไหนเลย")
+        self.assertAlmostEqual(b[16320.0]["paid"], 0.0, places=2)
+        self.assertAlmostEqual(b[13102.0]["paid"], 0.0, places=2)
+        self.assertEqual(settled, [])
+
+    def test_ambiguous_helper_matches_settle_decision(self):
+        """🔴 ตัวบอกเหตุผลต้องตรงกับตัวตัดสินเป๊ะ — ไม่งั้นเกิด 'ไม่ตัดให้ แต่ก็ไม่บอกว่าทำไม' = เงียบ"""
+        day = _d(9)
+        app.save_payable_bill(ACCT, 16320.0, note="รูป", doc_date=day)
+        app.save_payable_bill(ACCT, 13102.0, note="รูป", doc_date=day)
+
+        amb = app._payable_ambiguous_bills(ACCT, day, 3102.0)
+
+        self.assertEqual(len(amb), 2, "ต้องคืนทั้งสองใบไว้ให้คนเลือก")
+        self.assertEqual(app._amb_dates(amb), [day])
+
+    def test_spill_payment_still_fifo_not_ambiguous(self):
+        """จ่ายที่ 'ล้นใบ' ไม่กำกวม — บิล 1,000 + 2,000 จ่าย 1,500 มีใบเดียวที่ค้างเกิน 1,500
+        พฤติกรรมเดิม (กระจาย 1,000 + 500) ต้องไม่เปลี่ยน"""
+        day = _d(8)
+        app.save_payable_bill(ACCT, 1000.0, note="รูป", doc_date=day)
+        app.save_payable_bill(ACCT, 2000.0, note="รูป", doc_date=day)
+
+        self.assertEqual(app._payable_ambiguous_bills(ACCT, day, 1500.0), [])
+        allocated, _, _ = app._payable_settle(ACCT, day, 1500.0, from_memo=True)
+        self.assertAlmostEqual(allocated, 1500.0, places=2)
+
+    def test_single_bill_on_day_still_partial_cut(self):
+        """วันนั้นมีใบเดียว → ตัดบางส่วนได้ตามเดิม ไม่ถือว่ากำกวม"""
+        day = _d(4)
+        app.save_payable_bill(ACCT, 9000.0, note="รูป", doc_date=day)
+
+        allocated, _, _ = app._payable_settle(ACCT, day, 2000.0, from_memo=True)
+
+        self.assertAlmostEqual(allocated, 2000.0, places=2)
+        self.assertAlmostEqual(self._bills_by_amount()[9000.0]["paid"], 2000.0, places=2)
+
+    # ── โน้ตคนระบุวันแล้ว ห้ามข้ามวันไปจับใบอื่นที่ยอดบังเอิญตรง ──────
+    def test_memo_date_blocks_cross_date_exact_match(self):
+        """เคสจริง 08/11/26: จ่าย 10,000 ของบิล 11,464 (วัน 8/11)
+        แต่บิลคนละวันเหลือค้าง 10,000 พอดี — ของเดิมข้อ (2) จะลากไปตัดผิดวันทั้งก้อน"""
+        other_day, memo_day = _d(9), _d(2)
+        app.save_payable_bill(ACCT, 10000.0, note="รูป", doc_date=other_day)   # ค้าง 10,000 พอดี
+        app.save_payable_bill(ACCT, 11464.0, note="รูป", doc_date=memo_day)
+
+        allocated, _, _ = app._payable_settle(ACCT, memo_day, 10000.0,
+                                              left_after=1464.0, from_memo=True)
+
+        b = self._bills_by_amount()
+        self.assertAlmostEqual(b[10000.0]["paid"], 0.0, places=2,
+                               msg="โน้ตระบุวันแล้ว ห้ามข้ามวันไปตัดใบที่ยอดบังเอิญตรง")
+        self.assertAlmostEqual(b[11464.0]["paid"], 10000.0, places=2)
+        self.assertAlmostEqual(allocated, 10000.0, places=2)
+
+    def test_ai_date_still_allows_cross_date_exact_match(self):
+        """วันที่มาจาก AI (ไม่ใช่โน้ตคน) → ข้อ (2) ยังทำงานเหมือนเดิม
+        เคสจริง 12/08/26 ที่ข้อนี้ถูกเพิ่มเข้ามาแก้ ต้องไม่พัง"""
+        old_day, today = _d(14), _d(0)
+        app.save_payable_bill(ACCT, 2867.0, note="รูป", doc_date=old_day)
+        app.save_payable_bill(ACCT, 15091.0, note="รูป", doc_date=today)
+
+        allocated, _, _ = app._payable_settle(ACCT, today, 2867.0, from_memo=False)
+
+        self.assertAlmostEqual(allocated, 2867.0, places=2)
+        self.assertAlmostEqual(self._bills_by_amount()[2867.0]["paid"], 2867.0, places=2)
+
+
+class TestPayableCarryDedup(PayableTestCase):
+    """🔴 'ยกมา' กับบิลจริงยอด+วันเดียวกัน = ตัวซ้ำ ต้องกันได้ทั้งสองทิศทาง
+
+    เคสจริง 09/11/26: ยกมา 9,693 + บิลจริง 9,693 วันเดียวกัน → ยอดค้างเกินจริง 9,693 บาท
+    (เจ้าของยืนยัน 10/11/2569 ว่าวันนั้นมีของส่งใบเดียว)
+    ของเดิมกันเฉพาะตอน 'บิลจริงมาทีหลัง' — ถ้าวางบล็อกยอดค้างทับทีหลัง ไม่กันเลย"""
+
+    def test_real_bill_then_carry(self):
+        day = _d(1)
+        app.save_payable_bill(ACCT, 9693.0, note="รูป", doc_date=day)
+        app.save_payable_bill(ACCT, 9693.0, note=app._PAYABLE_CARRY_NOTE, doc_date=day)
+
+        self.assertEqual(len(self.bills()), 1, "บิลจริงมาก่อน แล้ววางยกมาทับ = ต้องไม่ได้สองบรรทัด")
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 9693.0, places=2)
+
+    def test_carry_then_real_bill(self):
+        day = _d(1)
+        app.save_payable_bill(ACCT, 9693.0, note=app._PAYABLE_CARRY_NOTE, doc_date=day)
+        app.save_payable_bill(ACCT, 9693.0, note="รูป", doc_date=day)
+
+        self.assertEqual(len(self.bills()), 1, "ทิศทางเดิมต้องยังกันได้เหมือนเดิม")
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 9693.0, places=2)
+
+    def test_different_day_is_not_a_duplicate(self):
+        app.save_payable_bill(ACCT, 9693.0, note="รูป", doc_date=_d(1))
+        app.save_payable_bill(ACCT, 9693.0, note=app._PAYABLE_CARRY_NOTE, doc_date=_d(2))
+
+        self.assertEqual(len(self.bills()), 2, "คนละวัน = คนละรายการ ห้ามกันซ้ำ")
+
+    def test_ledger_has_no_double_separator(self):
+        """เส้นคั่นซ้อนกัน 2 เส้นตอนหัวการ์ด (เจ้าของเห็น 10/11/2569)"""
+        app.save_payable_bill(ACCT, 19308.0, note="รูป", doc_date=_d(10))
+        app.save_payable_bill(ACCT, 9693.0, note=app._PAYABLE_CARRY_NOTE, doc_date=_d(1))
+
+        lines = app.build_payable_ledger(ACCT, with_total=True).split("\n")
+
+        bar = "━━━━━━━━━━━━━"
+        doubles = [i for i in range(1, len(lines)) if lines[i] == bar and lines[i - 1] == bar]
+        self.assertEqual(doubles, [], f"เส้นคั่นซ้อนกันที่บรรทัด {doubles}\n" + "\n".join(lines))
+
+
+class TestPayableMovePayment(PayableTestCase):
+    """คำสั่ง 'ย้ายจ่าย <ยอด> ไปบิล <ยอดบิล>' — ซ่อมเงินจ่ายที่เกาะผิดใบ โดยไม่ต้องแตะ DB ด้วยมือ
+    จำเป็นเพราะของที่ตัดผิดไปแล้วแก้ด้วย 'ลบจ่าย' + ส่งใหม่ไม่ได้เสมอ (สลิปซ้ำจะถูกปฏิเสธ)"""
+
+    def setUp(self):
+        super().setUp()
+        self.replies = []
+        self._orig_api = app.line_bot_api
+        self._orig_push = app._payable_push_summary
+
+        class _Api:
+            def reply_message(_s, tok, msg):
+                self.replies.append(getattr(msg, "text", str(msg)))
+        app.line_bot_api = _Api()
+        app._payable_push_summary = lambda *a, **k: None
+
+    def tearDown(self):
+        app.line_bot_api = self._orig_api
+        app._payable_push_summary = self._orig_push
+        super().tearDown()
+
+    class _Event:
+        reply_token = "tok"
+
+    def _cmd(self, text):
+        self.replies = []
+        handled = app.handle_payable_text(self._Event(), text, ACCT)
+        return handled, (self.replies[0] if self.replies else "")
+
+    def _pay(self, day, amount, onto_day=None):
+        """ลงเงินจ่าย 1 ก้อน (จับคู่ตามกติกาปกติ) แล้วคืน id"""
+        allocated, settled, note = app._payable_settle(ACCT, onto_day or day, amount)
+        return app.save_payable_payment(ACCT, amount, doc_date=day,
+                                        allocated=allocated, settle_note=note)
+
+    def test_moves_payment_to_the_named_bill(self):
+        """เคสจริง 01/11/26: จ่าย 3,102 ไปเกาะบิล 16,320 ผิดใบ → ย้ายไป 13,102 ให้เหลือค้าง 10,000"""
+        day = _d(9)
+        app.save_payable_bill(ACCT, 16320.0, note="รูป", doc_date=day)
+        app.save_payable_bill(ACCT, 13102.0, note="รูป", doc_date=day)
+        # จำลองของที่ตัดผิดไปแล้ว: ยัด paid ใส่ใบ 16,320 ตรงๆ เหมือนที่ FIFO ของเดิมทำ
+        with app._db() as conn:
+            conn.execute("UPDATE payable_bills SET paid=3102 WHERE group_id=? AND ABS(amount-16320)<0.01",
+                         (ACCT,))
+            conn.commit()
+        app.save_payable_payment(ACCT, 3102.0, doc_date=day, allocated=3102.0, settle_note="09/11")
+        before = app._payable_outstanding(ACCT)
+
+        handled, msg = self._cmd("ย้ายจ่าย 3102 ไปบิล 13102")
+
+        bills = {round(float(r["amount"]), 2): r for r in self.bills()}
+        self.assertTrue(handled)
+        self.assertIn("13,102", msg)
+        self.assertAlmostEqual(bills[13102.0]["paid"], 3102.0, places=2, msg="ต้องไปเกาะใบ 13,102")
+        self.assertAlmostEqual(bills[16320.0]["paid"], 0.0, places=2, msg="ใบ 16,320 ต้องกลับมาค้างเต็ม")
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), before, places=2,
+                               msg="🔴 ย้ายใบ ไม่ใช่เพิ่ม/ลดหนี้ — ยอดรวมต้องไม่ขยับ")
+
+    def test_message_reports_remaining_on_that_bill(self):
+        day = _d(9)
+        app.save_payable_bill(ACCT, 13102.0, note="รูป", doc_date=day)
+        app.save_payable_payment(ACCT, 3102.0, doc_date=day, allocated=0.0)
+
+        handled, msg = self._cmd("ย้ายจ่าย 3102 ไปบิล 13102")
+
+        self.assertIn("10,000", msg, f"ต้องบอกว่าเหลือค้างเท่าไร — ได้: {msg}")
+
+    def test_refuses_when_two_bills_share_the_amount(self):
+        """ยอดบิลซ้ำกันหลายใบ = ย้ายเจาะจงไม่ได้ ต้องไม่เดา (กติกาเดียวกับ 'ลบจ่าย')"""
+        app.save_payable_bill(ACCT, 13102.0, note="รูป", doc_date=_d(9))
+        app.save_payable_bill(ACCT, 13102.0, note="รูป", doc_date=_d(8))
+        app.save_payable_payment(ACCT, 3102.0, doc_date=_d(9), allocated=0.0)
+
+        handled, msg = self._cmd("ย้ายจ่าย 3102 ไปบิล 13102")
+
+        self.assertTrue(handled)
+        self.assertIn("ย้ายเจาะจงไม่ได้", msg)
+        self.assertEqual([r for r in self.bills() if float(r["paid"] or 0) > 0.01], [],
+                         "ปฏิเสธแล้วต้องไม่แตะข้อมูลเลย")
+
+    def test_date_disambiguates(self):
+        """ระบุวันฝั่งบิลได้ → ย้ายได้แม้ยอดบิลซ้ำ"""
+        d9, d8 = _d(9), _d(8)
+        app.save_payable_bill(ACCT, 13102.0, note="รูป", doc_date=d9)
+        app.save_payable_bill(ACCT, 13102.0, note="รูป", doc_date=d8)
+        app.save_payable_payment(ACCT, 3102.0, doc_date=d9, allocated=0.0)
+
+        handled, msg = self._cmd(f"ย้ายจ่าย 3102 ไปบิล {app._ddmmyy(d8)} 13102")
+
+        rows = {r["doc_date"]: r for r in self.bills()}
+        self.assertTrue(handled)
+        self.assertAlmostEqual(rows[d8]["paid"], 3102.0, places=2)
+        self.assertAlmostEqual(rows[d9]["paid"], 0.0, places=2)
+
+    def test_missing_payment_says_so(self):
+        app.save_payable_bill(ACCT, 13102.0, note="รูป", doc_date=_d(9))
+
+        handled, msg = self._cmd("ย้ายจ่าย 3102 ไปบิล 13102")
+
+        self.assertTrue(handled)
+        self.assertIn("ไม่พบ", msg)
+
+    def test_bad_format_explains(self):
+        handled, msg = self._cmd("ย้ายจ่าย 3102")
+        self.assertTrue(handled)
+        self.assertIn("รูปแบบไม่ถูก", msg)
+
+
+class TestDeleteDuplicateCarry(PayableTestCase):
+    """'ลบบิล <วัน> <ยอด>' เมื่อเจอคู่ 'ยกมา + บิลจริง' = ตัวซ้ำที่รู้แน่ว่าลบตัวไหน
+    ของเดิมปฏิเสธทุกกรณีที่เจอ >1 ใบ → ตัวซ้ำที่ค้างในฐานก่อนมีตัวกันซ้ำ ลบออกไม่ได้เลย"""
+
+    def setUp(self):
+        super().setUp()
+        self.replies = []
+        self._orig_api = app.line_bot_api
+
+        class _Api:
+            def reply_message(_s, tok, msg):
+                self.replies.append(getattr(msg, "text", str(msg)))
+        app.line_bot_api = _Api()
+
+    def tearDown(self):
+        app.line_bot_api = self._orig_api
+        super().tearDown()
+
+    class _Event:
+        reply_token = "tok"
+
+    def _mk_dup(self, day, amt):
+        """ยัดตัวซ้ำลงฐานตรงๆ — เลี่ยงตัวกันซ้ำตอนลงบิล (จำลองข้อมูลเก่าที่ค้างอยู่แล้ว)"""
+        with app._db() as conn:
+            for note in ("รูป", app._PAYABLE_CARRY_NOTE):
+                conn.execute("INSERT INTO payable_bills (group_id, doc_date, amount, note, recorded_at) "
+                             "VALUES (?,?,?,?,?)", (ACCT, day, float(amt), note, "2026-11-09 00:00:00"))
+            conn.commit()
+
+    def test_deletes_the_carry_not_the_real_bill(self):
+        day = "2026-11-09"
+        self._mk_dup(day, 9693.0)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 19386.0, places=2, msg="ตั้งต้น = นับซ้ำ")
+
+        app.handle_payable_text(self._Event(), "ลบบิล 9/11 9693", ACCT)
+
+        rows = self.bills()
+        self.assertEqual(len(rows), 1, "ต้องเหลือใบเดียว")
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 9693.0, places=2)
+        with app._db() as conn:
+            left = conn.execute("SELECT note FROM payable_bills WHERE group_id=?", (ACCT,)).fetchone()
+        self.assertNotEqual(left["note"], app._PAYABLE_CARRY_NOTE, "🔴 ต้องลบ 'ยกมา' ไม่ใช่บิลจริง")
+
+    def test_still_refuses_two_real_bills(self):
+        """บิลจริงสองใบยอด+วันเดียวกัน = ของจริงที่อาจส่งสองรอบ ห้ามเดาว่าจะลบใบไหน"""
+        day = "2026-11-09"
+        with app._db() as conn:
+            for _ in range(2):
+                conn.execute("INSERT INTO payable_bills (group_id, doc_date, amount, note, recorded_at) "
+                             "VALUES (?,?,?,?,?)", (ACCT, day, 9693.0, "รูป", "2026-11-09 00:00:00"))
+            conn.commit()
+
+        app.handle_payable_text(self._Event(), "ลบบิล 9/11 9693", ACCT)
+
+        self.assertEqual(len(self.bills()), 2, "ปฏิเสธแล้วต้องไม่ลบอะไรเลย")
+        self.assertIn("ลบเจาะจงไม่ได้", self.replies[0])
