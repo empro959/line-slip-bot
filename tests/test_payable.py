@@ -5369,3 +5369,80 @@ class TestDeleteDuplicateCarry(PayableTestCase):
 
         self.assertEqual(len(self.bills()), 2, "ปฏิเสธแล้วต้องไม่ลบอะไรเลย")
         self.assertIn("ลบเจาะจงไม่ได้", self.replies[0])
+
+
+class TestUnlinkPrefersExactBill(PayableTestCase):
+    """🔴 คืนยอดที่จับคู่ไว้ ต้องคืนจาก 'ใบที่ยอดตรงเป๊ะ' ก่อน
+
+    เคสจริง 11/11/2569 ตอนซ่อมข้อมูลด้วย 'ย้ายจ่าย': วันที่ 01/11 มีสองบิล
+      16,320 (paid 10,000 ← ก้อนที่กำลังย้าย)  ·  13,102 (paid 3,102 ← คนละก้อน)
+    settle_note ของทั้งสองก้อนเป็น '01/11' เหมือนกัน → ของเดิมเรียงแค่ 'ใหม่สุดก่อน'
+    เลยไปคืนจาก 13,102 ก่อน แล้วยอด paid สลับมั่วทั้งสองใบ
+    (ยอดรวมยังถูก แต่ 'ใบไหนจ่ายเท่าไร' พัง = ทำลายสิ่งที่คำสั่งนี้กำลังจะซ่อม)"""
+
+    def setUp(self):
+        super().setUp()
+        self.replies = []
+        self._orig_api = app.line_bot_api
+        self._orig_push = app._payable_push_summary
+
+        class _Api:
+            def reply_message(_s, tok, msg):
+                self.replies.append(getattr(msg, "text", str(msg)))
+        app.line_bot_api = _Api()
+        app._payable_push_summary = lambda *a, **k: None
+
+    def tearDown(self):
+        app.line_bot_api = self._orig_api
+        app._payable_push_summary = self._orig_push
+        super().tearDown()
+
+    class _Event:
+        reply_token = "tok"
+
+    def test_move_does_not_scramble_the_other_bill(self):
+        day = _d(10)
+        with app._db() as conn:
+            for amt, paid in ((16320.0, 10000.0), (13102.0, 3102.0)):
+                conn.execute("INSERT INTO payable_bills (group_id, doc_date, amount, paid, note, recorded_at) "
+                             "VALUES (?,?,?,?,?,?)", (ACCT, day, amt, paid, "รูป", "x"))
+            for amt, alloc in ((3102.0, 3102.0), (10000.0, 10000.0)):
+                conn.execute("INSERT INTO payable_payments (group_id, doc_date, amount, allocated, "
+                             "settle_note, recorded_at) VALUES (?,?,?,?,?,?)",
+                             (ACCT, day, amt, alloc, app._ddmmyy(day)[:5], "x"))
+            conn.commit()
+        before = app._payable_outstanding(ACCT)
+
+        app.handle_payable_text(self._Event(), f"ย้ายจ่าย {app._ddmmyy(day)} 10000 ไปบิล 13102", ACCT)
+
+        b = {round(float(r["amount"]), 2): float(r["paid"] or 0) for r in self.bills()}
+        self.assertAlmostEqual(b[16320.0], 0.0, places=2,
+                               msg="ก้อน 10,000 ต้องถูกคืนจากใบ 16,320 ทั้งก้อน")
+        self.assertAlmostEqual(b[13102.0], 13102.0, places=2,
+                               msg="ใบ 13,102 ต้องได้ 3,102 เดิม + 10,000 ที่ย้ายมา = จ่ายครบ")
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), before, places=2,
+                               msg="ย้ายใบ ไม่ใช่เพิ่ม/ลดหนี้")
+
+    def test_unlink_still_spreads_when_no_exact_bill(self):
+        """ไม่มีใบไหนยอดตรงเป๊ะ → คืนแบบกระจายเหมือนเดิม (ยอดรวมต้องถูกเสมอ)"""
+        day = _d(10)
+        with app._db() as conn:
+            for amt, paid in ((5000.0, 2000.0), (6000.0, 3000.0)):
+                conn.execute("INSERT INTO payable_bills (group_id, doc_date, amount, paid, note, recorded_at) "
+                             "VALUES (?,?,?,?,?,?)", (ACCT, day, amt, paid, "รูป", "x"))
+            conn.execute("INSERT INTO payable_payments (group_id, doc_date, amount, allocated, "
+                         "settle_note, recorded_at) VALUES (?,?,?,?,?,?)", (ACCT, day, 5000.0, 5000.0, None, "x"))
+            conn.commit()
+        before = app._payable_outstanding(ACCT)
+
+        with app._db() as conn:
+            row = conn.execute("SELECT * FROM payable_payments WHERE group_id=?", (ACCT,)).fetchone()
+            stuck = app._payable_unlink(conn, ACCT, "payable_payments", row)
+            conn.execute("DELETE FROM payable_payments WHERE id=?", (row["id"],))
+            conn.commit()
+
+        self.assertAlmostEqual(stuck, 0.0, places=2, msg="คืนได้ครบ 5,000 (2,000 + 3,000)")
+        self.assertAlmostEqual(sum(float(r["paid"] or 0) for r in self.bills()), 0.0, places=2,
+                               msg="ต้องคืนจากทั้งสองใบจนเหลือ 0 — ไม่มีใบไหนยอดตรงเป๊ะ จึงกระจาย")
+        # ลบเงินจ่าย = หนี้เพิ่มขึ้นเท่ายอดที่จ่ายไป (ไม่ใช่ยอดเท่าเดิมแบบตอน 'ย้าย')
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), before + 5000.0, places=2)

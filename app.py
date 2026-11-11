@@ -4214,7 +4214,17 @@ def _payable_unlink(conn, group_id: str, table: str, row) -> float:
             return datetime.strptime(d, "%Y-%m-%d").strftime("%d/%m")
         except (ValueError, TypeError):
             return ""
-    ordered = sorted(rows, key=lambda r: 0 if _dm(r["doc_date"]) in days else 1)
+    # 🔴 ใบที่ 'ยอดจับคู่ไว้เท่ากับก้อนนี้พอดี' ต้องมาก่อนทุกอย่าง — เกือบแน่นอนว่าคือคู่จริง
+    #    เคสจริง 11/11/26 (ตอนซ่อมข้อมูลด้วย 'ย้ายจ่าย'): วันเดียวกันมีสองบิล
+    #      16,320 (paid 10,000 ← ก้อนที่กำลังย้าย) · 13,102 (paid 3,102 ← คนละก้อน)
+    #    ของเดิมเรียงแค่ 'วันตรงกับ settle_note แล้วใหม่สุดก่อน' → ทั้งคู่วันตรงหมด
+    #      เลยไปคืนจาก 13,102 ก่อน 3,102 แล้วค่อยเอาจาก 16,320 อีก 6,898
+    #      ยอดรวมยังถูก แต่ 'ใบไหนจ่ายเท่าไร' สลับมั่วทั้งสองใบ = พังสิ่งที่กำลังจะซ่อมพอดี
+    #    ⚠️ ลำดับ: ยอดตรงเป๊ะ → วันตรงกับ settle_note → ใบที่รับได้ครบก้อน → ใหม่สุด (rows เรียง id DESC)
+    ordered = sorted(rows, key=lambda r: (
+        0 if abs(float(r["v"]) - amt) < 0.01 else 1,
+        0 if _dm(r["doc_date"]) in days else 1,
+        0 if float(r["v"]) >= amt - 0.01 else 1))
     left = amt
     for r in ordered:
         if left <= 0.01:
