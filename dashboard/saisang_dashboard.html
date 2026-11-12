@@ -398,7 +398,7 @@ tr:last-child td{border-bottom:none}
   <div id="tax-bar" class="xbar tbar"></div>
   <div id="flag-bar" class="fbar"></div>
   <div class="g2"><div class="card full anim">
-    <div class="ctitle"><span class="cdot" style="background:var(--cyan)"></span>ค่าใช้จ่ายจริง แยก 5 กลุ่ม</div>
+    <div class="ctitle"><span class="cdot" style="background:var(--cyan)"></span>ค่าใช้จ่ายจริง แยก <span id="grp-n">5</span> กลุ่ม</div>
     <div id="grp-wrap" class="grpwrap"></div>
   </div></div>
   <div class="g2"><div class="card full anim">
@@ -611,8 +611,10 @@ const EXP_GROUPS = [
   { key:'drink', label:'เครื่องดื่ม',    match:['เครื่องดื่ม'] },
   { key:'labor', label:'ค่าแรง',        match:['พนักงานหน้าร้าน','ครัว','นักร้อง','ก๋วยเตี๋ยว','CEO','พีอาร์'] },
   { key:'bill',  label:'บิลประจำเดือน',  match:['ค่าเช่า','ค่าสาธารณูปโภค','ค่าภาษี'] },
+  { key:'maint', label:'บำรุงรักษา',     match:['บำรุงรักษา'] },   // เจ้าของสั่ง 12/11/2569
 ];
-const OTHER_KNOWN = ['คชจ.ในร้าน','ของสิ้นเปลือง','BNI','อื่นๆ'];   // ตั้งใจให้อยู่ 'อื่นๆ'
+// 'คชจ.สาขานิมมานฯ' — เจ้าของยืนยัน 12/11/2569 ว่านับรวมเป็นค่าใช้จ่ายของร้าน ให้อยู่ 'อื่นๆ'
+const OTHER_KNOWN = ['คชจ.ในร้าน','ของสิ้นเปลือง','BNI','อื่นๆ','คชจ.สาขานิมมานฯ'];
 
 // 🪤 ชื่อจริงในไฟล์ไม่ตรงกับชื่อย่อในใบสั่งงาน — 'ครัว' ของจริงคือ 'พนักงานครัว'
 //    และ 'ก๋วยเตี๋ยว' คือ 'พนง.ก๋วยเตี๋ยว' → ถ้าจับแบบ "ขึ้นต้นด้วย" จะหลุดทั้งคู่ (838,862 + 89,150)
@@ -633,7 +635,7 @@ const _TH_MO_ABBR = ['มค','กพ','มีค','เมย','พค','มิ�
 // ผลคำนวณทั้งหมดของเดือนหนึ่ง — ฟังก์ชันบริสุทธิ์ ไม่แตะ m
 function mF(m){
   const cats = (m && m.expense_categories) || [];
-  const g = { raw:0, drink:0, labor:0, bill:0, other:0 };
+  const g = { raw:0, drink:0, labor:0, bill:0, maint:0, other:0 };
   let exp = 0, xfer = 0;
   const xferRows = [], otherRows = [];
   cats.forEach(c => {
@@ -655,10 +657,20 @@ function mF(m){
                       .map(c => ({ category:c.category, amount:+c.amount||0 }));
   const taxPaid = taxRows.reduce((a,c) => a + c.amount, 0);
   const vatOut  = Math.round(sales * 7 / 107);
-  const taxDue  = vatOut - taxPaid;
+  // 🔴 เจ้าของยืนยัน 12/11/2569: หมวด 'ค่าภาษี' มีทั้ง **VAT** และ **ภาษีหัก ณ ที่จ่าย (50 ทวิ)** ปนกัน
+  //    50 ทวิ เป็นคนละภาษีกับ VAT — เอาไปหักจาก 'VAT ที่ต้องนำส่ง' ไม่ได้
+  //    ข้อมูลดิบมีหมวดเดียว แยกไม่ได้ → ห้ามเดาสัดส่วน ให้แสดงเป็น 'ช่วง' แทนตัวเลขเดียวที่โกหก
+  //      ต่ำสุด = ถือว่าที่จ่ายไปเป็น VAT ทั้งก้อน · สูงสุด = ถือว่าไม่ใช่ VAT เลย
+  const taxDueMin = vatOut - taxPaid;
+  const taxDueMax = vatOut;
+  const taxDue    = taxDueMin;
+  // ⚠️ 'กำไรหลังกันภาษี' ยังใช้ตัวต่ำสุดตามเดิม — ตั้งใจไม่เปลี่ยนเอง
+  //    เปลี่ยนไปใช้ตัวสูงสุดจะทำให้บางเดือนพลิกจากกำไรเป็นขาดทุนบนหน้าจอ (ม.ค. +5,201 → -23,181)
+  //    นั่นเป็นการตีความ ไม่ใช่สิ่งที่เจ้าของสั่ง → เปิดเผยความไม่แน่นอนที่ช่อง 'ภาษีคงเหลือ' พอ
+  //    ถ้าเจ้าของสั่งให้กันเงินแบบระวังไว้ก่อน ค่อยสลับมาใช้ taxDueMax
 
   return { sales, exp, xfer, xferRows, otherRows, g, profit,
-           vatOut, taxPaid, taxRows, taxDue,
+           vatOut, taxPaid, taxRows, taxDue, taxDueMin, taxDueMax,
            profitNet: profit - taxDue,
            cost:   sales > 0 ? exp / sales * 100 : 0,
            margin: sales > 0 ? profit / sales * 100 : 0 };
@@ -707,8 +719,11 @@ const SYNC_URL_DEFAULT=(typeof window!=='undefined' && window.SAISANG_SYNC_URL)
 // 🔴 เลขรุ่น — เคยเสียเวลาไล่ปัญหาเพราะดูไม่ออกว่าหน้าที่เปิดอยู่เป็นไฟล์ชุดไหน
 //    (8 พ.ย. 69: ลากไฟล์ชุดเก่าทับโดยไม่รู้ตัว ตัวเลขกำไรย้อนกลับไปเป็นของเดิม)
 //    ⚠️ ต้องบวกเลขนี้ทุกครั้งที่แก้ไฟล์นี้ ไม่งั้นมันโกหก
-const BUILD='2026-11-08c';
+const BUILD='2026-11-12a';
 try{ const _b=document.getElementById('build-tag'); if(_b) _b.textContent='v'+BUILD; }catch(e){}
+// 🪤 ป้าย 'แยก N กลุ่ม' เคยฮาร์ดโค้ดเป็น 5 — พอเพิ่มกลุ่ม 'บำรุงรักษา' (12/11/69) ป้ายก็โกหกทันที
+//    นับจาก EXP_GROUPS + 'อื่นๆ' แทน จะได้ไม่ต้องจำว่าต้องตามแก้ป้ายด้วย
+try{ const _n=document.getElementById('grp-n'); if(_n) _n.textContent=String(EXP_GROUPS.length+1); }catch(e){}
 
 const _isPlaceholder=u=>!u||/^<</.test(u);
 let SYNC_URL=localStorage.getItem('saisang_sync_url')||'';
@@ -1107,9 +1122,12 @@ function buildBreakdown(m){
     tb.innerHTML =
       '<span class="xt">🧾 กันไว้จ่ายภาษี (ประมาณ)</span>'+
       '<span>VAT ขาย 7/107 <b>฿'+fmt(r.vatOut)+'</b></span>'+
-      '<span>− ค่าภาษีที่จ่าย <b>฿'+fmt(r.taxPaid)+'</b></span>'+
-      '<span>= ภาษีคงเหลือ <b>฿'+fmt(r.taxDue)+'</b></span>'+
+      '<span>ค่าภาษีที่จ่ายแล้ว <b>฿'+fmt(r.taxPaid)+'</b> <span class="tn">(VAT + 50 ทวิ ปนกัน)</span></span>'+
+      '<span>= ภาษีคงเหลือ <b>฿'+fmt(r.taxDueMin)+' – ฿'+fmt(r.taxDueMax)+'</b></span>'+
       '<span>กำไรหลังกันภาษี <span class="'+(net>=0?'tok':'tbad')+'">'+(net>=0?'+':'')+'฿'+fmt(net)+'</span></span>'+
+      '<span class="tn">หมวด “ค่าภาษี” มีทั้ง VAT และภาษีหัก ณ ที่จ่าย (50 ทวิ) ปนกัน '+
+      'แยกจากข้อมูลไม่ได้ จึงบอกเป็นช่วง · 50 ทวิ หักจาก VAT ไม่ได้ '+
+      '— “กำไรหลังกันภาษี” ด้านล่างยังคิดจากตัวต่ำสุด</span>'+
       '<span class="tn">ตัวเลขประมาณเพื่อกันเงิน ไม่ใช่บัญชีภาษี · ไม่ได้หักซ้ำจากกำไรด้านบน</span>';
   }
 
@@ -1134,11 +1152,13 @@ function buildBreakdown(m){
     if(flags.length) h+='<span class="fh">🟡 รอเจ้าของยืนยัน — ยังไม่แก้ข้อมูลใดๆ</span>'+
       flags.map(x=>'<div class="fi">• '+x.category+'  ฿'+fmt(x.amount)+'  — '+x.note+'</div>').join('');
     if(r.taxRows.length) h+=(h?'<div style="height:7px"></div>':'')+
-      '<span class="fh">🧾 ข้อสังเกตเรื่องภาษี — รอเจ้าของแยก</span>'+
+      '<span class="fh">🧾 ข้อสังเกตเรื่องภาษี</span>'+
       '<div class="fi">• ใช้หมวด “ค่าภาษี” เป็นตัวแทน VAT ที่ยื่น/จ่ายแล้ว ตามที่สั่ง'+
       (r.taxRows.length>1?' (พบ '+r.taxRows.length+' รายการ)':'')+'</div>'+
       r.taxRows.map(x=>'<div class="fi">   – '+x.category+'  ฿'+fmt(x.amount)+'</div>').join('')+
-      '<div class="fi">• ถ้าในนี้มีภาษีอื่นปน (ภาษีป้าย/โรงเรือน/ภาษีหัก ณ ที่จ่าย) ตัวเลขภาษีคงเหลือจะต่ำกว่าจริง — บอกมาได้ เดี๋ยวแยกให้</div>';
+      '<div class="fi">• เจ้าของยืนยัน 12/11/2569: ในนี้มีทั้ง <b>VAT</b> และ <b>ภาษีหัก ณ ที่จ่าย (50 ทวิ)</b></div>'+
+      '<div class="fi">• 50 ทวิ หักจาก VAT ที่ต้องนำส่งไม่ได้ และข้อมูลดิบแยกสองอย่างนี้ไม่ได้ → ภาษีคงเหลือจึงบอกเป็น “ช่วง”</div>'+
+      '<div class="fi">• อยากได้ตัวเลขเดียว ต้องแยกหมวดในไฟล์ต้นทางเป็น “ค่าภาษี-VAT” กับ “ค่าภาษี-หัก ณ ที่จ่าย”</div>';
     if(unlisted.length) h+=(h?'<div style="height:7px"></div>':'')+
       '<span class="fh">ℹ️ หมวดที่ยังไม่ได้จัดกลุ่มชัดเจน (นับรวมอยู่ใน “อื่นๆ” แล้ว)</span>'+
       unlisted.map(x=>'<div class="fi">• '+x.category+'  ฿'+fmt(x.amount)+'</div>').join('');
