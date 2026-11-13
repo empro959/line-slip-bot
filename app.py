@@ -1289,6 +1289,39 @@ def _sane_slip_dt(dt):
     return raw
 
 
+def resolve_slip_datetime(info: dict, image_bytes=None, dining=False, reread=None):
+    """ตัดสิน 'วันเวลาบนสลิป' ให้จบในที่เดียว — ปลายน้ำทุกจุดเห็นค่าที่ผ่านตาข่ายแล้วเสมอ
+
+    🪤 เคสจริง 12/11/2569 20:41: สลิปเขียน 12 พ.ย. 2569 แต่ AI อ่านเป็น 2023-11-12
+      `_sane_slip_dt` มีอยู่แล้ว **แต่ถูกเรียกแค่ตอนเขียนลงฐาน** (`save_slip`)
+      ฐานข้อมูลจึงไม่เสีย แต่สองจุดนี้ยังใช้ค่าดิบจาก AI:
+        · find_duplicate (amount_time) → เอาปีผิดไปเทียบ จับคู่ผิดใบ
+        · ข้อความที่เด้งในกลุ่ม         → โชว์ '2023-11-12' ให้คนอ่านเข้าใจผิด
+
+    ลำดับ: ค่าจาก AI → ไม่ผ่านตาข่าย → ให้ 'ตัวเก่ง' (pro) อ่านซ้ำ → ยังไม่ผ่าน = ทิ้ง (ไม่รู้)
+    ⚖️ **ไม่เดาปีให้** ถึงจะเดาถูกบ่อยก็ตาม — ถ้าวันหน้ามีคนเอาสลิปเก่ามาอ้างว่าเพิ่งจ่าย
+       การ snap เป็นปีปัจจุบันคือบอทช่วยกลบหลักฐาน · ไม่รู้ แล้วให้คนดูเอง ปลอดภัยกว่า
+    ยิง pro เฉพาะใบที่วันที่ไม่สมเหตุผล ไม่ใช่ทุกใบ — ค่าใช้จ่าย/เวลาเพิ่มเฉพาะเคสที่มีปัญหา
+    reread = ฉีดได้ (เทส) · ค่าตั้งต้นคือ extract_slip_info ตัวจริง
+    ตั้ง info['_dt_rejected'] ไว้ให้ build_verdict บอกคนอ่านว่า 'ทำไมช่องวันที่ว่าง' — ห้ามทิ้งเงียบ"""
+    raw = info.get("datetime")
+    if raw and not _sane_slip_dt(raw) and image_bytes:
+        try:
+            dt2 = ((reread or extract_slip_info)(image_bytes, retry=True, dining=dining) or {}).get("datetime")
+            if dt2 and _sane_slip_dt(dt2):
+                print(f"[slip] วันที่: รอบแรกอ่าน {raw!r} (ไม่สมเหตุผล) → โมเดลแรงอ่าน {dt2!r} ใช้ได้ → ใช้ค่าใหม่", flush=True)
+                info["datetime"] = dt2
+            else:
+                print(f"[slip] วันที่: โมเดลแรงอ่านได้ {dt2!r} ก็ยังไม่สมเหตุผล → ทิ้ง (ถือว่าไม่รู้)", flush=True)
+        except Exception as e:
+            print(f"[slip] อ่านวันที่ซ้ำไม่สำเร็จ: {e} — ใช้ผลเดิม", flush=True)
+    kept = _sane_slip_dt(info.get("datetime"))
+    if raw and not kept:
+        info["_dt_rejected"] = str(raw)
+    info["datetime"] = kept
+    return kept
+
+
 def find_duplicate(group_id: str, info: dict):
     """หาความซ้ำ/ความผิดปกติเทียบกับใบก่อนหน้าในกรุ๊ป — คืน (type, prev_amount, prev)
     prev = dict ข้อมูลสลิปใบก่อนที่ตรง (sender/slip_datetime/ref_number/recorded_at) ไว้โชว์ว่าซ้ำกับใบไหน
@@ -1520,6 +1553,12 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None, 
         issues.append(f"🔴 เลขอ้างอิง {info.get('ref_number')} เคยถูกส่งมาแล้ว! (สลิปซ้ำ){_dup_ref_line(prev)}")
     elif dup_type == "amount_time":
         issues.append(f"🔴 ยอด {info.get('amount')} บาท + วันเวลา + ผู้โอนเดียวกับสลิปใบก่อนหน้า → น่าจะเป็นสลิปซ้ำ (โปรดตรวจสอบ){_dup_ref_line(prev)}")
+
+    # วันเวลาบนสลิปถูกตาข่ายปัดตก → บอกให้รู้ว่า 'ทำไมช่องวันที่ว่าง' และอะไรไม่กระทบ
+    if info.get("_dt_rejected"):
+        issues.append(f"🟡 อ่านวันเวลาบนสลิปไม่ได้ (AI อ่านเป็น {info['_dt_rejected']} ซึ่งไม่สมเหตุผล) "
+                      f"→ ไม่เก็บวันเวลา และไม่ใช้ตรวจสลิปซ้ำ\n"
+                      f"   ↳ ยอดเงิน · ผู้โอน · ปลายทาง ไม่ได้พึ่งวันที่ ส่วนนั้นยังเชื่อได้ตามปกติ")
 
     # ข้อมูลไม่ครบ / ถูกตัด-บัง (เคสซ่อนปลายทาง ฯลฯ)
     receiver_missing = not (info.get("receiver") or info.get("receiver_account"))
@@ -6390,6 +6429,8 @@ def _process_slip_image(event, image_bytes=None, download_err=None, attempt=1):
         if info.get("ref_number"):
             info["ref_number"] = "".join(str(info["ref_number"]).upper().split())
         _clean_ref_number(info)      # เลขบัญชี/พร้อมเพย์ที่ถูกปิดบัง ไม่ใช่เลขอ้างอิง — ต้องทิ้งก่อนเทียบซ้ำ
+
+        resolve_slip_datetime(info, image_bytes, dining=_dining)
 
         # กัน false 'ตัดต่อ' จาก OCR อ่าน ref ผิด: ถ้าสงสัยตัดต่อ (ref ตรงใบเก่า + ยอดต่าง)
         # → อ่าน ref ซ้ำด้วยโมเดลแรง (นอกล็อก กันบล็อกคิว) · อ่านได้ 'ต่าง' = รอบแรกอ่านผิด ใช้เลขใหม่;

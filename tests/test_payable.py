@@ -5526,3 +5526,106 @@ class TestRefMismatchNeedsKnownSender(PayableTestCase):
             "datetime": "2026-11-12T21:00:00"})
 
         self.assertEqual(dup, "ref")
+
+
+class TestResolveSlipDatetime(PayableTestCase):
+    """🔴 วันเวลาบนสลิปต้องผ่านตาข่าย 'ก่อน' เข้าทุกอย่างที่ใช้มัน (เจ้าของสั่ง 13/11/2569 ข้อ 1+2)
+
+    เคสจริง 12/11/2569 20:41 — สลิปเขียน 12 พ.ย. 2569 แต่ AI อ่านเป็น 2023-11-12
+    `_sane_slip_dt` มีอยู่แล้วแต่ถูกเรียกแค่ตอนเขียนลงฐาน → ฐานไม่เสีย
+    แต่ตัวจับสลิปซ้ำกับข้อความที่เด้งในกลุ่มยังใช้ค่าดิบจาก AI"""
+
+    def _old(self, days):
+        return (datetime.now(app.TZ) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def _now(self):
+        return datetime.now(app.TZ).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def test_sane_date_passes_through_untouched(self):
+        info = {"datetime": self._now()}
+        kept = app.resolve_slip_datetime(info)
+        self.assertEqual(kept, info["datetime"])
+        self.assertNotIn("_dt_rejected", info, "วันที่ปกติต้องไม่ถูกติดธง")
+
+    def test_bad_year_is_dropped_not_guessed(self):
+        """⚖️ ห้าม snap เป็นปีปัจจุบัน — สลิปเก่าที่เอามาอ้างว่าเพิ่งจ่าย จะถูกกลบหลักฐาน"""
+        info = {"datetime": "2023-11-12T20:41:14"}
+        kept = app.resolve_slip_datetime(info)
+        self.assertIsNone(kept, "ปีเพี้ยน = ไม่รู้ ไม่ใช่เดาให้")
+        self.assertIsNone(info["datetime"])
+        self.assertEqual(info["_dt_rejected"], "2023-11-12T20:41:14", "ต้องจำค่าเดิมไว้บอกคนอ่าน")
+
+    def test_pro_retry_rescues_a_readable_date(self):
+        """ข้อ 2: วันที่ไม่สมเหตุผล → ให้ตัวเก่งอ่านซ้ำก่อนทิ้ง · อ่านได้ดี = ใช้ค่าใหม่"""
+        good = self._old(1)
+        calls = []
+
+        def _reread(img, retry=False, dining=False):
+            calls.append(retry)
+            return {"datetime": good}
+
+        info = {"datetime": "2023-11-12T20:41:14"}
+        kept = app.resolve_slip_datetime(info, image_bytes=b"x", reread=_reread)
+
+        self.assertEqual(calls, [True], "ต้องเรียกด้วยโมเดลตัวเก่ง (retry=True) ครั้งเดียว")
+        self.assertEqual(kept, good)
+        self.assertNotIn("_dt_rejected", info, "กู้ได้แล้วต้องไม่ติดธง")
+
+    def test_no_pro_call_when_date_is_fine(self):
+        """ยิงตัวเก่งเฉพาะใบที่มีปัญหา — ใบปกติต้องไม่เสียเงิน/เวลาเพิ่ม"""
+        calls = []
+
+        def _reread(img, retry=False, dining=False):
+            calls.append(retry)
+            return {"datetime": self._now()}
+
+        app.resolve_slip_datetime({"datetime": self._now()}, image_bytes=b"x", reread=_reread)
+        self.assertEqual(calls, [], "วันที่ปกติ = ห้ามเรียกโมเดลตัวเก่ง")
+
+    def test_pro_also_wrong_still_drops(self):
+        def _reread(img, retry=False, dining=False):
+            return {"datetime": "2022-09-15T20:54:04"}
+
+        info = {"datetime": "2023-11-12T20:41:14"}
+        self.assertIsNone(app.resolve_slip_datetime(info, image_bytes=b"x", reread=_reread))
+        self.assertIn("_dt_rejected", info)
+
+    def test_reread_blowing_up_keeps_original_behaviour(self):
+        """อ่านซ้ำพังต้องไม่ทำให้ทั้งสลิปพัง — ถอยไปใช้ผลเดิม (ทิ้งวันที่)"""
+        def _reread(img, retry=False, dining=False):
+            raise RuntimeError("โมเดลล่ม")
+
+        info = {"datetime": "2023-11-12T20:41:14"}
+        self.assertIsNone(app.resolve_slip_datetime(info, image_bytes=b"x", reread=_reread))
+        self.assertIn("_dt_rejected", info)
+
+    def test_verdict_explains_why_the_date_is_missing(self):
+        """🔴 ห้ามทิ้งเงียบ — ของเดิมช่องวันที่หายไปเฉยๆ คนอ่านไม่รู้ว่าทำไม"""
+        info = {"amount": 851.0, "sender": "ก", "ref_number": "R1"}
+        app.resolve_slip_datetime(info)   # ไม่มีวันที่เลย → ไม่ติดธง
+        self.assertNotIn("_dt_rejected", info)
+
+        info = {"amount": 851.0, "sender": "ก", "ref_number": "R1", "datetime": "2023-11-12T20:41:14"}
+        app.resolve_slip_datetime(info)
+        v = app.build_verdict(info, {})
+
+        self.assertEqual(v["status"], "WARN")
+        self.assertIn("2023-11-12", v["group_msg"], "ต้องโชว์ค่าที่ AI อ่านได้ ให้คนเทียบกับสลิปจริง")
+        self.assertIn("ไม่ใช้ตรวจสลิปซ้ำ", v["group_msg"])
+        self.assertIn("ยอดเงิน", v["group_msg"], "ต้องบอกด้วยว่าอะไรไม่กระทบ")
+
+    def test_dropped_date_cannot_match_a_duplicate(self):
+        """ปลายน้ำ: วันที่ถูกทิ้งแล้ว ตัวจับซ้ำแบบ ยอด+เวลา ต้องไม่ไปจับคู่กับใบเก่า"""
+        gid = "Gdt_" + self._testMethodName
+        with app._db() as conn:
+            conn.execute(
+                "INSERT INTO slips (group_id, sender, amount, ref_number, slip_datetime, verdict, recorded_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (gid, "ก", 851.0, None, "2023-11-12T20:41:14", "PASS", "x"))
+            conn.commit()
+
+        info = {"amount": 851.0, "sender": "ก", "datetime": "2023-11-12T20:41:14"}
+        app.resolve_slip_datetime(info)
+        dup, _, _ = app.find_duplicate(gid, info)
+
+        self.assertIsNone(dup, "ปีเพี้ยนเหมือนกันทั้งคู่ ไม่ใช่เหตุให้ฟันธงว่าซ้ำ")
