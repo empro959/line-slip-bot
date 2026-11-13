@@ -1292,7 +1292,8 @@ def _sane_slip_dt(dt):
 def find_duplicate(group_id: str, info: dict):
     """หาความซ้ำ/ความผิดปกติเทียบกับใบก่อนหน้าในกรุ๊ป — คืน (type, prev_amount, prev)
     prev = dict ข้อมูลสลิปใบก่อนที่ตรง (sender/slip_datetime/ref_number/recorded_at) ไว้โชว์ว่าซ้ำกับใบไหน
-    - ref_mismatch: เลขอ้างอิงเดียวกันแต่ยอดเงินไม่ตรง = ถูกตัดต่อ! (ฟันธง)
+    - ref_mismatch: เลขอ้างอิงเดียวกันแต่ยอดเงินไม่ตรง **และผู้โอนคนเดียวกัน** = ถูกตัดต่อ (ฟันธง)
+    - ref_mismatch_unsure: เหมือนบน แต่ 'อ่านชื่อผู้โอนไม่ออกสักฝั่ง' → เตือนให้ตรวจ ไม่ฟันธง
     - ref: เลขอ้างอิงตรง + ยอดตรง = สลิปซ้ำจริง
     - amount_time: ยอดเงิน + วันเวลาบนสลิปตรงกัน 'และผู้โอนคนเดียวกัน' (กันกรณี ref อ่านเพี้ยน)
       *ถ้าผู้โอนคนละคน = ลูกค้าคนละโต๊ะบังเอิญจ่ายยอดเท่ากัน ไม่ใช่สลิปซ้ำ → ไม่เตือน (กัน false positive)"""
@@ -1314,7 +1315,16 @@ def find_duplicate(group_id: str, info: dict):
                 diff_sender = cur_s and prev_s and cur_s != prev_s
                 if not diff_sender:
                     if amount and prev and abs(prev - amount) > 0.01:
-                        return ("ref_mismatch", prev, dict(row))
+                        # 🔴 เคสจริง 12/11/26 20:41: ลูกค้าโต๊ะ B7 สแกนจ่าย 851 (ตรงบิลเป๊ะ)
+                        #    แต่ถูกฟันธงว่า 'สลิปถูกตัดต่อ' ต่อหน้าลูกค้า
+                        #    รหัสบนสลิป Scan to Pay คือ 'EMP + รหัสร้านค้า + 005' = ซ้ำทุกใบที่จ่ายเข้าร้าน
+                        #    ตัวกัน diff_sender ด้านบนมีไว้กันเคสนี้อยู่แล้ว **แต่มันต้องอ่านชื่อได้ทั้งสองฝั่ง**
+                        #    ใบนั้นอ่านชื่อผู้โอนไม่ออก (cur_s ว่าง) → diff_sender เป็นเท็จ → หลุดมาฟันธง
+                        # ⚖️ 'อ่านชื่อไม่ออก' ไม่ใช่หลักฐานว่าเป็นคนเดียวกัน — กล่าวหาว่าปลอมแปลงต้องมีหลักฐาน
+                        #    ยังเตือนให้ตรวจเหมือนเดิม แค่ไม่ฟันธง (คนปลอมจริงชื่อยังอยู่บนสลิป → ยังจับได้)
+                        if cur_s and prev_s:
+                            return ("ref_mismatch", prev, dict(row))
+                        return ("ref_mismatch_unsure", prev, dict(row))
                     return ("ref", None, dict(row))
         if amount and dt:
             row = conn.execute(
@@ -1493,11 +1503,19 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None, 
         ptime = p.get("slip_datetime") or p.get("recorded_at") or "-"
         return f"\n   ↳ ซ้ำกับใบก่อน: {p.get('sender') or '-'} · เวลา {ptime} · อ้างอิง {p.get('ref_number') or '-'}"
 
-    if dup_type == "ref_mismatch":
+    if dup_type in ("ref_mismatch", "ref_mismatch_unsure"):
         cur_amt  = f"{float(info.get('amount') or 0):,.2f}"
         prev_amt = f"{float(prev_amount or 0):,.2f}"
-        issues.append(f"🔴 เลขอ้างอิงเดียวกับสลิปใบก่อน แต่ยอดเงินไม่ตรง! "
-                      f"(ใบก่อน {prev_amt} / ใบนี้ {cur_amt} บาท) → สลิปถูกตัดต่อ!{_dup_ref_line(prev)}")
+        if dup_type == "ref_mismatch":
+            issues.append(f"🔴 เลขอ้างอิงเดียวกับสลิปใบก่อน ผู้โอนคนเดียวกัน แต่ยอดเงินไม่ตรง! "
+                          f"(ใบก่อน {prev_amt} / ใบนี้ {cur_amt} บาท) → สลิปถูกตัดต่อ!{_dup_ref_line(prev)}")
+        else:
+            # อ่านชื่อผู้โอนไม่ออก → บอกให้ตรวจ พร้อมบอก 'วิธีตรวจ' ที่ใช้ได้จริงหน้าร้าน
+            issues.append(f"🟡 เลขอ้างอิงซ้ำกับใบก่อน แต่ยอดไม่ตรง "
+                          f"(ใบก่อน {prev_amt} / ใบนี้ {cur_amt} บาท) — และอ่านชื่อผู้โอนไม่ออก "
+                          f"จึงยังบอกไม่ได้ว่าเป็นคนเดียวกัน{_dup_ref_line(prev)}\n"
+                          f"   ↳ สลิป Scan to Pay ใช้ 'รหัสร้านค้า' เป็นเลขอ้างอิง ซ้ำกันทุกใบอยู่แล้ว "
+                          f"→ เช็กว่า **ยอดตรงบิล** และ **ปลายทางเป็นบัญชีร้าน** พอ")
     elif dup_type == "ref":
         issues.append(f"🔴 เลขอ้างอิง {info.get('ref_number')} เคยถูกส่งมาแล้ว! (สลิปซ้ำ){_dup_ref_line(prev)}")
     elif dup_type == "amount_time":
@@ -1557,7 +1575,10 @@ def build_verdict(info: dict, promptpay: dict, dup_type=None, prev_amount=None, 
         #   เจ้าของอ่านแล้วตกใจ ทั้งที่เป็นเงินจริง 350 บาทที่ส่งมาสองรอบ
         # ⚖️ เตือนเกินจริงบ่อยๆ = พนักงานเลิกอ่าน แล้ววันที่ปลอมจริงจะไม่มีใครสนใจ
         _dup_only = dup_type in ("ref", "amount_time") and not any("ตัดต่อ" in i for i in issues)
+        # ⚠️ unsure = 'เลขอ้างอิงซ้ำ แต่พิสูจน์ไม่ได้ว่าคนเดียวกัน' — ไม่ใช่ตัดต่อ และไม่ใช่สลิปซ้ำ
+        #    (ยอดไม่ตรง = คนละรายการ บอทนับเป็นเงินเข้าตามปกติ) จึงต้องมีพาดหัวของตัวเอง
         _head = ("🚨 [ALERT] สลิปถูกตัดต่อ" if dup_type == "ref_mismatch"
+                 else "⚠️ [ALERT] เลขอ้างอิงซ้ำ — ขอให้ตรวจยอดกับบิล" if dup_type == "ref_mismatch_unsure"
                  else "⚠️ [ALERT] สลิปส่งซ้ำ (ยอด+เลขอ้างอิงตรงกับใบก่อน)" if _dup_only
                  else "🚨 [ALERT] สลิปต้องสงสัย")
         admin_msg  = (f"{_head} — จาก {sender}\n"

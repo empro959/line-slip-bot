@@ -5446,3 +5446,83 @@ class TestUnlinkPrefersExactBill(PayableTestCase):
                                msg="ต้องคืนจากทั้งสองใบจนเหลือ 0 — ไม่มีใบไหนยอดตรงเป๊ะ จึงกระจาย")
         # ลบเงินจ่าย = หนี้เพิ่มขึ้นเท่ายอดที่จ่ายไป (ไม่ใช่ยอดเท่าเดิมแบบตอน 'ย้าย')
         self.assertAlmostEqual(app._payable_outstanding(ACCT), before + 5000.0, places=2)
+
+
+class TestRefMismatchNeedsKnownSender(PayableTestCase):
+    """🔴 'สลิปถูกตัดต่อ' ต้องพิสูจน์ได้ว่าเป็นผู้โอนคนเดียวกัน — อ่านชื่อไม่ออก ≠ คนเดียวกัน
+
+    เคสจริง 12/11/2569 20:41 — ลูกค้าโต๊ะ B7 สแกนจ่าย 851 (ตรงบิลเป๊ะ เข้าบัญชีร้านถูกต้อง)
+    บอทฟันธง '🚨 สลิปถูกตัดต่อ' ต่อหน้าลูกค้า
+      · สลิป Scan to Pay ของ KBank ใช้ 'EMP + รหัสร้านค้า + 005' เป็นเลขอ้างอิง → ซ้ำทุกใบที่จ่ายเข้าร้าน
+      · โค้ดมีตัวกัน diff_sender อยู่แล้ว (คอมเมนต์เขียนถึง EMPKB... ตรงๆ) แต่ต้องอ่านชื่อได้ 'ทั้งสองฝั่ง'
+      · ใบนั้นอ่านชื่อผู้โอนไม่ออก → cur_s ว่าง → ตัวกันเป็นเท็จ → หลุดมาฟันธง
+    """
+
+    # 🪤 PayableTestCase ล้างเฉพาะตารางเจ้าหนี้ ไม่ได้ล้าง `slips` → แถวจากเทสต์ก่อนหน้าค้างข้ามเคส
+    #    (เจอตอนเขียน: เคส 'ส่งซ้ำ' ไปเจอแถว 9,999 ของอีกเคสที่ใช้ ref เดียวกัน แล้วกลายเป็น ref_mismatch)
+    #    → แยกกรุ๊ปต่อเทสต์ ให้แต่ละเคสมองเห็นเฉพาะข้อมูลของตัวเอง
+    def setUp(self):
+        super().setUp()
+        self.GID = "Gslip_" + self._testMethodName
+
+    def _slip(self, sender, ref, amount, dt="2026-11-12T20:41:14"):
+        with app._db() as conn:
+            conn.execute(
+                "INSERT INTO slips (group_id, sender, amount, ref_number, slip_datetime, verdict, recorded_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (self.GID, sender, float(amount), ref, dt, "PASS", "2026-11-12 20:41:14"))
+            conn.commit()
+
+    def test_unknown_sender_is_not_proof_of_tampering(self):
+        """ใบก่อนมีชื่อ · ใบนี้อ่านชื่อไม่ออก → ห้ามฟันธงตัดต่อ"""
+        REF = "EMPKB000001944107005"
+        self._slip("NIKOOL M.", REF, 2124.0)
+
+        dup, prev_amt, prev = app.find_duplicate(self.GID, {
+            "ref_number": REF, "amount": 851.0, "sender": None,
+            "datetime": "2026-11-12T20:41:14"})
+
+        self.assertEqual(dup, "ref_mismatch_unsure", "อ่านชื่อไม่ออก = พิสูจน์ไม่ได้ ห้ามฟันธง")
+        v = app.build_verdict({"amount": 851.0, "sender": None, "ref_number": REF}, {}, dup, prev_amt, prev)
+        self.assertEqual(v["status"], "WARN", "ต้องเตือน แต่ไม่ FAIL")
+        self.assertNotIn("ตัดต่อ", v["group_msg"], "ห้ามกล่าวหาว่าปลอมโดยไม่มีหลักฐาน")
+        self.assertIn("ยอดตรงบิล", v["group_msg"], "ต้องบอกวิธีตรวจที่ใช้ได้จริงหน้าร้าน")
+        self.assertNotIn("ไม่ต้องทำอะไร", v["admin_msg"] or "",
+                         "ยอดไม่ตรง = คนละรายการ ไม่ใช่สลิปส่งซ้ำ")
+
+    def test_same_sender_different_amount_still_fails_loudly(self):
+        """🔴 ทิศตรงข้าม — ผู้โอนคนเดียวกัน ยอดต่าง = ตัดต่อจริง ต้องดังเหมือนเดิม ห้ามลดเสียง"""
+        REF = "016260125933AQR09626"
+        self._slip("นาย ก", REF, 9999.0)
+
+        dup, prev_amt, prev = app.find_duplicate(self.GID, {
+            "ref_number": REF, "amount": 350.0, "sender": "นาย ก",
+            "datetime": "2026-11-12T21:00:00"})
+
+        self.assertEqual(dup, "ref_mismatch")
+        v = app.build_verdict({"amount": 350.0, "sender": "นาย ก", "ref_number": REF}, {}, dup, prev_amt, prev)
+        self.assertEqual(v["status"], "FAIL")
+        self.assertIn("ตัดต่อ", v["group_msg"])
+        self.assertIn("🚨", v["admin_msg"])
+
+    def test_different_known_senders_not_flagged_at_all(self):
+        """ชื่อคนละคนทั้งสองฝั่ง = รหัสร้านค้าแน่นอน ไม่ใช่ความซ้ำ (พฤติกรรมเดิม ต้องไม่พัง)"""
+        REF = "EMPKB000001944107005"
+        self._slip("NIKOOL M.", REF, 2124.0)
+
+        dup, _, _ = app.find_duplicate(self.GID, {
+            "ref_number": REF, "amount": 851.0, "sender": "SOMCHAI K.",
+            "datetime": "2026-11-12T20:41:14"})
+
+        self.assertIsNone(dup, "คนละคนชัดเจน → ไม่ต้องเตือนเลย")
+
+    def test_same_sender_same_amount_is_still_a_resend(self):
+        """ref + ยอดตรง + คนเดียวกัน = ใบเดิมส่งซ้ำ (พฤติกรรมเดิม)"""
+        REF = "016260125933AQR09626"
+        self._slip("นาย ก", REF, 350.0)
+
+        dup, _, _ = app.find_duplicate(self.GID, {
+            "ref_number": REF, "amount": 350.0, "sender": "นาย ก",
+            "datetime": "2026-11-12T21:00:00"})
+
+        self.assertEqual(dup, "ref")
