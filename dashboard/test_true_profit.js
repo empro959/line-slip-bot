@@ -112,5 +112,45 @@ chk('ข้อความบอกเหตุผล',                 /ห่�
 const F2={period:'มกราคม 2570', total_sales:0, expense_categories:[{category:'ค่าเช่า(ธค)',amount:1}]};
 chk('ข้ามปี: (ธค) ในงวด ม.ค. = ปกติ', ctx.mFlags(F2).length===0);
 
+// ══ กลุ่ม 'บำรุงรักษา' + ภาษีที่ปนกัน (เจ้าของสั่ง/ยืนยัน 12/11/2569) ══
+console.log('\n7) กลุ่ม "บำรุงรักษา" แยกออกจาก "อื่นๆ"');
+{
+  const M={period:'มกราคม 2569', total_sales:1070, expense_categories:[
+    {category:'ค่าบำรุงรักษา', amount:1300},
+    {category:'คชจ.สาขานิมมานฯ', amount:3346},
+    {category:'คชจ.ในร้าน', amount:100}]};
+  const r=ctx.mF(M);
+  chk('ค่าบำรุงรักษาเข้ากลุ่ม maint', r.g.maint===1300, r.g.maint);
+  chk('ไม่ตกไปอยู่ "อื่นๆ"', r.g.other===3446, r.g.other);
+  chk('ยอดค่าใช้จ่ายรวมยังบรรจบ', r.exp===4746, r.exp);
+  // เจ้าของยืนยัน 12/11/2569: คชจ.สาขานิมมานฯ นับรวม และอยู่ 'อื่นๆ' ได้ ไม่ต้องติดธงแล้ว
+  chk('คชจ.สาขานิมมานฯ ไม่ติดธง "ยังไม่ได้จัดกลุ่ม"',
+      !r.otherRows.some(x=>x.category==='คชจ.สาขานิมมานฯ'),
+      JSON.stringify(r.otherRows));
+}
+
+console.log('\n8) 🔴 ภาษี: "ค่าภาษี" มี VAT + 50 ทวิ ปนกัน → ต้องบอกเป็นช่วง ห้ามเดาสัดส่วน');
+{
+  const M={period:'มกราคม 2569', total_sales:107000, expense_categories:[
+    {category:'ค่าภาษี', amount:3000}]};
+  const r=ctx.mF(M);
+  chk('VAT ขาย 7/107 = 7,000', r.vatOut===7000, r.vatOut);
+  chk('ต่ำสุด = หักที่จ่ายไปทั้งก้อน (4,000)', r.taxDueMin===4000, r.taxDueMin);
+  chk('สูงสุด = ไม่หักเลย (7,000)', r.taxDueMax===7000, r.taxDueMax);
+  chk('ช่วงกว้างเท่ายอดที่จ่าย', r.taxDueMax-r.taxDueMin===r.taxPaid);
+  // ⚠️ ตั้งใจไม่เปลี่ยน 'กำไรหลังกันภาษี' ไปใช้ตัวสูงสุด — จะพลิกบางเดือนเป็นขาดทุนบนหน้าจอ
+  //    ซึ่งเป็นการตีความ ไม่ใช่สิ่งที่เจ้าของสั่ง (ถ้าสั่งเมื่อไรค่อยสลับไป taxDueMax)
+  chk('กำไรหลังกันภาษียังคิดจากตัวต่ำสุด', r.profitNet===(r.sales-r.exp)-r.taxDueMin, r.profitNet);
+}
+
+console.log('\n9) ป้าย "แยก N กลุ่ม" ต้องนับจาก EXP_GROUPS ไม่ใช่ฮาร์ดโค้ด');
+{
+  const html=require('fs').readFileSync('dashboard/saisang_dashboard.html','utf8');
+  chk('มีช่อง #grp-n บนหน้าจอ', /id="grp-n"/.test(html));
+  chk('เขียนค่าจาก EXP_GROUPS.length+1',
+      /getElementById\('grp-n'\)[\s\S]{0,80}EXP_GROUPS\.length\s*\+\s*1/.test(html));
+  chk('ไม่มีเลขกลุ่มฮาร์ดโค้ดค้างอยู่', !/แยก 5 กลุ่ม/.test(html));
+}
+
 console.log(fails?('\n🔴 ไม่ผ่าน '+fails+' เคส'):'\n🟢 ผ่านทุกเคส');
 process.exit(fails?1:0);
