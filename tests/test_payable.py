@@ -404,6 +404,7 @@ class TestCarryBlock(PayableTestCase):
         (คอมมิตเก่าโฆษณาว่า 'ก๊อปสรุปมาทั้งดุ้นก็ได้' แต่ใช้ไม่ได้จริง)"""
         d1, d2, d3 = _d(10), _d(7), _d(5)
         summary = (
+            "ค้าง\n"   # ⬅️ กู้ยอด = คนต้องสั่งเอง (คำว่า 'สรุปหนี้' ในการ์ดของบอทไม่นับเป็นเจตนา)
             "📋 สรุปหนี้  — รายวัน\n"
             "━━━━━━━━━━━━━\n"
             f"{_dmy(d1)}  ยกมา 19,614.00\n"
@@ -429,7 +430,7 @@ class TestCarryBlock(PayableTestCase):
         carry = [(_d(10), 19614.0), (_d(7), 15835.0), (_d(5), 12788.0)]
         bills = [(_d(4), 30403.0), (_d(3), 22449.0), (_d(3), 7155.0), (_d(2), 13135.0),
                  (_d(1), 20250.0), (_d(1), 6210.0), (_d(0), 1740.0), (_d(0), 15538.0)]
-        summary = "📋 สรุปหนี้  — รายวัน\n━━━━━━━━━━━━━\n"
+        summary = "ค้าง\n📋 สรุปหนี้  — รายวัน\n━━━━━━━━━━━━━\n"
         summary += "".join(f"{_dmy(d)}  ยกมา {v:,.2f}\n" for d, v in carry)
         summary += "━━━━━━━━━━━━━\n"
         summary += "".join(f"{_dmy(d)}  📥+{v:,.2f}\n" for d, v in bills)
@@ -442,7 +443,7 @@ class TestCarryBlock(PayableTestCase):
 
     def test_pasting_full_summary_twice_does_not_double(self):
         """วางซ้ำต้องไม่นับเบิ้ล — บิลที่วันที่+ยอดตรงกันอยู่แล้วให้ข้าม"""
-        summary = (f"📋 สรุปหนี้\n{_dmy(_d(5))}  ยกมา 1,000.00\n"
+        summary = (f"ค้าง\n📋 สรุปหนี้\n{_dmy(_d(5))}  ยกมา 1,000.00\n"
                    f"{_dmy(_d(3))}  📥+2,000.00\n{_dmy(_d(2))}  📥+3,000.00")
         self._paste(summary)
         first = app._payable_outstanding(ACCT)
@@ -455,7 +456,7 @@ class TestCarryBlock(PayableTestCase):
     def test_payment_lines_cannot_be_restored_and_say_so(self):
         """บรรทัด 'จ่าย' คืนอัตโนมัติไม่ได้ (ต้องจับคู่บิล) — ต้องบอก ไม่ใช่เงียบ"""
         handled, msg = self._paste(
-            f"📋 สรุปหนี้\n{_dmy(_d(5))}  ยกมา 1,000.00\n{_dmy(_d(4))}  ยกมา 500.00\n"
+            f"ค้าง\n📋 สรุปหนี้\n{_dmy(_d(5))}  ยกมา 1,000.00\n{_dmy(_d(4))}  ยกมา 500.00\n"
             f"{_dmy(_d(3))}  💸−500.00")
 
         self.assertTrue(handled)
@@ -465,7 +466,7 @@ class TestCarryBlock(PayableTestCase):
     def test_summary_line_with_partial_payment_uses_remaining(self):
         """บรรทัดยกมาที่จ่ายบางส่วนแล้วมี '(เหลือ x)' ต่อท้าย → ต้องใช้ยอดที่เหลือ"""
         handled, msg = self._paste(
-            f"📋 สรุปหนี้\n{_dmy(_d(6))}  ยกมา 10,000.00  💸 จ่าย 4,000.00 (เหลือ 6,000.00)\n"
+            f"ค้าง\n📋 สรุปหนี้\n{_dmy(_d(6))}  ยกมา 10,000.00  💸 จ่าย 4,000.00 (เหลือ 6,000.00)\n"
             f"{_dmy(_d(5))}  ยกมา 2,000.00")
 
         self.assertTrue(handled)
@@ -2260,8 +2261,20 @@ class TestPastedLedgerFeedback(PayableTestCase):
         rows = "\n".join(f"{_dmy(_d(i))} 📥+{1000 + i:,}.00" for i in (5, 4, 3))
         return f"{header}\n━━━━━━━━━━━━━\n{rows}"
 
-    def test_pasted_ledger_with_header_is_accepted(self):
+    def test_bots_own_card_header_is_not_a_command(self):
+        """🔴 หัวการ์ด '📋 สรุปหนี้' เป็นคำที่ 'บอทพิมพ์เอง' ห้ามนับเป็นเจตนาของคน
+
+        ของเดิม has_carry_word จับคำว่า 'สรุปหนี้' → ก๊อปการ์ดมาวางก็ผ่านด่าน 100%
+        แล้วคำสั่งที่ลบยอดค้างเดิมทั้งชุดก็รันเงียบๆ (ต้นเหตุเคส 15/11/2569)"""
         handled = app.handle_payable_text(self._Ev(), self._ledger("📋 สรุปหนี้  — รายวัน"), ACCT)
+        self.assertTrue(handled, "ต้องตอบ ไม่ปล่อยเงียบ")
+        self.assertEqual(self.bills(), [], "ยังไม่บันทึกจนกว่าคนจะสั่งให้ชัด")
+        self.assertIn("ค้าง", self.sent[-1], "ต้องบอกว่าต้องพิมพ์อะไรเพิ่ม")
+
+    def test_pasted_ledger_with_human_header_is_accepted(self):
+        """คนพิมพ์คำว่า 'ค้าง' ไว้บรรทัดแรกเอง → ทางกู้ยอดยังทำงานครบ"""
+        handled = app.handle_payable_text(
+            self._Ev(), "ค้าง\n" + self._ledger("📋 สรุปหนี้  — รายวัน"), ACCT)
         self.assertTrue(handled)
         self.assertEqual(len(self.bills()), 3, "ต้องลงบิลครบ 3 ใบ")
 
@@ -5729,7 +5742,7 @@ class TestLedgerCarrySeparator(PayableTestCase):
         self._bill(_d(2), 6908)
 
         lines = self._lines()
-        body = lines[2:-2]            # ตัดหัวการ์ด+เส้นบน และเส้นล่าง+ยอดรวม
+        body = lines[2:-3]            # ตัดหัวการ์ด+เส้นบน และเส้นล่าง+ยอดรวม+ป้ายเตือนท้ายการ์ด
         self.assertNotIn(self.BAR, body,
                          "ยกมาอยู่กลางรายการ → ห้ามมีเส้นคั่นแทรก\n" + "\n".join(lines))
 
@@ -5748,7 +5761,7 @@ class TestLedgerCarrySeparator(PayableTestCase):
         self._bill(_d(10), 15603)
         self._bill(_d(2), 6908)
 
-        body = self._lines()[2:-2]
+        body = self._lines()[2:-3]
         self.assertNotIn(self.BAR, body)
 
     def test_never_two_separators_in_a_row(self):
@@ -5812,20 +5825,77 @@ class TestEditedLedgerPasteIsAmbiguous(PayableTestCase):
         self.assertIn("11602", msg.replace(",", ""), "ต้องเติมยอดให้พร้อมใช้")
         self.assertIn("ค้าง", msg, "ต้องบอกทางออกถ้าตั้งใจวางยอดค้างจริงๆ")
 
-    def test_clean_card_paste_still_restores(self):
-        """ทางกู้ข้อมูลที่ตั้งใจไว้ต้องไม่พัง — การ์ดล้วนๆ ใช้ 'ยกมา'/'📥' ไม่มี '='"""
-        block = ("📋 สรุปหนี้  — รายวัน\n"
-                 "━━━━━━━━━━━━━\n"
-                 f"{_dmy(_d(9))}  ยกมา 19,614.00\n"
-                 "━━━━━━━━━━━━━\n"
-                 f"{_dmy(_d(4))}  📥+30,403.00\n"
-                 f"{_dmy(_d(3))}  📥+22,449.00")
+    CLEAN_CARD = None   # ตั้งใน _clean_card()
 
-        handled, msg = self._paste(block)
+    def _clean_card(self):
+        """การ์ดล้วนๆ ที่บอทพิมพ์เอง — ไม่มี '=' เลย"""
+        return ("📋 สรุปหนี้  — รายวัน\n"
+                "━━━━━━━━━━━━━\n"
+                f"{_dmy(_d(9))}  ยกมา 19,614.00\n"
+                "━━━━━━━━━━━━━\n"
+                f"{_dmy(_d(4))}  📥+30,403.00\n"
+                f"{_dmy(_d(3))}  📥+22,449.00")
+
+    def test_clean_card_paste_without_header_is_refused(self):
+        """🔴 รูที่ยังเปิดอยู่หลังด่าน '=' — การ์ดที่ 'ลบบรรทัดทิ้ง' ไม่มี '=' เลย
+
+        ด่าน '=' ดักได้แค่ตอนมีบรรทัด 'วัน = ยอด' ปนมา แต่คนที่แก้การ์ดด้วยการ
+        ลบบรรทัดที่ผิดออก (หรือแก้ตัวเลขในบรรทัดเดิม) ไม่มี '=' สักตัว
+        → เคยผ่านด่านเงียบๆ แล้วลบยอดค้างเดิมทั้งชุดเขียนทับ"""
+        before = app._payable_outstanding(ACCT)
+
+        handled, msg = self._paste(self._clean_card())
+
+        self.assertTrue(handled, "ห้ามเงียบ")
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), before, places=2,
+                               msg="🔴 ยังไม่ได้สั่งให้ชัด = ห้ามแตะข้อมูล")
+        self.assertEqual(self.bills(), [], "ต้องไม่สร้างแถวไหนเลย")
+        self.assertIn("ค้าง", msg, "ต้องบอกคำที่ต้องพิมพ์เพิ่ม")
+        self.assertIn("ลบบิล", msg, "ต้องบอกทางแก้บิลลงวันผิดด้วย")
+
+    def test_clean_card_paste_with_header_still_restores(self):
+        """ทางกู้ข้อมูลที่ตั้งใจไว้ต้องไม่พัง — พิมพ์ 'ค้าง' บรรทัดแรกแล้ววางการ์ด"""
+        handled, msg = self._paste("ค้าง\n" + self._clean_card())
 
         self.assertTrue(handled)
         self.assertIn("✅", msg)
         self.assertAlmostEqual(app._payable_outstanding(ACCT), 72466.0, places=2)
+
+    def test_card_with_an_edited_number_is_refused(self):
+        """แก้ตัวเลขในการ์ดแล้วส่งกลับ (ไม่มี '=' เลย) → ต้องไม่เดาว่าหมายถึงอะไร"""
+        app.save_payable_bill(ACCT, 30403.0, note="รูป", doc_date=_d(4))
+        before = app._payable_outstanding(ACCT)
+
+        edited = self._clean_card().replace("30,403.00", "33,403.00")
+        handled, msg = self._paste(edited)
+
+        self.assertTrue(handled)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), before, places=2)
+        self.assertIn("ค้าง", msg)
+
+    def test_card_carries_the_dont_edit_warning(self):
+        """ป้ายท้ายการ์ด — สอนตรงจุดที่คนกำลังมองอยู่"""
+        app.save_payable_bill(ACCT, 5000.0, note="รูป", doc_date=_d(2))
+        card = app.build_payable_ledger(ACCT, with_total=True)
+
+        self.assertIn("ลบบิล", card.splitlines()[-1], "ป้ายต้องอยู่บรรทัดท้ายสุด")
+        self.assertNotIn("=", card, "🔴 ห้ามมี '=' ในการ์ด ไม่งั้นวางกลับเพื่อกู้ยอดจะเพี้ยน")
+
+    def test_warning_footer_does_not_break_restore(self):
+        """วางการ์ด (ที่มีป้ายท้ายติดมาด้วย) กลับเพื่อกู้ยอด ต้องได้ยอดเท่าเดิมเป๊ะ"""
+        app.save_payable_bill(ACCT, 19614.0, note=app._PAYABLE_CARRY_NOTE, doc_date=_d(9))
+        app.save_payable_bill(ACCT, 30403.0, note="รูป", doc_date=_d(4))
+        card = app.build_payable_ledger(ACCT, with_total=True)
+        want = app._payable_outstanding(ACCT)
+        with app._db() as conn:
+            conn.execute("DELETE FROM payable_bills WHERE group_id=?", (ACCT,))
+
+        handled, msg = self._paste("ค้าง\n" + card)
+
+        self.assertTrue(handled)
+        self.assertIn("✅", msg)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), want, places=2,
+                               msg="ป้ายท้ายการ์ดต้องไม่ถูกนับเป็นยอด/บรรทัดเสีย")
 
     def test_explicit_carry_header_still_wins(self):
         """ตั้งใจวางยอดค้างทับจริงๆ (พิมพ์ 'ค้าง' บรรทัดแรก) → ทำให้ตามสั่ง ไม่ต้องถาม"""
