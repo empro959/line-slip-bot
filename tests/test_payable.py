@@ -404,6 +404,7 @@ class TestCarryBlock(PayableTestCase):
         (คอมมิตเก่าโฆษณาว่า 'ก๊อปสรุปมาทั้งดุ้นก็ได้' แต่ใช้ไม่ได้จริง)"""
         d1, d2, d3 = _d(10), _d(7), _d(5)
         summary = (
+            "ค้าง\n"   # ⬅️ กู้ยอด = คนต้องสั่งเอง (คำว่า 'สรุปหนี้' ในการ์ดของบอทไม่นับเป็นเจตนา)
             "📋 สรุปหนี้  — รายวัน\n"
             "━━━━━━━━━━━━━\n"
             f"{_dmy(d1)}  ยกมา 19,614.00\n"
@@ -429,7 +430,7 @@ class TestCarryBlock(PayableTestCase):
         carry = [(_d(10), 19614.0), (_d(7), 15835.0), (_d(5), 12788.0)]
         bills = [(_d(4), 30403.0), (_d(3), 22449.0), (_d(3), 7155.0), (_d(2), 13135.0),
                  (_d(1), 20250.0), (_d(1), 6210.0), (_d(0), 1740.0), (_d(0), 15538.0)]
-        summary = "📋 สรุปหนี้  — รายวัน\n━━━━━━━━━━━━━\n"
+        summary = "ค้าง\n📋 สรุปหนี้  — รายวัน\n━━━━━━━━━━━━━\n"
         summary += "".join(f"{_dmy(d)}  ยกมา {v:,.2f}\n" for d, v in carry)
         summary += "━━━━━━━━━━━━━\n"
         summary += "".join(f"{_dmy(d)}  📥+{v:,.2f}\n" for d, v in bills)
@@ -442,7 +443,7 @@ class TestCarryBlock(PayableTestCase):
 
     def test_pasting_full_summary_twice_does_not_double(self):
         """วางซ้ำต้องไม่นับเบิ้ล — บิลที่วันที่+ยอดตรงกันอยู่แล้วให้ข้าม"""
-        summary = (f"📋 สรุปหนี้\n{_dmy(_d(5))}  ยกมา 1,000.00\n"
+        summary = (f"ค้าง\n📋 สรุปหนี้\n{_dmy(_d(5))}  ยกมา 1,000.00\n"
                    f"{_dmy(_d(3))}  📥+2,000.00\n{_dmy(_d(2))}  📥+3,000.00")
         self._paste(summary)
         first = app._payable_outstanding(ACCT)
@@ -455,7 +456,7 @@ class TestCarryBlock(PayableTestCase):
     def test_payment_lines_cannot_be_restored_and_say_so(self):
         """บรรทัด 'จ่าย' คืนอัตโนมัติไม่ได้ (ต้องจับคู่บิล) — ต้องบอก ไม่ใช่เงียบ"""
         handled, msg = self._paste(
-            f"📋 สรุปหนี้\n{_dmy(_d(5))}  ยกมา 1,000.00\n{_dmy(_d(4))}  ยกมา 500.00\n"
+            f"ค้าง\n📋 สรุปหนี้\n{_dmy(_d(5))}  ยกมา 1,000.00\n{_dmy(_d(4))}  ยกมา 500.00\n"
             f"{_dmy(_d(3))}  💸−500.00")
 
         self.assertTrue(handled)
@@ -465,7 +466,7 @@ class TestCarryBlock(PayableTestCase):
     def test_summary_line_with_partial_payment_uses_remaining(self):
         """บรรทัดยกมาที่จ่ายบางส่วนแล้วมี '(เหลือ x)' ต่อท้าย → ต้องใช้ยอดที่เหลือ"""
         handled, msg = self._paste(
-            f"📋 สรุปหนี้\n{_dmy(_d(6))}  ยกมา 10,000.00  💸 จ่าย 4,000.00 (เหลือ 6,000.00)\n"
+            f"ค้าง\n📋 สรุปหนี้\n{_dmy(_d(6))}  ยกมา 10,000.00  💸 จ่าย 4,000.00 (เหลือ 6,000.00)\n"
             f"{_dmy(_d(5))}  ยกมา 2,000.00")
 
         self.assertTrue(handled)
@@ -2260,8 +2261,20 @@ class TestPastedLedgerFeedback(PayableTestCase):
         rows = "\n".join(f"{_dmy(_d(i))} 📥+{1000 + i:,}.00" for i in (5, 4, 3))
         return f"{header}\n━━━━━━━━━━━━━\n{rows}"
 
-    def test_pasted_ledger_with_header_is_accepted(self):
+    def test_bots_own_card_header_is_not_a_command(self):
+        """🔴 หัวการ์ด '📋 สรุปหนี้' เป็นคำที่ 'บอทพิมพ์เอง' ห้ามนับเป็นเจตนาของคน
+
+        ของเดิม has_carry_word จับคำว่า 'สรุปหนี้' → ก๊อปการ์ดมาวางก็ผ่านด่าน 100%
+        แล้วคำสั่งที่ลบยอดค้างเดิมทั้งชุดก็รันเงียบๆ (ต้นเหตุเคส 15/11/2569)"""
         handled = app.handle_payable_text(self._Ev(), self._ledger("📋 สรุปหนี้  — รายวัน"), ACCT)
+        self.assertTrue(handled, "ต้องตอบ ไม่ปล่อยเงียบ")
+        self.assertEqual(self.bills(), [], "ยังไม่บันทึกจนกว่าคนจะสั่งให้ชัด")
+        self.assertIn("ค้าง", self.sent[-1], "ต้องบอกว่าต้องพิมพ์อะไรเพิ่ม")
+
+    def test_pasted_ledger_with_human_header_is_accepted(self):
+        """คนพิมพ์คำว่า 'ค้าง' ไว้บรรทัดแรกเอง → ทางกู้ยอดยังทำงานครบ"""
+        handled = app.handle_payable_text(
+            self._Ev(), "ค้าง\n" + self._ledger("📋 สรุปหนี้  — รายวัน"), ACCT)
         self.assertTrue(handled)
         self.assertEqual(len(self.bills()), 3, "ต้องลงบิลครบ 3 ใบ")
 
@@ -5629,3 +5642,281 @@ class TestResolveSlipDatetime(PayableTestCase):
         dup, _, _ = app.find_duplicate(gid, info)
 
         self.assertIsNone(dup, "ปีเพี้ยนเหมือนกันทั้งคู่ ไม่ใช่เหตุให้ฟันธงว่าซ้ำ")
+
+
+class TestBillDateFarFromToday(PayableTestCase):
+    """🔴 วันบนบิลที่ 'ดูสมเหตุผล แต่ผิด' — ตาข่ายเดิมจับไม่ได้ (เจ้าของแจ้ง 16/11/2569)
+
+    เคสจริง: บิลดวงใจพิมพ์ '14/11/2569' ชัดเจน ยอด 11,602 แต่ AI อ่านเป็น 2026-10-11
+    ห่าง 34 วัน — **ยังอยู่ในกรอบ 90 วันของ _sane_doc_date** ตาข่ายเดิมจึงปล่อยผ่านเงียบๆ
+    บิลไปโผล่ผิดเดือนในรายงาน เจ้าของต้องมาไล่เองว่าใบไหนผิด
+
+    ⚖️ 'ห่างจากวันนี้' ไม่ใช่หลักฐานว่าผิด (ส่งบิลเก่าย้อนหลังก็ปกติ) → ไม่ทิ้ง ไม่แก้ให้เอง
+       แค่ให้ตัวเก่งอ่านซ้ำ แล้วถ้ายังห่างก็เก็บตามนั้น + เตือนคน"""
+
+    def _d(self, days_ago):
+        return (datetime.now(app.TZ).date() - timedelta(days=days_ago)).isoformat()
+
+    def test_near_date_is_accepted_without_reread(self):
+        """บิลของวันนี้/เมื่อวาน = ปกติ ห้ามเรียกโมเดลตัวเก่ง (ไม่เสียเงิน/เวลาเพิ่ม)"""
+        calls = []
+
+        def _reread(img, retry=False):
+            calls.append(retry)
+            return {"doc_date": self._d(0)}
+
+        d, far = app.resolve_bill_doc_date({"doc_date": self._d(1)}, image_bytes=b"x", reread=_reread)
+
+        self.assertEqual(d, self._d(1))
+        self.assertIsNone(far, "ใกล้วันนี้ = ไม่ต้องเตือน")
+        self.assertEqual(calls, [], "ห้ามเรียกตัวเก่งกับบิลปกติ")
+
+    def test_far_date_triggers_reread_and_uses_better_answer(self):
+        """เคสจริง: รอบแรกอ่านห่าง 34 วัน → ตัวเก่งอ่านได้วันที่ใกล้กว่า → ใช้ค่าใหม่"""
+        good = self._d(2)
+        calls = []
+
+        def _reread(img, retry=False):
+            calls.append(retry)
+            return {"doc_date": good}
+
+        d, far = app.resolve_bill_doc_date({"doc_date": self._d(34)}, image_bytes=b"x", reread=_reread)
+
+        self.assertEqual(calls, [True], "ต้องเรียกด้วยโมเดลตัวเก่ง")
+        self.assertEqual(d, good, "ได้คำตอบที่ดีกว่าแล้วต้องใช้")
+        self.assertIsNone(far, "แก้ได้แล้วไม่ต้องเตือน")
+
+    def test_far_date_confirmed_is_kept_but_flagged(self):
+        """⚖️ ตัวเก่งยืนยันวันเดิม → เก็บไว้ตามนั้น ไม่แก้ให้เอง แต่ต้องเตือน"""
+        far_date = self._d(34)
+
+        def _reread(img, retry=False):
+            return {"doc_date": far_date}
+
+        d, far = app.resolve_bill_doc_date({"doc_date": far_date}, image_bytes=b"x", reread=_reread)
+
+        self.assertEqual(d, far_date, "ห้ามทิ้ง/ห้ามแก้เป็นวันนี้เอง — เงียบๆ ผิดพอกันแต่ไม่มีใครรู้")
+        self.assertEqual(far, 34, "ต้องคืนจำนวนวันไว้ให้คนอ่านตัดสิน")
+
+    def test_reread_failure_keeps_original_and_still_flags(self):
+        def _reread(img, retry=False):
+            raise RuntimeError("โมเดลล่ม")
+
+        d, far = app.resolve_bill_doc_date({"doc_date": self._d(34)}, image_bytes=b"x", reread=_reread)
+
+        self.assertEqual(d, self._d(34))
+        self.assertEqual(far, 34, "อ่านซ้ำพังก็ยังต้องเตือน ห้ามเงียบ")
+
+    def test_unreadable_date_still_falls_back_to_today(self):
+        """วันที่อ่านไม่ได้เลย → พฤติกรรมเดิม (คืน None แล้วให้ผู้เรียกใช้วันนี้) ต้องไม่พัง"""
+        d, far = app.resolve_bill_doc_date({"doc_date": "ไม่ใช่วันที่"}, image_bytes=b"x")
+        self.assertIsNone(d)
+        self.assertIsNone(far)
+
+    def test_future_date_still_rejected_by_existing_net(self):
+        """ตาข่ายเดิม (อนาคต / เก่าเกิน 90 วัน) ต้องยังทำงานเหมือนเดิม"""
+        future = (datetime.now(app.TZ).date() + timedelta(days=3)).isoformat()
+        self.assertEqual(app.resolve_bill_doc_date({"doc_date": future}), (None, None))
+        self.assertEqual(app.resolve_bill_doc_date({"doc_date": self._d(200)}), (None, None))
+
+
+class TestLedgerCarrySeparator(PayableTestCase):
+    """เส้นคั่น 'บล็อกยอดยกมา' ต้องมีเฉพาะตอนแถวยกมาอยู่รวมกันบนสุดจริง
+
+    🪤 เรียงตาม doc_date เป็นหลัก → 'ยกมา' ที่ลงวันกลางๆ จะแทรกกลางรายการ
+    ของเดิมเช็กแค่ 'มียกมาอยู่ที่ไหนสักที่' แล้วยิงเส้นคั่นหลังแถวแรกที่ไม่ใช่ยกมา
+    → เส้นไปตกหลังบรรทัดแรกแบบไร้ความหมาย (เจ้าของเห็น 16/11/2569)"""
+
+    BAR = "━━━━━━━━━━━━━"
+
+    def _bill(self, day, amount, note="รูป"):
+        app.save_payable_bill(ACCT, float(amount), note=note, doc_date=day)
+
+    def _lines(self):
+        return app.build_payable_ledger(ACCT, with_total=True).split("\n")
+
+    def test_carry_in_the_middle_gets_no_separator(self):
+        self._bill(_d(30), 11602)
+        self._bill(_d(10), 15603)
+        self._bill(_d(2), 11602, note=app._PAYABLE_CARRY_NOTE)
+        self._bill(_d(2), 6908)
+
+        lines = self._lines()
+        body = lines[2:-3]            # ตัดหัวการ์ด+เส้นบน และเส้นล่าง+ยอดรวม+ป้ายเตือนท้ายการ์ด
+        self.assertNotIn(self.BAR, body,
+                         "ยกมาอยู่กลางรายการ → ห้ามมีเส้นคั่นแทรก\n" + "\n".join(lines))
+
+    def test_carry_block_on_top_still_gets_its_separator(self):
+        """ของเดิมที่ถูกต้องต้องไม่พัง — ยกมาเป็นบล็อกบนสุด ยังขีดเส้นแยกเหมือนเดิม"""
+        self._bill(_d(30), 5000, note=app._PAYABLE_CARRY_NOTE)
+        self._bill(_d(30), 3000, note=app._PAYABLE_CARRY_NOTE)
+        self._bill(_d(2), 6908)
+
+        lines = self._lines()
+        i_last_carry = max(i for i, l in enumerate(lines) if "ยกมา" in l)
+        self.assertEqual(lines[i_last_carry + 1], self.BAR,
+                         "เส้นคั่นต้องอยู่ถัดจากแถวยกมาแถวสุดท้าย\n" + "\n".join(lines))
+
+    def test_no_carry_means_no_extra_separator(self):
+        self._bill(_d(10), 15603)
+        self._bill(_d(2), 6908)
+
+        body = self._lines()[2:-3]
+        self.assertNotIn(self.BAR, body)
+
+    def test_never_two_separators_in_a_row(self):
+        """กันอาการเดิมที่เคยเห็น — เส้นคั่นซ้อนกันสองเส้นติด"""
+        self._bill(_d(30), 5000, note=app._PAYABLE_CARRY_NOTE)
+        self._bill(_d(2), 6908)
+
+        lines = self._lines()
+        doubles = [i for i in range(1, len(lines)) if lines[i] == self.BAR and lines[i-1] == self.BAR]
+        self.assertEqual(doubles, [], "\n".join(lines))
+
+
+class TestEditedLedgerPasteIsAmbiguous(PayableTestCase):
+    """🔴 เคสจริง 15/11/2569 23:16 — ก๊อปการ์ดของบอทมาแก้วันที่บิล แล้วได้ 'ยกมา' แทน
+
+    บิล 11,602 ลงวันผิดเป็น 11/10 → Aod ก๊อปการ์ดสรุปของบอทมา ลบบรรทัดที่ผิดออก
+    แล้วเติม '14/11/26 = 11,602' เพื่อย้ายไปวันที่ถูก — **เจตนาถูกต้องทุกอย่าง**
+    แต่ '=' แปลว่า 'ยอดค้างยกมา' ไม่ใช่ 'บิล' → ได้แถวยกมาเกินมา ยอดค้างเกินจริง 11,602
+    บอทตอบ '✅ บันทึกยอดค้างยกมา 1 บรรทัด ... บิลซื้อ +0 ใบ (ข้ามที่มีอยู่แล้ว 12 ใบ)'
+
+    ⚖️ ไม่เดาว่าเขาหมายถึงบิล (เดาผิด = เงินผิด) — บอกให้ชัดว่าจะได้อะไร แล้วให้คนเลือก"""
+
+    def setUp(self):
+        super().setUp()
+        self._orig = (app._payable_send, app._payable_push_summary)
+        self.sent = []
+        app._payable_send = lambda ev, gid, out, text: self.sent.append(text)
+        app._payable_push_summary = lambda *a, **k: None
+
+    def tearDown(self):
+        app._payable_send, app._payable_push_summary = self._orig
+        super().tearDown()
+
+    class _Event:
+        reply_token = "tok"
+
+    def _paste(self, block):
+        self.sent = []
+        handled = app.handle_payable_text(self._Event(), block, ACCT)
+        return handled, (self.sent[0] if self.sent else "")
+
+    def _card(self, extra_line):
+        return ("📋 สรุปหนี้ ดวงใจการสุรา — รายวัน\n"
+                "━━━━━━━━━━━━━\n"
+                f"{_dmy(_d(5))}  📥+15,603.00\n"
+                f"{_dmy(_d(4))}  📥+23,950.00\n"
+                f"{extra_line}\n"
+                f"{_dmy(_d(2))}  📥+5,200.00")
+
+    def test_edited_card_is_refused_with_the_right_command(self):
+        before = app._payable_outstanding(ACCT)
+
+        handled, msg = self._paste(self._card(f"{_dmy(_d(3))} = 11,602"))
+
+        self.assertTrue(handled)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), before, places=2,
+                               msg="🔴 กำกวม = ห้ามแตะข้อมูลเลย")
+        self.assertEqual(self.bills(), [], "ต้องไม่สร้างแถวไหนเลย")
+        self.assertIn("ลบบิล", msg, "ต้องบอกคำสั่งที่ถูกต้องให้พิมพ์ตามได้")
+        self.assertIn("บิล " + _dmy(_d(3))[:5], msg, "ต้องเติมวัน/เดือนให้พร้อมใช้")
+        self.assertIn("11602", msg.replace(",", ""), "ต้องเติมยอดให้พร้อมใช้")
+        self.assertIn("ค้าง", msg, "ต้องบอกทางออกถ้าตั้งใจวางยอดค้างจริงๆ")
+
+    CLEAN_CARD = None   # ตั้งใน _clean_card()
+
+    def _clean_card(self):
+        """การ์ดล้วนๆ ที่บอทพิมพ์เอง — ไม่มี '=' เลย"""
+        return ("📋 สรุปหนี้  — รายวัน\n"
+                "━━━━━━━━━━━━━\n"
+                f"{_dmy(_d(9))}  ยกมา 19,614.00\n"
+                "━━━━━━━━━━━━━\n"
+                f"{_dmy(_d(4))}  📥+30,403.00\n"
+                f"{_dmy(_d(3))}  📥+22,449.00")
+
+    def test_clean_card_paste_without_header_is_refused(self):
+        """🔴 รูที่ยังเปิดอยู่หลังด่าน '=' — การ์ดที่ 'ลบบรรทัดทิ้ง' ไม่มี '=' เลย
+
+        ด่าน '=' ดักได้แค่ตอนมีบรรทัด 'วัน = ยอด' ปนมา แต่คนที่แก้การ์ดด้วยการ
+        ลบบรรทัดที่ผิดออก (หรือแก้ตัวเลขในบรรทัดเดิม) ไม่มี '=' สักตัว
+        → เคยผ่านด่านเงียบๆ แล้วลบยอดค้างเดิมทั้งชุดเขียนทับ"""
+        before = app._payable_outstanding(ACCT)
+
+        handled, msg = self._paste(self._clean_card())
+
+        self.assertTrue(handled, "ห้ามเงียบ")
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), before, places=2,
+                               msg="🔴 ยังไม่ได้สั่งให้ชัด = ห้ามแตะข้อมูล")
+        self.assertEqual(self.bills(), [], "ต้องไม่สร้างแถวไหนเลย")
+        self.assertIn("ค้าง", msg, "ต้องบอกคำที่ต้องพิมพ์เพิ่ม")
+        self.assertIn("ลบบิล", msg, "ต้องบอกทางแก้บิลลงวันผิดด้วย")
+
+    def test_clean_card_paste_with_header_still_restores(self):
+        """ทางกู้ข้อมูลที่ตั้งใจไว้ต้องไม่พัง — พิมพ์ 'ค้าง' บรรทัดแรกแล้ววางการ์ด"""
+        handled, msg = self._paste("ค้าง\n" + self._clean_card())
+
+        self.assertTrue(handled)
+        self.assertIn("✅", msg)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 72466.0, places=2)
+
+    def test_card_with_an_edited_number_is_refused(self):
+        """แก้ตัวเลขในการ์ดแล้วส่งกลับ (ไม่มี '=' เลย) → ต้องไม่เดาว่าหมายถึงอะไร"""
+        app.save_payable_bill(ACCT, 30403.0, note="รูป", doc_date=_d(4))
+        before = app._payable_outstanding(ACCT)
+
+        edited = self._clean_card().replace("30,403.00", "33,403.00")
+        handled, msg = self._paste(edited)
+
+        self.assertTrue(handled)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), before, places=2)
+        self.assertIn("ค้าง", msg)
+
+    def test_card_carries_the_dont_edit_warning(self):
+        """ป้ายท้ายการ์ด — สอนตรงจุดที่คนกำลังมองอยู่"""
+        app.save_payable_bill(ACCT, 5000.0, note="รูป", doc_date=_d(2))
+        card = app.build_payable_ledger(ACCT, with_total=True)
+
+        self.assertIn("ลบบิล", card.splitlines()[-1], "ป้ายต้องอยู่บรรทัดท้ายสุด")
+        self.assertNotIn("=", card, "🔴 ห้ามมี '=' ในการ์ด ไม่งั้นวางกลับเพื่อกู้ยอดจะเพี้ยน")
+
+    def test_warning_footer_does_not_break_restore(self):
+        """วางการ์ด (ที่มีป้ายท้ายติดมาด้วย) กลับเพื่อกู้ยอด ต้องได้ยอดเท่าเดิมเป๊ะ"""
+        app.save_payable_bill(ACCT, 19614.0, note=app._PAYABLE_CARRY_NOTE, doc_date=_d(9))
+        app.save_payable_bill(ACCT, 30403.0, note="รูป", doc_date=_d(4))
+        card = app.build_payable_ledger(ACCT, with_total=True)
+        want = app._payable_outstanding(ACCT)
+        with app._db() as conn:
+            conn.execute("DELETE FROM payable_bills WHERE group_id=?", (ACCT,))
+
+        handled, msg = self._paste("ค้าง\n" + card)
+
+        self.assertTrue(handled)
+        self.assertIn("✅", msg)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), want, places=2,
+                               msg="ป้ายท้ายการ์ดต้องไม่ถูกนับเป็นยอด/บรรทัดเสีย")
+
+    def test_explicit_carry_header_still_wins(self):
+        """ตั้งใจวางยอดค้างทับจริงๆ (พิมพ์ 'ค้าง' บรรทัดแรก) → ทำให้ตามสั่ง ไม่ต้องถาม"""
+        block = ("ค้าง\n"
+                 f"{_dmy(_d(5))}  📥+15,603.00\n"
+                 f"{_dmy(_d(4))}  📥+23,950.00\n"
+                 f"{_dmy(_d(3))} = 11,602")
+
+        handled, msg = self._paste(block)
+
+        self.assertTrue(handled)
+        self.assertIn("✅", msg)
+        self.assertIn("ยอดค้างยกมา", msg)
+
+    def test_typed_block_without_ledger_rows_unaffected(self):
+        """บล็อกที่พิมพ์เองล้วนๆ (ไม่มี 📥) ยังทำงานเหมือนเดิม"""
+        block = ("ยอดค้าง\n"
+                 f"{_dmy(_d(5))}=5000\n"
+                 f"{_dmy(_d(4))}=6000")
+
+        handled, msg = self._paste(block)
+
+        self.assertTrue(handled)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 11000.0, places=2)
