@@ -5759,3 +5759,94 @@ class TestLedgerCarrySeparator(PayableTestCase):
         lines = self._lines()
         doubles = [i for i in range(1, len(lines)) if lines[i] == self.BAR and lines[i-1] == self.BAR]
         self.assertEqual(doubles, [], "\n".join(lines))
+
+
+class TestEditedLedgerPasteIsAmbiguous(PayableTestCase):
+    """🔴 เคสจริง 15/11/2569 23:16 — ก๊อปการ์ดของบอทมาแก้วันที่บิล แล้วได้ 'ยกมา' แทน
+
+    บิล 11,602 ลงวันผิดเป็น 11/10 → Aod ก๊อปการ์ดสรุปของบอทมา ลบบรรทัดที่ผิดออก
+    แล้วเติม '14/11/26 = 11,602' เพื่อย้ายไปวันที่ถูก — **เจตนาถูกต้องทุกอย่าง**
+    แต่ '=' แปลว่า 'ยอดค้างยกมา' ไม่ใช่ 'บิล' → ได้แถวยกมาเกินมา ยอดค้างเกินจริง 11,602
+    บอทตอบ '✅ บันทึกยอดค้างยกมา 1 บรรทัด ... บิลซื้อ +0 ใบ (ข้ามที่มีอยู่แล้ว 12 ใบ)'
+
+    ⚖️ ไม่เดาว่าเขาหมายถึงบิล (เดาผิด = เงินผิด) — บอกให้ชัดว่าจะได้อะไร แล้วให้คนเลือก"""
+
+    def setUp(self):
+        super().setUp()
+        self._orig = (app._payable_send, app._payable_push_summary)
+        self.sent = []
+        app._payable_send = lambda ev, gid, out, text: self.sent.append(text)
+        app._payable_push_summary = lambda *a, **k: None
+
+    def tearDown(self):
+        app._payable_send, app._payable_push_summary = self._orig
+        super().tearDown()
+
+    class _Event:
+        reply_token = "tok"
+
+    def _paste(self, block):
+        self.sent = []
+        handled = app.handle_payable_text(self._Event(), block, ACCT)
+        return handled, (self.sent[0] if self.sent else "")
+
+    def _card(self, extra_line):
+        return ("📋 สรุปหนี้ ดวงใจการสุรา — รายวัน\n"
+                "━━━━━━━━━━━━━\n"
+                f"{_dmy(_d(5))}  📥+15,603.00\n"
+                f"{_dmy(_d(4))}  📥+23,950.00\n"
+                f"{extra_line}\n"
+                f"{_dmy(_d(2))}  📥+5,200.00")
+
+    def test_edited_card_is_refused_with_the_right_command(self):
+        before = app._payable_outstanding(ACCT)
+
+        handled, msg = self._paste(self._card(f"{_dmy(_d(3))} = 11,602"))
+
+        self.assertTrue(handled)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), before, places=2,
+                               msg="🔴 กำกวม = ห้ามแตะข้อมูลเลย")
+        self.assertEqual(self.bills(), [], "ต้องไม่สร้างแถวไหนเลย")
+        self.assertIn("ลบบิล", msg, "ต้องบอกคำสั่งที่ถูกต้องให้พิมพ์ตามได้")
+        self.assertIn("บิล " + _dmy(_d(3))[:5], msg, "ต้องเติมวัน/เดือนให้พร้อมใช้")
+        self.assertIn("11602", msg.replace(",", ""), "ต้องเติมยอดให้พร้อมใช้")
+        self.assertIn("ค้าง", msg, "ต้องบอกทางออกถ้าตั้งใจวางยอดค้างจริงๆ")
+
+    def test_clean_card_paste_still_restores(self):
+        """ทางกู้ข้อมูลที่ตั้งใจไว้ต้องไม่พัง — การ์ดล้วนๆ ใช้ 'ยกมา'/'📥' ไม่มี '='"""
+        block = ("📋 สรุปหนี้  — รายวัน\n"
+                 "━━━━━━━━━━━━━\n"
+                 f"{_dmy(_d(9))}  ยกมา 19,614.00\n"
+                 "━━━━━━━━━━━━━\n"
+                 f"{_dmy(_d(4))}  📥+30,403.00\n"
+                 f"{_dmy(_d(3))}  📥+22,449.00")
+
+        handled, msg = self._paste(block)
+
+        self.assertTrue(handled)
+        self.assertIn("✅", msg)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 72466.0, places=2)
+
+    def test_explicit_carry_header_still_wins(self):
+        """ตั้งใจวางยอดค้างทับจริงๆ (พิมพ์ 'ค้าง' บรรทัดแรก) → ทำให้ตามสั่ง ไม่ต้องถาม"""
+        block = ("ค้าง\n"
+                 f"{_dmy(_d(5))}  📥+15,603.00\n"
+                 f"{_dmy(_d(4))}  📥+23,950.00\n"
+                 f"{_dmy(_d(3))} = 11,602")
+
+        handled, msg = self._paste(block)
+
+        self.assertTrue(handled)
+        self.assertIn("✅", msg)
+        self.assertIn("ยอดค้างยกมา", msg)
+
+    def test_typed_block_without_ledger_rows_unaffected(self):
+        """บล็อกที่พิมพ์เองล้วนๆ (ไม่มี 📥) ยังทำงานเหมือนเดิม"""
+        block = ("ยอดค้าง\n"
+                 f"{_dmy(_d(5))}=5000\n"
+                 f"{_dmy(_d(4))}=6000")
+
+        handled, msg = self._paste(block)
+
+        self.assertTrue(handled)
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 11000.0, places=2)
