@@ -3123,7 +3123,13 @@ def build_payable_ledger(acct: str, with_total: bool = True) -> str:
     if not events and not opening:
         return f"📋 สรุปหนี้ {PAYABLE_VENDOR} — รายวัน\n{bar}\nยังไม่มีรายการ"
 
-    has_carry = any(e[3] == "carry" for e in events)
+    # เส้นคั่น 'บล็อกยอดยกมา' ใช้ได้เฉพาะตอนแถวยกมาอยู่รวมกันบนสุดจริงๆ
+    # 🪤 เรียงตาม doc_date เป็นหลัก → 'ยกมา' ที่ลงวันกลางๆ จะไปแทรกกลางรายการ
+    #    ของเดิมเช็กแค่ 'มียกมาอยู่ที่ไหนสักที่' แล้วยิงเส้นคั่นหลังแถวแรกที่ไม่ใช่ยกมา
+    #    → เส้นไปตกหลังบรรทัดแรกแบบไร้ความหมาย (เจ้าของเห็น 16/11/69)
+    #    ป้าย 'ยกมา' บนแต่ละบรรทัดบอกตัวเองอยู่แล้ว ไม่รวมหัวก็ไม่ต้องขีดเส้น
+    _n_carry  = sum(1 for e in events if e[3] == "carry")
+    has_carry = _n_carry > 0 and all(e[3] == "carry" for e in events[:_n_carry])
     lines = [f"📋 สรุปหนี้ {PAYABLE_VENDOR} — รายวัน", bar]
     if opening:   # โชว์ยอดยกมา 'ก้อนเดียว' เฉพาะกรณีตั้งด้วยคำสั่ง 'ตั้งยอดยกมา' (บล็อกค้างจะกระจายเป็นรายวันแทน)
         lines += [f"📌 ยอดยกมา   {opening:,.2f}", bar]

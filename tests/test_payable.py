@@ -5705,3 +5705,57 @@ class TestBillDateFarFromToday(PayableTestCase):
         future = (datetime.now(app.TZ).date() + timedelta(days=3)).isoformat()
         self.assertEqual(app.resolve_bill_doc_date({"doc_date": future}), (None, None))
         self.assertEqual(app.resolve_bill_doc_date({"doc_date": self._d(200)}), (None, None))
+
+
+class TestLedgerCarrySeparator(PayableTestCase):
+    """เส้นคั่น 'บล็อกยอดยกมา' ต้องมีเฉพาะตอนแถวยกมาอยู่รวมกันบนสุดจริง
+
+    🪤 เรียงตาม doc_date เป็นหลัก → 'ยกมา' ที่ลงวันกลางๆ จะแทรกกลางรายการ
+    ของเดิมเช็กแค่ 'มียกมาอยู่ที่ไหนสักที่' แล้วยิงเส้นคั่นหลังแถวแรกที่ไม่ใช่ยกมา
+    → เส้นไปตกหลังบรรทัดแรกแบบไร้ความหมาย (เจ้าของเห็น 16/11/2569)"""
+
+    BAR = "━━━━━━━━━━━━━"
+
+    def _bill(self, day, amount, note="รูป"):
+        app.save_payable_bill(ACCT, float(amount), note=note, doc_date=day)
+
+    def _lines(self):
+        return app.build_payable_ledger(ACCT, with_total=True).split("\n")
+
+    def test_carry_in_the_middle_gets_no_separator(self):
+        self._bill(_d(30), 11602)
+        self._bill(_d(10), 15603)
+        self._bill(_d(2), 11602, note=app._PAYABLE_CARRY_NOTE)
+        self._bill(_d(2), 6908)
+
+        lines = self._lines()
+        body = lines[2:-2]            # ตัดหัวการ์ด+เส้นบน และเส้นล่าง+ยอดรวม
+        self.assertNotIn(self.BAR, body,
+                         "ยกมาอยู่กลางรายการ → ห้ามมีเส้นคั่นแทรก\n" + "\n".join(lines))
+
+    def test_carry_block_on_top_still_gets_its_separator(self):
+        """ของเดิมที่ถูกต้องต้องไม่พัง — ยกมาเป็นบล็อกบนสุด ยังขีดเส้นแยกเหมือนเดิม"""
+        self._bill(_d(30), 5000, note=app._PAYABLE_CARRY_NOTE)
+        self._bill(_d(30), 3000, note=app._PAYABLE_CARRY_NOTE)
+        self._bill(_d(2), 6908)
+
+        lines = self._lines()
+        i_last_carry = max(i for i, l in enumerate(lines) if "ยกมา" in l)
+        self.assertEqual(lines[i_last_carry + 1], self.BAR,
+                         "เส้นคั่นต้องอยู่ถัดจากแถวยกมาแถวสุดท้าย\n" + "\n".join(lines))
+
+    def test_no_carry_means_no_extra_separator(self):
+        self._bill(_d(10), 15603)
+        self._bill(_d(2), 6908)
+
+        body = self._lines()[2:-2]
+        self.assertNotIn(self.BAR, body)
+
+    def test_never_two_separators_in_a_row(self):
+        """กันอาการเดิมที่เคยเห็น — เส้นคั่นซ้อนกันสองเส้นติด"""
+        self._bill(_d(30), 5000, note=app._PAYABLE_CARRY_NOTE)
+        self._bill(_d(2), 6908)
+
+        lines = self._lines()
+        doubles = [i for i in range(1, len(lines)) if lines[i] == self.BAR and lines[i-1] == self.BAR]
+        self.assertEqual(doubles, [], "\n".join(lines))
