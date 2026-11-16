@@ -55,6 +55,9 @@ PAYABLE_PAYEE_KEYWORDS = [k.strip() for k in os.environ.get("PAYABLE_PAYEE_KEYWO
 PAYABLE_SUMMARY_HOUR = int(os.environ.get("PAYABLE_SUMMARY_HOUR", "1"))  # ส่งสรุปหนี้รายวันหลังกี่โมง (ดีฟอลต์ ตี1)
 # รับวันที่ที่ AI อ่านจากบิล/สลิป(รูป) เฉพาะที่ไม่เก่าเกินกี่วัน (กันอ่านปีเพี้ยน/มั่ว) — ยอดค้างจริงเก่าได้ จึงตั้งกว้าง; เกินช่วงนี้หรืออนาคต→ใช้วันที่ส่ง
 PAYABLE_DATE_MAX_DAYS = int(os.environ.get("PAYABLE_DATE_MAX_DAYS", "90"))
+# บิลของดวงใจส่งของทุกวัน ร้านถ่ายรูปบิลวันเดียวกับที่ของมาถึง → วันบนบิลควรใกล้วันที่ส่งรูป
+# ห่างเกินนี้ = น่าสงสัยว่า AI อ่านวันผิด (ไม่ใช่ผิดแน่ๆ — ส่งบิลเก่าย้อนหลังก็มี) → ตรวจซ้ำ + เตือน
+PAYABLE_DATE_NEAR_DAYS = int(os.environ.get("PAYABLE_DATE_NEAR_DAYS", "7"))
 # บัญชีหนี้แบบ "บัญชีเดียว 2 กลุ่ม" (mirror) — รูปแบบ "primary:mirror,primary2:mirror2"
 #   primary = กลุ่มส่งบิล/สลิป (เงียบ ไม่ตอบในกลุ่ม) + เป็นที่เก็บข้อมูลจริง
 #   mirror  = กลุ่มที่บอทเด้งผล/ดูยอด/สรุป (ใช้ข้อมูลชุดเดียวกับ primary)
@@ -2625,6 +2628,44 @@ def _sane_doc_date(doc_date):
     return doc_date
 
 
+def resolve_bill_doc_date(info: dict, image_bytes=None, reread=None):
+    """วันที่บนบิลซื้อ — ผ่านตาข่ายเดิมก่อน แล้วค่อยดูว่า 'ห่างจากวันนี้ผิดปกติ' ไหม
+
+    🪤 เคสจริง 14/11/2569: บิลดวงใจพิมพ์ '14/11/2569' ชัดเจน ยอด 11,602
+      AI อ่านเป็น 2026-10-11 → ห่าง 34 วัน แต่ **ยังอยู่ในกรอบ 90 วันของ _sane_doc_date**
+      ตาข่ายเดิมจึงจับไม่ได้เลย (มันกันแค่ 'อนาคต' กับ 'เก่าเกินไปมาก')
+      บิลไปโผล่ผิดเดือนในรายงาน และเจ้าของต้องมาไล่เองว่าใบไหนผิด
+
+    ⚖️ 'ห่างจากวันนี้' ไม่ใช่หลักฐานว่าผิด — ส่งบิลเก่าย้อนหลังก็เป็นเรื่องปกติ
+       จึง **ไม่ทิ้ง ไม่แก้ให้เอง** แค่ให้ตัวเก่งอ่านซ้ำ แล้วถ้ายังห่างอยู่ก็เก็บไว้ตามนั้น + เตือนคน
+       (ทิ้งวันที่ = เงียบๆ กลายเป็นวันนี้ ซึ่งผิดพอกันแต่ไม่มีใครรู้)
+    คืน (doc_date, far_days|None) · far_days มีค่า = ต้องเตือน
+    reread = ฉีดได้ (เทส) · ค่าตั้งต้นคือ extract_payable_doc ตัวจริง"""
+    doc_date = _sane_doc_date(info.get("doc_date"))
+    if not doc_date:
+        return None, None
+
+    def _far(d):
+        try:
+            return (datetime.now(TZ).date() - datetime.strptime(d, "%Y-%m-%d").date()).days
+        except (ValueError, TypeError):
+            return 0
+
+    far = _far(doc_date)
+    if far <= PAYABLE_DATE_NEAR_DAYS or not image_bytes:
+        return doc_date, (far if far > PAYABLE_DATE_NEAR_DAYS else None)
+    try:
+        d2 = _sane_doc_date(((reread or extract_payable_doc)(image_bytes, retry=True) or {}).get("doc_date"))
+        if d2 and d2 != doc_date and _far(d2) <= PAYABLE_DATE_NEAR_DAYS:
+            print(f"[payable] วันบนบิล: รอบแรกอ่าน {doc_date} (ห่าง {far} วัน) → "
+                  f"โมเดลแรงอ่าน {d2} ใกล้กว่า → ใช้ค่าใหม่", flush=True)
+            return d2, None
+        print(f"[payable] วันบนบิล: โมเดลแรงอ่านได้ {d2 or '-'} → คงค่าเดิม {doc_date} (ห่าง {far} วัน) + เตือน", flush=True)
+    except Exception as e:
+        print(f"[payable] อ่านวันบนบิลซ้ำไม่สำเร็จ: {e} — คงค่าเดิม", flush=True)
+    return doc_date, far
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ระบบที่ 3 — บัญชีเจ้าหนี้การค้า (ดวงใจการสุรา): บิลซื้อ(+) / เงินจ่าย(−) / ยอดค้าง
 # หมายเหตุ: ห้าม cleanup ตาราง payable_* (เป็นบัญชีเดินสะสม ลบแถวเก่า = ยอดเพี้ยน)
@@ -3563,7 +3604,9 @@ def _process_payable_image(event, group_id: str):
 
     doc_type = (info.get("doc_type") or "other").lower()
     amount   = float(info.get("amount") or 0)
-    doc_date = _sane_doc_date(info.get("doc_date"))   # ใช้วันที่บนเอกสารเฉพาะที่สมเหตุผล (กัน AI อ่านเพี้ยน) ไม่งั้น = วันนี้
+    # ใช้วันที่บนเอกสารเฉพาะที่สมเหตุผล (กัน AI อ่านเพี้ยน) ไม่งั้น = วันนี้
+    # + ถ้าห่างจากวันนี้ผิดปกติ ให้ตัวเก่งอ่านซ้ำ แล้วเตือนถ้ายังห่างอยู่ (เคสจริง 14/11/2569)
+    doc_date, _date_far = resolve_bill_doc_date(info, image_bytes)
     # ⚠️ บรรทัดนี้คือของที่ 'ขาด' ตอนไล่เคส 9 ก.ย. 26 — ค้นคำว่า payable ใน log แล้วไม่เจออะไรเลย
     # เส้นทางรูปเจ้าหนี้เคย log เฉพาะตอน 'พัง' (อ่านรูปไม่สำเร็จ/ไม่ใช่บิลสลิป/retry) ส่วนขาที่
     # 'ทำงานได้' — บันทึกสำเร็จ และโดยเฉพาะ 'ปฏิเสธเพราะปลายทางไม่ตรง' — เงียบสนิททั้งคู่
@@ -3584,6 +3627,14 @@ def _process_payable_image(event, group_id: str):
         # บิลซื้อ: บันทึก แล้วเด้ง 'สรุปหนี้' ทุกกลุ่ม (primary=reply ฟรี, mirror=push)
         print(f"[payable] ✅ บันทึกบิล {amount:,.2f} วันที่ {eff_date} group={group_id}", flush=True)
         save_payable_bill(acct, amount, note="รูป", doc_date=doc_date)
+        # 🔴 ห้ามเงียบ — ลงไปแล้วแต่วันที่น่าสงสัย ต้องบอกพร้อมวิธีแก้ที่พิมพ์ตามได้เลย
+        if _date_far:
+            notify(f"📅 บิลนี้ลงวันที่ {_ddmmyy(eff_date)} ซึ่งห่างจากวันนี้ {_date_far} วัน — ผิดปกติสำหรับบิลรายวัน\n"
+                   f"   (ให้โมเดลตัวเก่งอ่านซ้ำแล้วยังได้วันเดิม)\n"
+                   f"✅ ยอด {amount:,.2f} บันทึกแล้ว ยอดค้างรวมถูกต้อง — ที่อาจผิดคือ 'วันที่' อย่างเดียว\n"
+                   f"ถ้าวันบนบิลไม่ใช่ {_ddmmyy(eff_date)} พิมพ์:\n"
+                   f"   ลบบิล {_ddmmyy(eff_date)[:5]} {amount:,.0f}\n"
+                   f"   บิล <วัน/เดือนที่ถูก> {amount:,.0f}", force=True)
         _payable_push_summary(event, group_id, acct)
         return
 

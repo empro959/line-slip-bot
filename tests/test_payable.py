@@ -5629,3 +5629,79 @@ class TestResolveSlipDatetime(PayableTestCase):
         dup, _, _ = app.find_duplicate(gid, info)
 
         self.assertIsNone(dup, "ปีเพี้ยนเหมือนกันทั้งคู่ ไม่ใช่เหตุให้ฟันธงว่าซ้ำ")
+
+
+class TestBillDateFarFromToday(PayableTestCase):
+    """🔴 วันบนบิลที่ 'ดูสมเหตุผล แต่ผิด' — ตาข่ายเดิมจับไม่ได้ (เจ้าของแจ้ง 16/11/2569)
+
+    เคสจริง: บิลดวงใจพิมพ์ '14/11/2569' ชัดเจน ยอด 11,602 แต่ AI อ่านเป็น 2026-10-11
+    ห่าง 34 วัน — **ยังอยู่ในกรอบ 90 วันของ _sane_doc_date** ตาข่ายเดิมจึงปล่อยผ่านเงียบๆ
+    บิลไปโผล่ผิดเดือนในรายงาน เจ้าของต้องมาไล่เองว่าใบไหนผิด
+
+    ⚖️ 'ห่างจากวันนี้' ไม่ใช่หลักฐานว่าผิด (ส่งบิลเก่าย้อนหลังก็ปกติ) → ไม่ทิ้ง ไม่แก้ให้เอง
+       แค่ให้ตัวเก่งอ่านซ้ำ แล้วถ้ายังห่างก็เก็บตามนั้น + เตือนคน"""
+
+    def _d(self, days_ago):
+        return (datetime.now(app.TZ).date() - timedelta(days=days_ago)).isoformat()
+
+    def test_near_date_is_accepted_without_reread(self):
+        """บิลของวันนี้/เมื่อวาน = ปกติ ห้ามเรียกโมเดลตัวเก่ง (ไม่เสียเงิน/เวลาเพิ่ม)"""
+        calls = []
+
+        def _reread(img, retry=False):
+            calls.append(retry)
+            return {"doc_date": self._d(0)}
+
+        d, far = app.resolve_bill_doc_date({"doc_date": self._d(1)}, image_bytes=b"x", reread=_reread)
+
+        self.assertEqual(d, self._d(1))
+        self.assertIsNone(far, "ใกล้วันนี้ = ไม่ต้องเตือน")
+        self.assertEqual(calls, [], "ห้ามเรียกตัวเก่งกับบิลปกติ")
+
+    def test_far_date_triggers_reread_and_uses_better_answer(self):
+        """เคสจริง: รอบแรกอ่านห่าง 34 วัน → ตัวเก่งอ่านได้วันที่ใกล้กว่า → ใช้ค่าใหม่"""
+        good = self._d(2)
+        calls = []
+
+        def _reread(img, retry=False):
+            calls.append(retry)
+            return {"doc_date": good}
+
+        d, far = app.resolve_bill_doc_date({"doc_date": self._d(34)}, image_bytes=b"x", reread=_reread)
+
+        self.assertEqual(calls, [True], "ต้องเรียกด้วยโมเดลตัวเก่ง")
+        self.assertEqual(d, good, "ได้คำตอบที่ดีกว่าแล้วต้องใช้")
+        self.assertIsNone(far, "แก้ได้แล้วไม่ต้องเตือน")
+
+    def test_far_date_confirmed_is_kept_but_flagged(self):
+        """⚖️ ตัวเก่งยืนยันวันเดิม → เก็บไว้ตามนั้น ไม่แก้ให้เอง แต่ต้องเตือน"""
+        far_date = self._d(34)
+
+        def _reread(img, retry=False):
+            return {"doc_date": far_date}
+
+        d, far = app.resolve_bill_doc_date({"doc_date": far_date}, image_bytes=b"x", reread=_reread)
+
+        self.assertEqual(d, far_date, "ห้ามทิ้ง/ห้ามแก้เป็นวันนี้เอง — เงียบๆ ผิดพอกันแต่ไม่มีใครรู้")
+        self.assertEqual(far, 34, "ต้องคืนจำนวนวันไว้ให้คนอ่านตัดสิน")
+
+    def test_reread_failure_keeps_original_and_still_flags(self):
+        def _reread(img, retry=False):
+            raise RuntimeError("โมเดลล่ม")
+
+        d, far = app.resolve_bill_doc_date({"doc_date": self._d(34)}, image_bytes=b"x", reread=_reread)
+
+        self.assertEqual(d, self._d(34))
+        self.assertEqual(far, 34, "อ่านซ้ำพังก็ยังต้องเตือน ห้ามเงียบ")
+
+    def test_unreadable_date_still_falls_back_to_today(self):
+        """วันที่อ่านไม่ได้เลย → พฤติกรรมเดิม (คืน None แล้วให้ผู้เรียกใช้วันนี้) ต้องไม่พัง"""
+        d, far = app.resolve_bill_doc_date({"doc_date": "ไม่ใช่วันที่"}, image_bytes=b"x")
+        self.assertIsNone(d)
+        self.assertIsNone(far)
+
+    def test_future_date_still_rejected_by_existing_net(self):
+        """ตาข่ายเดิม (อนาคต / เก่าเกิน 90 วัน) ต้องยังทำงานเหมือนเดิม"""
+        future = (datetime.now(app.TZ).date() + timedelta(days=3)).isoformat()
+        self.assertEqual(app.resolve_bill_doc_date({"doc_date": future}), (None, None))
+        self.assertEqual(app.resolve_bill_doc_date({"doc_date": self._d(200)}), (None, None))
