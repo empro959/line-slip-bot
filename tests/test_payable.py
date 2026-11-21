@@ -5922,6 +5922,99 @@ class TestEditedLedgerPasteIsAmbiguous(PayableTestCase):
         self.assertAlmostEqual(app._payable_outstanding(ACCT), 11000.0, places=2)
 
 
+class TestRealPushQuota(unittest.TestCase):
+    """เพดานโควต้า push ต้องมาจาก LINE ไม่ใช่จากค่าที่คนตั้งไว้ใน env
+
+    🔴 เคสที่กัน: ดาวน์เกรดแพ็ก LINE OA แล้วลืมแก้ PUSH_FREE_LIMIT
+    → บอทคิดว่ายังมีโควต้าเหลือทั้งที่เต็มแล้ว: ไม่เตือน ไม่มาร์คเต็ม ไม่สลับ OA สำรอง
+      push ล้มเงียบ = รายงาน 00:30 / แจ้งจอง / สรุปหนี้ หายไปโดยไม่มีใครรู้"""
+
+    class _Q:
+        def __init__(self, type_, value): self.type, self.value = type_, value
+
+    class _Api:
+        """OA ปลอม — นับจำนวนครั้งที่ถูกถาม ไว้พิสูจน์ว่าแคชทำงาน"""
+        def __init__(self, quota=None, boom=False):
+            self.quota, self.boom, self.calls = quota, boom, 0
+        def get_message_quota(self):
+            self.calls += 1
+            if self.boom:
+                raise RuntimeError("LINE ล่ม")
+            return self.quota
+
+    def setUp(self):
+        self._orig = (app._push_apis, app.PUSH_FREE_LIMIT)
+        app.PUSH_FREE_LIMIT = 15000          # ค่าเก่าที่ลืมแก้หลังดาวน์เกรด
+        app._quota_limit_cache.clear()
+
+    def tearDown(self):
+        app._push_apis, app.PUSH_FREE_LIMIT = self._orig
+        app._quota_limit_cache.clear()
+
+    def test_line_wins_over_stale_env(self):
+        """🔴 หัวใจของเรื่อง — env บอก 15,000 แต่แพ็กจริงเหลือ 300 ต้องใช้ 300"""
+        app._push_apis = [self._Api(self._Q("limited", 300))]
+
+        self.assertEqual(app._push_limit(0), 300)
+
+    def test_unlimited_plan_never_reads_as_full(self):
+        app._push_apis = [self._Api(self._Q("none", None))]
+
+        self.assertGreaterEqual(app._push_limit(0), app._UNLIMITED)
+
+    def test_each_oa_has_its_own_limit(self):
+        """แต่ละ OA ซื้อคนละแพ็กได้ — ค่าเดียวใน env ใช้กับทุกตัวไม่ได้"""
+        app._push_apis = [self._Api(self._Q("limited", 15000)),
+                          self._Api(self._Q("limited", 300))]
+
+        self.assertEqual(app._push_limit(0), 15000)
+        self.assertEqual(app._push_limit(1), 300)
+
+    def test_falls_back_to_env_when_line_cannot_answer(self):
+        """ถาม LINE ไม่ได้ ต้องไม่พัง และต้องไม่คืน 0 (0 = เต็มตลอด ข้อความหยุดหมด)"""
+        app._push_apis = [self._Api(boom=True)]
+
+        self.assertEqual(app._push_limit(0), 15000)
+
+    def test_fallback_is_not_cached_for_long(self):
+        """ค่าสำรองห้ามค้างนาน — ไม่งั้นแพ็กเปลี่ยนแล้วยังใช้ค่าผิดต่ออีกเป็นชั่วโมง"""
+        app._push_apis = [self._Api(boom=True)]
+        app._push_limit(0)
+
+        _, expires = app._quota_limit_cache[0]
+        self.assertLessEqual(expires - time.time(), 310)
+
+    def test_good_answer_is_cached(self):
+        """ห้ามยิง API ทุกครั้งที่ push — แพ็กไม่ได้เปลี่ยนบ่อย"""
+        api = self._Api(self._Q("limited", 300))
+        app._push_apis = [api]
+
+        for _ in range(5):
+            app._push_limit(0)
+
+        self.assertEqual(api.calls, 1, "ตอบได้แล้วต้องใช้แคช")
+
+    def test_zero_or_missing_value_does_not_silence_the_bot(self):
+        """LINE ตอบค่าแปลกๆ (0/None) = ไม่รู้ ≠ เต็ม → ถอยไปใช้ค่าสำรอง"""
+        for bad in (self._Q("limited", 0), self._Q("limited", None)):
+            with self.subTest(bad=bad.value):
+                app._quota_limit_cache.clear()
+                app._push_apis = [self._Api(bad)]
+                self.assertEqual(app._push_limit(0), 15000)
+
+    def test_warning_threshold_follows_the_real_plan(self):
+        """เกณฑ์เตือน 'ใกล้เต็ม' ต้องขยับตามแพ็กจริง ไม่ใช่ค้างที่ 80% ของค่า env"""
+        app._push_apis = [self._Api(self._Q("limited", 300))]
+
+        warn_at = max(1, int(app._push_limit(0) * app.PUSH_WARN_RATIO))
+        stale   = max(1, int(app.PUSH_FREE_LIMIT * app.PUSH_WARN_RATIO))   # วิธีเดิม (env 15,000)
+
+        self.assertEqual(warn_at, int(300 * app.PUSH_WARN_RATIO), "ต้องคิดจากแพ็กจริง 300")
+        self.assertLess(warn_at, 300, "ต้องเตือนก่อนถึงเพดานจริง")
+        self.assertGreater(stale, 300,
+                           "🔴 วิธีเดิมได้เกณฑ์ 12,000 ซึ่งเกินเพดานจริง = ไม่มีวันเตือน")
+
+
 class TestGroupRegistry(PayableTestCase):
     """ทะเบียนกลุ่ม — 'ภาพก่อนย้าย OA'
 

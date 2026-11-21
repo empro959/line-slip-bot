@@ -198,7 +198,8 @@ admin_push_api = LineBotApi(_ADMIN_PUSH_TOKEN) if _ADMIN_PUSH_TOKEN else line_bo
 # OA สำรองต้อง: (1) เชิญเข้าทุกกลุ่มเหมือน OA1 (2) ปิด auto-reply + ปิด webhook (ตัวสำรอง push อย่างเดียว)
 # ตั้ง token สำรองใน env: LINE_CHANNEL_ACCESS_TOKEN_2, _3, _4, _5 — ใส่แค่ตัวไหนก็เปิดใช้ตัวนั้นทันที
 # โควต้า push ฟรี/เดือน/OA — แผนฟรีของไทย = 300/เดือน (แพ็กเสียเงินสูงกว่านี้ เช่น 15,000)
-# ตั้ง env ให้ตรงแพ็กเกจจริงของ OA ที่ใช้อยู่ (เช่นตอนเอดมีแพ็ก 15,000 → PUSH_FREE_LIMIT=15000)
+# 📌 ตั้งแต่ 21 พ.ย. 69 บอทถาม 'เพดานจริง' จาก LINE เอง (_push_limit) — ค่านี้เหลือเป็นแค่
+#    ค่าสำรองตอนถาม LINE ไม่ได้ จึงไม่ต้องตามแก้ทุกครั้งที่เปลี่ยนแพ็กอีกแล้ว
 # ⚠️ LINE นับ 'push เข้ากลุ่ม' = จำนวนสมาชิกกลุ่ม (ไม่ใช่ 1) — ดู _recipient_count
 PUSH_FREE_LIMIT = int(os.environ.get("PUSH_FREE_LIMIT", "300"))
 # เวลาส่ง 'รายงานสลิปของเมื่อวาน' — ดีฟอลต์ 00:30 ตามเดิม
@@ -222,6 +223,7 @@ CONTENT_HEARTBEAT_TIMEOUT = float(os.environ.get("CONTENT_HEARTBEAT_TIMEOUT", "8
 # เตือนเจ้าของครั้งเดียว/เดือน เมื่อ 'OA ตัวสุดท้าย' (ไม่มีตัวสำรองต่อ) push ใกล้เต็ม — ใช้เป็นสัญญาณว่า
 # 'push ไม่พอแล้ว' ถึงเวลาพิจารณาแยกกลุ่มไปอีก OA (แผน B) หรือลด push ก่อนข้อความตกหล่น
 PUSH_WARN_RATIO = float(os.environ.get("PUSH_WARN_RATIO", "0.8"))
+# ⚠️ ค่านี้คิดจาก env — ใช้เป็นค่าสำรองเท่านั้น ของจริงคิดจาก _push_limit(idx) ตอนใช้งาน
 PUSH_WARN_AT    = max(1, int(PUSH_FREE_LIMIT * PUSH_WARN_RATIO))
 _push_apis = [line_bot_api]        # index 0 = OA1 (ตัวหลัก)
 for _i in range(2, 10):            # รองรับ OA2..OA9 (เพิ่ม OA ได้แค่ตั้ง env LINE_CHANNEL_ACCESS_TOKEN_6/_7/... )
@@ -4634,6 +4636,41 @@ def _line_real_usage(idx: int):
     return val
 
 
+# เพดานโควต้าจริงจาก LINE — ถามตรงดีกว่าเชื่อค่าที่คนตั้งไว้ใน env
+# 🔴 เคสที่กันอยู่: ดาวน์เกรด/อัปเกรดแพ็กแล้วลืมแก้ PUSH_FREE_LIMIT
+#    → บอทคิดว่ายังมีโควต้าเหลือทั้งที่เต็มแล้ว: ไม่เตือน ไม่มาร์คเต็ม ไม่สลับ OA สำรอง
+#      push ล้มเงียบ = รายงาน 00:30 / แจ้งจอง / สรุปหนี้ หายไปเฉยๆ โดยไม่มีใครรู้
+#    และค่าเดียวใน env ใช้กับทุก OA ไม่ได้อยู่แล้ว — แต่ละตัวซื้อคนละแพ็กได้
+QUOTA_LIMIT_TTL = int(os.environ.get("QUOTA_LIMIT_TTL", "3600"))   # แพ็กไม่ได้เปลี่ยนบ่อย
+_UNLIMITED = 10 ** 9          # แพ็กแบบไม่จำกัด (type='none') — ใหญ่พอที่จะไม่มีวันถึง
+_quota_limit_cache = {}       # idx -> (limit, expires_epoch)
+
+
+def _push_limit(idx: int) -> int:
+    """เพดาน push ของ OA ตัวนี้ — ถาม LINE ก่อน ถามไม่ได้ค่อยถอยไปใช้ PUSH_FREE_LIMIT จาก env"""
+    now = time.time()
+    hit = _quota_limit_cache.get(idx)
+    if hit and hit[1] > now:
+        return hit[0]
+    val = None
+    try:
+        q = _push_apis[idx].get_message_quota()
+        if getattr(q, "type", "") == "none":
+            val = _UNLIMITED
+        else:
+            raw = getattr(q, "value", None)
+            val = int(raw) if raw is not None else None
+    except Exception as e:
+        print(f"[quota] ถามเพดานโควต้า OA{idx+1} ไม่ได้: {e} → ใช้ค่าจาก env ({PUSH_FREE_LIMIT})", flush=True)
+    if not val or val <= 0:
+        # ถามไม่ได้ = อย่าแคชค่า fallback ไว้นาน ไม่งั้นแพ็กเปลี่ยนแล้วยังใช้ค่าผิดอีกชั่วโมง
+        val, ttl = PUSH_FREE_LIMIT, 300
+    else:
+        ttl = QUOTA_LIMIT_TTL
+    _quota_limit_cache[idx] = (val, now + ttl)
+    return val
+
+
 # แคชจำนวนสมาชิกกลุ่ม/ห้อง — LINE นับ 'push เข้ากลุ่ม 1 ครั้ง' = จำนวนสมาชิก (ไม่ใช่ 1)
 # จึงต้องรู้จำนวนสมาชิกเพื่อให้ตัวนับโควต้าตรงกับที่ LINE คิดจริง (เดิมนับเป็น 'จำนวน bubble' → ต่ำกว่าจริงมาก)
 _member_count_cache = {}     # id -> (count, expires_epoch); กันยิง API ถี่ทุก push
@@ -4677,7 +4714,7 @@ def _notify_push_near_limit(idx: int, cnt: int):
         return
     try:
         _push(ADMIN_USER_ID, TextSendMessage(
-            text=(f"⚠️ push OA{idx+1} เดือนนี้ใช้ไป {cnt}/{PUSH_FREE_LIMIT} ข้อความ (ใกล้เต็มโควต้าฟรี)\n"
+            text=(f"⚠️ push OA{idx+1} เดือนนี้ใช้ไป {cnt}/{_push_limit(idx)} ข้อความ (ใกล้เต็มโควต้า)\n"
                   "OA นี้ใกล้ตันแล้ว — ถ้าเต็ม ข้อความที่บอทเด้งเอง (รายงาน/ตื๊อจอง) ของกลุ่มที่ผูกกับ OA นี้จะตกหล่น\n"
                   "แก้: ลด push ที่ไม่จำเป็น หรือย้าย/แยกกลุ่มไปอีก OA\n"
                   "พิมพ์ 'โควต้า' ในกลุ่มเพื่อดูรายละเอียด")))
@@ -4722,7 +4759,8 @@ def _push(to, messages):
                 if idx != candidates[0]:
                     print(f"[push] ส่งผ่าน OA{idx+1} (OA ก่อนหน้าเต็มโควต้า) → {to}", flush=True)
                 # เตือนเมื่อ OA 'ตัวท้ายสุดที่ยังลองได้' ใกล้เต็ม (ไม่มีตัวสำรองต่อ) — มาร์คใน lock กันส่งซ้ำ, ส่งจริงนอก lock
-                if idx == last and new_cnt >= PUSH_WARN_AT and _get_meta(_push_warn_key(idx)) != "1":
+                _warn_at = max(1, int(_push_limit(idx) * PUSH_WARN_RATIO))   # เพดานจริงของ OA ตัวนี้
+                if idx == last and new_cnt >= _warn_at and _get_meta(_push_warn_key(idx)) != "1":
                     _set_meta(_push_warn_key(idx), "1")
                     warn_idx, warn_at = idx, new_cnt
                 sent = True
@@ -4732,7 +4770,7 @@ def _push(to, messages):
                 # สลับ OA ถัดไปเมื่อ: เต็มโควต้า (429) หรือส่งไม่ได้ (400 เช่น OA ไม่ได้อยู่ในกลุ่ม) — ถ้ายังมีตัวสำรอง
                 if idx != last and isinstance(e, LineBotApiError) and getattr(e, "status_code", None) in (400, 429):
                     if _is_quota_error(e):
-                        _set_meta(_push_month_key(idx), str(PUSH_FREE_LIMIT))  # มาร์คเต็ม กันเลือกซ้ำเดือนนี้
+                        _set_meta(_push_month_key(idx), str(_push_limit(idx)))  # มาร์คเต็ม กันเลือกซ้ำเดือนนี้
                     print(f"[push] OA{idx+1} ส่งไม่ได้ ({getattr(e,'status_code','?')}) → ลอง OA ถัดไป", flush=True)
                     continue
                 raise
@@ -7160,18 +7198,20 @@ def handle_text(event):
     # เช็คโควต้า push ที่ใช้ไปเดือนนี้ (แยกราย OA) — ไว้ดูว่าใกล้เต็ม/สลับ OA แล้วหรือยัง
     if _cmd in ("โควต้า", "quota", "โควตา", "push"):
         mon = datetime.now(TZ).strftime("%Y-%m")
-        lines = [f"📈 โควต้า push เดือน {mon} (ลิมิต {PUSH_FREE_LIMIT}/OA)"]
+        lines = [f"📈 โควต้า push เดือน {mon}"]
         total = 0
         for i in range(len(_push_apis)):
             used = _push_count(i)                 # บอทนับ (เฉพาะที่บอท push)
             real = _line_real_usage(i)            # LINE นับจริง (รวมบรอดแคสต์/ข้อความอื่น)
             shown = real if real is not None else used
             total += shown
-            bar = "🔴 เต็ม" if shown >= PUSH_FREE_LIMIT else ("🟡" if shown >= PUSH_FREE_LIMIT * 0.9 else "🟢")
+            cap  = _push_limit(i)                 # เพดานจริงจาก LINE (คนละแพ็กกันได้)
+            cap_t = "ไม่จำกัด" if cap >= _UNLIMITED else f"{cap:,}"
+            bar  = "🔴 เต็ม" if shown >= cap else ("🟡" if shown >= cap * 0.9 else "🟢")
             if real is not None and real != used:
-                lines.append(f"{bar} OA{i+1}: {real}/{PUSH_FREE_LIMIT}  (LINE จริง · บอทนับ {used})")
+                lines.append(f"{bar} OA{i+1}: {real:,}/{cap_t}  (LINE จริง · บอทนับ {used:,})")
             else:
-                lines.append(f"{bar} OA{i+1}: {shown}/{PUSH_FREE_LIMIT}")
+                lines.append(f"{bar} OA{i+1}: {shown:,}/{cap_t}")
         lines.append(f"─────────────────\nรวมทั้งหมด {total} ข้อความ (ยอดจริงจาก LINE)")
         if _oa_route:
             # แผน B: แต่ละกลุ่มผูก OA ของตัวเอง (ไม่มี 'OA ที่ใช้อยู่' ตัวเดียวแบบ failover เก่า)
@@ -7183,7 +7223,7 @@ def handle_text(event):
                 lines.append("📍 กลุ่มนี้ push ผ่าน OA1")
             lines.append("โหมด: แยกกลุ่มคนละ OA (แผน B)" + (" + สลับ OA อัตโนมัติเมื่อเต็ม" if here and len(here) > 1 else ""))
         else:
-            active = next((i for i in range(len(_push_apis)) if _push_count(i) < PUSH_FREE_LIMIT), len(_push_apis) - 1)
+            active = next((i for i in range(len(_push_apis)) if _push_count(i) < _push_limit(i)), len(_push_apis) - 1)
             lines.append(f"กำลังใช้: OA{active+1}")
         lines.append("ℹ️ นับแบบ LINE: push เข้ากลุ่ม = จำนวนสมาชิก (reply ฟรี ไม่นับ) — เทียบเลขจริงที่ LINE OA Manager")
         if len(_push_apis) == 1:
