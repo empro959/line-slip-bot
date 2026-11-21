@@ -5920,3 +5920,147 @@ class TestEditedLedgerPasteIsAmbiguous(PayableTestCase):
 
         self.assertTrue(handled)
         self.assertAlmostEqual(app._payable_outstanding(ACCT), 11000.0, places=2)
+
+
+class TestGroupRegistry(PayableTestCase):
+    """ทะเบียนกลุ่ม — 'ภาพก่อนย้าย OA'
+
+    🔴 group id ของ LINE ออกให้ต่อ provider → เปลี่ยน OA ข้าม provider = id ใหม่หมด
+    และ LINE ให้ OA อยู่กลุ่มละตัว → ต้องเตะบอทเก่าออกก่อนเชิญตัวใหม่เข้า
+    ถ้าไม่เก็บทะเบียนไว้ก่อน = ไม่รู้ว่า id เก่าตัวไหนคือกลุ่มไหน ข้อมูลเงินกำพร้าถาวร"""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_name = app._group_display_name
+        app._group_display_name = lambda gid: f"ชื่อของ {gid}"   # ไม่ยิง LINE API ตอนเทส
+        with app._db() as conn:
+            conn.execute("DELETE FROM groups")   # PayableTestCase ไม่ได้ล้างให้ → รั่วข้ามเทส
+
+    def tearDown(self):
+        app._group_display_name = self._orig_name
+        super().tearDown()
+
+    def test_every_group_id_column_is_registered(self):
+        """🔴 เทสหลัก: เพิ่มตารางที่มีคอลัมน์ group id แล้วลืมเติม _GROUP_ID_TABLES
+
+        พลาดตรงนี้ = ตอนย้าย OA ตารางนั้นไม่ถูกนับและไม่ถูกย้าย ข้อมูลหายเงียบ"""
+        found = set()
+        with app._db() as conn:
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            for t in tables:
+                for col in conn.execute(f"PRAGMA table_info({t})").fetchall():
+                    if "group_id" in col[1]:
+                        found.add((t, col[1]))
+        registered = {(t, c) for _, t, c in app._GROUP_ID_TABLES}
+        # ตาราง groups = ทะเบียน id ที่บอทเคยเห็น (สร้างใหม่เองได้) ไม่ใช่ข้อมูลที่ต้องย้าย
+        missing = found - registered - {("groups", "group_id")}
+        self.assertEqual(missing, set(),
+                         f"มีคอลัมน์ group id ที่ยังไม่อยู่ในทะเบียน: {sorted(missing)}")
+
+    def test_counts_rows_attached_to_the_group(self):
+        app.save_payable_bill(ACCT, 1500.0, note="รูป", doc_date=_d(2))
+        app.save_payable_bill(ACCT, 2500.0, note="รูป", doc_date=_d(1))
+
+        counts = app._group_row_counts(ACCT)
+
+        self.assertEqual(counts.get("บิลหนี้"), 2, counts)
+        self.assertNotIn("สลิป", counts, "ตารางที่ไม่มีข้อมูลต้องไม่โผล่")
+
+    def test_registry_shows_id_env_and_data(self):
+        app.save_payable_bill(ACCT, 1500.0, note="รูป", doc_date=_d(2))
+
+        txt = app.build_group_registry()
+
+        self.assertIn(ACCT, txt, "ต้องมี group id เต็มๆ ให้ก๊อปไปใช้ได้")
+        self.assertIn("PAYABLE_GROUPS", txt, "ต้องบอกว่า env ตัวไหนอ้างถึงกลุ่มนี้")
+        self.assertIn("บิลหนี้ 1", txt, "ต้องบอกว่ามีข้อมูลผูกอยู่เท่าไร")
+        self.assertIn("ชื่อของ " + ACCT, txt, "ต้องมีชื่อกลุ่ม ไม่งั้นแมปกลับไม่ได้")
+
+    def test_group_in_env_but_never_seen_is_still_listed(self):
+        """กลุ่มที่ตั้งใน env แต่บอทยังไม่เคยเห็นข้อความ ก็ต้องอยู่ในทะเบียน
+        ไม่งั้นตอนย้ายจะลืมกลุ่มนั้นทั้งกลุ่ม"""
+        self.assertIn(ACCT, app.build_group_registry())
+        with app._db() as conn:
+            conn.execute("DELETE FROM groups")
+        self.assertIn(ACCT, app.build_group_registry(),
+                      "มาจาก PAYABLE_GROUPS ต้องยังอยู่แม้ตาราง groups ว่าง")
+
+    def test_registry_fits_in_one_line_message(self):
+        """LINE ส่งได้ 5,000 ตัวอักษร/ข้อความ — ยาวเกินถูกตัดทิ้งเงียบ ต้องตัดเองแล้วบอก"""
+        with app._db() as conn:
+            for i in range(200):
+                conn.execute("INSERT INTO groups (group_id) VALUES (?)", (f"Cfake{i:04d}",))
+
+        txt = app.build_group_registry()
+
+        self.assertLessEqual(len(txt), 5000)
+        self.assertIn("⚠️", txt, "ตัดแล้วต้องบอก ห้ามตัดเงียบ")
+
+
+class TestGroupRegistryIsAdminOnly(PayableTestCase):
+    """ทะเบียนบอกปริมาณข้อมูลของร้าน → ไม่ใช่ของสาธารณะ"""
+
+    class _Msg:
+        id, text = "mid-reg", "ทะเบียนกลุ่ม"
+
+    class _Src:
+        type, group_id, user_id = "group", ACCT, "Ustranger"
+
+    class _Ev:
+        reply_token = "tok"
+        message, source = None, None
+
+    def setUp(self):
+        super().setUp()
+        self.sent = []
+        self._orig = (app.line_bot_api, app.ADMIN_USER_IDS)
+
+        class _Api:
+            def __init__(s, box): s.box = box
+            def reply_message(s, tok, msg): s.box.append(getattr(msg, "text", ""))
+            def push_message(s, to, msg):   s.box.append(getattr(msg, "text", ""))
+        app.line_bot_api = _Api(self.sent)
+        self._orig_name = app._group_display_name
+        app._group_display_name = lambda gid: f"ชื่อของ {gid}"
+        with app._db() as conn:
+            conn.execute("DELETE FROM groups")
+
+    def tearDown(self):
+        app.line_bot_api, app.ADMIN_USER_IDS = self._orig
+        app._group_display_name = self._orig_name
+        super().tearDown()
+
+    def _ask(self, user_id):
+        ev = self._Ev()
+        ev.message, ev.source = self._Msg(), self._Src()
+        ev.source.user_id = user_id
+        self.sent.clear()
+        self._Msg.id = f"mid-{user_id}-{time.time()}"   # กันตัวกัน redelivery กลืนข้อความที่ 2
+        app.handle_text(ev)
+        return "\n".join(self.sent)
+
+    def test_stranger_is_refused_and_told_why(self):
+        app.ADMIN_USER_IDS = ["Uowner"]
+
+        out = self._ask("Ustranger")
+
+        self.assertIn("เฉพาะแอดมิน", out, "ต้องบอกเหตุผล ห้ามเงียบ")
+        self.assertNotIn(ACCT, out, "🔴 ห้ามหลุดทะเบียนออกไป")
+
+    def test_admin_gets_the_registry(self):
+        app.ADMIN_USER_IDS = ["Uowner"]
+
+        out = self._ask("Uowner")
+
+        self.assertIn("ทะเบียนกลุ่ม", out)
+        self.assertIn(ACCT, out)
+
+    def test_unset_admin_env_closes_the_door(self):
+        """ไม่ได้ตั้ง LINE_ADMIN_USER_ID = ไม่รู้ว่าใครมีสิทธิ์ → ไม่เปิดให้ใครเลย"""
+        app.ADMIN_USER_IDS = []
+
+        out = self._ask("Uowner")
+
+        self.assertIn("LINE_ADMIN_USER_ID", out)
+        self.assertNotIn(ACCT, out)
