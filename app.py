@@ -6821,6 +6821,141 @@ def do_reset_payable(event):
              "พร้อมเริ่มนับใหม่แล้ว"))
 
 
+# ── ทะเบียนกลุ่ม: 'กลุ่มไหนผูกข้อมูลอะไรไว้บ้าง' — ภาพก่อนย้าย OA ────────────────
+# 🔴 ทำไมต้องมี: group id ของ LINE ออกให้ 'ต่อ provider' (เอกสาร LINE: user id ต่อ provider
+#    · โค้ดเราเองยืนยันที่ _handle_secondary_callback ว่าได้ไอดีคนละตัวแม้คนละ provider)
+#    → เปลี่ยน OA ไป provider ใหม่ = group id ใหม่หมดทุกกลุ่ม
+#    และ LINE ให้ OA อยู่กลุ่มละตัว → ต้อง 'เตะบอทเก่าออกก่อน' ถึงจะเชิญตัวใหม่เข้าได้
+#    ถ้าไม่เก็บทะเบียนไว้ก่อนเตะ = ไม่มีทางรู้ว่า id เก่าตัวไหนคือกลุ่มไหน → ข้อมูลเงินกำพร้าถาวร
+#
+# ⚠️ เพิ่มตารางใหม่ที่มีคอลัมน์ group id แล้วลืมเติมในนี้ = ตอนย้าย OA ตารางนั้นถูกลืมเงียบๆ
+_GROUP_ID_TABLES = (
+    ("สลิป",         "slips",            "group_id"),
+    ("บิลหนี้",       "payable_bills",    "group_id"),
+    ("จ่ายหนี้",      "payable_payments", "group_id"),
+    ("บิลโต๊ะ",       "dining_bills",     "group_id"),
+    ("คู่บิล-สลิป",   "dining_pairs",     "group_id"),
+    ("รูปอ่านไม่ออก",  "image_misses",     "group_id"),
+    ("กระทบ POS",    "recon_pending",    "group_id"),
+    ("จอง(ต้นทาง)",   "reservations",     "origin_group_id"),
+    ("จอง(ปลายทาง)",  "reservations",     "notify_group_id"),
+)
+
+
+def _group_env_hits(gid: str):
+    """ชื่อ env ทุกตัวที่อ้างถึงกลุ่มนี้ — ตอนย้าย OA ต้องแก้ให้ครบทุกตัวที่โผล่ตรงนี้"""
+    hits = []
+    for name, lst in (("SLIP_GROUPS", SLIP_GROUPS), ("RESV_GROUPS", RESV_GROUPS),
+                      ("RESV_EXCLUDE_GROUPS", RESV_EXCLUDE_GROUPS),
+                      ("RESV_INFO_GROUPS", RESV_INFO_GROUPS), ("IGNORE_GROUPS", IGNORE_GROUPS),
+                      ("PAYABLE_GROUPS", PAYABLE_GROUPS), ("RECON_GROUPS", RECON_GROUPS),
+                      ("INCOME_ONLY_GROUPS", INCOME_ONLY_GROUPS), ("DINING_GROUPS", DINING_GROUPS)):
+        if gid in lst:
+            hits.append(name)
+    for name, val in (("BAR_GROUP_ID", BAR_GROUP_ID), ("STAFF_GROUP_ID", STAFF_GROUP_ID),
+                      ("CONTENT_HEARTBEAT_GROUP", CONTENT_HEARTBEAT_GROUP)):
+        if val and gid == val:
+            hits.append(name)
+    for name, d in (("PAYABLE_MIRROR", PAYABLE_MIRROR), ("REPORT_REDIRECT", REPORT_REDIRECT)):
+        if gid in d:
+            hits.append(f"{name}(ต้นทาง)")
+        if gid in d.values():
+            hits.append(f"{name}(ปลายทาง)")
+    if gid in _oa_route:
+        hits.append("OA_ROUTE")
+    return hits
+
+
+def _group_row_counts(gid: str) -> dict:
+    """นับแถวที่ผูกกับกลุ่มนี้ในทุกตาราง — ชื่อตาราง/คอลัมน์มาจาก _GROUP_ID_TABLES เท่านั้น
+    (ค่าคงที่ของเราเอง ไม่ใช่อินพุตจากผู้ใช้) ส่วน gid ส่งเป็นพารามิเตอร์ปกติ"""
+    out = {}
+    with _db() as conn:
+        for label, table, col in _GROUP_ID_TABLES:
+            try:
+                row = conn.execute(f"SELECT COUNT(*) c FROM {table} WHERE {col}=?", (gid,)).fetchone()
+            except Exception as e:
+                # ตารางยังไม่ถูกสร้าง/สคีมาต่าง → ข้ามตัวนั้น ห้ามทำให้ทั้งทะเบียนพัง
+                print(f"[groupmap] นับ {table}.{col} ไม่ได้: {e}", flush=True)
+                continue
+            n = int((row["c"] if row else 0) or 0)
+            if n:
+                out[label] = out.get(label, 0) + n
+    return out
+
+
+def _group_display_name(gid: str) -> str:
+    """ชื่อกลุ่มจาก LINE — ได้เฉพาะกลุ่มที่บอทยังอยู่ (ออกจากกลุ่มแล้วจะไม่มีชื่อให้)
+    🔴 จึงต้องเรียกทะเบียน 'ก่อน' เตะบอทเก่าออก ไม่ใช่หลัง"""
+    gid = gid or ""
+    if gid.startswith("U"):
+        return "(แชทส่วนตัว)"
+    if not gid.startswith("C"):
+        return "(ไม่ทราบชนิด)"
+    try:
+        return ((line_bot_api.get_group_summary(gid).group_name or "").strip() or "(กลุ่มไม่มีชื่อ)")
+    except Exception as e:
+        return f"(ขอชื่อไม่ได้ — บอทอาจไม่อยู่ในกลุ่มแล้ว: {type(e).__name__})"
+
+
+def build_group_registry(max_groups: int = 40, with_names: bool = True) -> str:
+    """ทะเบียนกลุ่มทั้งหมด = รายการงานตอนย้าย OA (id เก่า + ชื่อ + env ที่ต้องแก้ + ข้อมูลที่ผูกอยู่)"""
+    gids = set()
+    try:
+        with _db() as conn:
+            for r in conn.execute("SELECT group_id FROM groups").fetchall():
+                if r["group_id"]:
+                    gids.add(r["group_id"])
+    except Exception as e:
+        print(f"[groupmap] อ่านตาราง groups ไม่ได้: {e}", flush=True)
+    # กลุ่มที่ตั้งไว้ใน env แต่บอทยังไม่เคยเห็นข้อความ ก็ต้องอยู่ในทะเบียนด้วย
+    for lst in (SLIP_GROUPS, RESV_GROUPS, RESV_EXCLUDE_GROUPS, RESV_INFO_GROUPS, IGNORE_GROUPS,
+                PAYABLE_GROUPS, RECON_GROUPS, INCOME_ONLY_GROUPS, DINING_GROUPS):
+        gids.update(x for x in lst if x)
+    for val in (BAR_GROUP_ID, STAFF_GROUP_ID, CONTENT_HEARTBEAT_GROUP):
+        if val:
+            gids.add(val)
+    for d in (PAYABLE_MIRROR, REPORT_REDIRECT):
+        gids.update(k for k in d if k)
+        gids.update(v for v in d.values() if v)
+    gids.update(k for k in _oa_route if k)
+
+    if not gids:
+        return "📋 ทะเบียนกลุ่ม — ยังไม่มีกลุ่มไหนเลย"
+
+    rows = []
+    for gid in gids:
+        counts = _group_row_counts(gid)
+        rows.append((sum(counts.values()), gid, counts, _group_env_hits(gid)))
+    # 🔴 กลุ่มที่ 'ตั้งไว้ใน env' ต้องขึ้นก่อนเสมอ แม้ยังไม่มีข้อมูลสักแถว — มันคือกลุ่มที่ต้องย้าย
+    #    ของเดิมเรียงด้วยจำนวนแถวอย่างเดียว → กลุ่มร้างที่บอทเคยเห็นผ่านๆ เบียดกลุ่มจริงตกรายการได้
+    #    (เทสจับได้: กลุ่มร้าง 200 กลุ่ม ดัน PAYABLE_GROUPS หลุดหายไปทั้งกลุ่ม)
+    rows.sort(key=lambda r: (0 if r[3] else 1, -r[0], r[1]))
+
+    head = (f"📋 ทะเบียนกลุ่ม ({len(rows)} กลุ่ม)\n"
+            "ใช้เป็น 'ภาพก่อนย้าย OA' — เก็บไว้ก่อนเตะบอทเก่าออกจากกลุ่ม\n"
+            "━━━━━━━━━━━━━")
+    out, shown = [head], 0
+    for total, gid, counts, envs in rows[:max_groups]:
+        shown += 1
+        data = " · ".join(f"{k} {v:,}" for k, v in counts.items()) or "ไม่มีข้อมูลผูกอยู่"
+        out.append(
+            f"\n{shown}) {_group_display_name(gid) if with_names else ''}\n"
+            f"{gid}\n"
+            f"⚙️ env: {', '.join(envs) if envs else '— ไม่ได้ตั้งไว้ที่ไหนเลย'}\n"
+            f"🗃️ {data}")
+    if len(rows) > max_groups:
+        # ตัดข้อมูลทิ้ง = ต้องเห็นชัดว่าตัด ห้ามให้เข้าใจว่านี่คือรายการครบ
+        out.append(f"\n⚠️ ตัดไป {len(rows) - max_groups} กลุ่ม (เกิน {max_groups}) "
+                   "— ที่เหลือไม่ได้ตั้งไว้ใน env และไม่มีข้อมูลผูกอยู่ ดูครบจาก log")
+    out.append("\n━━━━━━━━━━━━━\n🔴 group id เปลี่ยนตาม provider — ย้าย OA แล้วต้องแมปใหม่ทุกตัว")
+    text = "\n".join(out)
+    # LINE รับข้อความละ 5,000 ตัวอักษร — ยาวเกินแล้วถูกตัดทิ้งเงียบๆ ดีกว่าตัดเองแล้วบอก
+    if len(text) > 4800:
+        text = text[:4700].rstrip() + "\n…\n⚠️ ตัดเพราะยาวเกินที่ LINE ส่งได้ — ดูที่เหลือจาก log"
+    return text
+
+
 def build_help(group_id: str) -> str:
     """เมนูคำสั่ง — แสดงเฉพาะหมวดที่กลุ่มนั้นใช้ได้ (สลิป/จอง/บัญชีหนี้)"""
     if group_id in PAYABLE_GROUPS:
@@ -7045,6 +7180,20 @@ def handle_text(event):
             roles.append("🪞 บัญชีหนี้แบบ mirror: กลุ่มนี้=กลุ่มดูสรุป (รับเฉพาะสรุปรายวันของบัญชีร่วม ไม่เด้งทุกบิล/สลิป)")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(
             text=f"🆔 Group ID:\n{group_id}\n─────────────────\n" + "\n".join(roles)))
+        return
+    # ทะเบียนกลุ่มทั้งหมด (แอดมินเท่านั้น) — ใช้ตอนย้าย OA: เก็บ id เก่าให้ครบก่อนเตะบอทเก่าออก
+    if _cmd in ("ทะเบียนกลุ่ม", "ทะเบียน", "groupmap", "groups"):
+        uid = getattr(event.source, "user_id", "") or ""
+        # ไม่ได้ตั้งแอดมินไว้ = ไม่รู้ว่าใครมีสิทธิ์ → ไม่เปิดให้ใครเลย (ทะเบียนบอกปริมาณข้อมูลของร้าน)
+        if not ADMIN_USER_IDS:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="🔒 คำสั่งนี้ต้องตั้ง LINE_ADMIN_USER_ID ก่อน"))
+            return
+        if uid not in ADMIN_USER_IDS:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(
+                text="🔒 คำสั่งนี้ใช้ได้เฉพาะแอดมิน"))
+            return
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=build_group_registry()))
         return
     # เช็คโควต้า push ที่ใช้ไปเดือนนี้ (แยกราย OA) — ไว้ดูว่าใกล้เต็ม/สลับ OA แล้วหรือยัง
     if _cmd in ("โควต้า", "quota", "โควตา", "push"):
