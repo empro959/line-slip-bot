@@ -2298,17 +2298,49 @@ function buildDailyMsg_(){
   return lines.join('\n');
 }
 
-// สรุป 7 วันล่าสุด
+function _todayIso_(){ return Utilities.formatDate(new Date(),'GMT+7','yyyy-MM-dd'); }
+
+// กัน 'รายงานออกสองใบ'
+// 🔴 trigger ของ Apps Script เป็นของ 'แต่ละบัญชี' — getProjectTriggers() เห็นแค่ของคนที่รัน
+//    สองบัญชีกด setupTriggers คนละครั้ง = trigger สองตัว ลบของกันไม่ได้ ต่างคนต่างยิง
+//    (เคสจริง 23/11/69: สรุปรายสัปดาห์ออก 09:01 กับ 09:03)
+// ⚖️ ScriptProperties ใช้ร่วมกันทั้งโปรเจกต์ → มาร์คไว้ตรงนี้กันซ้ำได้ ไม่ว่าบัญชีไหนเป็นคนยิง
+//    มาร์ค 'ก่อนส่ง' เพราะอาการที่ต้องกันคือส่งซ้ำ · ถ้า LINE ส่งไม่ออก ยังมีอีเมลสำรองอยู่แล้ว
+function _alertOnce_(tag, stamp){
+  var lock=null;
+  try{ lock=LockService.getScriptLock(); lock.waitLock(20000); }
+  catch(e){ Logger.log('⏭️ '+tag+': อีกรอบกำลังส่งอยู่ → ไม่ส่งซ้ำ'); return false; }
+  try{
+    var p=PropertiesService.getScriptProperties(), k='SENT_'+tag;
+    if(p.getProperty(k)===stamp){ Logger.log('⏭️ '+tag+': ส่งไปแล้วรอบ '+stamp+' → ไม่ส่งซ้ำ'); return false; }
+    p.setProperty(k, stamp);
+    return true;
+  } finally { if(lock){ try{ lock.releaseLock(); }catch(e2){} } }
+}
+
+// สรุป 7 วันล่าสุด (ช่วงวันที่ตายตัว จบที่ 'เมื่อวาน')
 function buildWeeklyMsg_(){
   var daily=loadDaily_(); if(!daily.length) return null;
-  var keep={}; daily.map(function(d){return d.date;}).sort().reverse().slice(0,7).forEach(function(x){keep[x]=true;});
-  var wk=daily.filter(function(d){return keep[d.date];});
+  // 🔴 ของเดิมหยิบ '7 วันล่าสุดที่มีข้อมูล' (เรียงวันแล้ว slice) → พอมีแถววันใหม่โผล่
+  //    ระหว่างรายงานสองรอบ หน้าต่างเลื่อน วันเก่าสุดหลุดออก ยอดรวมเปลี่ยนทันที
+  //    เคสจริง 23/11/69: ส่งห่างกัน 2 นาที ได้ ฿697,944 กับ ฿600,003
+  //    (ต่างกัน 97,941 = ยอดขายของวันที่หลุดออกไปพอดี · 'วันขายดีสุด' กับ 'ลบบิล' เท่าเดิม
+  //     เพราะวันที่หลุดไม่ได้เป็นวันขายดีและไม่มีบิลถูกลบ — ตรงกับที่เจ้าของเห็นทุกตัว)
+  // ⚖️ ยึดช่วงวันที่ตายตัว 'จบที่เมื่อวาน' แล้วพิมพ์ช่วงบนการ์ด → รันกี่รอบก็ได้ตัวเลขเดียวกัน
+  //    และไม่เอาวันนี้ที่ยังขายไม่จบมาถัวค่าเฉลี่ย
+  var end=_shiftIso_(_todayIso_(), -1), start=_shiftIso_(end, -6);
+  var wk=daily.filter(function(d){ return d.date>=start && d.date<=end; });
+  if(!wk.length){   // ห้ามเงียบ — ไม่มีข้อมูลเลยทั้งสัปดาห์ = เส้นนำเข้า POS พัง ต้องรู้
+    return '📅 สรุปรายสัปดาห์ '+start+' → '+end+'\n─────────────\n'+
+           '🔴 ไม่มีข้อมูลสักวันในช่วงนี้ — เส้นนำเข้า POS น่าจะไม่ทำงาน\n'+
+           '   เปิด Apps Script → รัน checkPosPipeline() ดูสาเหตุ';
+  }
   var sales=0,exp=0,del=0,best=null,unknownDays=0;
   wk.forEach(function(d){ var s=daySum_(d); sales+=s.sales;
     if(s.expKnown) exp+=s.exp; else unknownDays++;   // วันที่ไม่ทราบค่าใช้จ่าย ห้ามนับเป็น 0 (จะรวมยอดต่ำกว่าจริงเงียบๆ)
     del+=(d.voids||{}).deleted||0;
     if(!best||s.sales>best.s) best={date:d.date,s:s.sales}; });
-  var lines=['📅 สรุปรายสัปดาห์ ('+wk.length+' วันล่าสุด)','─────────────',
+  var lines=['📅 สรุปรายสัปดาห์ '+start+' → '+end,'─────────────',
     '💰 ยอดขายรวม: ฿'+fmtT_(sales)];
   // มีวันไหนไม่ทราบค่าใช้จ่ายในสัปดาห์นี้ → รวมยอด/กำไรทั้งสัปดาห์เชื่อไม่ได้ ต้องบอกตรงๆ ไม่ใช่โชว์ยอดที่ขาดวันนั้นไปเงียบๆ
   if(unknownDays>0){
@@ -2319,7 +2351,13 @@ function buildWeeklyMsg_(){
     lines.push('💸 ค่าใช้จ่ายรวม: ฿'+fmtT_(exp));
     lines.push((prof>=0?'✅ กำไร: +฿':'🔻 ขาดทุน: -฿')+fmtT_(Math.abs(prof)));
   }
-  lines.push('📈 เฉลี่ย/วัน: ฿'+fmtT_(sales/(wk.length||1)));
+  lines.push('📈 เฉลี่ย/วัน: ฿'+fmtT_(sales/(wk.length||1))+' (จาก '+wk.length+' วัน)');
+  // วันที่หายไปจากช่วง = ยอดรวมต่ำกว่าจริง ต้องบอก ไม่ใช่หารด้วยจำนวนวันที่มีแล้วเงียบ
+  if(wk.length<7){
+    var have={}; wk.forEach(function(d){have[d.date]=true;});
+    var miss=[]; for(var i=0;i<7;i++){ var x=_shiftIso_(start,i); if(!have[x]) miss.push(x); }
+    lines.push('⚠️ ไม่มีข้อมูล '+miss.length+' วัน ('+miss.join(', ')+') — ยอดรวมต่ำกว่าจริง');
+  }
   if(best) lines.push('🏆 วันขายดีสุด: '+best.date+' (฿'+fmtT_(best.s)+')');
   if(del>0) lines.push('🗑️ ลบบิลรวมสัปดาห์: ฿'+fmtT_(del)+' — ตรวจสอบ');
   return lines.join('\n');
@@ -2342,12 +2380,17 @@ function setOwnerEmails(){
 // [แก้ 17/08/26] ถ้า LINE ส่งไม่ออก → ฟ้องใน "หัวเรื่องอีเมล" + ต่อท้ายเนื้อหา
 // (ของเดิม try{}catch(e){} กลืนเงียบ → ได้แต่อีเมล ไม่รู้ว่าไลน์พัง)
 function sendDailyAlert(){ var m=buildDailyMsg_(); if(!m) return;
+  // มาร์คด้วย 'วันที่ของการ์ด' ไม่ใช่วันที่รัน — คืนเดียวอาจนำเข้าหลายวัน (ตอนเติมวันที่ขาด)
+  // แต่ละวันต้องได้การ์ดของตัวเอง · ที่ต้องกันคือ 'วันเดิมส่งสองรอบ' เท่านั้น
+  if(!_alertOnce_('daily', (m.match(/(\d{4}-\d{2}-\d{2})/)||[])[1]||_todayIso_())) return;
   var err=''; try{ err=pushOwner_(m)||''; }catch(e){ err=String(e); }
   var subj='📊 สรุปยอดขายเมื่อวาน — ไส้ย่างซอย๔'+(err?' ⚠️ (LINE ส่งไม่ออก)':'');
   emailOwners_(subj, m+(err?('\n\n─────────────\n⚠️ ส่งเข้า LINE ไม่สำเร็จ: '+err+
     '\nวิธีเช็ก: เปิด Apps Script → รัน showSlipUrl() ดู host → ถ้าเป็นบอทตัวเก่าให้รัน fixSlipUrl()'):''));
 }
 function sendWeeklyAlert(){ var m=buildWeeklyMsg_(); if(!m) return;
+  // ผูกกับ 'วันสุดท้ายของช่วง' → รันกี่รอบในวันเดียวกันก็ส่งใบเดียว
+  if(!_alertOnce_('weekly', _shiftIso_(_todayIso_(), -1))) return;
   var err=''; try{ err=pushOwner_(m)||''; }catch(e){ err=String(e); }
   var subj='📅 สรุปรายสัปดาห์ — ไส้ย่างซอย๔'+(err?' ⚠️ (LINE ส่งไม่ออก)':'');
   emailOwners_(subj, m+(err?('\n\n─────────────\n⚠️ ส่งเข้า LINE ไม่สำเร็จ: '+err):''));
