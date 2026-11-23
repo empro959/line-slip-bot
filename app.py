@@ -2539,7 +2539,7 @@ def _resv_when_label(r: dict) -> str:
     return f"{day} {tm}" if tm else day
 
 
-def _resv_line(r: dict) -> str:
+def _resv_line(r: dict, clash: dict = None) -> str:
     icon = "✅" if r.get("status") == "CONFIRMED" else "⏳"
     cust = r.get("customer") or "?"
     ppl  = f" {r['people']}" if r.get("people") else ""
@@ -2550,7 +2550,9 @@ def _resv_line(r: dict) -> str:
         by = f" (โดย {r['confirmed_by']})" if r.get("confirmed_by") else ""
     else:
         by = "  ⚠️ ยังไม่ยืนยัน"   # จองที่ยังไม่กดปุ่มคอนเฟิร์ม → ขึ้นสรุปด้วยแต่ติดป้ายชัด
-    return f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}"
+    dup = (clash or {}).get(r.get("id"))
+    flag = ("\n   ⚠️ โต๊ะซ้ำกับ " + ", ".join(f"#{i}" for i in dup)) if dup else ""
+    return f"{icon} #{r['id']} {cust}{ppl}{when}{zone}{by}{flag}"
 
 
 def build_resv_summary(notify_group=None, title="📋 สรุปการจองวันนี้", upcoming=False, skip_if_empty=False, match_origin=False, date_mode=None) -> str:
@@ -2595,17 +2597,30 @@ def build_resv_summary(notify_group=None, title="📋 สรุปการจ�
     if not rows:
         return None if skip_if_empty else f"{title}\n─────────────────\nไม่มีการจอง"
     confirmed = sum(1 for r in rows if r.get("status") == "CONFIRMED")
+    # โต๊ะซ้ำ 'ในชุดที่กำลังแสดง' — เจ้าของสั่ง: โต๊ะ+วันเดียวกัน = ชน ไม่สนเวลา
+    # เทียบกันเองในลิสต์ (ไม่ยิง DB ซ้ำรายใบ) → สรุปที่กรองเฉพาะบางกลุ่มก็ยังสอดคล้องกับสิ่งที่เห็น
+    clash = {}
+    for _i, _a in enumerate(rows):
+        _ka, _da = _resv_table_codes(_a.get("table_no")), _resv_day_key(_a)
+        if not _ka or not _da:
+            continue
+        for _b in rows[_i + 1:]:
+            if _da == _resv_day_key(_b) and (_ka & _resv_table_codes(_b.get("table_no"))):
+                clash.setdefault(_a["id"], []).append(_b["id"])
+                clash.setdefault(_b["id"], []).append(_a["id"])
     lines = [title, "─────────────────",
              f"ทั้งหมด {len(rows)} | ✅ คอนเฟิร์ม {confirmed} | ⏳ รอ {len(rows) - confirmed}"]
+    if clash:
+        lines.append(f"🔴 โต๊ะซ้ำ {len(clash)} รายการ — ดู ⚠️ ข้างล่าง")
     if upcoming:
         today_rows = [r for r in rows if r.get("resv_date") == today]
         later_rows = [r for r in rows if r.get("resv_date") != today]
         if today_rows:
-            lines += ["", f"📍 วันนี้ ({len(today_rows)})"] + [_resv_line(r) for r in today_rows]
+            lines += ["", f"📍 วันนี้ ({len(today_rows)})"] + [_resv_line(r, clash) for r in today_rows]
         if later_rows:
-            lines += ["", f"📅 ล่วงหน้า ({len(later_rows)})"] + [_resv_line(r) for r in later_rows]
+            lines += ["", f"📅 ล่วงหน้า ({len(later_rows)})"] + [_resv_line(r, clash) for r in later_rows]
     else:
-        lines += [""] + [_resv_line(r) for r in rows]
+        lines += [""] + [_resv_line(r, clash) for r in rows]
     return "\n".join(lines)
 
 
@@ -5458,12 +5473,73 @@ def _resv_table_key(s) -> str:
         return ""
     zm = re.search(r"โซน\s*([A-Za-z])", t)
     zone = (zm.group(1) if zm else "").upper()
-    codes = {f"{m.group(1).upper()}{int(m.group(2))}" for m in _TBL_CODE_PAIR.finditer(t)}
+    pairs = list(_TBL_CODE_PAIR.finditer(t))
+    codes = {f"{m.group(1).upper()}{int(m.group(2))}" for m in pairs}
+    # ไม่มีคำว่า 'โซน' แต่มีรหัสโต๊ะนำหน้า → เลขที่ตามมายืมตัวอักษรจากรหัสตัวแรก
+    # 🪤 เคสจริง 22 พ.ย. 69 #118 'A11,12,7,8' → ของเดิมได้ '12,7,8,A11'
+    #    เลข 12/7/8 ไม่ได้รับตัว A → ใครจอง 'A12' วันเดียวกันก็ไม่ชนกัน ทั้งที่โต๊ะเดียวกัน
+    if not zone and pairs:
+        zone = pairs[0].group(1).upper()
     for n in re.findall(r"\d{1,2}", _TBL_CODE_PAIR.sub(" ", t)):   # เลขที่ไม่ได้ติดตัวอักษร
         codes.add(f"{zone}{int(n)}" if zone else str(int(n)))
     if not codes:                       # ไม่มีเลขเลย ('โซน A') → เทียบด้วยข้อความที่ถอดคำนำหน้าแล้ว
         return re.sub(r"โซน|โต๊ะ|\s+", "", t).lower()
     return ",".join(sorted(codes))
+
+
+def _resv_table_codes(s) -> set:
+    """ชุดรหัสโต๊ะของจองใบหนึ่ง — ไว้เทียบ 'ซ้อนกันบางโต๊ะ' (A11,A12 กับ A12 = ชนที่ A12)"""
+    return {c for c in _resv_table_key(s).split(",") if c}
+
+
+def _resv_day_key(r: dict) -> str:
+    """วันงานจริงของจองใบนี้ — ไม่ระบุวัน = วันที่แจ้ง (ตรงกับที่ build_resv_summary ใช้)"""
+    return (r.get("resv_date") or (r.get("created_at") or "")[:10]) or ""
+
+
+def _resv_table_clashes(day: str, table_no, exclude_id=None) -> list:
+    """จองใบอื่นที่ 'โต๊ะเดียวกัน วันเดียวกัน'
+
+    ⚖️ เจ้าของสั่ง 22 พ.ย. 69: โต๊ะ+วันซ้ำ = ชนทันที **ไม่สนว่าห่างกันกี่ชั่วโมง**
+       ร้านนี้ลูกค้าอยู่ยาวทั้งคืน ไม่ได้หมุนโต๊ะ → ห่าง 1-2 ชม. ก็ยังเป็นโต๊ะที่ถูกกันไว้แล้ว
+    🪤 ไม่มีรหัสโต๊ะ = 'ไม่รู้' ไม่ใช่ 'ว่าง' → ไม่เตือน (เดาแล้วผิดจะกลายเป็นเตือนมั่วจนคนเลิกสนใจ)"""
+    want = _resv_table_codes(table_no)
+    if not want or not day:
+        return []
+    try:
+        with _db() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM reservations WHERE COALESCE(resv_date, substr(created_at,1,10))=? "
+                "AND COALESCE(status,'') != 'CANCELLED' ORDER BY id", (day,)).fetchall()]
+    except Exception as e:
+        print(f"[resv] หาโต๊ะซ้ำไม่ได้: {e}", flush=True)
+        return []
+    return [r for r in rows
+            if r.get("id") != exclude_id and (want & _resv_table_codes(r.get("table_no")))]
+
+
+def _resv_clash_warn(resv_id: int) -> str:
+    """ข้อความต่อท้ายการ์ดจอง เมื่อโต๊ะชนกับใบอื่นในวันเดียวกัน
+
+    ⚖️ เตือนอย่างเดียว **ไม่บล็อก** — บางทีตั้งใจ (รวมโต๊ะ/ย้ายลูกค้า) การบล็อกจะทำให้
+       จองจริงหายไปเงียบๆ ซึ่งแพงกว่า · แต่ต้องเห็นตอนนี้ ไม่ใช่ตอนลูกค้ามาถึงหน้าร้าน"""
+    try:
+        with _db() as conn:
+            row = conn.execute("SELECT * FROM reservations WHERE id=?", (resv_id,)).fetchone()
+        if not row:
+            return ""
+        r = dict(row)
+        hits = _resv_table_clashes(_resv_day_key(r), r.get("table_no"), exclude_id=resv_id)
+        if not hits:
+            return ""
+        body = "\n".join(f"   #{h['id']} {h.get('customer') or '?'} {h.get('people') or ''}"
+                         f" | {_resv_when_label(h) or '-'} | {h.get('table_no') or '-'}"
+                         for h in hits)
+        return ("\n\n⚠️ โต๊ะนี้มีคนจองไว้แล้ววันเดียวกัน\n" + body +
+                "\n→ เช็กก่อนยืนยัน · ถ้าตั้งใจ (รวมโต๊ะ/ย้าย) กดยืนยันได้เลย")
+    except Exception as e:
+        print(f"[resv] เช็กโต๊ะซ้ำไม่ได้: {e}", flush=True)
+        return ""   # เช็กไม่ได้ ห้ามทำให้จองพัง — จองสำคัญกว่าคำเตือน
 
 
 def _resv_time_key(s) -> str:
@@ -5794,6 +5870,7 @@ def handle_reservation_text(event, text: str, group_id: str):
     dest = (BAR_GROUP_ID if is_advance else STAFF_GROUP_ID) or group_id
     resv_id = save_reservation(group_id, requested_by, info, text, dest)
     detail = _resv_detail_lines(info)
+    time_warn += _resv_clash_warn(resv_id)   # โต๊ะชนกับใบอื่นวันเดียวกัน → ต่อท้ายทุกช่องทางที่ตอบ
     head = "📅 จองล่วงหน้า" if is_advance else "🔔 จองโต๊ะ"
 
     detail_msg = TextSendMessage(

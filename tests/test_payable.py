@@ -6157,3 +6157,113 @@ class TestGroupRegistryIsAdminOnly(PayableTestCase):
 
         self.assertIn("LINE_ADMIN_USER_ID", out)
         self.assertNotIn(ACCT, out)
+
+
+class TestReservationTableClash(unittest.TestCase):
+    """โต๊ะเดียวกัน วันเดียวกัน = ชน — เจ้าของสั่ง 22 พ.ย. 69 (ไม่สนว่าห่างกี่ชั่วโมง)
+
+    🔴 เคสจริง 22/11/2569 — ลูกค้าคนละคนจอง B10 วันเดียวกัน แล้วบอทเงียบ
+      ✅ #133 คุณต้น bni 7 | 18:30 | B10
+      ✅ #131 คุณมด 5 ท่าน | 20:00 | โซน B โต๊ะ 10
+    เขียนคนละแบบ แต่ตัวถอดรหัสโต๊ะได้ B10 ทั้งคู่อยู่แล้ว — ที่ขาดคือ 'ไม่มีใครเรียกใช้'
+    ตัวกันซ้ำเดิมบังคับว่าต้องชื่อลูกค้าเดียวกัน → คนละคนจองโต๊ะเดียวกันเลยผ่านฉลุย"""
+
+    def setUp(self):
+        with app._db() as conn:
+            conn.execute("DELETE FROM reservations")
+        self.today = datetime.now(app.TZ).date().isoformat()
+
+    def tearDown(self):
+        with app._db() as conn:
+            conn.execute("DELETE FROM reservations")
+
+    def _add(self, cust, table, when="19:00", day=None, status="CONFIRMED"):
+        with app._db() as conn:
+            conn.execute(
+                "INSERT INTO reservations (customer, people, resv_datetime, table_no, "
+                "status, created_at, resv_date) VALUES (?,?,?,?,?,?,?)",
+                (cust, "4 ท่าน", when, table, status, (day or self.today) + "T12:00:00",
+                 day or self.today))
+            return conn.execute("SELECT MAX(id) m FROM reservations").fetchone()["m"]
+
+    # ── ตัวถอดรหัสโต๊ะ ───────────────────────────────────────────────────
+    def test_bare_numbers_inherit_the_letter(self):
+        """🪤 #118 'A11,12,7,8' — ของเดิมได้ '12,7,8,A11' เลขลอยไม่ได้ตัว A"""
+        self.assertEqual(app._resv_table_codes("A11,12,7,8"), {"A11", "A12", "A7", "A8"})
+        self.assertEqual(app._resv_table_codes("โต๊ะ A11,12,7,8"), {"A11", "A12", "A7", "A8"})
+
+    def test_zone_wording_still_works(self):
+        """ของเดิมที่ถูกอยู่แล้วต้องไม่พัง"""
+        self.assertEqual(app._resv_table_codes("โซน A โต๊ะ 9-10"), {"A9", "A10"})
+        self.assertEqual(app._resv_table_codes("โซน A9 โต๊ะ A10"), {"A9", "A10"})
+        self.assertEqual(app._resv_table_codes(""), set())
+
+    # ── การชน ────────────────────────────────────────────────────────────
+    def test_the_real_case_b10_is_caught(self):
+        a = self._add("คุณต้น bni", "B10", "18:30")
+        b = self._add("คุณมด", "โซน B โต๊ะ 10", "20:00")
+
+        self.assertEqual([h["id"] for h in
+                          app._resv_table_clashes(self.today, "B10", exclude_id=a)], [b])
+        self.assertIn("โต๊ะนี้มีคนจองไว้แล้ว", app._resv_clash_warn(b))
+        self.assertIn(f"#{a}", app._resv_clash_warn(b))
+
+    def test_hours_apart_still_clashes(self):
+        """ร้านนี้ลูกค้าอยู่ยาวทั้งคืน — ห่างกี่ชั่วโมงก็ยังเป็นโต๊ะที่ถูกกันไว้แล้ว"""
+        self._add("คนแรก", "B10", "17:00")
+        b = self._add("คนที่สอง", "B10", "23:00")
+
+        self.assertNotEqual(app._resv_clash_warn(b), "")
+
+    def test_partial_overlap_of_a_table_set_clashes(self):
+        """จองหลายโต๊ะ ชนแค่โต๊ะเดียวก็ต้องเตือน"""
+        self._add("คุณฝ้าย", "A11,12,7,8")
+        b = self._add("ลูกค้าใหม่", "A12")
+
+        self.assertIn("คุณฝ้าย", app._resv_clash_warn(b))
+
+    def test_different_day_does_not_clash(self):
+        self._add("คนเก่า", "B10", day="2026-12-31")
+        b = self._add("คนใหม่", "B10")
+
+        self.assertEqual(app._resv_clash_warn(b), "")
+
+    def test_cancelled_booking_frees_the_table(self):
+        self._add("ยกเลิกไปแล้ว", "B10", status="CANCELLED")
+        b = self._add("คนใหม่", "B10")
+
+        self.assertEqual(app._resv_clash_warn(b), "")
+
+    def test_unknown_table_is_not_treated_as_free_nor_warned(self):
+        """🪤 ไม่มีรหัสโต๊ะ = 'ไม่รู้' ไม่ใช่ 'ว่าง' → ไม่เดา ไม่เตือนมั่ว"""
+        self._add("ไม่ระบุโต๊ะ", "")
+        b = self._add("คนใหม่", "")
+
+        self.assertEqual(app._resv_clash_warn(b), "")
+
+    def test_different_tables_do_not_clash(self):
+        self._add("คนแรก", "โซน B โต๊ะ 15")
+        b = self._add("คนที่สอง", "โซน B โต๊ะ 11")
+
+        self.assertEqual(app._resv_clash_warn(b), "")
+
+    # ── การ์ดสรุป ─────────────────────────────────────────────────────────
+    def test_summary_flags_the_clash(self):
+        a = self._add("คุณต้น bni", "B10", "18:30")
+        b = self._add("คุณมด", "โซน B โต๊ะ 10", "20:00")
+        self._add("วาริน", "A14", "19:00")
+
+        out = app.build_resv_summary(None, "📋 สรุป", upcoming=True)
+
+        self.assertIn("🔴 โต๊ะซ้ำ 2 รายการ", out)
+        self.assertIn(f"⚠️ โต๊ะซ้ำกับ #{b}", out)
+        self.assertIn(f"⚠️ โต๊ะซ้ำกับ #{a}", out)
+        self.assertEqual(out.count("⚠️ โต๊ะซ้ำกับ"), 2, "วารินไม่ชน ต้องไม่ติดธง\n" + out)
+
+    def test_summary_without_clash_says_nothing_extra(self):
+        self._add("วาริน", "A14")
+        self._add("พล", "โซน B โต๊ะ 11")
+
+        out = app.build_resv_summary(None, "📋 สรุป", upcoming=True)
+
+        self.assertNotIn("โต๊ะซ้ำ", out)
