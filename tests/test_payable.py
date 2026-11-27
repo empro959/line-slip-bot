@@ -6267,3 +6267,106 @@ class TestReservationTableClash(unittest.TestCase):
         out = app.build_resv_summary(None, "📋 สรุป", upcoming=True)
 
         self.assertNotIn("โต๊ะซ้ำ", out)
+
+
+class TestBillVendorCheck(PayableTestCase):
+    """บิลของร้านอื่นต้องไม่หลุดเข้าบัญชีหนี้ดวงใจ
+
+    🔴 เคสจริง 27/11/2569 — บิลเบียร์สิงห์ของ 'ย.ยอดเยี่ยม จำกัด' 2,752 บาท
+    ถูกบันทึกเป็นหนี้ดวงใจ · ฝั่งสลิปเช็กปลายทางมาตั้งแต่เคส 9 ก.ย. (_payable_payee_ok)
+    แต่ฝั่ง 'บิลซื้อ' ไม่เคยเช็กชื่อร้านเลย — ส่งรูปบิลอะไรเข้ามาก็ขึ้นหนี้ดวงใจหมด"""
+
+    def setUp(self):
+        super().setUp()
+        self._orig = (app.extract_payable_doc, app._payable_send, app._payable_push_summary,
+                      app.PAYABLE_VENDOR_ALIASES, app.line_bot_api)
+        self.sent = []
+        app._payable_send = lambda ev, gid, out, text: self.sent.append(text)
+        app._payable_push_summary = lambda *a, **k: None
+
+        class _Content:                       # ของปลอมแทนการโหลดรูปจาก LINE
+            def iter_content(self): return [b"fake-image"]
+
+        class _Api:
+            def get_message_content(self, mid): return _Content()
+            def reply_message(self, tok, msg): pass
+            def push_message(self, to, msg): pass
+        app.line_bot_api = _Api()
+
+    def tearDown(self):
+        (app.extract_payable_doc, app._payable_send, app._payable_push_summary,
+         app.PAYABLE_VENDOR_ALIASES, app.line_bot_api) = self._orig
+        super().tearDown()
+
+    class _Msg:
+        id = "mid-vendor"
+
+    class _Ev:
+        reply_token = "tok"
+        message = None
+
+    def _send_bill(self, vendor, amount=2752.0):
+        """ส่งรูปบิลเข้ากลุ่มเจ้าหนี้ — ผ่านเส้นจริง _process_payable_image"""
+        self.sent = []
+        self._Msg.id = f"mid-{vendor}-{amount}-{time.time()}"
+        app.extract_payable_doc = lambda b, retry=False: {
+            "doc_type": "bill", "amount": amount, "vendor": vendor,
+            "doc_date": datetime.now(app.TZ).date().isoformat()}
+        ev = self._Ev(); ev.message = self._Msg()
+        app._process_payable_image(ev, ACCT)
+        return "\n".join(self.sent)
+
+    # ── ตัวเทียบชื่อ ──────────────────────────────────────────────────────
+    def test_different_shop_is_rejected(self):
+        self.assertTrue(app._vendor_mismatch("ย.ยอดเยี่ยม จำกัด"))
+        self.assertTrue(app._vendor_mismatch("บริษัท ย.ยอดเยี่ยม จำกัด"))
+
+    def test_same_shop_written_differently_passes(self):
+        """หัวบิลเขียนไม่เหมือนกันทุกใบ — ต้องไม่ปฏิเสธบิลจริง"""
+        for name in ("ดวงใจการสุรา", "หจก. ดวงใจการสุรา", "ดวงใจการสุรา จำกัด",
+                     "ร้านดวงใจ", "ดวงใจ"):
+            with self.subTest(name=name):
+                self.assertEqual(app._vendor_mismatch(name), "", name)
+
+    def test_unreadable_name_is_not_a_rejection(self):
+        """🪤 อ่านไม่ออก = 'ไม่รู้' ไม่ใช่ 'ไม่ใช่' — บิลดวงใจจริงต้องไม่หายเพราะหัวบิลเบลอ"""
+        for name in (None, "", "   ", "ด", "ดว"):
+            with self.subTest(name=name):
+                self.assertEqual(app._vendor_mismatch(name), "")
+
+    def test_alias_env_accepts_another_spelling(self):
+        app.PAYABLE_VENDOR_ALIASES = ["ดวงใจ สุรา เชียงใหม่"]
+        self.assertEqual(app._vendor_mismatch("หจก.ดวงใจสุราเชียงใหม่"), "")
+
+    # ── เส้นจริง ──────────────────────────────────────────────────────────
+    def test_the_real_case_is_not_recorded(self):
+        before = app._payable_outstanding(ACCT)
+
+        msg = self._send_bill("ย.ยอดเยี่ยม จำกัด", 2752.0)
+
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), before, places=2,
+                               msg="🔴 บิลร้านอื่นห้ามเพิ่มหนี้")
+        self.assertEqual(self.bills(), [], "ต้องไม่สร้างแถวบิลเลย")
+        self.assertIn("ย.ยอดเยี่ยม", msg, "ต้องบอกว่าอ่านชื่อร้านได้ว่าอะไร")
+        self.assertIn("2,752.00", msg, "ต้องบอกยอดที่ไม่ได้บันทึก")
+        self.assertIn("บิล ", msg, "ต้องบอกคำสั่งที่พิมพ์ตามได้ถ้าบอทอ่านชื่อเพี้ยน")
+
+    def test_our_vendor_bill_is_still_recorded(self):
+        """ของเดิมที่ถูกอยู่แล้วต้องไม่พัง"""
+        self._send_bill("หจก. ดวงใจการสุรา", 5000.0)
+
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 5000.0, places=2)
+
+    def test_bill_without_vendor_is_still_recorded(self):
+        """พรอมป์ตสั่งให้ใส่ null ถ้าไม่แน่ใจ — null ต้องไม่ทำให้บิลหาย"""
+        self._send_bill(None, 3000.0)
+
+        self.assertAlmostEqual(app._payable_outstanding(ACCT), 3000.0, places=2)
+
+    def test_rejection_message_is_a_copyable_command(self):
+        """ปฏิเสธแล้วต้องกู้ได้ง่าย — เติมวัน/เดือนและยอดให้พร้อมพิมพ์ตาม"""
+        msg = self._send_bill("ย.ยอดเยี่ยม จำกัด", 2752.0)
+
+        today = datetime.now(app.TZ).date()
+        self.assertIn(f"บิล {today.day:02d}/{today.month:02d} 2,752", msg,
+                      "ต้องเติมวัน/เดือนและยอดให้ครบ พิมพ์ตามได้ทันที\n" + msg)
